@@ -1,0 +1,102 @@
+%!TEX root = ../main.tex
+
+\newcommand{\tombstone}{\square}
+\newcommand{\mcsstate}{\mathsf{DS}}
+\newcommand{\mcslstate}{\mcsstate}%{\overline{\mcsstate}}
+\newcommand{\Hist}{\mathit{Hist}}
+\newcommand{\Status}{\mathit{Status}}
+\newcommand{\obl}{\mathsf{OBL}}
+\newcommand{\ful}{\mathsf{FUL}}
+\newcommand{\slt}{\mathsf{SLT}}
+\renewcommand{\anobl}[1]{\obl(#1)}
+\renewcommand{\aful}[1]{\ful(#1)}
+\newcommand{\aslt}[1]{\slt(#1)}
+\newcommand{\astatus}[1]{\mathit{status}(#1)}
+\newcommand{\Valid}{\mathit{Valid}}
+\newcommand{\tid}{\mathit{tid}}
+\newcommand{\latest}{\mathit{latest}}
+
+\subsection{Linearizability with Helping}
+\label{sec:motivation:lin}
+
+We illustrate contextual reasoning for the purpose of linearizability proofs of concurrent data structure operations whose linearization points are future-dependent and potentially located in other threads.
+Specifically, we focus on proofs that use prophecy variables and involve \emph{helping protocols} that govern the transfer of linearizability obligations between threads~\cite{DBLP:journals/pacmpl/JungLPRTDJ20,DBLP:journals/pacmpl/PatelKSW21}.
+
+Concretely, we consider concurrent data structures that implement a (total) map $M$ from keys $K$ to values $V$.
+For simplicity, assume a dedicated \emph{tombstone} value $\tombstone \in V$ that indicates the absence of a mapped value.
+There are two types of operations: \code{search(k)} retrieves the value associated with $k$ in $M$ and \code{upsert(k,v)} updates the value of $k$ in $M$ to the new value $v$. 
+We represent the data structure's physical state using an abstract predicate $\mcslstate(M)$.
+So the goal is to prove that the operations are linearizable subject to the expected sequential specification:
+\begin{alignat*}{2}
+  & \hoareof{\mcslstate(M)}{&~\mcode{search}(k)\,~~&}{\mcode{$v$}.\; \mcslstate(M) * M(k)=v}
+  \\
+  & \hoareof{\mcslstate(M)}{&~\mcode{upsert}(k,v)~&}{\mcslstate(M[k \mapsto v])}\ .
+\end{alignat*}
+To do so, we can use the history $h \in (K \times V)^*$ of key/value pairs that have been upserted thus far as an intermediate abstraction of the physical state.
+To be precise, $h$ induces the abstract state $M(h)$ that evaluates every key to the latest upserted value for that key or the tombstone if there is no upsert for the key.
+The core aspect of the linearizability proof is carried out at this level of abstraction \cite{DBLP:journals/pacmpl/PatelKSW21}.
+(Refer to \Cref{sec:motivation:flow} to see how relating the physical state to such an abstraction can also benefit from contextual reasoning.)
+
+We focus on the linearizability argument for search threads.
+A thread executing \code{search($k$)} may return value $v$ if either $M(h)(k)=v$ holds for the history $h$ when the search started or some \code{upsert($k$,$v$)} operation linearized during the execution of the search.
+In the first case, the linearization point of \code{search($k$)} is right at the start of the operation.
+In the second case, its linearization point coincides with the linearization point of the interfering \code{upsert($k$,$v$)} thread.
+
+To enable thread modular reasoning about linearizability, the proof maintains a shared ghost state component that consists of a registry $R$.
+The registry is a partial map from the thread IDs of all active search threads to their \emph{linearizability status}, $\anobl{k,v}$ or $\aful{k,v}$.
+Status $\anobl{k,v}$ indicates that the thread (i) is searching for key $k$, (ii) it will return value $v$, and (iii) it still has the obligation to linearize.
+Status $\aful{k,v}$ is similar but indicates that the thread has fulfilled its obligation to linearize.
+The choice of the return value $v$ is implemented using a prophecy variable; we elide the details here.
+
+Overall, the ghost state for the proof is a pair $(h, R)$ consisting of the current history $h$ and the registry $R$.
+The actual code induces two kinds of updates to that ghost state: spawning a new search and linearizing an upsert.
+When spawning a new \code{search($k$)}, an entry $\tid \mapsto s(k,v)$ for a fresh thread ID $\tid$ is added to the registry $R$, where $v$ is the thread's prophesied return value.
+If $M(h)(k)=v$ then $s$ is chosen to be $\ful$ (the thread immediately linearizes) and otherwise $s=\obl$.
+That is, the resulting ghost state is $(h, R\uplus\setcompact{\tid \mapsto s(k,v)})$.
+
+When linearizing an \code{upsert($k$, $v$)}, a new pair $(k,v)$ is appended to the history $h$.
+More importantly, the registry is updated to linearize other threads that are searching for key $k$ and expect value $v$.
+To be precise, the new ghost state is $\bigl((k,v) \cdot h, R'\bigr)$ where $\cdot$ is the concatenation of histories and, for all threads $\tid$, $R'(\tid)=\aful{k,v}$ if $R(\tid)=\anobl{k,v}$ and $R'(\tid)=R(\tid)$ otherwise.
+Note that this means we have $M((k,v) \cdot h)(k)=M(h)[k \mapsto v]=v$, so the sequential specification of \code{search($k$)} is satisfied and the search can indeed linearize.
+
+Now, the actual proof of \code{upsert} operations has to deal with both the physical representation and the ghost state, i.e., with assertions $\mcslstate(M(h)) \mstar (h, R)$.
+Consequently, for a command $\acom$ executing the linearization point of $\mcode{upsert}(k,v)$, the proof goal will be: \[
+  \hoareof{\mcslstate(M(h)) \mstar (h, R)}{\acom}{\mcslstate(M(h)[k \mapsto v]) \mstar ((k,v) \cdot h, R')}
+  \enspace .
+\]
+Notably, the entire proof has to deal with the registry $R$ although its updates are not relevant when updating the physical representation $\mcslstate(M)$.
+Nevertheless, we cannot frame $R$ because separation logic does not allow the frame to be changed by $\acom$.
+\begin{quote}\itshape
+In short, due to the update of the ghost state, separation logic fails to localize the reasoning about the physical update.
+\end{quote}
+
+To alleviate this shortcoming of the frame rule, we approximate the exact registry $R$.
+Towards this, we define the separating conjunction for the ghost state as $(h_1, R_1) \mstar (h_2, R_2) \defeq (h_1, R_1 \uplus R_1)$ if $h_1=h_2$ and $R_1,R_2$ are disjoint, leaving it undefined in all other case.
+Then, rewrite $(h, R)$ into $(h, \emptyset) \mstar (h, R)$.
+We use the former conjunct to keep track of the history.
+The latter conjunct we approximate by a predicate $\acontext$ that corresponds to the smallest set of ghost states containing $(h, R)$ as well as all $(h'', R'')$ that result from $(h, R)$ by applying some sequence of search and upsert ghost updates, as discussed above.
+By construction, $\acontext$ is stable under $\acom$: it denotes the ghost state $(h, R)$ from the precondition as well as the ghost state $((k,v) \cdot h, R')$ from the postcondition.
+Note that despite this approximation, we can recover the desired registry $R'$ from computing $(h, \emptyset) \mstar \acontext$.
+This leaves us with the following new proof goal: \[
+  \hoareof{\mcslstate(M(h)) \mstar (h, \emptyset) \mstar \acontext}{\acom}{\mcslstate(M(h)[k \mapsto v]) \mstar ((k,v) \cdot h, \emptyset) \mstar \acontext}
+  \enspace .
+\]
+Now, we treat $\acontext$ like a frame and ``remove'' it from the proof.
+Technically, we do not use the frame rule.
+Instead, we use a new context rule.
+Like the frame rule, it allows us to ignore $\acontext$ and focus on the remaining parts of the proof.
+Unlike the frame rule, we allow commands to modify the resources in $\acontext$.
+To that end, we keep $\acontext$ syntactically in the proof tree and ensure its stability under updates of commands like $\acom$.
+The result is a \highlight{context-aware} Hoare triple: \[
+  \choareHighOf{\highlight{\acontext}}
+  {\mcslstate(M(h)) \mstar (h, \emptyset)}{\acom}{\mcslstate(M(h)[k \mapsto v]) \mstar ((k,v) \cdot h, \emptyset)}
+  \enspace .
+\]
+Applying this argument to the full proof of \code{upsert} allows us to focus on the updates of the physical representation.
+While moving the registry to the context does not come for free, i.e., without any proof obligation, we observe that stability arguments are typically quite simple and may even be discharged upfront by reasoning over the semantics of commands rather than specific commands, just as we did when introducing the ghost state updates.
+Hence, the context-aware Hoare triple that we are left with removes the need for reasoning about the registry altogether.
+
+%%% Local Variables:
+%%% mode: latex
+%%% TeX-master: "../main"
+%%% End:

@@ -1,0 +1,130 @@
+\input{pdg}
+In this section, we describe how we collect examples for learning repair strategies without any version-controlled data. Specifically, we first detect \safeprogs and corresponding witnesses using \sawitnessfull (witnesses are sanitizers and guards that protect from vulnerabilities)  in Section~\ref{subsec:sa-witness}. Using these witness annotations, we generate unsafe programs and \textit{edits} from the \safeprog using a \textbf{witness-removal} step (Section ~\ref{subsec:witness-removal}). In the following, we define terminology for the \astree  data-structure we operate on. 
+
+
+\astree refers to the abstract syntax tree representation of programs, augmented with data flow edges and annotations for sources, sinks, sanitizers, guards, witnesses etc. 
+An \astree is a five-tuple 
+$\langle \mathcal{N},\mathcal{V},\mathcal{T},\mathcal{E}, \mathcal{A} \rangle$, where:
+\begin{enumerate}
+\item
+$\mathcal{N}=\{\mathit{id}_0,\ldots\mathit{id}_n\}$  is a set of nodes, where  $\mathit{id_i}\in\mathbb{N}$ for 
+$ 0 \leq i \leq n$.
+\item
+$\mathcal{V}$ is a map from nodes to program snippets
+represented as strings. For a node $n$, we have that $\mathcal{V}(n)$ is a string representing the code snippet associated with $n$
+\item
+$\mathcal{T}$ is a map from nodes to their types defined by 
+ \sa~\cite{codeqlast}. For example, \callexpr is the type of a node representing a function call, \indexexpr is the type of a node representing an array index, and \blockstmt is the type of a node representing a basic block of statements.
+\item
+$\mathcal{E}$ is a set of directed edges.
+Each edge is of the form $(n_1,n_2,\edgetype,z)$, where
+$n_1$ is a source node, $n_2$ is a target node, 
+$\edgetype \in \{\T{SynParent}, \T{SynChild}, \T{SemParent},
+\T{SemChild} \}$ denotes the relationship from 
+$n_1$ to $n_2$, as one of syntactic parent, syntactic child, semantic parent or semantic child,
+and $z\in\mathbb{Z}$ is the index of $n_2$ among $n_1's$ children if this edge is a child edge, and $-1$ if the edge is a parent edge. 
+\item
+$\mathcal{A}$ is a set of annotations associated with each node. The annotations are from the set $\{\T{source},
+\T{sink},\T{sanitizer},\T{guard}$,\T{witness}\}. We also refer to annotations using predicates or relations. For instance, for a node $n$, if an annotation  $\T{source}$ is present, we say that
+the predicate $\T{source}(n)$ is true.
+\end{enumerate}
+
+%\input{astsyntax}
+A {\em traversal} or a {\em path} in an \astree is a sequence of edges $e_0,\ldots,e_{i-1},e_i,\ldots ,e_k$ such that the target node of $e_{i-1}$ is also the source node of $e_i$, for all $i\in\{1,\ldots,k\}$. That is, $e_{i-1}$ is of the form $(\_,n,\_,\_)$ and $e_i$ is of the form $(n,\_,\_,\_,\_)$. The source node of $e_0$ is the source of this path and the target node of $e_k$ is the target of the path.
+
+
+\lstMakeShortInline[columns=fixed]@
+%Note that these additional edges can capture long-range dependencies in programs. E.g. edge 4 in Figure ~\ref{fig:unsafememberex} links two nodes across the function boundaries. 
+Figure~\ref{fig:example1-pdg} depicts a partial \pdg corresponding to the unsafe program in Figure~\ref{fig:unsafememberex}. Each oval corresponds to an \astree-node containing a type $\tau$ and an associated value. The dark edges denote the syntactic child edges. For example, the oval with value @foo(data)@ is an \astree-node with type \callexpr and has two children -- @foo@ and @data@, both with the type \varexpr. 
+%Similarly, the \blockstmt node on the top refers to the function body between Line~\ref{lst:line:handlers-run} and Line~\ref{lst:line:handlers-run-end} in Figure ~\ref{fig:unsafememberex}. As the body of a function block can contain a variable number of children, we link to @handlers[callerId](data);@ as the k-th child of the \blockstmt. 
+The semantic child edges are at the bottom in cyan. These edges correspond to the ones depicted in cyan in Figure ~\ref{fig:unsafememberex}. 
+\lstDeleteShortInline@
+
+%TODO:FIX THIS
+
+%With this simplification, 
+If $\prog$ is an \pdg then
+we use  $\prog.\mathtt{source}$ to denote the source node, $\prog.\mathtt{sink}$ to denote the sink node, and $\prog.\mathtt{witness}$ to denote the witness node.
+If the program has several sources, sinks and sanitizers then we generate a separate \pdg for each $(\mathtt{source},\mathtt{witness},\mathtt{sink})$ triple.
+For a node $n$, its syntactic parent is $n.\mathtt{parent}$, syntactic children are $n.\mathtt{children}$, semantic parent is $n.\mathtt{semparent}$, and semantic children are $n.\mathtt{semchildren}$.
+
+%\input{ql.tex}
+
+\subsection{Static Analysis Witnessing}
+\label{subsec:sa-witness}
+
+\input{judgements}
+
+%\naman{TODO - sell this more as technique to work with any \sa tool ; our master query is a general framework implemented in \codeql that can work for any vulnerability -- easily extendable to other languages }
+In this section, we show how to repurpose \sa tools to generate witnesses.
+\sa tools perform dataflow analysis to check for rule-violations in programs. They use pattern matching to identify known sources, sinks, sanitizers, and guards. For commercial tools, these patterns are implemented (and continuously updated) manually by developers and encode this domain knowledge. Next, 
+%these patterns are used to detect sources, sinks, sanitizers, and guards in programs and
+\sa checks if there exists a flow between a source and a sink that does not cross a sanitizer or guard. We capture this formally in Figure~\ref{fig:judgements} (top two rules), and explain the notation used in it below.
+
+\sa tools encode domain knowledge about the vulnerability by annotating nodes as \T{Source}, \T{Sink}, \T{Sanitizer}, and \T{Guard}. %These relations operate on the set of dataflow nodes in the programs.
+So \DMethod{Source}{\I{n}}\ is true iff the node \I{n} is a \textit{source} node for a vulnerability. Next, \sa tools perform dataflow analysis by defining the relation \DMethod{SemChild}{$n_1$}{$n_2$}\ which is true iff there is a \taintpropedge between $n_1$ and $n_2$. Then the \DMethod{Vulnerability}{$n_1$}{$n_2$}\ relation can be defined as:
+\begin{enumerate}
+    \item $n_1$ and $n_2$ are source and sink nodes (\DMethod{Source}{$n_1$}\ and \DMethod{Sink}{$n_2$}\ are true)
+    \item There exists a \textit{path} between $n_1$ and $n_2$ which is free of sanitizers or guards (\DMethod{SanGuardFree*}{$n_1$}{$n_2$}\ is true). A path is free of sanitizers and guards iff every \textit{edge} in the \textit{path} is free of sanitizers and guards. An edge between $n_1$ and $n_2$ is considered free of sanitizers and guards (\DMethod{SanGuardFree}{$n_1$}{$n_2$}\ is true) iff $(n_1, n_2, \_, \T{SemChild}) \in \mathcal{E}$ and neither of $n_1$ or $n_2$ is a sanitizer or a guard
+\end{enumerate}
+
+Here, we make the following observation - \emph{this domain knowledge present in these annotations and relations is helpful beyond just detecting vulnerabilities}. For instance, simply using the sanitizer relation allows us to query the different kinds of sanitizers domain experts have specified. We use this observation to discover \emph{\safeprogs} i.e., programs having a source, sink, and a sanitizer or guard that \textit{blocks} the \taintprop or, in simpler terms, make the program safe. In addition, we also detect the corresponding sanitizers or guards in the programs and refer to them as \textit{witnesses} because they serve as the evidence of making the program safe. We call this procedure \sawitnessfull (abbreviated as \sawitness). 
+We define this as the \T{Witness} relation in Figure~\ref{fig:judgements} (bottom two rules). Specifically, \DMethod{Witness}{$n_1$}{$n_3$}{$n_2$}\ is defined as:
+\begin{enumerate}
+    \item $n_1$ and $n_2$ are source and sink nodes (\DMethod{Source}{$n_1$}\ and \DMethod{Sink}{$n_2$}\ are true)
+    \item There exists a node $n_3$ such that it satisfies \DMethod{SanGuardInMid}{$n_1$}{$n_3$}{$n_2$}. \DMethod{SanGuardInMid}{$n_1$}{$n_3$}{$n_2$}\ is true iff there exists a \T{SemChild}
+    %\naga{notation for flow inconsistent with (2) above} 
+    path between $n_1$, $n_3$, between $n_3$ and $n_2$, with the additional constraint of $n_3$ being a sanitizer or guard. 
+\end{enumerate}
+
+The difference between the \T{Vulnerability} relation (which \sa populates) and \T{Witness} relations (which we want to find) is highlighted in {\color{red} red} and {\color{ForestGreen} green}. Notice that while defining the \T{Witness} relation, we simply use the existing relations that define the \T{Vulnerability} relation. Thus, we argue that \sawitness can be implemented on top of \sa by using the intermediate relations that \sa is computing.
+%for every pair of source and sink, they track taint through a taint-flow analysis. If there is a flow from a source to a sink that does not go through a sanitizer or guard, then the source-sink pair is reported as vulnerable.
+
+%We make the following observation - \emph{the patterns defined by experts encodes domain knowledge which can be used for use cases beyond just detecting vulnerabilities}. For instance, we can use the sanitizer patterns to search for all sanitizers in source-code. In this work, we use this idea to detect \safeprogs, which we define as programs having a source, sink, and a sanitizer or guard that blocks the \unsure{flow} or in other words, makes the program safe.  \naman{highlighted part of Figure somethings shows the difference between semantics of witnessing vs traditional semantics}
+
+%We realize the following -- the set of patterns of sources, sinks, and sanitizers are useful beyond detecting vulnerabilities. We override the existing static analysis query that detects unsafe programs and use these encoded sanitizers for detecting sanitizers and guards in programs. Specifically, in the existing query that detects unsafe programs, we modify the taint-propagation steps to propagate taints through sanitizers and guards and then use static analysis to then find these dataflows containing sanitizers and guards. Thus, we can directly find the safe programs containing these \textit{witnesses} of safety. 
+%Once such a dataset is collected, we use these witnesses to convert safe  to unsafe  and thus obtain paired examples for learning repair strategies (Section~\ref{subsec:witness-removal}). 
+
+\lstMakeShortInline[columns=fixed]@
+%We instantiate our \sawitness technique using \codeql~\cite{a}. It is an open-source \sa tool that allows implementing custom static analysis as queries in a high-level object-oriented extension of datalog. These queries usually contain a \Verb|select from where| statement that allows querying the program database. \codeql maintains these patterns of sources, sinks, sanitizers, and guards using \Verb"Configuration" classes. Consider an example of a simplified \Verb"Configuration" for \xss vulnerability in Figure~\ref{fig:configuration}. It defines a set of predicates @isSource@, @isSink@, @isSanitizer@, and @isGuard@. These predicates are written manually by \codeql authors and improved through rich community support\footnote{\url{https://github.com/github/codeql}}. With this configuration, vulnerabilities are reported by selecting source-sink pairs such that the @cfg.hasFlow@ predicate is true for the source, and the sink. This predicate is internally defined by \codeql and uses the patterns defined in the configuration to check for the presence of vulnerability-causing dataflows. %\spsays{Showing corresponding programs will be useful}
+
+%Now, we demonstrate the static-analysis-witnessing approach for collecting examples of \safeprog and witnesses in Figure~\ref{fig:safe-configuration}. Specifically, we inherit from the existing configuration, using the same @isSource@ and @isSink@ predicates while overriding the @isSanitizer@ and @isGuard@ predicates to @none()@. This ensures that all the source and sink pairs are detected independent of the presence of sanitizers/guards between them. Finally, to detect our witnesses, we define the @isWitness@ predicate which uses the @isSanitizer@ and @isGuard@ predicates from the original configuration. Specifically, witnesses are defined as sanitizers/guards that lie between a source-sink pair. Finally, to report \safeprog and witnesses, the @cfg.hasFlow@ predicate is used to select all valid source-sink pairs and the corresponding witnesses are detected via the @isWitness@ predicate. Note that Figure~\ref{fig:configuration-vs-safe-configuration} depicts the key idea behind our approach in a simplified view. In practice, additional measures need to block the taint propagation internally and we share the actual \codeql queries used as part of the Appendix~\ref{app:codeql-queries}.
+
+
+\subsection{Witness Removal}
+\label{subsec:witness-removal}
+
+We obtain \safeprogs and witnesses by applying \sawitness to a snapshot of a codebase. Recall that the witnesses block the flow between a source and a sink and thus help make programs  \textit{safe}. Hence, removing these witnesses will make the programs unsafe. Recall also that the witnesses are either sanitizing functions of the form @sanitize(taintedVar)@ or guards of the form @if checkSafe(taintedVar) {executeSink(taintedVar)}@. %Usually, they are used only for ensuring the safety of programs and are not critical to the functionality of programs. Therefore, 
+We implement witness-removal perturbations  that precisely remove the guard-checks and sanitizer-functions. Note that our goal here is to generate unsafe programs and corresponding edits that enable learning repair strategies that insert such witnesses. So, while we generate the unsafe programs by perturbation, they should look structurally similar to natural unsafe programs written by the developers, otherwise the repair strategies learned on this artificially generated data through perturbations would not generalize to code in the wild. 
+%At the same time, minor syntactic-semantic issues in parts of unsafe programs not directly relevant to the vulnerability or repair do not impact learning.
+\lstDeleteShortInline@
+
+% Figure environment removed
+
+\lstMakeShortInline[columns=fixed]@
+
+\input{witnessremoval.tex}
+
+We use \rmSan and \rmGuard functions to programmatically remove the witnesses. A high-level sketch of these functions is illustrated in Figure~\ref{fig:remove-functions}. The functions use the structure of the corresponding \astree (node types $\tau$) to decide how to remove witnesses. Consider the \rmGuard function. It first computes the parent (\witnesspar) and grand-parent (\witnessparpar) of the witness guard condition. Then if the type of \witnesspar is \ifstmt (i.e., program is of the form @if (witness) body@ then we modify the \astree edge from \witnessparpar and \witnesspar to instead point to the body of the \ifstmt (index 1 child is body of \ifstmt). Similarly, if the type of \witnesspar is \binaryexpr with operator @&&@ (i.e. of the form @if (otherCond && guard)@ or @if (guard && otherCond)@) then we again modify the edge from \witnessparpar and \witnesspar to instead point to the non-guard child of \binaryexpr (@otherCond@ in the example). Note that since \binaryexpr has 3 children, the index of non-guard child is index of guard-child subtracted from 2. 
+Figure~\ref{fig:witness-removal} depicts this removal on the \astree level, where the syntactic edges in red are removed and the syntactic edges in green are inserted.
+In the end, the functions returns a tuple of the \pdg of the unsafe program ($\prog_{unsafe}$), \pdg of the safe program ($\prog_{safe}$)
+and an edit object (\edit) which stores
+
+
+\begin{enumerate}
+    \item \astree for the removed witness (referred to as \editprog)
+    \item location in the \pdg where the witness is removed (referred to as editloc
+    %\naga{shouldn't it be editloc to be consistent with (1)?} 
+    or \editloc)
+    %\item an enum (\insertsc or \replace) depending on whether \concedit is inserted or replaced 
+\end{enumerate}
+
+Since $\prog_{unsafe}$ and edit-object can generate the safe program, we only propagate the unsafe programs and edits as the output of this step. Applying \rmGuard function to the safe program in Figure~\ref{fig:safememberex} removes the \ifstmt on Line~\ref{lst:line:fix-start} while preserving the @handlers[callerId](data);@ statement and in fact produces the unsafe program in Figure~\ref{fig:unsafememberex}. Additionally, it  returns the removed witness guard  @if handlers.hasOwnProperty(data.id){ ... }@ as the \editprog and \blockstmt (blue oval in Figure~\ref{fig:example1-pdg}) as the edit location \edit.editloc. Figure~\ref{fig:example1-editprog} shows the \astree for the \editprog containing the \ifstmt. 
+The dashed line and dark circle correspond to the \textit{removed} \astree edge between the \blockstmt and the \expr @handlers[callerId](data)@. 
+
+Note that Figure~\ref{fig:remove-functions} provides a high-level sketch of witness-removal and elides over implementation details that are required to make it work for real \js programs. We discuss these issues in the implementation section (Section~\ref{subsec:impl:witness-removal}).% and include the full implementation as part of supplementing source code\naga{we should make sure we are doing these, else remove this sentence}. 
+%. In practice, we need implement such decisions more carefully to cover other traditional cases in which guards occur and we document them in the supplementing source code.
+\lstDeleteShortInline@
+
+%\naman{add examples $\dots$ } \spsays{do we re-run codeql on this generated bad program? -- NO (naman)}
+

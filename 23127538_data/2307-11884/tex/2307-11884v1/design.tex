@@ -1,0 +1,498 @@
+\section{Methodology: Symbolic Execution for Information Flow}
+\label{sec:design}
+Given a design and an input signal of interest, \texttt{src}, our goal is to
+find how information can flow during execution from \texttt{src} through the design. Our approach
+is to first use the IF graph to enumerate all potential paths of information flow
+through the design from \texttt{src}. As this is a static analysis, complexity
+grows linearly with the number of variables in the design and the length of the
+RTL code. Then, for each enumerated path, SEIF uses symbolic execution to
+either find a corresponding information-flow path through the design, or
+determine that no such path exists.
+
+\subsection{Overview}
+
+Once the IF graph is generated, the analysis proceeds in three main phases: pruning globally unrealizable paths,
+symbolically executing the design to find realizable paths through the design,
+and analyzing the semantics of each found path to find true paths of information
+flow. In the following sections, we describe each phase in more detail.
+
+If SEIF returns a path, it is a true path through
+the design corresponding to the path in the IF graph. Depending on the
+post-processing option used, this will either be a path starting at the design's
+reset state or an intermediate state. 
+
+If SEIF does not return a path, there are three
+possibilities. First, the path in the IF graph has been identified
+as infeasible within a bounded number of clock cycles.
+Second, the path in the IF graph is
+feasible in the design, but does not represent an actual flow of information --
+this result is sound with one caveat discussed in
+Section~\ref{sec:semantic}. Third, the path in the IF graph cannot be
+accounted for. These options are discussed in
+Section~\ref{sec:postprocessing} and evaluated in Section~\ref{sec:eval-acctingpaths}. 
+
+
+%The IF graph is used in the first two phases. In the first phase, information taken directly from the IF graph
+%can be used to eliminate paths in the IF graph that are unrealizable. These are
+%paths that would require mutually contradictory constraints to hold in order to
+%be realized. These are globally unrealizable paths because the constraints are
+%unsatisfiable regardless of the current state of the design during execution.
+
+%In the second
+%phase, we use symbolic execution to find, for each remaining path through the IF
+%graph, a corresponding path through the design. Our methodology relies on the hardware-oriented symbolic 
+%execution engine described in \cite{ryan2023countering}. The number of possible paths
+%through the design is large and paths are of unbounded length. The IF graph enables pruning some paths at each clock cycle
+%boundary and enables a search heuristic to guide execution toward paths
+%more likely to complete the flow of information from \texttt{src}.
+
+%In the third
+%phase, we use the symbolic state and path condition from the symbolic execution
+%engine to eliminate paths that represent true paths through
+%the design, but which do not correspond to a true information flow from \texttt{src}.
+
+\subsection{Pruning Globally Unrealizable Paths from the IF Graph}
+\label{sec:pruningglobally}
+
+In the first phase, our goal is to quickly and cheaply eliminate paths through the IF graph that are easily
+falsified before moving on to the next, more expensive phase. Consider
+the example code in Figure~\ref{fig:toy2}. The variable \texttt{temp} carries the input
+\texttt{secret} only when the input signal \texttt{enable} is high. The \texttt{secret}
+information is conditionally passed on to \texttt{result} and from there to
+\texttt{led2}. The corresponding IF graph is shown in
+Figure~\ref{fig:toy2fig}. While the IF graph appears
+to show a flow of information from \texttt{secret} to \texttt{led2} via
+\texttt{temp}, the constraint for edges (\texttt{secret},
+\texttt{temp}) and (\texttt{temp}, \texttt{result}) require \texttt{enable} to be high and low, respectively. Since both edges must occur in the same clock cycle,
+this flow cannot be realized.
+
+   % Figure environment removed
+
+
+% Figure environment removed
+
+This analysis requires knowing where clock
+cycle boundaries are. In the IF graph, an edge corresponding to a nonblocking
+assignment (for example, $\mathtt{result} <=
+\mathtt{temp}$) denotes a clock cycle boundary. When \texttt{state} is updated in
+one clock cycle, the updated value can be read in the next clock cycle.
+
+At the start of this phase, the given path through the IF is divided into
+\emph{segments}.
+One segment of an IF-graph path is a sequence of hops in the IF graph.
+These hops could be any implicit or explicit flows. However, the explicit non-blocking assignments are of particular interest to us
+in determining how we should break the IF path into segments. Each non-blocking assignment
+represents exactly where we reach a clock cycle boundary in the IF path and thus
+break off a new segment after that flow.
+If a path
+has $n$ nonblocking assignments, it has $n+1$ segments.
+Let us take the following IF path in Figure \ref{fig:toy2fig} as an example:
+$\langle (\mathtt{secret}, \mathtt{temp}), (\mathtt{temp},\mathtt{result}),
+(\mathtt{result}, \mathtt{led2})\rangle$.
+This path has two segments. The first segment is the two-hop sequence,
+$\langle (\mathtt{secret}, \mathtt{temp}), (\mathtt{temp},
+\mathtt{result})\rangle$, made up of a continuous assignment and a non-blocking assignment.
+The second segment, $\langle (\mathtt{result}, \mathtt{led2})\rangle$, is a single hop and a continuous assignment.
+
+For every segment in a given IF-graph path, the conditions
+involved in that segment are collected and checked for co-satisfiability. If
+the hops in any one segment have mutually contradictory constraints,
+that path is discarded. In Figure~\ref{fig:toy2fig}, the segment $\langle
+(\mathtt{secret}, \mathtt{temp}), (\mathtt{temp}, \mathtt{result})\rangle$ has
+contradictory constraints, as the first hop requires that \texttt{enable} is high, while the second hop requires it to be low.
+
+This pruning analysis is sound---only unrealizable paths are discarded---as long as the co-satisfiability check considers only state-holding signals and input signals in the
+satisfiability query, as these signals do not change value in the middle of
+a clock cycle.
+
+\subsection{Symbolic Execution to Find Paths through the Design}
+
+In the second phase, the goal is to find true paths through the design for each
+remaining path in the IF graph. We use symbolic execution to find
+a sequence of
+machine states and a corresponding sequence of input signals (for example, as
+seen in Figure~\ref{fig:toy1states}) that aligns with the
+path outlined by the IF-graph path.
+
+\subsubsection{Symbolic Execution Guided by IF-Graph Path Segments}
+The segment analysis done in the first phase provides information about where
+the clock cycle boundaries lie; the IF graph also provides information about
+which lines of code must execute for each hop in a segment. SEIF uses
+this information to drive symbolic execution along the path outlined by the IF graph.
+
+In each clock cycle, the symbolic execution engine is restricted to following only
+those design paths which include the lines of code that must be executed for the current
+IF-path segment to be realized. For example, in Figure~\ref{fig:toy1}, the
+symbolic execution engine only considers paths which take the \texttt{if}
+branch at line 8, when $\mathtt{state == 3}$. By doing so, the search space is significantly reduced.
+
+However, there may still be many possible paths through the design to consider,
+only some of which allow the complete IF path to be realized. Continuing
+with our example, Figure~\ref{fig:se-tree-paths} shows the symbolic execution
+tree for one clock cycle of the code in
+Figure~\ref{fig:toy1}. Each node in the tree represents a line of code, or non-branching sequence of code (e.g., lines 3-4) to be
+executed.
+
+The path of interest, this time annotated with which line of code needs to
+execute for each hop to be realized, is $\langle
+(\mathtt{secret}, \mathtt{guard})_{\mathrm{line~} 8}, (\mathtt{guard},
+\mathtt{led})_{\mathrm{line~} 13}\rangle$. Examining the symbolic execution tree
+in Figure~\ref{fig:se-tree-paths}, it would appear that two of the four
+possible paths achieve the desired flow. But annotations
+in the IF graph tell us that the
+sequence of conditions $(\mathtt{state} == 3)_{s3}, (\mathtt{prev} == 3)_{s4}$
+needs to be met. For that to happen, lines 3-4 need to
+execute in the first four clock cycles and lines 8, 13 need to execute in only
+the fourth clock cycle. While this is clear to see when examining the
+state transition diagram (Figure~\ref{fig:toy1states}), there is nothing in the IF graph, or even the
+code itself, indicating that it will take four clock cycles to realize this flow. Finding the desired path through the multi-clock-cycle symbolic execution tree is a search problem. We discuss the search strategies we developed to guide search in SEIF in Section \ref{sec:strategies}
+
+
+
+%%  Thus, even after forcing the appropriate conditions in each clock cycle, the
+%%  resulting tree of paths through the design might still be quite
+%%  large. The number of paths to explore is still large. Some of those paths will be infeasible. Some of
+%% those paths are feasible, but advance the design to a new state in which
+%% down-path segments are unrealizable. Sometimes the design must be advanced to a
+%% new state before the next segment can be realized. We discuss each of these
+%% conditions, and how they are handled, in the next sections.
+
+
+ % Figure environment removed
+
+%% \cks{Can each subsection be matched to a problem? E.g., infeasible paths in the
+%%   SE tree,
+%%   advancing to a state which will make down-path segments unrealizable,
+%%   advancing to a state required in order to make down-path segments realizable,
+%%   large search space}
+
+
+\subsubsection{Pruning Unrealizable Paths at Clock Cycle Boundaries}
+As a first strategy, the symbolic execution engine prunes unrealizable
+paths at each clock cycle boundary. At each clock cycle, the engine first
+checks the co-satisfiability of the conditions required in the current IF
+segment, similar to the check done to prune globally unrealizable paths
+(Section~\ref{sec:pruningglobally}). However, this time the SMT query
+includes the current symbolic state along with the conditions required for the
+IF segment. As with the global pruning step, the check considers only the
+state-holding variables in the segment conditions, as the value of combinational
+logic variables may change during the course of a clock cycle.
+
+Continuing with
+our example from Figure~\ref{fig:toy1}, at the start of the initial clock cycle,
+the symbolic execution engine checks whether the condition required for the
+first hop in the IF graph ($\mathtt{state} == 3$) is
+mutually contradictory with the initial symbolic state (in which $\mathtt{state}
+== 0$). Indeed, it is, and the symbolic execution engine discards any paths
+that would include line 8, the line of code required for the first hop in the IF
+graph.\footnote{Discarding these paths can be done prior to exploration of any paths in
+the current clock cycle, as the engine has information from the design's
+statically built control
+flow graph about which lines of code
+are included in which path.} At this point, SEIF recognizes that realizing
+the first segment of the IF graph at the current state (state $s0$) is infeasible.
+
+\subsubsection{Stalling the IF-Graph Path to Advance to a New Machine State} 
+\label{sec:stalling}
+
+The second strategy used by SEIF is to pause the search for realizing a
+segment of the IF path in order to advance the design to a next-state
+when needed. In our example, the first segment of the IF graph cannot be
+realized from the initial reset state. SEIF symbolically executes the
+design for a single clock cycle, without considering the constraints required by
+the next IF path segment, to advance the design to a new state. SEIF then
+checks whether the IF graph segment can be realized from this new state.
+
+There are many possible next states and SEIF must find one that satisfies two
+criteria:
+\begin{enumerate}
+  \item The next state advances the design toward a state in which the next IF
+    segment can be realized, and
+  \item The next state does not undo any prior progress along the IF graph path
+    that has already been made.
+\end{enumerate}
+
+We discuss search strategies for
+finding valuable next-states in the next section.
+The second constraint is trickier. During normal execution, it is likely that information written to a \texttt{reg} in one clock cycle gets
+overwritten in a subsequent clock cycle. For example, consider the code in
+Figure~\ref{fig:toystalling}, which is similar to that of our first example
+(Figure~\ref{fig:toy1}), but made slightly more complex by the addition of two
+new registers: $\mathtt{guard0}$ and $\mathtt{clear}$.
+
+% Figure environment removed
+
+The IF path of interest is now from \texttt{secret} to \texttt{guard0} to
+\texttt{guard} to \texttt{led}. To achieve the second flow segment,
+$\langle(\mathtt{guard0},\mathtt{guard})\rangle$, SEIF needs to first
+advance the design to a state $s' = \langle\mathtt{state} == 3\rangle$. However, it is
+important that while the design advances to state $s'$, the \texttt{clear}
+signal is never set, as a 0 written to \texttt{guard0} would undo the information flow from \texttt{secret} to
+\texttt{guard0} from the prior IF path segment.
+
+SEIF uses information from the IF graph to \emph{stall}
+the information flow while advancing the design to a next-state. We define
+stalling as symbolically executing the design for a single clock cycle, such that
+the design transitions to a next state, but the position along the IF path
+remains unchanged. To stall, SEIF prevents the symbolic execution engine from considering any paths of
+execution that will undo information flow from prior segments in the IF
+path. To do this, SEIF considers the node $n$ in the IF path, in which information
+currently ``resides.'' In our current example, this would be the node
+\texttt{guard0}. SEIF then uses the IF graph to find all edges incident to node
+$n$, which represent flows of information from variables in the design to $n$ and are associated with lines of code. Explicit
+flows need to be prevented during stalling, but implicit
+flows do not need to be prevented, as they do not cause the value in $n$ to be overwritten. SEIF avoids exploration of any paths through
+the design which would execute a line of code in which $n$ is written to. In
+this way, the information in $n$ is not lost while stalling. 
+
+There are two edge cases to consider. The first is self-loops. Direct flows from $n$ to $n$ (e.g.,
+$\mathtt{n} <= \mathtt{n} + 1$ are
+allowed, as the information in $n$ stays in $n$. The second is the case when $n$
+is assigned a constant (e.g., $\mathtt{n} <= 1$). SEIF
+checks this corner case during symbolic execution and abandons any path in
+which it occurs. If the assignment by a constant happens regardless of the rest of the state,
+then stalling cannot occur at this point in the IF graph.
+
+Because of stalling, the number of clock cycles needed to verify the information flow
+may exceed the length of the IF path.
+
+%% The symbolic execution engine must find a path through the SE
+%% tree such that the leaf node corresponds to a useful next-state in the state
+%% transition diagram of the design, and the current position in the IF-graph path
+%% has not changed.
+
+%% To do this the symbolic execution engine leverages information from the IF
+%% graph. \cks{What are the conditions for excluding paths when stalling? Lines of
+%%   code that write to the variable which is the last node in the current segment
+%%   need to be excluded, but if the variable is writing to itself, that is ok. Any
+%%   other exceptions? From the graph we know all edges incident to the node of
+%%   interest. And for each edge, we know the line of code associated with it. We
+%%   exclude any paths that include that line of code. What about when the last hop
+%% in a segment is an implicit flow?}
+
+%% During the preprocessing step, our goal was to identify all the flow conditions for each signal
+%% along our information flow path.  In addition, for each register in the flow path,
+%% we need to know all flows into the register which
+%% are not part of the particular flow in question.
+%% When we want to hold the information flow in
+%% a particular register during execution, we need
+%% to turn off all such flows, or \textit{stall}. 
+
+%% When we stall, the design is (symbolically) executed for one
+%%   clock cycle. The symbolic execution is guided such that information that has flown to
+%%     a signal that is a mid-point between source and sink does not get
+%%     overwritten during this execution.
+
+%Because of stalling, the number of segments in the information flow path, not
+%including any tail segment,
+%determines only the minimum number of
+  %  clock cycles of simulation needed to verify the information flow. More cycles may be required.
+
+    
+
+%This is necessary for our stalling step, or for when we want to hold 
+%the information flow in a particular register during execution. We need to know all such flows, in order to 
+%``turn them off''/stall even if these flows are not part of the particular composite information flow path in question.
+
+
+
+
+
+
+%% %\kar{this is from matthew's paper}
+%% When symbolically executing the design, we
+%% start from a fully symbolic state. Since a fully
+%% symbolic state has no restrictions, this simplifies our approach. We only have
+%% to consider flows that move information from the
+%% initial symbol in the source register to the sink in question. It’s possible that, if we continue execution, we are able to find flows starting after the
+%% first clock cycle. But because the fully symbolic
+%% state is unrestricted, these flows are necessarily
+%% special cases of flows we would be able to find
+%% in fewer clock cycles of simulation. This helps to
+%% mitigate the path explosion problem.
+
+%% Starting from a fully symbolic state means that
+%% we generate path suffixes, instead of full execution
+%% paths from a reset state. This has two important
+%% implications. First, it completely eliminates false
+%% negatives from our analysis. That is, if we elimi-
+%% nate an information flow path from our consider-
+%% ation, it cannot be realized in any execution trace.
+
+%% However, the reverse is not necessarily true: if
+%% we determine that a flow is indeed possible, it
+%% could be the case that the path suffix containing
+%% the flow started from an unreachable state.  If the final path
+%% condition constrains the starting state to include
+%% at least one reachable state, then we have a true
+%% positive result.
+
+%% This decision offers several advantages over
+%% starting execution from a reset state. If we start
+%% execution from reset, we can’t guarantee that the
+%% information flow will start in the first clock cycle
+%% of execution, as the design may have a reset cycle
+%% that requires many clock cycles before it reaches
+%% a standard operating state. This means we have
+%% to keep track of information flows from every
+%% value the source signal takes on in every clock
+%% cycle. In addition, this prevents elimination of
+%% paths in which an intermediary tainted register is overwritten while stalling. This is because the new
+%% data may in fact represent a new flow along the
+%% same flow path. 
+
+
+\subsubsection{Search Strategies}
+\label{sec:strategies}
+The goal is to find a sequence of design states, and corresponding
+input values, that correspond to an IF path, or determine that
+no such sequence exists. The search space is large; an IF path with $n$ segments
+requires at least $n$ clock cycles through the design. When stalling is
+needed, the number of clock cycles required is 
+unbounded (although finite).
+
+Information from the IF graph is used to prune the symbolic execution tree at each clock cycle, but a single IF hop can correspond to many paths through the symbolic
+execution tree. This is because a segment of the IF-path involves only a small number (typically
+fewer than 5) of lines of code be executed. The input space is partially
+constrained to ensure
+those few lines of code are executed, but most of the input space is unconstrained,
+and therefore there is freedom in how most of the design is explored at each
+clock cycle.
+
+%And a poorly chosen path through the design in an early clock
+%cycle may preclude successfully finding a needed path through the design in a
+%later clock cycle.
+ 
+  %\kar{cut this?} Additionally, at each clock cycle it may be the case that information flow can stall
+    %for an arbitrary or fixed amount of time. In other words, the IF-path can
+    %stutter while the design continues to execute for some number of clock
+    %cycles, and then the IF-path is picked back up again.
+ 
+We developed and implemented four search strategies:
+\begin{itemize} 
+  \item Baseline 1 --  Continue / Stall Only.
+  \item Baseline 2 -- Backtracking Only
+  \item Stalling with Backtracking
+  \item Stalling with UNSAT Core Heuristic
+  \end{itemize}
+  
+ \paragraph{\textbf{Baseline 1: Continue / Stall Only}}
+ \label{sec:baseline-1}
+The key idea behind this strategy is that, for each segment, we can either symbolically
+execute until a design path is found in which the segment conditions are 
+satisfied (termed a \emph{continue}), or we can stall for some bounded number of cycles. For an IF path, we build and exhaustively search a list of all possible \emph{continue}, \emph{stall}
+combinations. If SEIF is unable to complete the IF path for a given
+continue-stall pattern, it moves on to the
+next pattern. The list of continue-stall combinations are in truth-table order to allow the SEIF
+engine to explore as deeply as possible first, aiming to verify the shortest path possible with no stalls.
+In this context, depth equates to the number of IF-path segments successfully
+traversed, and for which SEIF has realized a partial path of execution.
+      %then there are two options: stall or backtrack. Use heuristics \cks{from the unsat core we think}to determine which option to chose.
+    %\item If stalling, choose one of CCSC, CSCC, etc. and either start the
+      %search fresh, this time with a stall cycle in between two continue cycles,
+      %or go back to an earlier clock cycle in this search and add a stall
+      %cycle. Our strategy proceeds in truth-table order. \kar{need to explain better probably}
+      %\item With this truth-table ordering, we go deep as possible first. The idea being that we may as well try for
+      %the shortest possible path with no stalls first. In this context, we mean depth to mean the number of information
+      % flow segments successfully traversed, and for which we have a path through the symbolic execution tree. We have
+      % found realizable paths through the design for these partial flows. Breadth in this context through a symbolic execution
+      % tree would be exploring all of the paths until we find one that produces the necessary flow for a particular information
+      % flow segment.
+      %\item Once all SE paths for this cc have been explored and none
+      %    have produced the information flow that we desire for this IF-path
+       %   segment, then we know we need to either a) find a different SE path in
+       %   one of the earlier clock cycles or b) stall somewhere along the
+       %   IF-path -- maybe here or maybe earlier. The order we proceed in is defined for us -- truth-table.
+
+ \paragraph{\textbf{Baseline 2: Backtracking Only}}
+In this search strategy SEIF
+begins by symbolically executing for one clock cycle for the first segment. If the flow found, SEIF 
+moves to the next segment in the IF path. If at any segment, the flow is not found in some bounded number
+of clock cycles, or there are no more design paths to try, SEIF returns (or \emph{backtracks}) to an earlier
+segment to find a different path that satisfies the same segment conditions.
+
+%Some bookkeeping is done here to be able to re-search the second clock cycle to look for a new path
+%without repeating work, too. \kar{explain}
+
+% \begin{itemize}
+ %\item  Go back to an earlier clock cycle to look for a different path that satisfies
+%the same IF-path-segment flow requirement. 
+ %\item If backtracking, go back to the prior clock cycle and look for a
+ %     second path in which the leaf node shows that information has flown from
+ %     $x$ to $y$ -- again, not looking at leaf nodes, just whether or not a line
+ %     of code has been executed. Some bookkeeping is needed to be able to re-search the second
+ %     clock cycle to look for a new path without repeating work.
+% \end{itemize}
+ 
+  \paragraph{\textbf{Stalling with Backtracking}}
+   This strategy is a hybrid of baselines 1 and 2. 
+   For any given \emph{continue}, \emph{stall} pattern, after successfully
+   executing consecutive \emph{continues}, and reaching a \emph{stall}, SEIF
+   stalls for a bounded number of clock cycles and
+   attempts to find execution paths where SEIF can make forward progress in the next segments. If all symbolic execution paths are explored, or SEIF times out (according to some pre-determined bound), it backtracks.
+
+\paragraph{\textbf{Stalling with Heuristic}}
+    \label{sec:unsat}
+   This strategy builds on top of stalling with backtracking. Our heuristic
+   relies on the \emph{UNSAT core}, the subset of constraints in a SAT query for
+   which no satisfying assignment exists. If SEIF stalls, it is searching for a
+   new machine state that will satisfy the conditions of the next IF path segment. 
+In this case, SEIF pushes the symbolic state and the constraints from the next 
+   segment to the SMT solver, which returns the UNSAT core. %%  From these constraints we derive the UNSAT core, which helps to find a path in the design that (1) corresponds to a stall of the information flow, and (2) makes
+   %% forward progress along the IF flow path. To do this, after stalling,
+   For each path explored while stalling, SEIF checks if the
+   UNSAT core became smaller. If it did, SEIF continues searching for a new
+   machine state along the path. If it grows, SEIF prioritize the next candidate stall path.
+
+   \subsubsection{Post Processing to Find Reset}
+   \label{sec:postprocessing}
+       SEIF begins exploration from a symbolic state, and therefore the
+       design paths it generates inputs for may not start from the
+       reset state. We mitigate this by checking whether the found
+       design path has constraints that conflict with the design's reset
+       state. If not, the path can start from reset. If so, the path
+       starts from an intermediate state of the design, and SEIF cannot
+       guarantee that it is a reachable state. Most often, SEIF finds paths that
+       can start from reset and we evaluate this in Section~\ref{sec:eval-acctingpaths}.
+
+     
+\subsection{Semantic Analysis to Identify True Information Flows}
+\label{sec:semantic}
+Once per execution path, SEIF performs a semantic analysis check to prune 
+flows that represent viable design paths, but not true flows of information. 
+This can happen when a textual flow does not represent an information flow. For example, \texttt{y <= x  xor  x}, would yield a path showing x flows
+to y even though there is no flow from x to y. SEIF prunes explicit textual
+flows which do not represent information flows.
+
+If there is an implicit textual flow that is not a true information flow, SEIF cannot eliminate
+that false positive. For example, \texttt{if (x XOR x) y <= 0; else  y <= 1;}
+ (Here, there is no path in which \texttt{y} is set to 0, and SEIF does recognize
+that.)
+    
+%% % Figure environment removed
+%% \vspace{-10pt}
+
+In the case of reconvergent fan-out SEIF may or may not find the flow. In
+the example of Figure \ref{fig:reconvergent}, \texttt{x} is an input and blocks 2 and
+3 represent different areas of the design (i.e. modules, always blocks). There are 4
+cases to consider: 
+\begin{enumerate}
+\item The writes to \texttt{y} and \texttt{y'} are both unconditional and there is no flow from \texttt{x} to \texttt{z} because $\mathtt{z} = 3\mathtt{x} - 3\mathtt{x}$.
+SEIF performs the check and correctly detects no flow.
+\item The writes to \texttt{y} and \texttt{y'} are conditional, and depend on
+  the same conditions. SEIF detects there is no flow
+\item The write to \texttt{y'} is conditioned on something that is mutually UNSAT with the condition for \texttt{y}. In this case, there 
+is always a flow from \texttt{x} into \texttt{z}, and SEIF detects it.
+\item The write to \texttt{y'} is conditioned on something mutually satisfiable with the condition for \texttt{y}, where the condition
+for \texttt{y} is different. If SEIF follows a design path where both conditions are true at the same time, it detects no flow,
+while there may be other design paths through block 3 which would enable a flow,
+and vice-versa. Unless SEIF is able
+to exhaustively explore, it may report an incorrect result.
+\end{enumerate}
+\vspace{-5pt}
+% Figure environment removed
+    \vspace{-10pt}
+
+%In the case of an implicit flow at the textual/signal level from $x$ to $y$, but
+%where there is no flow at the semantic level, we do not differentiate.
+

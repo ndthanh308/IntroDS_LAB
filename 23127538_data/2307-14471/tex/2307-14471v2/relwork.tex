@@ -1,0 +1,145 @@
+\section{Related Work}
+\label{sec:relwork}
+
+There has been relatively little prior work on formal verification of virtual memory.
+Instead, much OS verification work has focused on minimizing reasoning about virtual memory management.
+The original Verisoft project~\cite{alkassar2008verisoft,alkassar2010pervasive,alkassar2008formal,dalinger2005verification,hillebrand2005address,alkassar2008formal,starostin2010formal} relied on custom hardware which, among other things, always ran kernel code with virtual memory disabled, removing the circularity that is a key challenge of verifying actual virtual memory code: at that point page tables become a basic partial map data structure to represent user program address translations.
+Other work on OS verification either never progressed far enough to address VMM verification (Verisoft XT~\cite{cohen2009vcc,cohen2010local,dahlweid2009vcc,cohen2013SOFSEM}), or uses memory-safe languages to enable safe co-habitation of a single address space by all processes (Singularity~\cite{Fahndrich2006language,Hunt2007singularity,Hunt2007sealing,Barnett2011specsharp}, Verve~\cite{Yang2010Verve}, and Tock~\cite{levy2017multiprogramming}).
+
+The work that does address the core challenges of VMM verification is all associated with either \textsc{seL4} or \textsc{CertiKOS}.
+
+\textsc{CertiKOS}~\cite{gu15,gu2016certikos,gu2018certikos,chen2016interrupts} is a microkernel intended for use as a hypervisor,
+and its papers do not explicitly detail verification of the VMM, so we do not know the full space of which VMM functionality 
+is verified, but we do know it includes the ability to map or unmap pages.
+The work is clear, however, that it trusts low-level assembly fragments such as the instruction sequence which actually
+switches address spaces, rather than verifying them.
+The overall approach in that body of work is many layers of refinement proofs, using a
+ proliferation of layers with small differences to keep most individual refinements tractable. In keeping with precursor work 
+on the project from the same group~\cite{vaynberg2012compositional}, the purpose of some layers is to abstract away from 
+virtual memory, so the proof is essentially a simulation proof covering for example a proof that execution with page-in on 
+page faults is a valid refinement of an execution model where no paging occurs.
+% Another key aspect of their approach is that the OS is written in Clight and compiled with \textsc{CompCert}~\cite{blazy2006formal,leroy2009formally,leroy2008formal}.
+% CompCert's memory abstraction~\cite{leroy2008formal} assumes
+% memory is a set of disjoint chunks of bytes with no overlap, so the lowest levels of CertiKOS must provide a matching 
+% machine model as a layer. This prohibits virtual address aliasing, so CertiKOS cannot support simultaneous memory-mapped 
+% (\texttt{mmap}) and stream-oriented (\texttt{read}/\texttt{write}) IO to a single file\todo{should we go into this detail?}, 
+% and cannot use
+% the common kernel design choice of mapping all physical memory into the bottom of the kernel's address space for direct access i
+% while the kernel code is simultaneously mapped (and executed) at higher virtual addresses.
+% This is not necessary for \textsc{CertiKOS}'s intended primary use case (a hypervisor), but means that \textsc{CertiKOS}'s
+% approach cannot be used to support this functionality in other systems, without major surgery to \textsc{CompCert}.
+
+\textsc{seL4}~\cite{Klein2009seL4,seL4TOCS,Sewell2013translation} is a formally verified L4 microkernel~\cite{Liedtke1995,Liedtke1996} (and the first verified OS kernel to run on real-world hardware), verified with a mix of refinement proofs and program logic reasoning down to the assembly level.
+Because \textsc{seL4} is a microkernel, most VMM functionality actually lives in usermode and is unverified, and moreover, their hardware model omits address translation entirely and the MMU entirely~\cite{Klein2009seL4,seL4TOCS}. As a result, the limited page table management present in the microkernel treats page tables as idiosyncratic tree-maps, ignoring the risks posed by even transient inconsistencies that would crash the kernel on real hardware (like ``temporarily'' unmapping the kernel). This is mitigated primarily by manually identifying some trusted invariants (e.g., that the address range designated for the kernel is appropriately mapped) and setting up the proof to ensure those invariants are maintained (i.e., as an extra proof obligation not required by their hardware model).
+
+
+One important outgrowth of the \textsc{seL4} project, not integrated into the main project's proof, was work by 
+Kolanski and Klein which studied verification of code against a hardware model that \emph{did} include address translation
+ --- the only work aside from ours to do so --- initially in terms of basic memory~\cite{kolanski08vstte} and subsequently 
+integrating source-level types into the interpretation~\cite{kolanski09tphols}. 
+They were the first work to model physical and virtual points-to assertions separately, defining virtual points-to assertions
+in terms of physical points-to assertions mimicking page table walks, and defining all of their assertions as predicates on a
+pair of (physical) machine memory and a page table root, an approach we improve on.
+
+Their work has a number of significant limitations which our work addresses.
+They also define their virtual points-to assertions such that a virtual points-to $p\mapsto_\mathsf{v} a$ owns the full 
+lookup path to virtual address $p$. This means that given two virtual points-to assertions at the same time, such as 
+$p\mapsto_\mathsf{v}a \ast p'\mapsto_\mathsf{v}b$, the memory locations traversed to translate $p$ and $p'$ must be disjoint. 
+This means the logic has a peculiar limit on how many virtual points-to assertions can coexist in a proof. Since page tables 
+fan out, the bottleneck is the number of entries in the root table. For their 32-bit ARMv6 example, the top-level address is 
+still 4Kb (4096 bytes), and each entry (consumed entirely by a virtual points-to in their scheme) is 4 bytes, so they have a 
+maximum of 1024 virtual points-tos in their ARMv6 configuration. Any assertion which implies more than that number
+of virtual addresses are mapped implies false in their logic.
+(They do formulate their logic over an abstract model, but every architecture would incur a similar limitation;
+Na\"ively transferring their model to x86-64 4-level tables would yield a limit of 512 assertions (also a 4Kb root page, 
+but 8-byte entries).
+
+% Kolanski and Klein's points-to assertions do not model that page table entries for nearby addresses typically 
+% \emph{share} entries in higher layers of the page tables --- a single L1 entry maps 4KB of memory on many architectures,
+% but their logics avoid fractional ownership, so they can in fact only use a single memory location per page of memory.
+% In fact, because their virtual points-to assertions contain \emph{full} ownership of all entries, even in the highest-level
+% page table (L4 in our case), each entry can contribute to only a single mapped address. Thus any assertion
+% in their logic that implies there are more virtual addresses mapped than entries in the top-level page table implies false.
+Our definitions make use of fractional permissions throughout; Figure \ref{fig:strongvirtualpointsto}'s definition
+of \lstinline|L4_L1_PointsTo| ellides the specific fractions used, but it in fact asserts 1/512 ownership of
+the L1 entry, 1/($512^2$) of the L2 entry, and so on, so each entry may map the appropriate number of machine words.
+
+As noted earlier, Kolanski and Klein's logics, by collocating both the physical ownership of the page table walk
+as part of the virtual points-to itself, preempt support for changes to page tables which do not actually affect 
+address translation.
+
+The other major distinction is that Kolanski and Klein have no accounting for other address spaces.
+Their logic does not deal with change of address space, and has no way to assert that certain facts hold
+in another address space.
+They verify only one address space manipulation: mapping a single unmapped page into the current address space (in both papers).
+We verify this, as well as a change-of-address-space, which requires us to introduce assertions for talking
+about other address spaces (we must know, for example, that the precondition of the code after the change must be true
+in the \emph{other} address space), and to deal with the fact that the standard frame rule
+for separation logic is unsound in the presence of address space changes and address-space-contingent assertions.
+% The mapping write is verified in an ad hoc way by unfolding the machine semantics, because the logic lacks proper reusable rules for
+% updating page tables.
+
+Our approach in this paper uses modalities to distinguish virtual-address-based assertions that hold only in specific 
+address spaces, making it possible to manipulate other address spaces, and equally critically, to \emph{change} address 
+spaces while reasoning about correctness. 
+
+Unlike our work, Kolanski and Klein prove very useful embedding theorems stating that code that does not modify page table 
+entries can be verified in a VM-ignorant program logic, and that proofs in that logic can be embedded into the VM-aware logic 
+(essentially by interpreting ``normal'' points-to relations as virtual points-to facts). While we have not proven such a result,
+an analagous result {should} hold of our work: consider that the doubles for the \texttt{mov} instructions
+that access memory behave just as one would expect for a VM-ignorant logic~\cite{Chlipala2013Bedrock}.
+With our general approach to virtual points-to assertions being inspired by Kolanski and Klein, \emph{both}
+ our approach and theirs could in principle be extended to account for pageable points-to assertions by adding additional 
+disjunctions to an extended points-to definition; embedding ``regular'' separation logic into such a variant
+is the appropriate next step to extend reasoning to usermode programs running with a kernel that may demand-page the program's
+memory.
+
+As noted throughout the paper, the inspiration for our other-space modality comes from hybrid logic~\cite{areces2001hybrid,blackburn1995hybrid,gargov1993modal,goranko1996hierarchies},
+where modalities are indexed by \emph{nominals} which are names for specific individual states in a Kripke model.
+We are aware of only two prior works combining hybrid logics with program logics specifically. 
+Brotherston and Villard~\cite{brotherston2014parametric} demonstrated that may properties true of various 
+separation logics are not definable in boolean \BI (\BBI), and showed that a hybrid extension \HyBBI allows
+most such properties to be defined (e.g., the fact that separating conjunction is cancellative is unprovable 
+in boolean \BI, but provable in \HyBBI). There, nominals named resources 
+(roughly, but not exactly, heap fragments). 
+Gordon~\cite{gordon2019modal} described a use of hybrid logic in the verification of actor programs, 
+where nominals named the local state of individual actors (with such assertions stabilized with a 
+rely/guarantee approach). Beyond these, there is limited work on the interaction of specifically 
+\emph{hybrid logic} with substructural logics. 
+Primarily there is a line of work on hybrid linear logic (\HyLL)~\cite{despeyroux2014hybrid}, 
+originally used as a way to more conveniently express aspects of transition systems in linear logic. 
+However, \HyLL's proof rules offer no non-trivial interactions with multiplicative connectives 
+(every \HyLL proof can in fact be embedded into regular linear logic~\cite{chaudhuri2019hybrid}, 
+unlike Brotherston and Villard's \HyBBI, which demonstrably increases expressive power over its base \BBI.
+
+In both \HyLL and \HyBBI, nominals denote worlds with monoidal structure (as worlds in Kripke semantics
+for either LL or \BBI necessarily have monoidal structure). Our nominals, by contrast, 
+do not name worlds in the same sense with respect to Iris's CMRAs, 
+but in fact \emph{classes} of worlds, because the names are locations 
+(a means of \emph{selecting} resources) rather than resources.  
+A key difference is that the use of nominals in those logics corresponds specifically to hypothetical 
+reasoning about resources (until a nominal is connected to a current resource, in which case conclusions 
+can be drawn about the current resource), which means the modalities themselves do not ``own'' resources. 
+Instead, assertions under our other-space modality can and do
+have resource footprints.
+Pleasantly, we sidestep most of the metatheoretical complexity of those other substructural hybrid
+systems by building our logic within a substructural metatheory (\iris).
+
+\iris has been used to build other logics through pointwise lifting, notably logics that deal with weak
+memory models~\cite{dang2019rustbelt,dang2022compass}. Those systems build a derived logic
+whose lifting consists of functions from thread-local views of events (an operationalization of the release-acquire + nonatomic
+portion of the repaired C11 memory model~\cite{lahav2017repairing}): there modalities $\Delta_\pi(P)$ and $\nabla_\pi(P)$
+represent that $P$ held before or will hold after certain memory fence operations by thread $\pi$.
+The definitions of those specific modalities existentially quantify over other views, related to the ``current'' view (the one where
+the current thread's assertions are evaluated), and evaluate $P$ with respect to those other views. This approach to parameterizing
+assertion semantics by a point of evaluation, and evaluating modalized assertions at other points, is what it means
+to have a modality at all.
+It is \emph{not}, however, an instance of hybrid logic, which is specifically demarcated by an assertion language where
+\emph{assertions}, not their semantics, choose and name the evaluation points for modal assertions.
+A hybrid extension of the aforementioned logics would include assertions which named specific views at which to evaluate
+$P$, in the syntax of the assertion (e.g., $\Delta_\pi^v(P):=\lambda\_\ldotp (P\;v)$) rather than the 
+$\Delta_\pi(P):= \lambda v\ldotp (\exists v_{rel}\ldotp \ownGhost{\pi}{\mathsf{RelV}(v_{rel})\;v} \ast (P\;v_{rel})))$ actually used.
+Note the hybrid version takes the place to evaluate $P$ as a parameter, and therefore allows the \emph{derived} (modal) logic to explicitly
+reason in terms of evaluation points, rather than hiding all points of evaluation in the internal definitions of modalities.
+
+

@@ -1,0 +1,84 @@
+
+
+The PELICAN architecture is simpler than many previous architectures due to its use of a complete set of Lorentz-invariants at the input stage, namely the set of pairwise dot products between the input 4-momenta (see \secref{equivariance}), and this has significant implications for both the overall architecture as well as the ease of training and interpretability of the network. This section discusses each of the primary components of the network, including the inputs and their embedding, the permutation-equivariant blocks, and the output layers that determine the nature of the task, namely classification or 4-vector regression.
+
+%------------------------
+% PELICAN INPUTS
+%------------------------
+\subsection{Inputs and embeddings}\label{PELICANinputs}
+
+\paragraph{Dot Products and Beams}\label{beams}
+On the input side of the architecture, the first step is to compute all pairwise dot products of the input 4-momenta. Appended to the list of these 4-momenta are two auxiliary beam particles with 4-momenta $(1,0,0,\pm 1)$. This is helpful since the datasets we are using are all simulated in a fixed laboratory frame where the original proton-proton collision happens along the $z$-axis, and the auxiliary inputs restore this orientational knowledge. In particular, the dot products between constituents and beams give PELICAN access to the energies and transverse momenta of all constituents.
+
+It is worth emphasizing that introducing beams in this manner allows us to fix a particular spatial orientation of the events without restricting or violating the global Lorentz symmetry inherent in the architecture. Indeed, if one were to treat the auxiliary beams as constant vectors of hyperparameters, then this action would reduce the full Lorentz symmetry to merely rotations in the $xy$-plane and $z$-boosts. However, due to the fact that the beams are fed into the network on equal footing with all other inputs, they are properly treated as full-fledged 4-vectors that should also transform under the global Lorentz symmetry. Thus, counter-intuitively, we let the network access individual energies, transverse momenta and $z$-momenta while still preserving the full Lorentz symmetry and all the computational benefits that come with it (e.g.~the number of learnable parameters remains unchanged, whereas an architecture with a smaller symmetry group would have more degrees of freedom).
+
+\paragraph{Embedding of dot products}
+ Next there is an embedding layer that applies the function $f_\alpha(x)=((1+x)^{\alpha^2} -1)/\alpha^2$ to each dot product with several values of the trainable parameter $\alpha$ (initialized to span the interval $[0.05,0.5]$). This is roughly inspired by the logarithmic embedding in ref.~\cite{LorentzNet22} and serves to mollify the extremely heavy-tailed (approximately Pareto) distribution of the input momenta. The addition of the learnable $\alpha$ parameter allows PELICAN to resolve the inputs at multiple momentum scales, providing a slight boost to performance.
+
+\paragraph{Embedding of scalar constituent data} In addition to dot products, we introduce a binary scalar label to distinguish jet constituents from the custom beam vectors. More generally, jet datasets can involve scalar particle data $s_i$ such as particle IDs (PID), charge, color, spin, etc. Let's say each $s_i$ is a column of dimension $C_{\text{scalar}}$. To be able to process such inputs alongside the dot products, they need to be promoted to arrays with two particle indices. One way to do this is to double the number of channels and define the array $s_i\oplus s_j$ of shape $[B,N_{\rm max},N_{\rm max},2C_{\text{scalar}}]$. This array can then be concatenated with the embedded dot products.
+ 
+However, there is a more natural way of doing this within the PELICAN framework. In the next section we will introduce permutation-equivariant $\mathrm{Eq}_{2\to 2}$ blocks that act on arrays with two constituent indices. To embed scalar particle data (``node features'') into the space of such arrays (``edge features''), it is convenient to utilize an analogous equivariant $\mathrm{Eq}_{1\to 2}$ block and apply it directly to $s$, the array of constituent scalars. This way we can produce a flexible number $C_{\text{scalar}}'$ of scalar channels. By choosing the dimensionality of the dot product embedding to be $C^0-C_{\text{scalar}}'$ and then concatenating it with the array of promoted scalars, we get a tensor of shape $[B,N_{\rm max},N_{\rm max}, C^0]$, where the feature vector for each particle pair is $C^0$-dimensional and has the form $\left(f_{\alpha_1}(d_{ij}), \ldots, f_{\alpha_{C^0-C_{\text{scalar}}'}}(d_{ij})\right)\oplus \mathrm{Eq}_{1\to 2}(s)_{ij}$. This approach allows for any number of Lorentz invariants per constituent, but in all of the tasks considered in this paper we have $C_{\text{scalar}}=1$.
+ 
+
+%------------------------
+% PERMUTATION EQUIV BLOCKS
+%------------------------
+\subsection{Permutation equivariant blocks}\label{permutationequiv}
+%\paragraph{Permutation Equivariant Blocks}
+
+The main element of the equivariant architecture is the permutation-equivariant block transforming arrays of rank 2, represented schematically in \figref{fig:PELICANblock}. Namely, we assume that the input tensor to the block has shape $[B,N_{\mathrm{max}},N_{\mathrm{max}},C^l]$, where $B$ is the batch size, $N_{\rm max}$ is the maximum number of jet constituents per event (with zero padding for events with fewer constituents), and $C^l$ is the number of input channels. We also use a binary mask of shape $[B,N_{\rm max},N_{\rm max}]$ to appropriately exclude the zero padding from operations like \texttt{BatchNorm} and aggregation. The output of the block will be a similar tensor of shape $[B,N_{\mathrm{max}},N_{\mathrm{max}},C^{l+1}]$ with the same mask. 
+%===========================================
+% Figure environment removed
+%===========================================
+
+As outlined above, the equivariant layer consists of a message block and an aggregation block. The message block is chosen to be a dense multilayer perceptron (MLP) acting on the channel dimension with a \texttt{LeakyReLU} activation and \texttt{BatchNorm2D} (normalization over the first three dimensions of the tensor, for each channel separately, followed by an affine transform with two learnable parameters per channel). Here we use a masked implementation of batch normalization so that the variable particle number is respected. The message block is then followed by \texttt{Dropout} that zeroes out each of the $B\times N_{\mathrm{max}}^2\times C^l_{\text{eq}}$ components independently with a certain probability.
+
+The aggregation block applies 15 linear aggregation functions ($\texttt{LinEq}_{2\to 2}$) which, for each component of the output tensor, compute the mean over some subset of the components of the input tensor, as explained in \secref{EEA}. Note that this is a non-parametric transformation performed on each channel separately. Each of the $C_{\text{eq}}^l\times 15$  resulting aggregation values is then independently multiplied by $N^\alpha/\bar{N}^\alpha$ with a trainable exponent $\alpha$ (initialized as a random float in $[0,1]$), where $N$ is the number of particles in the corresponding event. This allows for some flexibility in the aggregation process, for example $\alpha=1$ returns the sum aggregation function, and combining multiple aggregators is known to boost accuracy, see e.g.~ref.~\cite{Aggregators}.
+
+Aggregation is followed by a dense layer that mixes the $C_{\text{eq}}^l\times 15$ aggregators down to $C^{l+1}$ features. Due to the size of this layer, we employ a simple factorization to reduce the number of parameters. Namely the weight tensor $W_{abc}$, where $a$ is the input channel index, $b$ is the basis index ($1$ to $15$), and $c$ is the output channel index, can be replaced by the following combination:
+\[W_{abc}^{\text{factorized}}=W^0_{ab}W^1_{ac}+W^2_{cb}W^3_{ac}.\]
+Here, the first term first mixes the $15$ aggregators among each other for each output channel, and then mixes the channels. Similarly, the second term first mixes the $15$ aggregators for each input channel, and then mixes the channels. It is technically possible to increase the rank of this factorization by adding together multiple tensors of this form, but in practice we find one to be sufficient -- in our tasks the factorized network performs as well as the unfactorized one (except at very low network widths, in which case the unfactorized network performs better and may even have fewer parameters). The final result is a tensor of shape $[B,N_{\mathrm{max}},N_{\mathrm{max}},C^{l+1}]$, so these equivariant layers can be stacked multiple times.
+
+As already indicated above, a few other equivariant blocks will be useful to us, namely $\mathrm{Eq}_{1\to 2}$, $\mathrm{Eq}_{2\to 1}$, and $\mathrm{Eq}_{2\to 0}$. The only difference in their definition is that they involve just 5, 5, and 2 aggregators, respectively.
+
+%------------------------
+% OUTPUTS
+%------------------------
+\subsection{Classification and 4-vector regression outputs}\label{outputs}
+
+One of the strengths of the PELICAN architecture is the ability to easily switch between serving as a classification tool for jet tagging, to being able to provide 4-vector outputs in tasks such as momentum reconstruction. Here we summarize both architectures.
+
+\paragraph{PELICAN classifier}
+To build a classifier, aside from the $\mathrm{Eq}_{2\to 2}$ equivariant layer one needs a $\mathrm{Eq}_{2\to 0}$ layer that reduces the rank 2 array to permutation-invariant scalars, as represented by \equref{Classifierlayer}. This layer involves just 2 aggregation functions instead of $15$ -- the trace and the total sum of the input square array, but is otherwise identical to the equivariant layer described in the last section. The input block concatenates the embeddings of the dot products $d_{ij}$ and the scalar data $s_i$ as described above.
+\[
+\tikz[overlay]{\draw[draw=black] (1.65,-1.3) rectangle (10.5,1.3);}
+\begin{tikzcd}[column sep=small, row sep=small]
+\{d_{ij}\}  & \arrow[r]& \text{Emb} \arrow[dr] &&&&\\
+&& & \bigoplus \arrow[r] & \left[\mathrm{Eq_{2\to 2}}\right]^L \arrow[r] & \mathrm{Eq_{2\to 0}} \arrow[r] & \mathrm{MLP} \arrow[r] & \,& \hspace{-0.5em} \{w_c\}\\
+\{s_i\} & \arrow[r] & \text{Eq}_{1\to 2} \arrow[ur] &&&&
+\end{tikzcd}
+\label{Classifierlayer}
+\]
+% \[\small \{d_{ij}\}\to \boxed{\mathrm{Emb} \to \left[\mathrm{Eq_{2\to 2}}\right]^L \to \mathrm{Eq_{2\to 0}}\to \mathrm{MLP}}\to \{w_c\}\]
+% \begin{center}{\includesvg[width=0.9\linewidth]{diagram}}\end{center}
+
+From the input block, the tensor is passed through $L$ equivariant $\mathrm{Eq}_{2\to 2}$ layers, and the $\mathrm{Eq}_{2\to 0}$ layer with dropout. This produces a tensor of shape $[B,C_{\mathrm{out}}]$. One final MLP mixes this down to just $n_{\text{classes}}$ classification weights $w_c$ per event. A cross-entropy loss function is then used for optimization.
+
+
+\paragraph{PELICAN 4-vector regression}
+The same architecture can also be easily adapted for 4-vector regression tasks such as momentum reconstruction. Any Lorentz-equivariant map from a collection of 4-vectors $p_1,\ldots,p_N$ to one 4-vector (or several) has the form
+\[F(p_1,\ldots,p_N)=\sum_{i=1}^N f_i(p_1,\ldots,p_N)\cdot p_i,\label{equiv}\]
+where $f_i$'s are Lorentz-invariant functions, see e.g.~ref.~\cite{Hogg21} for a proof. Combining this with permutation invariance, we conclude that the multi-valued map $(p_1,\ldots,p_N)\mapsto (f_1,\ldots,f_N)$ must also be equivariant with respect to permutations of the inputs.
+
+The only change required to the architecture we've introduced for classification is that  $\mathrm{Eq}_{2\to 0}$ must be replaced with $\mathrm{Eq}_{2\to 1}$ and the final output layer must have only one output channel (assuming we are regressing on a single 4-vector). The $\mathrm{Eq}_{2\to 1}$ layer is again identical to $\mathrm{Eq}_{2\to 2}$ except that it uses only $5$ linear aggregators: taking the diagonal, row sums, column sums, trace, and full sum. The architecture is summarized by the relationship represented in \equref{RegressionLayer}, where we treat $f_i$ as the outputs, and use \equref{equiv} to recover the final predicted vector.
+\[
+\tikz[overlay]{\draw[draw=black] (1.65,-1.3) rectangle (10.5,1.3);}
+\begin{tikzcd}[column sep=small, row sep=small]
+\{d_{ij}\}  & \arrow[r]& \text{Emb} \arrow[dr] &&&&\\
+&& & \bigoplus \arrow[r] & \left[\mathrm{Eq_{2\to 2}}\right]^L \arrow[r] & \mathrm{Eq_{2\to 1}} \arrow[r] & \mathrm{MLP} \arrow[r] & \,& \hspace{-0.5em} \{f_i\}_{i=1}^N\\
+\{s_i\} & \arrow[r] & \text{Eq}_{1\to 2} \arrow[ur] &&&&
+\end{tikzcd}
+\label{RegressionLayer}
+\]
+In summary, \textit{the simultaneous imposition of the full Lorentz and permutation symmetries lets us express a Lorentz-equivariant and permutation-invariant vector-valued model via an equivalent Lorentz-invariant and permutation-equivariant scalar-valued one}. To recover the final 4-vector output one needs only aggregate the output using \equref{equiv}. As we will see, in particular tasks the coefficients $f_i$ become identifiable physical features, making the model explainable. Crucially, this would not have been possible with only a partial Lorentz symmetry.
+% \[\small \{d_{ij}\}\to \boxed{\mathrm{Emb} \to \left[\mathrm{Eq_{2\to 2}}\right]^L \to \mathrm{Eq_{2\to 1}}\to \mathrm{MLP}}\to \{f_i\}_{i=1}^N\]

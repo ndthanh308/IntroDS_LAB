@@ -1,0 +1,82 @@
+\section{Methodology}
+Given the past trajectories of all agents on a High-Definition~(HD) map of the scene, our goal is to predict the future trajectories of agents in the scene. 
+In a vectorized scene representation, we model different types of interactions between the agents and the map to obtain a representation for agents~(\secref{sec:feature_encoding}). Following goal-conditioned approaches~\cite{Zhao2020CoRL, Gu2021ICCV}, we first predict a possible set of endpoints. We then refine each endpoint by predicting an offset~(\secref{sec:endpoint_prediction}). Finally, we predict the full trajectories conditioned on endpoints~(\secref{sec:trajectory_prediction}). We stabilize training by separating endpoint and trajectory prediction with gradient detaching. Our pipeline is illustrated in~\figref{fig:pipeline}. Our model uses small MLPs in endpoint and trajectory prediction, keeping model complexity low.
+
+
+\subsection{Feature Encoding}
+\label{sec:feature_encoding}
+
+\boldparagraph{Polyline Encoding} We represent the map and the agents using a vectorized representation in a structured way. The vectorized representation initially proposed in VectorNet~\cite{Gao2020CVPR} creates a connected graph for each scene element independently. Given past trajectories of agents, $\cA = \{\ba_i\}$ where $\ba_i \in \nR^{T \times 2}$ denotes the location of agent $i$ at previous $T$ time steps and HD map, $\cM = \{\bm_i\}$ where $\bm_i \in \nR^{l_i \times 2}$ denotes the lane $i$ with $l_i$ consecutive points constituting the lane. We encode each scene element, \ie a polyline, with a polyline subgraph. We use two separate subgraphs for the agents and lanes~(\figref{fig:pipeline}, left), resulting in a feature vector of length $d$, $\bff_i \in \mathbb{R}^{d}$ for each polyline.
+
+\boldparagraph{Interaction Modelling} We model different types of interactions between the scene elements~(\figref{fig:pipeline}, left). Following LaneGCN~\cite{Liang2020ECCV}, we model four types of relations: agent-to-lane~(\textbf{AL}), lane-to-lane~(\textbf{LL}), lane-to-agent~(\textbf{LA}), and agent-to-agent~(\textbf{AA}).
+Using attention, we update each feature $\bff_i$ extracted by the polyline subgraph. 
+
+In contrast to previous work using simple attention operation~\cite{Liang2020ECCV}, and given the importance of multi-head attention and feed-forward networks 
+in understanding the relations~\cite{Geva2020ARXIV},
+we use a Multi-Head Attention Block~(MHAB) as proposed in \cite{Girgis2022ICLR}. 
+Specifically, we update self-relations~(\textbf{AA, LL}) using a self-attention encoder followed by a feed-forward network~(FFN) and cross-relations~(\textbf{AL, LA}) using a cross-attention encoder followed by the FFN:
+\begin{align}
+    \text{MHA}(\bff_\bq,~\bff_{\bk\bv}) =&~ \text{softmax}\left(\frac{\bQ\,\bK^T}{\sqrt{dim_\bk}}\right)\bV \\
+    \text{where}~~\bQ,\bK,\bV =&~ \bW^\bq\bff_\bq, \bW^\bk\bff_{\bk\bv}, \bW^\bv\bff_{\bk\bv} \nonumber
+\end{align}
+where each $\bW$ is a learned projection. Similar to the original block in~\cite{Vaswani2017NeurIPS}, our Multi-Head Attention Block is formally defined as follows:
+\begin{align}
+    \label{eq:mhab}
+    \text{MHAB}(\bff_\bq,~\bff_{\bk\bv}) =&~ \text{norm}(\tilde{\bff} + \text{FFN}(\tilde{\bff})) \\
+    \text{where}~~ \tilde{\bff} =&~ \text{norm}(\bff_\bq + \text{MHA}(\bff_\bq,~\bff_{\bk\bv})) \nonumber
+\end{align}
+where the norm is the Layer Normalization~\cite{Ba2016ARXIV}. Different than LaneGCN~\cite{Liang2020ECCV} applying different interaction types $L$ times sequentially one by one, we model each interaction in order and repeat the process $L$ times. This way, intermediate features can be updated at each iteration, and then the updated features are used to compute attention in the next iteration. Each scene element can be informed by different types of relations $L$ times. See Supplementary for the experiment comparing the two design choices.
+
+    
+
+
+
+
+\subsection{Endpoint Prediction}
+\label{sec:endpoint_prediction}
+
+For endpoint prediction, we either use a single MLP if an agent-centric reference frame is used which might be preferred due to its advantages in single-agent prediction %
+or an adaptive head with dynamic weights if a scene-centric reference frame is used which might be preferred due to its efficiency in multi-agent prediction. %
+Our model uses simple linear layers for endpoint prediction rather than sophisticated modules used in previous work~\cite{Ngiam2022ICLR, Girgis2022ICLR}.
+
+\boldparagraph{Endpoint Prediction Head} We predict a possible set of endpoints for each agent based on the agent features from previous attention layers. We utilize two different types of heads to predict the future trajectory of a single agent in an agent-centric reference frame and future trajectories of multiple agents in a scene-centric frame. In single-agent setting, we predict the endpoints with a simple MLP, which we call a \textit{static head}. In multi-agent setting, we train an \textit{adaptive head} to dynamically learn the weights that predict the endpoints. Dynamic weight learning~\cite{Jia2016NeurIPS, Tian2020ECCV} enables the prediction head to adapt to the situation of each agent.
+\begin{align}
+    \label{eq:dynamic}
+    \bW_1 &= \bW_{d_1} \tilde{\bff} \\
+    \bW_2 &= \bW_{d_2} \tilde{\bff} \nonumber \\
+    \bF_{d_1} &= \text{ReLU}(\text{norm}(\bW_1 \bff)) \nonumber \\
+    \hat{\by}_{\text{pred}} &= \bW_2 \bF_{d_1} \nonumber
+\end{align}
+
+
+
+% % Figure environment removed
+
+
+% Figure environment removed
+
+We visualize the adaptive head in \figref{fig:pipeline} and explain it mathematically in \eqref{eq:dynamic} where $\bW_{\bd_1}$ and $\bW_{\bd_2}$ are trainable parameters and norm is the layer normalization. We process the encoded agent features concatenated with meta info, $\bff$ with an MLP and obtain $\tilde{\bff}$. Meta info includes the direction and location information of the agent at prediction time. By providing the current state information to the prediction head as input, we allow the dynamic weights to adjust to the state of the agent while predicting the endpoints. %
+
+\boldparagraph{Refinement} We further refine the endpoints by predicting an offset to the initial endpoint proposals from the prediction head. Given the endpoint proposals and the features of the agent, we predict the corresponding offset for each proposal with a simple MLP. We detach the gradients of endpoints before passing them as input to decouple the training of the endpoint prediction and refinement. Intuitively, offsets that are supposed to correct the endpoints can receive an independent gradient update from the endpoints. A similar approach is used to update queries in~\cite{Jia2022ICLR}.
+
+
+\subsection{Trajectory Prediction}
+\label{sec:trajectory_prediction}
+\boldparagraph{Trajectory Interpolation} After obtaining the refined endpoint for each agent, we interpolate future coordinates between the initial point and the endpoint with an MLP. We detach the endpoints to ensure that weight updates for full trajectory prediction are separated from endpoint prediction. %
+Similarly, we predict a probability for each trajectory using detached endpoints. %
+We provide the pseudo-code for endpoint and trajectory prediction  in \figref{fig:pseudo-code}. We train static and adaptive heads as the endpoint head for the agent-centric and the scene-centric reference frames, respectively.
+
+
+\boldparagraph{Training} For training, we predict $K$ trajectories and apply variety loss to capture multi-modal futures by back-propagating the loss only through the most accurate trajectory.
+As we predict the full trajectories conditioned on the endpoints, the accuracy of endpoint prediction is essential for full trajectory prediction. 
+Therefore, we apply a loss on endpoints to improve the endpoint prediction. The final term in our loss function is classification loss to guide the probabilities assigned to trajectories.
+In summary, we train our model using the endpoint loss, the full trajectory loss, and the trajectory classification loss.
+Please see Supplementary for the details of our loss functions.
+
+
+
+
+
+
+
+% Figure environment removed

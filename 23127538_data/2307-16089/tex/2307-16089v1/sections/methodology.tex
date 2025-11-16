@@ -1,0 +1,84 @@
+\section{\manner{}: Methodology}
+\label{sec:methodology}
+
+% Figure environment removed
+
+
+The goal of personalized news recommendation is to produce for each candidate news $n^c$ and user $u$, with corresponding click history $H= \{ n^u_1, n^u_2, ..., n^u_N \} $, a relevance score $s(n^c, u)$ that quantifies the candidate's relevance for the user. In this work, we define an \textit{aspect} $A_p$ as a categorical variable that encodes a characteristic of a piece of news (e.g. its topical category or sentiment), where each news $n_i$ can belong only to one value of $A_p$ (e.g. if $A_p$ is the sentiment, then $n_i$ may take exactly one value from the set \{\textit{positive}, \textit{negative}, \textit{neutral}\}). 
+%%
+As discussed in \S\ref{sec:related_work}, aspects are additional dimensions (next to content) over which to tailor recommendations, whether it is by (i) personalizing or (ii) diversifying over those dimensions. In line with earlier work, we define \textit{aspect-based personalization} as the level of homogeneity between a user's recommendations and clicked news w.r.t. the distribution of aspect $A_p$. In contrast, we define \textit{aspect-based diversity} as the level of uniformity of aspect $A_p$'s distribution among the news in the recommendation list. 
+
+
+Motivated by the limitations of existing NNR work (see \S\ref{sec:related_work}), we introduce a modular framework for multi-aspect news recommendation \manner{}, illustrated in Figure \ref{fig:framework}. Starting from a pretrained language model (PLM), during (1) training, we resort to metric-based contrastive learning to reshape the representation space of the PLM, independently for each aspect; this results in one specialized NE for each aspect; at (2) inference, we can arbitrarily (i.e., depending on the concrete recommendation task/requirements) aggregate the resulting aspect-specific similarity scores to produce a final ranking function. 
+
+
+
+\subsection{News Encoder}
+\label{subsec:news_encoder}
+
+In line with prior work \cite{qi2021pp, qi2021hierec}, for the NE we adopt a dual-component architecture that couples (i) a text and (ii) an entity encoder. The text encoder, a PLM, transforms the tokenized text input into a text-based news embedding $\mathbf{n}_{t}$: we concatenate the news title and abstract as input, and take the PLM's output representation of the sequence start token (\texttt{[CLS]}) as $\mathbf{n}_{t}$. The entity encoder embeds entities (i.e., all named entities extracted from the title and abstract) via pretrained entity embeddings, %\cite{bordes2013translating} 
+contextualized in a layer that combines multi-head self-attention \cite{vaswani2017attention} and additive attention \cite{bahdanau2014neural}, resulting in an entity-level news embedding $\mathbf{n}_e$. The final news embedding $\mathbf{n}$ is the concatenation of $\mathbf{n}_t$ and $\mathbf{n}_e$. 
+
+
+\subsection{Training}
+\label{subsec:training}
+
+
+\manner{} consists of two types of modules, each with a dedicated NE, responsible for content-based (\texttt{CR-Module)} and aspect-based (\texttt{A-Module}) recommendation relevance, respectively. 
+%%
+We train both modules with a metric-learning objective. Concretely, we minimize the supervised contrastive loss (SCL) \cite{khosla2020supervised, gunelsupervised} (Eq.~\ref{eq:scl}) which aims to reshape the encoder's representation space so that the embeddings of same-class instances become mutually closer (according to some distance/similarity metric) than instances of different classes. This is accomplished by contrasting the distance/similarity score of a positive example (pair of same-class instances) against the scores of corresponding negative examples (pairs of instances from different classes):
+%
+\begin{equation}
+\small
+  \mathcal{L} \hspace{-0.2em} = 
+  \hspace{-0.2em}-\hspace{-0.4em}\sum_{i=1}^N\frac{1}{N_{y_i} -1} 
+  \hspace{-0.8em}
+  \sum_{\substack{
+      j \in [1, N] \\
+      i \neq j, y_i=y_j
+      }}
+  \hspace{-1em}
+  \log 
+  \frac{
+    e^{(\mathbf{n}_i \cdot \mathbf{n}_j / \tau)}
+    }
+    {
+    \sum_{\substack{
+            k \in [1, N] \\ 
+            i \neq k 
+            }}
+    e^{(\mathbf{n}_i \cdot \mathbf{n}_k / \tau)}
+    }
+  \label{eq:scl}
+\end{equation}
+with $y_i$ as the label of the news $n_i$, $N$ the batch size, $N_{y_i}$ the number of batch instances with the same label $y_i$, and $\tau>0$ the temperature hyperparameter that controls the extent of class separation. 
+%
+We use the dot product as the similarity metric in SCL for both module types. 
+
+% \vspace{1.4mm}
+% \noindent \textbf{CR-Module.}
+\rparagraph{CR-Module.}
+Our \texttt{CR-Module} is a modification of the common content-based NNR architecture \cite{wu2023personalized}. Concretely, we use a dedicated NE to encode both candidate and clicked news. However, we propose, following \citet{iana2023simplifying}, to replace the widely used UEs (i.e., early fusion of representations of clicked news) with the much simpler (and non-parameterized) mean-pooling of dot-product scores between the candidate embedding $\mathbf{n}^c$ and embeddings of clicked news $\mathbf{n}_i^u$: $s(\mathbf{n}^c, u) = \frac{1}{N} \sum_{i=1}^N \mathbf{n}^c \cdot \mathbf{n}_i^u$ (i.e., late-fusion of the similarity scores).\footnote{Note that this is equivalent to the dot product between the candidate embedding and the mean of the embeddings of the user's clicked news, $s(\mathbf{n}^c, u) = \mathbf{n}^c \cdot \left(\frac{1}{N} \sum_{i=1}^N \mathbf{n}_i^u \right)$. This means that we can effortlessly derive user embeddings as averages of embeddings of their clicked news.} This way we reduce the computational complexity of the standard (i.e., early-fusion) approaches with elaborate parameterized UEs. We then update the \texttt{CR-Module}'s encoder (i.e., fine-tune the PLM) by minimizing SCL, with clicked candidate news as positive examples and non-clicked news as negative examples for the user. Since there are many more non-clicked news, we resort to negative sampling \cite{ijcai2022infonce}.
+
+% \vspace{1.4mm}
+% \noindent \textbf{A-Module.}
+\rparagraph{A-Module.}
+Each \texttt{A-Module} trains a specialized NE for one aspect other than content. Via the metric-based SCL objective, we reshape the representation space of the PLM so that it groups news according to the aspect classes. Given a multi-class aspect $A_p$, we first construct the training set from pairs of candidate and clicked news. Pairs of candidate and clicked news with the same aspect label make positive pairs for SCL; we obtain the corresponding negatives by pairing the same candidate with clicked news from other aspect classes (e.g., for topical category as $A_p$, a candidate from \textit{sports} paired with the clicked news from \textit{politics}). 
+For each aspect, we independently fine-tune (via SCL) a separate copy of the same initial PLM. 
+%%%
+Note that the resulting aspect-specific NE encodes no information on user preferences: it only encodes how similar news are w.r.t. the aspect in question. Importantly, this means we can seamlessly extend \manner{} to support new aspects by training additional \texttt{A-Modules}.
+
+
+\subsection{Inference}
+\label{subsec:inference}
+
+At inference time, the news encoders (NEs) of the \texttt{CR-Module} and of each of the \texttt{A-Modules} are leveraged in exactly the same way: we encode the candidate news $n^c$ as well as the user's clicked news $n^{u}_i$ with the respective NE, obtaining their module-specific embeddings $\mathbf{n}^c$ and $\mathbf{n}^{u}_i$ -- the dot product between the two, $s = \mathbf{n}^c \cdot \mathbf{n}^{u}_i$ quantifies their similarity according to the aspect of the module (or content in case of \texttt{CR-Module}'s NE).  %%
+We observed that different NEs produce similarity scores of different  magnitudes. We thus standardize (z-score normalization) each module's scores per user. The final similarity score for ranking is then a linear combination of the aspect-specific similarity scores: 
+%
+\begin{equation}
+s_{final}(\mathbf{n}^c, u) = s_{CR} + \lambda_{A_p} s_{A_p}    
+\end{equation}
+%
+\noindent where $s_{CR}$ and $s_{A_p}$ denote the content and aspect similarity scores, respectively, and $\lambda_{A_p}$ is the scaling weight for the aspect score. 
+%%
+Crucially, this modular formulation of the ranking function allows different ad-hoc realizations that match custom recommendation goals. For example, (i) with $\lambda_{A_p}=0$, \manner{} will perform standard content-based personalization, (ii) for $\lambda_{A_p}>0$ it will recommend based on both content- and aspect-based personalization, whereas (iii) for $\lambda_{A_p}<0$ it will personalize by content but diversify for the aspect at the same time. Note that \manner{} trivially generalizes to recommendation objectives that include multiple aspects at once: $s_{final}(\mathbf{n}^c, u) = s_{CR} + \sum_{A_p \in A} \lambda_{A_p} s_{A_p}$, with $A$ as the set of all aspects of interest.    

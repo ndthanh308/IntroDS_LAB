@@ -1,0 +1,96 @@
+\section{Evaluation}
+\label{sec:eval}
+
+This section presents our preliminary evaluation results. We describe the experimental setup in Section~\ref{sec:eval-setup} and compare predicate transfer with baseline join strategies in Section~\ref{sec:eval-main-results}. %the results  Then we demonstrate the overall result over the entire workload. 
+Then we perform a deep drive to understand the performance on TPC-H Q5 in Section~\ref{sec:eval-q5}.
+%drill-down analysis for a specific query that benefits from predicate transfer.
+
+\subsection{Experimental Setup}
+\label{sec:eval-setup}
+
+We conduct all experiments on a single AWS EC2 r5.4xlarge instance, with 16vCPU and 128GB memory. The server runs the Ubuntu 20.04 operating system. We use the widely adopted data analytics benchmark, TPC-H, with 22 queries in total. We use 1GB data set (a scale factor of 1). Queries are executed on a single CPU core. For all the experiments, we measure the in-memory query performance by running the query twice, where the first run loads all the tables into the memory, and we measure the performance of the second run.
+
+The testbed we use on evaluation is FlexPushdownDB~\cite{fpdb} (\textit{FPDB} in short), an open-source cloud-native OLAP DBMS. Table data is placed on local disks in Parquet~\cite{parquet} format unsharded. FPDB leverages join and Bloom filter implementation of Apache Arrow~\cite{arrow}. The evaluation results may vary on different DBMSs, depending on the performance ratio between the join and Bloom filter implemented.
+
+% \yxy{need to mention we use FPDB for the experiment. Mention we use Arrow's join and bloom implementation. May also mention that for a different DB where the perf ratio between join and bloom filter is different, the results will also change.}
+
+We compare the proposed join strategy \textit{Pred-Trans} with three other baselines: \textit{No-Pred-Trans}, \textit{Bloom Join}, and the \textit{Yannakakis} algorithm. \textit{No-Pred-Trans} does not transfer predicates among joining tables---pairs of tables are joined regularly as in most DBMSs. \textit{Bloom Join} performs one-hop predicate transfer between joining table pairs, where the build side constructs a bloom filter which is used to filter the probe side. \textit{Yannakakis} executes the semi-join phase of the Yanakakis algorithm ahead of the join phase.
+
+Since the vanilla Yannakakis algorithm is only applicable on acyclic conjunctive queries, we make two extensions to make it applicable on all TPC-H queries. First, we adopt the same mechanisms that \textit{Pred-Trans} deploys to handle the case of outer joins and non-join operators in the query plan. Second, for cyclic queries like Q5 and Q9, we break the cycle in the join graph by randomly picking a root node and, perform a BFS search from the root. The result join tree represents the transfer order of the semi-join phase. 
+%\paris{could we just say that we follow the transfer schedule by replacing the Bloom filter with a semi-join? Or is this not what we are doing?}
+
+\subsection{TPC-H Performance}
+\label{sec:eval-main-results}
+
+% Figure environment removed
+
+Figure~\ref{fig:exp-tpch} shows the execution time of different predicate transfer strategies on TPC-H queries. Since Q1 and Q6 involve no joins, we exclude them from the benchmark. On average, \textit{Pred-Trans} outperforms \textit{No-Pred-Trans} by 3.8$\times$, \textit{Bloom Join} by 3.1$\times$, and \textit{Yannakakis} by 3.7$\times$. 15 queries out of 20 see performance improvement.
+
+\textit{Pred-Trans} achieves significant performance improvement on queries with a large amount of joins. Half queries include joins across at lease four tables. Among this, Q2 (joins across nine tables) benefits most from predicate transfer, which outperforms \textit{No-Pred-Trans} and \textit{Bloom-Join} by 45$\times$ and 40$\times$, respectively. Through predicate transfer, filter predicates on tables \texttt{Part} and \texttt{Region} are sent to every other table in the join graph through lightweight Bloom filters. As a result, the predicate transfer phase of \textit{Pred-Trans} reduces the size of input tables that participate in the join phase by over 99\%, such that the expensive join operations are only performed on a tiny fraction of data. The \textit{Yannakakis} algorithm outperforms both \textit{No-Pred-Trans} and \textit{Bloom Join} baselines by over 4$\times$. In fact, compared to \textit{Pred-Trans}, \textit{Yannakakis} can pre-filter even more unnecessary data records ahead of the join phase since the Bloom filters leveraged by \textit{Pred-Trans} incur false positives. However, the small performance benefit within the join phase is overwhelmed by the large overhead brought by semi-joins, making \textit{Yannakakis} perform worse that \textit{Pred-Trans}.
+
+We observe the highest speed up on queries Q2, Q17, Q18, and Q21, between 7$\times$ to over 40$\times$. In these queries, there is a subquery executed with the results joined with the tables in the main query, and the large fact table are accessed by both the main query and the subquery (e.g., \texttt{Lineitem} in Q17 and Q18). Since \textit{No-Pred-Trans} and \textit{Bloom Join} perform no predicate transfer and one-hop transfer only, a single filter predicate cannot be sent to both the main query and the subquery to pre-filter the corresponding fact table. Conversely, \textit{Pred-Trans} broadcasts every filter predicate globally inside the join graph, such that both fact tables in the main query and subquery can be filtered. Moreover, Q17 joins base tables with aggregation results. By executing the aggregation beforehand, predicate transfer is able to achieve a higher selectivity by starting transfer from a smaller intermediate result table.
+
+Queries with fewer join operations benefit less from predicate transfer (e.g., Q13, Q14), since one-hop predicate transfer may already be enough to forward local filter predicates to the global. However, we still observe a 10$\times$ speedup on Q3. Q3 joins three relatively large tables \texttt{customer}, \texttt{orders}, and \texttt{lineitem}. Since all three tables have local filters, \textit{Bloom Join} can only transfer a portion of them within a single hop. Instead, \textit{Pred-Trans} can make sure each table receives the transformed filter predicates of every other table, which maximizes the effectiveness of the pre-filter phase.
+
+Another interesting observation is that \textit{Yannakakis} may not always outperform \textit{No-Pred-Trans} and \textit{Bloom Join} baselines (e.g., in Q11 \textit{Yannakakis} underperforms \textit{Bloom Join} by 12$\times$). One cause is that the Yannakakis algorithm does not specify the root of the join tree in the semi-join phase, and a bad semi-join order may construct several large hash tables at the beginning. However, this is not an issue in \textit{Pred-Trans} since we use a heuristic to transfer from smaller tables to larger tables (see Section~\ref{sec:transfer-phase}), minimizing the memory stalls incurred by bitmap operations.
+
+\subsection{Case Study --- TPC-H Q5}
+\label{sec:eval-q5}
+
+To get a deeper understanding of the performance benefits, we conduct a detailed analysis on Q5, one of the complex queries in TPC-H. The query performs inner joins across six tables, and the join graph is shown in Figure~\ref{fig:join-graph}.
+
+\begin{table}[h]
+  \caption{Join Table Size in Q5 \textnormal{---\textit{HT} denotes the number of rows in the hash table, and \textit{PR} represents the number of rows that probe the hash table.}}
+  \label{tab:tbl-size}
+  \footnotesize
+  \begin{tblr}{
+    colspec = {c|cc|cc|cc|cc},
+    cell{3}{8-9} = {green!15},
+    cell{4}{8-9} = {green!15},
+    cell{5}{8-9} = {green!15},
+    cell{6}{8-9} = {green!15},
+    cell{7}{8-9} = {green!15},
+  }
+    \toprule
+    & \SetCell[c=2]{c} \textbf{No-Pred-Trans} & & \SetCell[c=2]{c} \textbf{Bloom Join} & & \SetCell[c=2]{c} \textbf{Yannakakis} & & \SetCell[c=2]{c} \textbf{Pred-Trans}\\
+    \cmidrule{2-9}
+    & \textbf{HT} & \textbf{PR} & \textbf{HT} & \textbf{PR} & \textbf{HT} & \textbf{PR} & \textbf{HT} & \textbf{PR}\\
+    \cmidrule{1-9}\morecmidrules\cmidrule{1-9}
+    \textbf{Join 1} & 10K & 6M & 10K & 6M & 2K & 181K & 2K & 63K\\
+    \cmidrule{1-9}
+    \textbf{Join 2} & 228K & 6M & 228K & 103K & 133K & 181K & 30K & 56K\\
+    \cmidrule{1-9}
+    \textbf{Join 3} & 150K & 910K & 150K & 44K & 69K & 193K & 15K & 39K\\
+    \cmidrule{1-9}
+    \textbf{Join 4} & 25 & 36K & 25 & 36K & 5 & 8K & 5 & 7K\\
+    \cmidrule{1-9}
+    \textbf{Join 5} & 1 & 36K & 1 & 7K & 1 & 8K & 1 & 7K\\
+    \bottomrule
+  \end{tblr}
+\end{table}
+
+\vspace{0.05in}
+\noindent
+\textbf{Join Table Size.} We measure the sizes of both input tables of each join, following the join order specified in the query plan (FPDB utilizes Apache Calcite~\cite{calcite} for query optimization like join ordering), and the result is shown in Table~\ref{tab:tbl-size}.
+% \yxy{generated by Calcite?}
+On average \textit{Pred-Trans} reduces the join table size by 98\% over \textit{No-Pred-Trans}, and 97\% over \textit{Bloom Join}. In \textit{Bloom Join}, the largest fact table \texttt{lineitem} can only be pre-filtered after the first join, where the inner table \texttt{Orders} owns local filter predicates that can be trasferred to \texttt{lineitem}. \textit{Pred-Trans} shows the superiority to be able to pre-filter all join tables ahead of the entire join phase.
+
+We observe a higher selectivity in the predicate transfer phase achieved by \textit{Pred-Trans}, compared to \textit{Yannakakis}. This is because \textit{Yannakakis} can only guarantee the optimal pre-filtering on acyclic queries. For a cyclic query (like Q5), some edges in cycles are removed to form a tree, 
+%are broken have to break the cycles in the join graph to form a join tree that can be taken by \textit{Yannakakis}, 
+which sacrifices the overall filtering power. % on the removed join edges. 
+Instead, the heuristics adopted by \textit{Pred-Trans} allow us to perform transfer for every join regardless the cyclicity of the join graph, resulting in more base table records filtered ahead of the join phase. 
+
+% Figure environment removed
+
+\vspace{0.05in}
+\noindent
+\textbf{Performance Breakdown.} Figure~\ref{fig:exp-break} demonstrates the performance breakdown of Q5 in different predicate transfer strategies. The execution time is divided into predicate transfer and join execution. Compared to \textit{No-Pred-Trans} and \textit{Bloom Join}, joins are accelerated by 63$\times$ and 45$\times$ in \textit{Pred-Trans}, due to the significant size reduction of the input join tables (Table~\ref{tab:tbl-size}). \textit{Yannakakis} is also able to achieve a shrinkage on the input join tables. But the semi-joins it relies on are computationally expensive and dominate the entire execution time. The predicate transfer phase in \textit{Pred-Trans} outperforms the semi-join phase in \textit{Yannakakis} by 11$\times$, since bit operations used in bloom filters are much cheaper than the construction and probe of the hash tables.
+
+% Figure environment removed
+
+\vspace{0.05in}
+\noindent
+\textbf{Robustness.} We next evaluate the sensitiveness on join orders for different predicate strategies. We pick three different join orders and the result is shown in Figure~\ref{fig:exp-robust}. \textit{Pred-Trans} achieves the best performance and outperforms other predicate transfer strategies on all the join orders. Notably, the join order makes a relatively smaller performance variance in \textit{Pred-Trans} compared to other strategies, for instance, between the first and the second join orders.
+% For instance, the performance gap of \textit{Bloom Join} between the first and the second join order is 4.6$\times$ as large of the performance gap observed in \textit{Pred-Trans}. 
+\textit{Pred-Trans} inherits the property of the Yannakakis algorithm which bounds the size of the intermediate join results, making itself robust to different join orders. 
+%\paris{it would have been better to have more data here, but perhaps we leave this for another paper}

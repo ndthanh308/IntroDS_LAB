@@ -1,0 +1,105 @@
+\section{System Overview}
+In this section, we provide an overview of the Online Matching system. We introduce the end-to-end workflow, followed by a detailed overview of the online agent in Section \ref{sec:online_agent}.
+
+\subsection{End-to-end workflow}
+\label{sec:workflow}
+The entire Online Matching workflow consists of an offline pipeline and an online agent responsible for the closed-loop learning, as shown in Fig. \ref{fig:e2e}. The offline pipeline produces a sparse bipartite graph, as introduced in Section \ref{sec:sparse_bipartite_graph}, which is adopted by the online agent. It has the following components:
+% Figure environment removed
+
+\begin{itemize}
+
+\item \textbf{Two-tower model trainer.}
+We train an offline two-tower model by sequentially consuming a large amount of logged user feedback over time. The sequential training ensures that the model can adapt to the distribution change in the latest batch of data.
+As mentioned earlier, this model encodes item features, allowing it to generate meaningful embeddings even for newly added items. The two-tower model is exported on a daily basis, with both towers used by the downstream components to create the sparse bipartite graph. The user tower is also used by the online system to generate user embedding $\rvu$ and context vector $\rvw_u$.
+
+\item \textbf{Candidate selection.} 
+This component creates a corpus of items eligible for exploration. Multiple filters are applied to ensure the selected candidates satisfy our strict trust-and-safety criteria.
+In this paper, our system is mainly focused on exploring fresh videos, therefore a rolling time window that covers a few days is used for item selection. We also apply various quality thresholds to balance the quality and size of the corpus. 
+
+\item \textbf{Clustering and graph building.}
+Once clustering is finished based on the two-tower model exported most recently, graph builder is triggered to build the sparse graph according to Algorithm ~\ref{alg:graph-construction}. 
+The graph building process is executed in both batch and real-time modes concurrently. In batch mode, graph builder takes the output of the candidate selection step, and exports a new graph every few hours. Real-time mode complements batch mode by incrementally updating the sparse graph with newly eligible items to ensure a small latency for items to enter the exploration pool. 
+\end{itemize}
+
+Online agent represents the system that conducts the bandit algorithm and aggregates user feedback in real-time. It takes the sparse graph produced from the above pipeline as input. Whenever the sparse graph is updated, bandit parameters are synchronized in online agent with low latency: 
+% new edges are added with infinite confidence bound 
+new edges are added with infinite confidence bound (so that they will be prioritized for future exploration),
+and old edges that are only in the previous graph version are removed. In the next section, we will delve into the specifics of online agent.
+
+\subsection{Online Agent} \label{sec:online_agent}
+
+% Figure environment removed
+
+As shown in Fig. \ref{fig:feedback}, the key components of online agent are chained as a closed loop. 
+Explored items from Online Matching are allowed to be shown at a fixed position in the UI, so that users' direct feedback on them can be measured without being affected by 
+% ranking policies.
+existing ranking policies. 
+The log processor is used to incrementally generate various kinds of engagement signals on the explored items in the format compatible with the downstream jobs. The feedback aggregation processor is built on top of Bigtable ~\cite{bigtable-osdi06} and is responsible for aggregating pair-wise (cluster and video) bandit parameters according to Eq. \eqref{eq:diag_linucb_update}. As illustrated in Table ~\ref{tbl:toy-example}, each row in the Bigtable represents one cluster, and each column represents the corresponding items of that cluster in the sparse graph. Conceptually, Bigtable is a sparsely populated table that can scale to the billions of rows and columns, and is compatible with the proposed Diag-LinUCB algorithm.   
+
+
+\begin{table}[h]
+  \begin{tabular}{|c|c| }
+    \hline
+     \textbf{Column} & \textbf{Cell value} \\
+    \hline
+     feedback:$item_1$ & \{ $d_{1,1}$: $54.4$, $b_{1,1}$: $624.2$, $w_{1,1}^{2}$: $1.5$ \} \\
+    \hline
+     feedback:$item_2$ & \{ $d_{2,1}$: 57.6, $b_{2,1}$: 144.6, $w_{2,1}^{2}$: 1.8 \} \\
+    \hline
+     feedback:$item_3$ & \{ $d_{3,1}$: 76, $b_{3,1}$: 547.1, $w_{3,1}^{2}$: 2.6 \} \\
+    \hline
+  \end{tabular}
+  \caption{Illustration of how the aggregated bandit parameters $d_{j,c}$, $b_{j,c}$, $w_{j,c}^{2}$ in Eq. \eqref{eq:diag_linucb_update} are stored in Bigtable.  Row keys correspond to hashed cluster IDs. Here we demonstrate one row corresponding to cluster 1 and its three columns.} 
+  \label{tbl:toy-example}
+\end{table}
+
+Bandit parameters in Bigtable are frequently pushed to the cluster-to-candidates lookup service. The recommender service is used for obtaining user clusters, and look up the candidates and their bandit parameters from the lookup service. The recommender service is further used to rank all the candidates according to the UCB in Eq. \eqref{eq:ucbj} or Eq. \eqref{eq:diag-exploit} if the goal is to exploit high quality candidates.
+
+
+It is worth noting that, compared to the classic bandits setup with a fixed set of arms, we always have fresh items added as new arms in Online Matching. In particular, fresh items are \textsl{continuously} injected into the bipartite graph through the graph building pipeline. New items that have never been explored would have an infinite confidence bound in Eq. ~\eqref{eq:ucbj} and are therefore prioritized for exploration in the recommender service. Due to the batch addition of new items, we can observe spikes of infinite UCB scores as shown in Fig. \ref{fig:inf-score}. The spikes usually disappear quickly, demonstrating that users' feedback to new items are quickly incorporated in bandit parameters.
+
+
+% Figure environment removed
+
+\subsection{System Performance}
+To demonstrate the real-time performance of Online Matching, we measure the following two types of update latency:
+\begin{itemize}
+    \item \textsl{Policy update latency}: This is the period of time from the point user sees the explored item, to the point when user's feedback on the item is incorporated in bandit parameters contained in the lookup service in Fig. \ref{fig:feedback}. 
+    Since our primary application is video recommendation, this latency also includes user's watch time on video capped at a certain value, as a major part of the latency in the log processor. Actually sessionizing user feedback in the log processor contributes to most of the policy update latency.
+    \item \textsl{Corpus update latency}: This is the period of time from the point a fresh item is eligible for exploration to the point when the item is added to the sparse graph. 
+\end{itemize}
+The median and the 95-th percentile of both latency are summarized in Table \ref{tbl:latency}. Besides latency, our system achieves high throughput, e.g., it can handle millions of bandit updates per second, allowing it to scale to billions of users.
+
+\begin{table*}
+  \begin{tabular}{ |c|c|c|c| }
+    \hline
+     & P50 (minutes) & P95 (minutes) & Throughput (updates/second)\\
+    \hline
+    Policy update latency & 45 & 74 & O(1M) \\
+    \hline
+    Corpus update latency & 41.1 & 60.1 & O(1K) \\
+    \hline
+  \end{tabular}
+  \caption{Policy update latency, corpus update latency and the system throughput.}
+  \label{tbl:latency}
+\end{table*}
+
+Particularly, the low latency of policy update is critical for recommendation quality since the expected regret grows as the feedback delay increases \cite{delayfeedback-JoulaniGS13}. To empirically verify the expected regrets, we add artificial latency into the aggregation processor in Fig. \ref{fig:feedback}. As shown in Table ~\ref{tbl:latency-inject}, as latency was introduced, the agent became less capable of identifying low-performing bandits, resulting in a decrease in CTR and total rewards on explored items.
+
+\begin{table}[h]
+  \begin{tabular}{ |c|c|c| }
+    \hline
+     &  CTR & Total Rewards\\
+    \hline
+    Baseline with no artificial delay injected & - & - \\
+    \hline
+    20 min delay added & -2.82\% & -11.82\% \\
+    \hline
+    40 min delay added & -4.4\% & -22.84\% \\
+    \hline
+  \end{tabular}
+\caption{A study of artificial latency injection in policy updates' impact on CTR (click-through rate) and total rewards (measured by multiple user satisfaction and engagement metrics).}
+  \label{tbl:latency-inject}
+\end{table}
+
+

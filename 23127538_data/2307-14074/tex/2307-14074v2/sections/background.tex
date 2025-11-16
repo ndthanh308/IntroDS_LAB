@@ -1,0 +1,140 @@
+
+%--------------------------------------------------------------------------
+\section{Background and Motivation}
+%--------------------------------------------------------------------------
+We first introduce some basic concepts of RDMA ($\S$\ref{rdma}); then present the prevalence of multicast pattern ($\S$\ref{multicast-pattern}); finally reveal the insufficiencies of existing solutions ($\S$\ref{multicast}). 
+
+\subsection{RDMA Overview} \label{rdma}
+RDMA is an emerging hardware-offloaded transport that implements the transport functionalities entirely in RNICs, including the basic packet encap/decap, reliability enhancements, congestion control, \etc As a consequence, RDMA provides high throughput, low latency, and efficient CPU utilization~\cite{zhu2015congestion}.
+
+\parab{RDMA Transport Services.}
+Commodity RNICs support three transport services: \textit{reliable connection} (RC), \textit{unreliable connection} (UC), and \textit{unrelibale datagram} (UD), each of which supports a different subset of RDMA operations. There are two types of operations: one-sided (\rdwrite and \rdread) and two-sided (\rdsend/\rdreceive). The one-sided operations don't involve the remote CPU, while the two-sided operations require the remote CPU to participate. 
+
+Among the supported RDMA transport services, RC owns various advantages over UC and UD~\cite{dragojevic2014farm,monga2021birds}. Firstly, RC supports all RDMA operations, especially the one-sided \rdwrite, while UD only supports \rdsend/\rdreceive. Additionally, RC provides hardware-supported reliability, which reduces the software overhead, while UC and UD lack this benefit. Finally, the message size limits are also different; the message of RC and UC can span multiple packets with a total size of up to 2GB, while the message of UD is limited to a single packet. We summarize the RDMA transport service characteristics in Table~\ref{tab:rdma-transport}.
+ 
+%Firstly, RC support all RDMA primitives, especially the one-sided \rdread and \rdwrite, while UD only supports \rdsend/\rdreceive. Additionally, RC provides hardware-supported reliability, which reduces the software overhead, while UC and UD lack this benefit. Finally, the message size limits are also different; the message of RC and UC can span multiple packets with a total size of up to 2GB, while the message of UD is limited to a single packet. We summarize the RDMA transport characteristics in Table \ref{tab:rdma-transport}.
+
+\parab{Queue Pair and Memory Region.}
+RDMA applications communicate through \textit{queue pairs} (QPs) and request a network communication by submitting a \textit{work queue element} (\rdwqe) to the associated QP via \rdverbs. Each QP is identified by a QP number (QPN) and includes two queues: a \textit{send queue} (SQ) and a \textit{receive queue} (RQ). Each QP is usually associated with a \textit{completion queue} (CQ), which is used for RNIC to post the \textit{completion queue event} (\rdcqe) that contains the completion status of the previous submitted \rdwqe. 
+
+RDMA applications register the to-be-accessed memory area as \textit{memory region} (MR) before communication starts. Each MR is associated with a \textit{virtual address} (VA) and a pair of keys: \lkey and \rkey. The application utilizes the \lkey (\rkey) as authorization to access the local (remote) MR. As the one-sided operations don't involve the remote CPU, the related MR info is formatted into the header of the one-sided request's first packet.
+
+\subsection{Multicast Pattern}\label{multicast-pattern}
+Datacenter applications are usually deployed in a distributed approach to gain more computation capability. The participants frequently communicate with others, representing group communication patterns. Multicast is a prevalent communication pattern that many applications exhibit, such as database~\cite{gao2021cloud, miao2022luna}, telemetry and monitoring system~\cite{massie2004ganglia}, HPC~\cite{top500} and machine learning system~\cite{li2014communication, jiang2020unified}. We present examples in HPC and storage networks in detail below.
+
+\parab{HPC.} High-performance Linpack (HPL)~\cite{hpl} is a benchmark application used to rank the supercomputer's computing capacity~\cite{top500}. HPL solves a linear system, $Ax=b$ (usually with a large order), by LU decomposition. The overall HPL procedure is divided into multiple epochs, each including three steps:  \textit{Panel Factorization}, \textit{Panel Broadcast} and \textit{Update}. The \textit{Panel Broadcast} is a standard multicast transmission, and the \textit{Update} includes a communication phase (called \textit{Row Swap}) which can be implemented with multicast. As the volume of communicated traffic is large~\cite{dongarra2003linpack}, an efficient multicast can significantly improve HPL's performance. 
+
+\parab{Storage network.} Distributed storage networks offer high availability and durability using multiple replications~\cite{gao2021cloud}. Failures of storage devices are inevitable in large-scale clusters. Therefore, replicas are critical to prevent data loss.
+The replication delivery impacts application's QoS significantly, as it may last for minutes~\cite{miao2022luna}. Thus, an efficient multicast service can substantially improve the application's experience.
+
+%The one-to-many replication delivery is pervasive because the failure is inevitable in large-scale clusters resulting in machine recovery \cite{guo2016rdma}. In addition, storage servers need frequent synchronization to fence data consistency.
+
+% Figure environment removed
+
+\begin{table}[t]
+	\small
+    \centering
+    \begin{tabular}{c|c|c|c|c}
+    \toprule
+		\textbf{} & \textbf{SEND/RECV} & \textbf{WRITE} & \textbf{READ}  & \textbf{Message Size}\\
+    \midrule
+    	\textbf{RC}	& \blue{\cmark}	& \blue{\cmark}	 & \blue{\cmark} & 2\,GB \\ 
+    	\textbf{UC}	& \blue{\cmark}	& \blue{\cmark}	 & \red{\xmark} & 2\,GB \\
+		\textbf{UD}	& \blue{\cmark}	& \red{\xmark}	 & \red{\xmark} & 4\,KB \\
+    \bottomrule
+    \end{tabular}
+    \caption{RDMA operations and message size that supported in each RDMA transport.}
+    \label{tab:rdma-transport}
+    \vspace{-0.25cm}
+\end{table}
+
+\subsection{Insufficiencies of Existing Solutions} \label{multicast}
+Existing multicast solutions cannot simultaneously achieve optimal multicast forwarding and efficient utilization of advanced RDMA capabilities.
+
+\parab{Application-layer Multicast.} 
+Primary distributed computation frameworks, such as MPI~\cite{openmpi} and NCCL~\cite{nccl}, develop their private multicast protocol upon the RC transport service. Thus they can efficiently utilize the advanced features of RC. However, they cannot achieve optimal traffic forwarding resulting in inefficient communication performance. There are primarily two types of implementations: 1) the basic multiple sender-to-receiver unicasts (abbreviated as multiple unicasts in this paper), and 2) the overlay multicast. 
+
+As illustrated in Fig.~\ref{fig:intro:unicast}, for multiple unicasts, the sender establishes multiple connections and transmits identical data to different receivers via multiple unicasts. This inevitably incurs severe bandwidth wastage and leads to a potential network bottleneck at the sender side. To address it, various overlay algorithms, \eg, Ring and Double-binary tree~\cite{gibiansky2017bringing, mlsl, oneccl}), are proposed to leverage a pipelined transmission strategy. Specifically, some intermediate receivers can relay data distribution after receiving data, thus spreading the transmission burden to all participants (Fig.~\ref{fig:intro:overlay}). However, the overlay multicast results in longer communication distance and higher latency because of intermediate nodes' forwarding. Specifically, in intermediate nodes, packets must go through \textsf{RX} stack, interrupt the CPU to make a forwarding decision, and finally go through \textsf{TX} stack to be sent out.
+
+
+\parab{In-fabric Multicast.}
+With in-fabric multicast, the sender only needs to send out one single copy of data; then, the fabric replicates and forwards the data to multiple receivers via a multicast distribution tree (Fig.~\ref{fig:intro:infabric}). However, existing solutions cannot unleash the full power of RDMA. In particular, IP-based multicast~\cite{crowcroft1988multicast, diab2022orca, shahbaz2019elmo} only supports layer-3 routing without any layer-4 functionality. Developing a specific layer-4 protocol in software upon existing IP-based multicast incurs additional CPU overhead and still forgo the efficient RDMA. IB multicast, defined in IB standard~\cite{Infiniband}, only supports UD transport, inheriting all constraints of UD transport, as described in $\S$\ref{rdma}. Therefore, the insufficiencies of existing in-fabric multicast solutions make their large-scale deployment less attractive.
+
+%As mentioned before, RDMA only supports the one-to-one reliable connection. Thus many multicast solutions have been proposed to address the insufficiency of the limited RDMA transports. However, existing solutions suffer from a tradeoff between optimal forwarding multicast traffic and efficiently utilizing the advanced capabilities of RDMA.
+
+%As mentioned before, RDMA only supports one-to-one reliable connection. However, one-to-many communication patterns are really common in today's datacenter applications, including large-scale cloud storage systems \cite{gao2021cloud}, distributed machine learning systems \cite{li2014communication, jiang2020unified}, \etc
+%On the one hand, various distributed frameworks (\ie, MPI \cite{openmpi}, and NCCL \cite{nccl}) choose to develop their private multicast protocol upon advanced RDMA transport (\aka, application-layer multicast). Thus they can efficiently utilize the advanced capabilities of RDMA. However, application-layer multicast cannot achieve the optimal traffic forwarding resulting in inefficient bandwidth utilization and communication bottleneck \cite{diab2022orca, shahbaz2019elmo}. Allthough many multicast algorithms are proposed to mitigate communication bottleneck (\eg, Ring \cite{gibiansky2017bringing}), they inevitably incur longer communication distance and additional CPU overhead for medium forwarding. 
+
+%When using the one-sided memory \rdverbs (\rdread and \rdwrite), an application needs to identify which memory area to access in  \rdwqe. The memory area to be accessed must be registered as \textsf{memory region} (MR) before communication starts. Each MR is associated with a \textit{virtual address} (VA) and a pair of keys: \lkey and \rkey. The application utilizes the \lkey (\rkey) to access the local (remote) MR, and the VA to identify a specific location within a MR.
+%Because of the growth in data and workload, many datacenter applications represent the increasing computational requirements. Datacenter operators usually deploy these applications in a distributed approach to provide more computation capability, \ie, many servers are responsible for partial task and aggregate the partial results together to finish the total task. During this process, they represent group communication pattern in the form of one-to-many and many-to-many patterns. Multicast is prevalent among them, and many applications exhibit one-to-many patterns, such as cloud database \cite{gao2021cloud, miao2022luna}, telemetry and monitoring system \cite{massie2004ganglia}, HPC \cite{top500} and machine learning system \cite{li2014communication, jiang2020unified}. In particular, we further presents examples in HPC and storage networks in detail as below.
+
+%In the multiple unicasts, sender needs to establish multiple connections and transmit the identical data to multiple receivers, which can inevitably waste network bandwidth, amplifies CPU consumption for \rdwqe and \rdcqe processing, and exacerbate the scalability problem in sender. On the other hand, the overlay network can somewhat alleviate the scalability issue in sender via a piplelined transmission strategy, \ie, some medium receivers will send data out when receiving the data from sender, thus spreading transmission burden to many multicast members. However, this piplelined transmission strategy cannot achieve optimal bandwidth utilization and add additional CPU overhead and processing latency for forwarding decision. Because in medium nodes that forward data, packets must go through \textsf{RX} protocol stack, then interrupt the CPU to make forward decision, and finally go through \textsf{TX} protocol stack to be sent out. 
+
+%An inefficient multicast service not only impacts its performance but also influences other out-of-band services. As the network fabric is shared among multiple tenants and applications, unnecessary multicast traffic will compete for network resources with other valuable traffic, eventually causing overall performance degradation. 
+
+%\begin{table}[t]
+%    \centering
+%    \begin{tabular}{c|c|c|c|c}
+%    \hline
+%    \textbf{} & \textbf{READ} & \textbf{WRITE} & \textbf{SEND/RECV}  & \textbf{Message Size}\\
+%    \hline
+%    \textbf{RC}	& \blue{\cmark}	& \blue{\cmark}	 & \blue{\cmark}	 & 2\,GB \\ 
+%    \hline
+%    \textbf{UC}	& \red{\xmark}	& \blue{\cmark}	 & \blue{\cmark}	 & 2\,GB \\
+%    \hline
+%	\textbf{UD}	& \red{\xmark}	& \red{\xmark}	 & \blue{\cmark}	 & 4\,KB \\
+%    \hline
+%    \end{tabular}
+%    \caption{RDMA primitives and message size limit that supported in each RDMA transport.}
+%    \label{tab:rdma-transport}
+%    \vspace{-0.5cm}
+%\end{table}
+
+%Thus they can achieve efficient bandwidth utilization and mimimized communication distance.
+
+%We first gives a brief description of RDMA network ($\S$\ref{rdma}). Then we present the need for an efficient multicast protocol and the insufficiency of existing solutions ($\S$\ref{multicast}). 
+%We finally introduce the practical requirements of developing multicast among RDMA ($\S$\ref{deployment limitations}).
+
+%RDMA is an emerging networking technology that allows a local host to access the memory in a remote host, bypassing the kernel. RDMA offloads the layer-4 logic, including the basic packet encap/decap, reliability enhancements, congestion control, and \etc to RNICs. As a consequence, RDMA achieves promising communication performance, such as microsecond latency, hundreds of Gbps throughput, consistent quality support, and very low CPU overhead.
+%Among the supported RDMA transports, RC owns various advantages over UC and UD \cite{dragojevic2014farm,monga2021birds}. Firstly, RC support all RDMA primitives, especially the one-sided \rdread and \rdwrite, while UD only supports \rdsend/\rdreceive. Additionally, RC provides hardware-supported reliability, which reduces the software overhead, while UC and UD lack this benefit. Finally, the message size limits are also different; the message of RC and UC can span multiple packets with a total size of up to 2GB, while the message of UD is limited to a single packet. We summarize the RDMA transport characteristics in Table \ref{tab:rdma-transport}. 
+%Operators must carefully select transport when deploying new services based on the specific requirements of these services.
+
+%In-fabric multicast can achieve the ideal bandwidth utilization, as we illustrate in Fig. \ref{fig:intro:infabric}. With in-fabric multicast, the sender only needs to send a single copy of the data, then letting the fabric to copy and forward the data to multiple receivers. However, existing solutions \cite{crowcroft1988multicast,Infiniband,diab2022orca, shahbaz2019elmo} cannot provide connectivity and reliability (\ie, only supporting best-effort delivery). For example, IP multicast \cite{crowcroft1988multicast} only support IP-layer multicast routing, while IB multicast (defined in Infiniband specification\cite{Infiniband}) is only compatible with UD transport, thus inhabiting all constraints listed in $\S$ \ref{rdma}. The lack of connectivity and reliability limits the large-scale deployment of existing in-fabric multicast, and is the reason that the application-layer multicast is produced \cite{monga2021birds, dragojevic2014farm}.
+
+%\parab{Why not UD.}
+%One may wonder whether UD is suitable for multicast as UD can provide many-to-many communications. However, the native UD that RNIC provide has many constraints. 
+%Firstly, UD cannot provide reliable delivery, which limits its adoption among applications that desire reliable delivery. Secondly, implementing a reliable guarantee at the application level will bring high software overhead and cannot fully utilize RDMA offloading benefits. Thirdly, UD only supports \textit{message verbs} (\ie{}, \rdsend and \rdreceive) that need remote host involvement. Finally, as UD has an MTU limit (4KB), UD is unsuitable for large traffic transmission. The application needs to cut the big message into small slides to fit UD primitives. Cutting messages can degrade application performance and bring high CPU overhead, as remote hosts need to pool status from RNIC frequently. Given the above analysis, RDMA UD-based multicast has many limitations and is not a promising solution.
+
+%\subsection{Practical Deployment Requirements} \label{deployment limitations}
+%Besides meeting the the performance demand, deploying a new service in the datacenter should also support the practical deployment requirements. The new multicast protocol must requires minimized application program changes and handle the programmability limitation in the large-scale deployed commodity RNICs.
+%
+%\parab{Lack of programmability in commodity RNICs.}
+%Nowaday commodity RNICs provide little or even no programmability. Taking the ConnectX-5 RNIC from Mellanox as an example, almost all network stacks, including the basic layer-4 connection management logic, the retransmission functionality, and the congesion control compoment, \etc, are fixed in specialized circuits. The programmability shortness generates lots of problems when designing multicast upon RNICs. For instance, the RNIC logic is designed for one-to-one communication, \eg,  connection management logic is proposed for one-to-one connection, and the retransmission component is designed for single ACK stream from one receiver. 
+%thus multiple ack stream from multiple receivers are incompatible with its processing logic.
+
+%\parab{Resource limitation in smart NICs}
+%Smart NICs are commodity-produced and programmability-supported. However, smart NICs are limited by their restricted deployment scope, bounded on-chip resources and high price. In particular, \todo{cost comparison example, deployment scope citation}. In addition, the on-chip resource in smart NICs are limited due to the unaffordable cost and power consumption. \todo{memory in smart nic citation} Thus, even though the network stack can be modified to match the multicast communication pattern, it's technique-challenging to implement a separate multicast tranport in smart RNICs with such limited on-chip resources. 
+
+%\begin{table*}[t]
+%    \centering
+%   
+%    \begin{tabular}{c|c|c|c|c|c}
+%    \hline
+%    \textbf{} & \textbf{In-fabric multicast} & \textbf{multiple unicast} & \textbf{Overlay multicast}  & \textbf{\sys}\\
+%    \hline
+%    \textbf{Bandwidth Utilization}	& \blue{\cmark}	& \blue{\cmark}	 & \blue{\cmark}	 &  \\ 
+%    \hline
+%    \textbf{RDMA primitives}	& \red{\xmark}	& \blue{\cmark}	 & \blue{\cmark}	 &  \\
+%    \hline
+%    \textbf{Connection scalability}	& \red{\xmark}	& \blue{\cmark}	 & \blue{\cmark}	 &  \\
+%    \hline
+%    \textbf{CPU overhead}	& \red{\xmark}	& \blue{\cmark}	 & \blue{\cmark}	 &  \\
+%    \hline
+%	\textbf{Reliability}	& \red{\xmark}	& \red{\xmark}	 & \blue{\cmark}	 &  \\
+%    \hline
+%    \end{tabular}
+%
+%    \caption{Comparison between \sys and related multicast solutions.}
+%    \label{tab:rdma-transport}
+%%    \vspace{-0.5cm}
+%\end{table*}

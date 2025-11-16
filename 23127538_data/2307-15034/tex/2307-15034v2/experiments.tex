@@ -1,0 +1,265 @@
+\section{Mixed-Precision FNO} \label{sec:experiments}
+
+In this section, we first discuss the potential speedups when using mixed-precision FNO, then we address the issue of numerical stability for mixed-precision FNO, and finally, we devise and run our final training pipeline.
+%we summarize our study of mixed-precision training for FNO.
+%we start in \cref{subsec:potential} by discussing the potential speedups when using mixed-precision FNO. In the next two sections, we address the issue of numerical stability via pre-activation and reducing the number of learnable modes. Finally, in \cref{subsec:final}, we devise and run our final training pipeline.
+
+Throughout this section, we run experiments on two datasets.
+The first dataset is the two-dimensional Navier-Stokes equation for a viscous, incompressible fluid on the unit torus. 
+
+\begin{align}
+    \partial_t\omega + \nabla^{\bot}\phi\cdot\omega = \frac{1}{\text{Re}}\Delta\omega + f,\quad&\text{for }x\in \T^2,~t\in (0,T]\nonumber\\
+    -\Delta\phi=\omega,\quad \int_{\T^2}\phi=0,\quad&\text{for }x\in\T^2,~t\in (0,T]\label{eq:navier}\\
+    \omega(0,\cdot)=0~\quad&\nonumber
+\end{align}
+% todo: dot above L?
+where $\T^2\cong [0,2\pi)^2$ is the unit torus, $f\in L^2(\T^2,\R)$ is a forcing function, and $\text{Re}>0$ is the Reynolds number.
+The goal is to predict $\omega(5,\cdot)$, that is, the weak solution to \cref{eq:navier} at 5 timesteps into the future.
+We use the dataset from prior work \citep{kossaifi2023multigrid}, which sets $\text{Re}=500$ and generates forcing functions from the Gaussian measure, $\mathcal{N}(0,27(-\Delta+9I)^{-4})$, and computes the solution function via a pseudo-spectral solver \citep{chandler2013invariant}.
+There are 10\,000 training and 2\,000 test samples.
+
+
+The second dataset is the steady-state two-dimensional Darcy flow equation, which is a second-order, linear, elliptic PDE. 
+\begin{align}
+-\nabla\cdot (a(x)\nabla u(x))=f(x),\quad&\text{for }x\in D\\
+u(x)=0,\quad&\text{for }x\in\partial D
+\end{align}
+where $D=(0,1)^2$ is the unit square.
+We fix $f\equiv 1$ and seek to learn the operator 
+$\G^\dagger: a\mapsto u$, the mapping from the diffusion coefficient to the solution function.
+There are 5\,000 training and 1\,000 test samples.
+The resolution for both datasets is $128\times 128$.
+
+
+\subsection{Potential Speedup of Mixed-Precision FNO} \label{subsec:potential}
+
+
+We compare the runtime of FNO in full and mixed precision.
+First, we run mixed precision via Automatic Mixed Precision (AMP) \citep{paszke2019pytorch}.
+It places all operations into half precision (from \texttt{float32} to \texttt{float16}) with a few exceptions: reduction operations, such as computing the sum or mean of a tensor; weight updates; normalization layers; and operations involving complex numbers.
+The first three exceptions are due to the additional precision needed for operations that involve small numbers or small differences among numbers; the last one is due to the lack of support for half-precision complex datatype in PyTorch \citep{paszke2019pytorch}.
+Therefore, we devise a custom half-precision implementation of the FNO block for complex-valued operations.
+
+First, we use the cuFFT library \citep{cufft} to run both the FFT and iFFT operations in half precision.
+Next, in order to run the tensor multiplication in half precision, we simply cast the complex-valued input tensor into a real-valued tensor with an extra dimension, for the real part and imaginary part.
+For the case of tensorized FNO \citep{kossaifi2023multigrid}, we achieve additional speedups using \texttt{tensorly} \citep{kossaifi2019tensorly} by computing the optimal einsum path at the start of training and caching it. 
+
+% run with final config? batch_size=32, n_layers=8
+\begin{comment}
+\begin{wrapfigure}{r}{.5\textwidth}
+%\vskip -0.7in
+\begin{center}
+% Figure removed
+\caption{
+\textbf{Runtime per epoch as a function of the training method, on different hardware.} 
+We see up to a 35.7\% speedup for running mixed-precision FNO + AMP. 
+Our method is over 20\% faster than PyTorch's native Automatic Mixed Precision (AMP). 
+}
+\label{fig:speedup}
+\end{center}
+\vskip -0.2in
+\end{wrapfigure}
+\end{comment}
+
+% Figure environment removed
+
+\begin{wrapfigure}{r}{.5\textwidth}
+%\vskip -0.7in
+\begin{center}
+% Figure removed
+\caption{
+\textbf{Reduction in GPU memory consumption on different hardware.} 
+Under the same setting, our method reduces FNO's GPU memory footprint by close to 50\%, with Half-Precision FNO contributing the most reduction. 
+}
+\label{fig:memory}
+\end{center}
+\vskip -0.2in
+\end{wrapfigure}
+
+Based on the maximum training throughput on the Navier Stokes dataset described above,
+we show that our mixed-precision approach increases throughput to 1.41X on Ampere GPUs (RTX 3090Ti) and to 1.58X on Volta GPUs (V100), while improving upon the AMP baseline by up to 1.3X. 
+For a fixed batch size on V100, we measure the training time per epoch and find that AMP and half-precision-Fourier operations result in 11.4\% and 24.0\% speedups, respectively, and together result in a 36.8\% speedup; see \cref{fig:efficiency}.
+For GPU memory usage, we observe a significant reduction of up to 50\% for the same fixed batch size. Our half-precision implementation of FNO is responsible for most of the reduction, as the FNO layers remain the main GPU memory bottleneck; see \cref{fig:memory} 
+We also find that the memory reduction for AMP+half-precision-Fourier on the Darcy flow dataset is 24.4\% on RTX 3090Ti.
+However, for both datasets, running in mixed precision results in numerical instability, especially for the forward and inverse FFTs.
+In particular, the forward FFT causes overflow in first few epochs of training. 
+In the next section, we consider stabilizing techniques for these operations.
+
+
+
+
+
+
+\subsection{Stabilizing Mixed-Precision FFT} \label{subsec:stability}
+%Now we consider half-precision stabilizing techniques in order to realize the potential 28\% speedup shown in the previous section.
+%
+Mixed-precision training is prone to underflow and overflow because the dynamic range of half precision is significantly smaller than full precision.
+We empirically show that na\"{i}ve methods such as scaling, normalization, and alternating half and full precision do not fix the numerical instability.
+In particular, a simple idea is to scale down all values by adding a fixed pointwise division operation before the FFT.
+However, this does not work: due to the presence of outliers, all values must be scaled down by significant amount (a factor of at least $10^4$). 
+This forces all numbers into a very small range, which half precision cannot distinguish, preventing the model from converging to an acceptable performance.
+We also find that changing the normalization of the Fourier transform (essentially equivalent to scaling) does not fix the numerical instability.
+
+\begin{wraptable}{r}{10cm}
+\vspace{-12pt}
+\caption{\textbf{Comparison of different pre-activation functions used for numerical stability.}
+\texttt{tanh} achieves the fastest runtime without significantly compromising on loss.
+Since our focus now is on numerical stability, we compare only the average train loss over the 5 final epochs (we compare the test losses in Section \ref{subsec:final}).
+}
+\label{tab:preactivation}
+\begin{center}
+\begin{small}
+%\begin{tabular}{p{1.2cm}p{0.6cm}p{1.4cm}p{1.2cm}p{1.3cm}}
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Fourier} & \textbf{AMP} & \textbf{Pre-} & \textbf{Runtime} & \textbf{Train} \\
+\textbf{Precision} & \textbf{(T/F)} & \textbf{Activation} & \textbf{per epoch} & \textbf{loss} \\
+%Fourier\newline Precision & AMP \newline (T/F) & Pre- \newline Activation & Runtime \newline per epoch & Train \newline Error \\
+\midrule
+Full & F & N/A  & 44.4 & 0.0457 \\
+Full & T & N/A  & 42.3 & 0.0457 \\ 
+Half & F & N/A  & N/A & N/A \\ 
+Half & T & \texttt{hard-clip} & 37.1 & 0.0483\\ 
+Half & T & \texttt{2$\sigma$-clip}  & 40.0 & 0.0474\\ 
+Half & T & \texttt{tanh}  & 36.5 & 0.0481 \\ 
+\bottomrule
+\end{tabular}
+\end{small}
+\vspace{-20pt}
+\end{center}
+\end{wraptable}
+
+We also find normalization simply scales by the variance of the batch or layer, which faces the same problems as above.
+And due to the stochastic yet consistent nature of the overflow errors, alternating between half and full precision also does not mitigate overflow.
+
+On the other hand, we show that pre-activation is a very effective method for overcoming numerical instability.
+Pre-activation is the practice of adding a nonlinearity before a typical `main' operation such as a convolution \citep{he2016identity}.
+%
+Unlike scaling and normalization, pre-activations such as \texttt{tanh} force all values within the range $[-1,1]$ while being robust to outliers: the shape of \texttt{tanh} maintains the trends in the values near the mean.
+
+We observe that only adding a pre-activation before the first FFT still results in overflow in the next FFT.
+Therefore, we add a pre-activation function before every forward FFT in the architecture.
+We test AMP+half-precision-Fourier with three pre-activation functions: \texttt{tanh} (the hyperbolic tangent function), \texttt{hard-clip} (the identity function, but mapping all values $\geq 1$ to 1 and $\leq -1$ to -1), and \texttt{2$\sigma$-clip} (similar to hard clip, but using 2 times the standard deviation as threshold values).
+For this ablation study, we train each model for 100 epochs using the default hyperparameters from the FNO architecture \citep{li2021fourier,kossaifi2023multigrid};
+see Table \ref{tab:preactivation}.
+We find that \texttt{tanh} is the most promising pre-activation overall: it is the fastest, it is smooth and fully-differentiable, and since the operation is pointwise, \texttt{tanh} maintains discretization invariance of the FNO architecture.
+Therefore, we use \texttt{tanh} in our final experiments later in this section.
+
+\begin{comment}
+
+%\subsection{Frequency Mode Truncation}
+\paragraph{Frequency Mode Truncation.}
+Now we study frequency mode truncation in mixed precision.
+When solving systems of PDEs, typically the most important information in the input function is in the low frequency modes. The higher frequencies are typically noisier and must be truncated to prevent overfitting \citep{li2021fourier}.
+We show that in half precision, with a lower range of representable numbers, it helps to truncate more frequency modes than in full precision.
+%
+%Now we validate this phenomenon empirically on the Navier Stokes dataset with FNO.
+We run the full-precision FNO and the mixed-precision FNO from the previous section (\algo) across four frequency modes: 128, 64, 32, and 16, and we otherwise keep the same experimental setup as in Section \ref{subsec:stability}; see Figure \ref{fig:mode_ablation}.
+Note that the default number of modes for Navier Stokes is 64 \citep{kossaifi2023multigrid}.
+% todo: verify and talk about in the context of theory.
+Using 16 modes does not yield good results for either model, and we find that the decrease in accuracy when going from 64 to 32 modes is significantly less for mixed-precision FNO, compared to full-precision FNO.
+In Appendix \ref{app:experiments}, we also run an experiment on synthetic data to demonstrate that the error caused by half precision is higher for higher frequencies, relative to the amplitude.
+\end{comment}
+
+
+% Figure environment removed
+
+
+
+
+\subsection{Final Training Pipeline} \label{subsec:final}
+
+
+
+Based on the results from the previous sections, we compare full-precision FNO to mixed-precision FNO with \texttt{tanh} pre-activation, on the full training pipeline consisting of 500 epochs.
+As in prior work \citep{li2021learning,kossaifi2023multigrid}, training is done using the H1 Sobolev norm \citep{czarnecki2017sobolev,li2021learning}.
+We perform evaluation with the $H^1$ norm, and we also present results with the $L^2$ norm in Appendix \ref{app:experiments}.
+We run experiments on both Navier Stokes and Darcy flow data, with and without
+Canonical-Polyadic factorization \citep{kolda2009tensor} of the weight matrices (which was recently shown to substantially improve performance and memory usage of FNO \citep{kossaifi2023multigrid}).
+
+
+In addition to running full precision and \algo{}, we also test a precision schedule, in which the first 25\% of training is in \algo{}, the middle 50\% of training puts the FFT in full precision, and the final 25\% of training is in full precision.
+See \cref{fig:full_results} (left) for results on the Navier Stokes dataset. 
+Across all settings, na\"ively running mixed-precision results in NaN's after a few epochs, but adding \texttt{tanh} pre-activation allows the model to converge much faster and with nearly the same final performance.
+\algo{} achieves a 34\%
+reduction in runtime per epoch on an NVIDIA Tesla V100 GPU.
+While \algo{} converges to an error that is 6-11\% worse than full-precision, the precision schedule converges to an error that is 10\% \emph{better} than full precision, due to its better \emph{anytime performance}.
+%We also note that the learning rate schedule and other hyperparameters were optimized for full-precision Navier Stokes in prior work, which suggests that additional hyperparameter tuning might lead to even better performance in mixed precision.
+
+
+We also test our method on the Darcy flow dataset described in \cref{sec:experiments}.
+Similar to the Navier Stokes dataset, we find that simply running the FFT in half precision leads to numerical instability, but running \algo{} gives an 18\% reduction in runtime with no increase in loss.
+See \cref{fig:full_results} (right).
+This confirms that our findings from Section \ref{subsec:stability} can generalize to other datasets.
+
+\paragraph{\texttt{tanh} Ablation Study.}
+Since our full method, \algo{} uses a hyperbolic tangent preactivation, a natural question is to ask how a hyperbolic tangent would affect the full precision FNO model with no other changes.
+In \cref{tab:full-prec-tanh}, we answer this question by running the full precision FNO model on the Navier Stokes dataset.
+We find that there is no noticeable change in the test losses, and the runtime-per-epoch increases by 0.8 seconds, or 1.6\%.
+This concludes that \texttt{tanh} is a reasonable and practical choice to improve numerical stability for half precision methods.
+
+%One of the motivations for running the FNO block in half precision is that we already incur \emph{approximation error} due to approximating the Fourier transform with the discrete Fourier transform, since real-world datapoints are not infinite-dimensional.
+
+
+ \begin{wrapfigure}{r}{0.5\textwidth}
+\vspace{-15pt}
+\begin{center}
+% Figure removed
+\caption{
+\textbf{Comparison of the full-precision and mixed-precision (\algo) FNO} 
+ with different frequency modes, on the Darcy flow dataset.
+ For 16 frequency modes, the half precision error (compared to full precision) is higher than for 32, 64, or 128 modes.
+}
+\label{fig:mode_ablation}
+\end{center}
+\vspace{-10pt}
+\end{wrapfigure}
+
+
+\begin{table}[b]
+\centering
+{\small
+\caption{\textbf{Ablation study on full-precision FNO with and without tanh} on the Navier Stokes dataset.
+There is no noticeable change in accuracy, showing that \texttt{tanh} is a practical choice to improve numerical stability in low precision methods. 
+}
+\label{tab:full-prec-tanh}
+\begin{tabular}{lrrr}
+\toprule
+{} & $H^1$ & $L^2$ & time-per-epoch (sec) \\
+\midrule
+Full precision & 0.0121 & 0.00470 & 51.72 \\
+Full precision + tanh & 0.0122 & 0.00465 & 52.56 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+
+\paragraph{Frequency Mode Ablation Study.}
+Recall that in the FNO architecture, after the FFT, we crucially truncate to a fixed number of frequency modes to improve performance, typically $\nicefrac{1}{3}$ to $\nicefrac{2}{3}$.
+Now we run an ablation study on the number of frequency modes used in the FNO architecture.
+We run frequency modes $\{16, 32, 64, 128\}$ on the $128\times 128$ Darcy flow dataset in full and half precision; see \cref{fig:mode_ablation}.
+We find that using two few frequency modes hurts accuracy substantially, while using too many frequency modes increases runtime substantially. 
+There is not a significant difference between half precision and full precision, for all frequencies.
+
+
+
+
+Next, we run an experiment on synthetic data to demonstrate that the error caused by half precision is higher for higher frequencies, relative to the amplitude.
+We create a signal based on sine and cosine waves with frequencies from 1 to 10, with randomly drawn, exponentially decaying amplitudes.
+Then we plot the Fourier spectrum in full and half precision, as well as the absolute error of the half-precision spectrum as a percentage of the true amplitudes. 
+See \cref{fig:synthetic};
+we find that the percentage error exponentially increases.
+Since in real-world data, the energy is concentrated in the lowest frequency modes, and the higher frequency modes are truncated, this gives further justification for our half precision method.
+
+
+
+\paragraph{Resolution Invariance.}
+An important property of neural operators is their \emph{resolution invariance}, meaning that they can be trained on one resolution and tested on a higher resolution (zero-shot super resolution).
+In order to show that our low-precision training pipeline maintains resolution invariance, we show zero-shot super resolution results. We use the Navier Stokes dataset, trained on $128\times 128$ resolution (the same setting and model as \cref{fig:full_results}), and tested on $256\times 256$, $512\times 512$, and $1024\times 1024$ resolutions; see \cref{tab:super-res}.
+We find that similarly to $128\times 128$ test data, half-precision has a small decrease in accuracy compared to full precision, and using a precision schedule achieves significantly better performance with the same training time.
+
+
+
+
+

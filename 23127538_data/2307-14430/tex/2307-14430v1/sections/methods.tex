@@ -1,0 +1,112 @@
+\section{Skills-based data selection}
+
+\vspace{-0.5em}
+
+Now that we have established the existence of ordered skill sets, we discuss how to use them for data selection.
+%
+We state the data selection problem for learning across skills in Section~\ref{sec:problem_statement}.
+We discuss how to learn the skills graph that will be exploited in our data selection methods in Section~\ref{sec:graph_learning}.
+We then introduce two sampling methods that utilize the graph, a simple skill-stratified sampling method and the online sampling method \name, in Section~\ref{sec:sampling}.
+
+\subsection{Problem statement} \label{sec:problem_statement}
+
+We are given an ordered training skill set $\strainset = \{\strain{1}, \dots, \strain{k}\}$ on the training data, each with associated support set $\X_{\strain{1}}, \dots \X_{\strain{k}}$, and an ordered evaluation skill set $\sevalset = \{\seval{1}, \dots, \seval{m}\}$ of $m$ evaluation skills on a separate evaluation dataset.
+We aim to select $n$ samples from $\strainset$ via a mixture of training skills, $p \in \Delta^{k-1}$, to achieve three goals depending on how $\sevalset$ is constructed:
+\begin{itemize}[itemsep=0.05pt,topsep=0pt,leftmargin=*]
+    \item \textbf{Continual pre-training}: when $\sevalset = \strainset$, our goal is select a mixture of training skills to learn all of them.
+    \item \textbf{Fine-tuning}: when $\sevalset \subset \strainset$, our goal is to select a mixture of training skills to learn an individual target skill or subset of these skills. 
+    \item \textbf{Out-of-domain}: when $\sevalset \cap \strainset = \emptyset$, our goal is to select a mixture of training skills to learn a disjoint set of evaluation skills we cannot train on. This can arise when we have a separate downstream validation dataset or the skills identified in the training dataset are noisy.
+
+    
+\end{itemize}
+Furthermore, we have a skills graph $G = (\strainset \cup \sevalset, E)$, where $E \subseteq \strainset \times \sevalset$ and $A \in \R^{k \times m}$ is a weighted adjacency submatrix, where $A_{ij}$ describes the strength of the edge from $\strain{i}$ to $\seval{j}$. In Table~\ref{tab:settings}, we summarize how the three different settings are constructed and how $A$ varies across them. Next, we discuss how $A$ can be estimated from the data. 
+
+\begin{table*}
+\footnotesize
+\caption{Summary of three settings---continual pre-training, fine-tuning, and out-of-domain. These settings are determined by how $\sevalset$ is defined and result in different skills graphs used for our sampling methods.}
+\begin{tabular}{c|c|c}
+    \toprule
+    Setting & $\sevalset$ & Skills graph \\
+    \midrule 
+    Continual pre-training & $\sevalset = \strainset$ & $A \in \R^{k \times k}$, edges among all $\strainset$  \\
+    Fine-tuning & $\sevalset \subset \strainset$ & $A \in \R^{k \times m}$, edges from all training skills to target skill subset \\
+    Out-of-domain & $\sevalset \cap \strainset = \emptyset$ & $A \in \R^{k \times m}$, edges from all training skills to separate evaluation skill set \\
+    \bottomrule
+\end{tabular}
+\label{tab:settings}
+\end{table*}
+
+
+\subsection{Skills graph learning} \label{sec:graph_learning}
+The skills graph is important for determining how to sample from the ordered skill set for training efficiently.
+We present two approaches for learning the skills graph---brute-force and linear approximation. Algorithms are provided in Appendix~\ref{supp:graph_learning}. By definition~\ref{def:oss}, the brute-force way of identifying edges involves fixing an overall training budget of $H$ steps and 1) training and evaluating the model on each $s_i$ and 2) training the model on each pair of $(s_i, s_j)$ and evaluating on $s_i$ and $s_j$. If the loss on $s_j$ when trained on both $s_i$ and $s_j$ is lower, there exists an edge from $s_i$ to $s_j$. This approach has runtime $\mathcal{O}(H k^2)$, which is feasible for small $k$. 
+When $k$ is large, we can approximate this approach in linear time by training on each $s_i$ for $h < H$ steps and setting $A_{ij} > 0$ if the loss on $s_j$ decreases over $h$ steps for a runtime of $\mathcal{O}(hk)$. 
+This linear approach is necessary in the out-of-domain setting when $\sevalset$ and $\strainset$ are disjoint, as we do not train on data associated with $\sevalset$. In addition, both graph learning approaches can be performed on a smaller model, and the learned graph can be used for data selection for training a larger model (Appendix~\ref{supp:larger_model}).
+
+\subsection{Skills graph-aware sampling}\label{sec:sampling}
+
+We present two approaches for sampling over the mixture of training skills according to the skills graph: skill-stratified sampling, which samples uniformly over relevant training skills according to $A$, and \name, which is an online generalization that incorporates knowledge of how skills are being learned throughout training.
+
+
+\subsubsection{Skill-stratified sampling}\label{sec:skill_stratified}
+
+
+A straightforward sampling approach is to discard training skills that do not benefit the evaluation skills and sample uniformly over the set of relevant training skills, which we call \textit{skill-stratified sampling}. 
+For continual pre-training, the relevant skills are the entire training skill set; for each $\strain{i} \in \strainset$, $\Pr(\strain{i}) = \frac{1}{k}$. 
+This enables each skill to have sufficient training data.
+For fine-tuning, the relevant skills are the target skills and prerequisite skills, which can be identified via positive entries of the $i$th column of $A$ with $\sprereq = \{\strain{i}: \exists \; \seval{j} \; \text{s.t.} \; A_{ij} > 0 \}$. 
+We then set $\Pr(s) = \frac{1}{|\sprereq \cup \sevalset|}$ for $s \in \sprereq \cup \sevalset$. 
+For the out-of-domain setting, skill-stratified sampling is over the set of prerequisite skills. 
+For each $s \in \sprereq$, we set $\Pr(s) = \frac{1}{|\sprereq|}$. 
+Next, we propose our online algorithm that exploits the graph dynamically for more efficient training.
+
+
+\subsubsection{\name online data selection algorithm} \label{sec:alg}
+
+
+\begin{algorithm}[tb]
+   \caption{\name Online Data Selection Algorithm}
+\begin{algorithmic}[1]
+   \STATE {\bfseries Input:} Ordered training skill set $\strainset$, ordered evaluation skill set $\sevalset$.  Learning rate $\eta$, $T$ rounds, $n$ samples, $H$ training steps per run for graph learning, model $f_1$, window parameter $w$.
+   \STATE $A \gets$ \textsc{LearnGraph}$(\strainset, \sevalset, H, f_1)$ (Alg.~\ref{alg:bruteforce_graph},~\ref{alg:approximate_graph}).
+   \STATE Initialize $p_1^i = \exp(\eta \sum_{j = 1}^m A_{ij})$ for all $i \in [k]$, the softmax over $A$.
+   \FOR{$t = 1, \dots, T-1$}
+    \STATE Observe losses $\Leval{j}(f_t)$ for all $\seval{j} \in \sevalset$.
+    \STATE Train model $f_t$ with $n/T$ samples from mixture $p_t$ over $\strainset$. Update model $f_{t+1} = \Phi(f_t, p_t)$.
+    \STATE Set $p_{t+1}^i = \exp(\eta \sum_{\tau = t - w+1}^t \sum_{j = 1}^m A_{ij} \Leval{j}(f_{\tau}))$.
+   \ENDFOR
+\end{algorithmic}
+\label{alg:skillit}
+\end{algorithm}
+
+Despite accounting for prerequisite skills, one shortcoming of skill-stratified sampling is that even if a skill has already obtained sufficiently low validation loss early during training, we will continue to allocate the same weight to that skill throughout training. Therefore, we formulate our data selection problem as an online learning problem and propose \name, which both prioritizes prerequisite skills and skills that are not yet learned. 
+
+We are given a budget of $T$ rounds and $n$ total samples to train on.
+At round $t$, we select a mixture $p_t \in \Delta^{k-1}$ from the $k$-dimensional unit simplex, and for each training skill $\strain{i} \in \strainset$, we sample from $\X_{\strain{i}}$ with proportion $p_t^i$ for a total of $\frac{n}{T}$ samples per round. Let $f_t$ be the model at at the start of round $t$. We can define $f_t$ recursively as a function of the previous round's model $f_{t-1}$ and mixture $p_{t-1}$ via a dynamics function $\Phi: \F \times \Delta^{k-1} \rightarrow \F$; that is, $f_t = \Phi(f_{t-1}, p_{t-1})$.
+Let $\Leval{j}(f_{t})$ be the validation loss of $f_t$ on $\seval{j}$. Our goal is to select $p_1, \dots, p_T$ to minimize loss per evaluation skill at the end of training:
+\begin{align}
+    \underset{p_1, \dots, p_T \in \Delta^{k-1}}{\text{minimize}} \; \frac{1}{m} \sum_{j=1}^m \Leval{j}(f_T).\label{eq:opt}
+\end{align}
+
+This optimization problem is challenging to solve without additional assumptions. In order to make the problem tractable, we impose an explicit dynamics rule for the each evaluation skill's loss $\Leval{j}$ in terms of the current loss and data mixture. 
+Assuming for simplicity that $\sevalset \subseteq \strainset$, a simple rule would be $\Leval{j}(f_t) = \Leval{j}(\Phi(f_{t-1}, p_{t-1})) := \Leval{j}(f_{t-1}) (1 - \alpha p_{t-1}^j)$ for $\alpha \in [0, 1]$. That is, we expect that allocating more data to skill $j$ should result in the validation loss on skill $j$ decreasing. However, such an expression assumes that only training on the $j$th skill will help learn the $j$th skill.  Instead, Section~\ref{sec:skill_examples} suggests that there are other skills that may help with the $j$th skill. We propose the following dynamics:
+\begin{align}
+    \Leval{j}(f_t)=\Leval{j}(f_{t-1})(1- A_{:, j}^\top p_{t-1}),
+\end{align}
+
+where $A_{:, j}$ is the column with weights of all skills that influence $\seval{j}$, and we absorb the scalar $\alpha$ into $A$.
+The optimization problem in~\eqref{eq:opt} can thus be simplified as follows:
+\begin{align} \label{eq:skillit_opt}
+    &\underset{p_1, \dots, p_T \in \Delta^{k-1}}{\text{minimize}} \; \frac{1}{m}\sum_{j = 1}^m \Leval{j}(f_T) \\
+    &  \text{s.t} \;\;\;  f_t = \Phi(f_{t-1}, p_{t-1}) \; \forall t = 1, \dots T \nonumber \\
+    &\;\;\;\;\;\;\Leval{j}(f_t) = \Leval{j}(f_{t-1})(1 -  A_{:, j}^\top p_{t-1}) \; \forall j \in [m] \nonumber
+ \end{align}
+
+In Appendix~\ref{supp:alg}, we derive the following update rule via online mirror descent~\cite{nemirovskij1983problem} for learning rate $\eta > 0$:
+\begin{align}
+    p_{t+1}^{i} = p_{t}^{i} \exp \bigg(\eta \sum_{j = 1}^m A_{ij} \Leval{j}(f_{t})\bigg).\label{eq:mw_update}
+\end{align}
+
+ In addition, when equation~\ref{eq:mw_update} is expanded, we have that $p_{t+1}^i = p_1^{i} \exp \Big(\eta \sum_{\tau = 1}^{t} \sum_{j = 1}^m A_{ij} \Leval{j}(f_{\tau})\Big)$. Since this summation over $\tau$ results in diminishing strength of updates, we change it to a moving window of size $w$. Our full method is in Algorithm~\ref{alg:skillit}.
+
+ Intuitively, at each step we adjust the weight on skill $i$ based on the losses of skills that $i$ influences, with the assumption that more training data helps decrease loss. Note that when we use our algorithm with a complete graph or empty graph, we achieve expected behavior discussed in Section~\ref{sec:def}. For the complete graph, our algorithm reduces to stratified sampling. When we have a skill set with an empty graph, the update rule reduces to sampling proportional to each skill's validation loss.

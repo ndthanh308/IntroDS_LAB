@@ -1,0 +1,158 @@
+\section{Our Composite Diffusion method}
+\label{sec:our_method}
+We present our method for Composite Diffusion. It can directly utilize a pre-trained text-conditioned diffusion model or a control-conditioned model without the need to retrain them. We first formally define our goal. We will use the term \textit{`segment'} particularly to denote a \textit{sub-scene}.
+
+\subsection{Goal definition} 
+\label{sec:goal-definition}
+We want to generate an image $\mathbf{x}$ which is composed entirely based on two types of input specifications: 
+\begin{enumerate}
+    \item \textbf{Segment Layout}: a set of free-form segments $S=[s^1, s^2, ..., s^n]$, and 
+    \item \textbf{Segment Content}: a set of natural text descriptions, $D = [d^1, d^2, ..., d^n]$, and optional additional control conditions, $C = [c^1, c^2, ..., c^n]$. 
+\end{enumerate}
+
+Each segment $s^j$ in $S$ describes the spatial form of a sub-scene and has a corresponding natural text description $d^j$ in $D$, and optionally a corresponding control condition $c^j$ in $C$. The segments don't non-overlap and fully partition the image space of $\mathbf{x}$. Additionally, we convert the segment layout to  segment-specific masks, $M=[m^1, m^2, ..., m^n]$, as one-hot encoding vectors. The height and width dimensions of the encoding vector are the same as that of $\mathbf{x}$. `$1$s' in the encoded mask vector indicate the presence of image pixels corresponding to a segment, and `$0$'s indicate the absence of pixel information in the complementary image area (Refer to Appendix Figure \ref{fig:running-example}).
+
+Our method divides the generative process of a diffusion model into two successive temporal stages: (a) the Scaffolding stage and (b) the Harmonization stage. We explain these stages below:
+
+% Figure environment removed
+
+\begin{algorithm}[ht!]
+\caption{Composite Diffusion: Scaffolding Stage. The input is as defined in the section \ref{sec:goal-definition}.}
+\label{alg:scaff}
+\uIf{Segment Reference Images} 
+{
+\For{\textbf{all segments} $i$  \textbf{from} $1$ to $n$}
+    {
+     $x_{\kappa-1}^{seg_i} \leftarrow Noise(x^{ref_i}, \kappa) $ \tcp*{Q-sample reference images to last timestep of scaffolding stage. }  
+    }
+}
+\uElseIf{Only Segment Text Descriptions}
+{ 
+    \For {\textbf{all} $t$ \textbf{from} $T$ to $\kappa$}
+    {
+     \For{\textbf{all segments} $i$  \textbf{from} $1$ to $n$} 
+        {
+            $x_{t}^{scaff}     \leftarrow Noise(x^{scaff}, t) $ \tcp*{Q-sample scaffold. }    
+
+            % $x_{t-1}^{seg_i} \leftarrow Denoise(x_t \odot m^i + x_{t}^{scaff}  \odot (1 -  m^i),  d^i)$ \tcp*{Scaffold with the Scaffolding Image and denoise}
+            $x_{t-1}^{seg_i} \leftarrow Denoise(x_t, x_{t}^{scaff}, m^i, d^i)$ \tcp*{Step-inpaint with the scaffolding image. }
+        }
+    }       
+}   
+\uElseIf{Text and Segment Control Conditions}
+{
+    \For {\textbf{all} $t$ \textbf{from} $T$ to $\kappa$}  
+    { 
+        \For{\textbf{all segments} $i$  \textbf{from} $1$ to $n$} 
+        {
+            $x_{t-1}^{seg_i} \leftarrow Denoise(x_t , m^i, d^i, c^i)$ \tcp*{ Scaffold with the control condition and denoise.}
+        }
+    }
+}
+$x^{comp}_{\kappa-1} \leftarrow \sum_{i=1}^{n} x_{\kappa-1}^{seg_i} \odot m^i$ \tcp*{Merge segments.}
+\Return  $x^{comp}_{\kappa-1}$
+\end{algorithm}
+
+% Figure environment removed
+
+\subsection{Scaffolding stage}
+We introduce the concept of \textit{scaffolding}, which we define as a mechanism for guiding image generation within a segment with some external help. We borrow the term `scaffolding' from the construction industry \cite{scaffolding_2022_ref}, where it refers to the temporary structures that facilitate the construction of the main building or structure. These scaffolding structures are removed in the building construction once the construction work is complete or has reached a stage where it does not require external help. Similarly, we may drop the scaffolding help after completing the scaffolding stage.
+
+The external structural help, in our case, can be provided by any means that help generate or anchor the appropriate image within a segment. We provide this help through either (i) \textit{scaffolding reference image} - in the case where reference example images are provided for the segments, (ii) \textit{a scaffolding image} - in the case where only text descriptions are available as conditioning information for the segments, or (iii) a \textit{scaffolding control condition} - in the case where the base generative model supports conditioning controls and additional control inputs are available for the segments.
+
+\subsubsection{Segment generation using a scaffolding reference image}
+An individual segment may be provided with an example image called \textit{scaffolding reference image} to gain specific control over the segment generation. This conditioning is akin to using image-to-image translation \cite{stable_diffusion} to guide the production of images in a particular segment. 
+
+Algorithmically, we directly noise the reference image (refer to Q-sampling in Appendix \ref{sec:forward_diff}) to the time-stamp $t=\kappa$ that depicts the last time-step of the scaffolding stage in the generative diffusion process (Algo. \ref{alg:scaff}, 1-4, and Fig. \ref{fig:scaff-all-conditions}, A).  The generated segment can be made more or less in the likeness of the reference image by varying the initializing noising levels of the reference images. Refer to Fig. \ref{fig:reference-images} for an example of scaffolding using segment-specific reference images.
+
+% Figure environment removed
+
+\subsubsection{Segment generation with a scaffolding image} 
+This case is applicable when we have only text descriptions for each segment. The essence of this method is the use of a predefined image called \textit{scaffolding image} ($x^{scaff}$), to help with the segment generation process. Refer to Algo. \ref{alg:scaff}, 5-11 and Fig. \ref{fig:scaff-all-conditions}, B. 
+
+Algorithmically, to generate one segment at any timestep $t$ : (i) we apply the segment mask $m$ to the noisy image latent $x_t$ to isolate the area  $x_t \odot m$ where we want generation, (ii) we apply a complementary mask $(1-m)$ to an appropriately noised (q-sampled to timestep $t$) version of scaffold image $x^{scaff}_{t}$  to isolate a complementary area $x^{scaff}_{t} \odot (1-m)$, and (iii) we merge these two complementary isolated areas and denoise the composite directly through the denoiser along with the corresponding textual description for the segment. Refer to Appendix \ref{sec:our_method_implementation} Fig. \ref{fig:our-algo}(a) for an illustration of the single-step generation. We then replicate this process for all the segments. 
+
+These steps are akin to performing an inpainting \cite{latent_blended} step on each segment but in the context of a scaffolding image. Please note that our method step (Algo. \ref{alg:scaff}, 9) is generic and flexible to allow the use of any inpainting method, including the use of a specially trained model (e.g., RunwayML Stable Diffusion inpainting 1.5 \cite{stable_diffusion}) that can directly generate inpainted segments.   
+
+We repeat this generative process for successive time steps till the time step $t=\kappa$. The choice of scaffolding image can be arbitrary. Although convenient, we do not restrict keeping the same scaffolding image for every segment.
+
+\subsubsection{Segment generation with a scaffolding control} 
+This case is applicable where the base generative model supports conditioning controls, and, besides the text-conditioning, additional control inputs are available for the segment. In this method, we do away with the need for a scaffolding image. Instead of a scaffolding image, an artist provides a scaffolding control input for the segment. The control conditioning input can be a line art, an open pose model, a scribble,  a canny image, or any other supported control input that can guide image generation in a generative diffusion process.
+
+Algorithmically, we proceed as follows: (i) We use a control input specifically tailored to the segment's dimensions, or we apply the segment mask $m$ to the control condition input $c^i$ to restrict the control condition only to the segment where we want generation, (ii) The image latent  $x_t$ is directly denoised through a suitable control-denoiser along with conditioning inputs of natural text and control inputs for the particular segment. We then repeat the process for all segments and for all the timesteps till $t=\kappa$. Refer to Algo.\ref{alg:scaff}, 12-17, and Fig. \ref{fig:scaff-all-conditions}, C. 
+
+Note that since each segment is denoised independently, the algorithm supports the use of different specialized denoisers for different segments. For example, refer to Fig. \ref{fig:teaser} where we use three distinct control inputs, viz., scribble, lineart, and openpose. Combining control conditions into Composite Diffusion enables capabilities more powerful than both - the text-to-image diffusion models \cite{stable_diffusion} and the control-conditioned models\cite{zhang2023adding}. Fig. \ref{fig:control-seg-examples} refers to two example cases where we accomplish image generation tasks that are not feasible through either of these two models. 
+
+At the end of the scaffolding stage, we construct an intermediate composite image by composing from the segment-specific latents. For each segment specific latent, we retain the region corresponding to the segment masks and discard the complementary region (Refer to Fig. \ref{fig:scaff-all-conditions} and Algo. \ref{alg:scaff}, 20-21).  The essence of the scaffolding stage is that \textit {each segment develops independently and has no influence on the development of the other segments}. We next proceed to the  `harmonization' stage,  where the intermediate composite serves as the starting point for further diffusion steps.
+
+% Figure environment removed
+
+\begin{algorithm}[ht!]
+\caption{Composite Diffusion: Harmonization Stage. Input same as Algo. \ref{alg:scaff}, plus  $x^{comp}_{\kappa-1}$}
+\label{alg:harmon}
+
+
+\For {\textbf{all} $t$ \textbf{from} $\kappa - 1$ to $0$} 
+{ 
+    \uIf{Global Text Conditioning}
+        {
+            $x_{t-1} \leftarrow Denoise(x_t, D)$ \tcp*{Base Denoiser}              
+        }
+    
+    \uElseIf {Segment Text Conditioning}
+        {
+            \For{\textbf{all segments} $i$  \textbf{from} $1$ to $n$}              
+            {
+                $x_{t-1}^{seg_i} \leftarrow Denoise(x_t, d^i)$ \tcp*{Base Denoiser}
+                % Alternatively:
+                % $z_{t-1}^{seg_i} \leftarrow Denoise(x_t, d^i, c^i)$  
+            }
+             $x^{comp}_{t-1} \leftarrow \sum_{i=1}^{n} x_{t-1}^{seg_i} \odot m^i$ \tcp*{Merge segments}
+            
+        }
+  
+    \uElseIf{Segment Control+Text Conditioning}
+        {
+            \For{\textbf{all segments} $i$  \textbf{from} $1$ to $n$}              
+                {
+                    $x_{t-1}^{seg_i} \leftarrow Denoise(x_t, d^i, c^i )$ \tcp*{Controlled Denoiser}
+                
+                }
+             $x^{comp}_{t-1} \leftarrow \sum_{i=1}^{n} x_{t-1}^{seg_i} \odot m^i$ \tcp*{Merge segments}
+        }
+ 
+}
+\Return  $x^{comp} \leftarrow  (x^{comp}_{-1})$ \tcp*{Final Composite}
+\end{algorithm}
+
+\subsection{Harmonizing stage}
+The above method, if applied to all diffusion steps, can produce good composite images. However, because the segments are being constructed independently, the composite tends to be less harmonized and less well-blended at the segment edges. To alleviate this problem, we introduce a new succeeding stage called the \textit{`harmonization stage'}. The essential difference from the preceding scaffolding stage is that in this stage \textit{each segment develops in the context of the other segments}. We also drop any help through scaffolding images in this stage.
+
+We can further develop the intermediate composite from the previous stage in the following ways: (i) by direct denoising the composite image latent via a global prompt (Algo. \ref{alg:harmon}, 2-3, and Fig. \ref{fig:harmony-all-conditions}, A), or (ii) by denoising the intermediate composite latent separately with each segment specific conditioning and then composing the denoised segment-specific latents. The segment-specific conditions can be either pure natural text descriptions or may include additional control conditions (Refer to Algo. \ref{alg:harmon}, 4-8 and 9-13, and Fig. \ref{fig:harmony-all-conditions}, B and C). 
+
+While using global prompts, the output of each diffusion step is a single latent and we do not need any compositional step. For harmonization using segment-specific conditions, the compositional step of merging different segment latents at every time step (Algo. \ref{alg:harmon}, 8 and 13) ensures that the context of all the segments is available for the next diffusion step. This leads to better blending and harmony among segments after each denoising iteration. Our observation is that both these methods lead to a natural coherence and convergence among the segments of the composite image (Fig. \ref{fig:global_prompt_comparison} provides an example illustration).
+
+% Figure environment removed
+
+\subsection{Scaffolding factor $\kappa$: }
+\label{sec:scaffolding_factor}
+We define a parameter called the scaffolding factor, denoted by $\kappa$ (kappa), whose value determines the percentage of the diffusion process that we assign to the scaffolding stage.  
+$\kappa = \frac{\text{number of scaffolding steps}} {\text{total diffusion steps}} \times 100$.
+The number of harmonization steps is calculated as total diffusion steps minus the scaffolding steps. If we increase the $\kappa$ value, we allow the segments to develop independently longer. This gives better conformance with the segment boundaries while reducing the blending and harmony of the composite image. If we decrease the $\kappa$ value, the individual segments may show a weaker anchoring of the image and lesser conformance to the mask boundaries. However, we see increased harmony and blending among the segments.
+
+Our experience has shown that the appropriate value of $\kappa$ depends upon the domain and the creative needs of an artist. Typically, we find that values of kappa around 20-50 are sufficient to anchor an image in the segments. 
+Figure \ref{fig:kappa} illustrates the impact of $\kappa$ on image generation that gives artists an interesting creative control on segment blending. Appendix Table \ref{tab:kappa_ablation} provides a quantitative evaluation of the impact of the scaffolding factor on the various parameters of image quality. 
+
+
+% Figure environment removed
+
+
+
+
+
+
+
+
+
+
+

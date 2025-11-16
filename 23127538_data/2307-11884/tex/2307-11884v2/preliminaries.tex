@@ -1,0 +1,363 @@
+\section{Problem Statement}
+
+We approach the problem of information-flow analysis by
+transforming it into a graph reachability problem over a labeled, directed graph
+representing signal connectivity, extracted from the Verilog RTL design. We use symbolic execution of the RTL
+to determine which paths through the labeled directed graph represent true flows of information through
+the design in execution. 
+
+%We can also think of this as using symbolic execution to model how
+%information flows through the design, and using the static signal connectivity graph
+%to guide the symbolic execution engine through the
+%large search space.
+
+%The signal connectivity graph helps us tackle
+%the path explosion problem inherent in symbolic execution. 
+
+%Our problem statement is as follows.
+%Given a hardware design at the register transfer level (RTL), and an input
+%signal of interest, $x$, determine the information
+%flow of that signal. Information flows from signal $x$ to signal $y$ when the value
+%of $y$ at any clock cycle depends on or is influenced by the value of $x$. 
+
+%This
+%definition allows for checking
+%non-interference~\cite{goguen1982security}: under this definition, we can say
+%that $x$ is non-interfering with
+% $y$ if there exist no execution traces
+%in which $x$ flows to $y$.
+
+Given a hardware design and a particular input signal of
+interest, the goal is to return:
+\begin{enumerate}[noitemsep]
+\item  the set of realizable information flows through the design originating at
+  that signal; and
+\item for each found information flow, return a sequence of input values to the design that will
+  drive the information flow.
+%% \item \cks{OR: (Kaki, which do you think is more accurate?)} 
+%% \item the set of variables in the design that are influenced by the input
+%%   signal $v$; and 
+%% \item for each found signal, return a sequence of input values to the design
+%%   that will drive the information flow from $v$ to that signal.
+\end{enumerate}
+
+
+
+\section{Preliminaries}
+It is useful to keep in
+mind three models: the state diagram of the design
+showing machine states and transitions between them; the labeled, directed, signal-connectivity graph, which we
+call the \emph{Information Flow (IF)} graph; and the symbolic execution
+(SE) tree, showing execution paths through the RTL along with the associated
+(symbolic) states and path conditions. We describe these three in the following
+sections, but first we introduce a fragment of Verilog RTL as a toy example to
+help illustrate the three models.
+
+
+\subsection{Toy Example}
+The code snippet of Figure~\ref{fig:toy1} shows a flow from an input, \texttt{secret}, to an output, \texttt{led}. The flow is
+guarded by an internal, state-holding variable and the secret will only flow to the
+LED output in the clock cycle after $\mathtt{state} = 3$. Note that with non-blocking assignments (``$<=$'')
+ all right-hand side expressions are calculated at the same time and assignments
+ take effect at the next clock cycle. Blocking assignments (``$=$'') take effect
+ immediately.
+
+
+  % Figure environment removed
+
+  \subsection{State Diagram}
+
+We model a
+hardware design as a tuple, $D = (S, s_0, I, \delta, \omega)$,
+where
+\begin{itemize}[noitemsep]
+\item $S$ is the set of states of the design;
+\item $S_0 \subset S$ is the set of initial states;
+\item $I$ is the finite set of input strings;
+\item $\delta: S \times I \rightarrow S$ is the transition function;
+\item $\omega: S \rightarrow O$ is the output function.
+\end{itemize}
+
+A state $s \in S$ is a vector of valuations to state-holding internal variables of the design,
+$s = \langle v_0, v_1, \ldots, v_{|s|}\rangle$. We use $v_i$
+to indicate the variable and $\langle v_i = x \rangle_{s_j}$ to indicate that the value of
+variable $v_i$ is $x$ in state $s_j$. As shorthand, we sometimes use $v_i$ to
+refer to both the variable and its value, when it is clear in the text what we
+mean. The design powers up in an
+initial state, $s_0$. Many state-holding variables are reset to 0 in the initial
+state. An input string $i \in I$ is a concatenation of values to input variables
+of the design. Inputs are provided on every clock cycle. Similarly to
+state-holding variables, we refer to the value of input variable $v_j$ at any given clock
+cycle as $\langle v_j = x \rangle$ or simply $v_j$. The
+\texttt{clk} signal is a special input that synchronizes reading input values and state
+transitions, which happen on clock cycle edges. The output function is the
+identity function over a subset of the design's variables.
+
+For example, Figure~\ref{fig:toy1states} shows a sequence of state transitions for the toy example, starting
+with the initial state, in which
+information flows from
+ \texttt{secret} to \texttt{guard} to output variable \texttt{led}.
+In this example, the initial state $s_0 = \langle
+\texttt{prev} = 0, \texttt{state} = 0, \texttt{guard} = 0\rangle$ produces output
+$\omega(s_0) = \langle\texttt{led} = 0\rangle$, and transitions to state $s_1 = \langle\texttt{prev} = 0,
+\texttt{state} = 1, \texttt{guard} = 0\rangle$ when \texttt{enable} is high on a positive clock edge.
+  
+
+ % Figure environment removed
+
+ \subsection{Information Flow (IF) Graph}
+
+The Information Flow (IF) graph is a labeled, directed graph that captures signal
+connectivity and provides additional information, taken from the Verilog source,
+about the conditions under which two signals are connected~\cite{meza2023hyperflowgraph}. Nodes represent the variables (\texttt{wire}s
+and \texttt{reg}s) of the design, and edges indicate a possible flow of
+information from one variable to another. An edge $(v_1,v_2)$
+exists when either there is an assignment from $v_1$ to $v_2$ (e.g., $v_2 <=
+v_1$) or $v_1$ appears in a condition (e.g., $\mathtt{if} (v_1)$), and $v_2$ appears
+on the left-hand side of an assignment in either branch. The edge is labeled
+with the line number of the relevant Verilog statement and lists the surrounding
+conditions in the code that must be true for the information flow to take
+place. For example, in Figure~\ref{fig:toy1ifg}, which shows the IF graph for the code in
+Figure~\ref{fig:toy1}, the edge $(\mathtt{secret}, \mathtt{guard})$ would be
+labeled with the condition that $\mathtt{state} == 3$. Note that this graph inherently has no notion of timing or
+clock cycles.
+
+
+% Figure environment removed
+
+Each edge in the IF graph represents a viable 1-hop flow of
+information in the design. However, multi-hop paths through the IF graph may not
+correspond to viable information flows. In other words, if
+we view the IF graph as an information-flow relation, taking the
+transitive closure of the relation yields an over-approximation of information
+flow through the design. To demonstrate, consider the code in
+Figure~\ref{fig:toy1}, but with the last line replaced with the following:
+\begin{verbatim}
+assign led = (prev == 2) ? guard : 0;
+\end{verbatim} 
+
+The IF graph would have the same nodes and edges, but the path from
+\texttt{secret} to \texttt{guard} to \texttt{led} does not correspond to any
+flow of information through the design.
+
+There are two reasons why a path through the IF graph may not correspond to a
+true information flow. The first is that, as in the example above,
+the sequence of conditions needed for
+each edge cannot be satisfied. The second is that a path through the IF graph
+from $x$ to $y$ may not correspond to a true flow of
+information in the sense that the value of $y$ depends on the value of $x$. A
+common example of this is the assignment $y = x \oplus x$.
+
+%We use symbolic execution to find which
+%paths through the IF graph represent true flows of information through the design.
+
+
+\subsection{Symbolic Execution}
+In symbolic execution, concrete input values are replaced with abstract
+symbols. The design is executed using the symbols in place of
+literals. When a branch point (e.g., $\mathtt{if}$\texttt{(enable)}) is reached, both paths are separately
+explored. For each path, the branching condition that must be true for that path
+(e.g., \texttt{enable} $== 1$).
+is maintained in the
+\emph{path condition}. At the end of a single path of symbolic execution, satisfying
+assignments to the constraints in the path condition can be used as concrete
+input values to drive concrete execution down that same path.
+
+Symbolic execution is modeled as a directed tree. Each node $n$ in the tree
+is associated with a line of code in the design and is associated with a symbolic state, $\sigma$, and path condition, $\pi$. A node's children are the possible next
+lines of code to symbolically execute. A path from the root node to any leaf
+node represents a realizable path through the design.
+
+The number of paths to explore grows quickly. For example, the symbolic execution of the design in Figure~\ref{fig:toy1} for
+the four clock cycles necessary to find the information-flow path from
+\texttt{secret} to \texttt{led} would yield the tree of nodes shown in Figure~\ref{fig:toy1tree}.
+%%
+%%
+%% single clock cycle, starting from the initial state and initializing inputs
+%% \texttt{enable} and \texttt{secret} with symbolic values $\alpha$, and $\beta$,
+%% respectively, would yield two leaf nodes: $n_1 = (\sigma
+%%
+%% , one in which \texttt{enable} is high
+%% and one in which it is low. a tree with 8 leaf nodes corresponding to 8 paths
+%% through the design. Let \texttt{enable} and \texttt{secret} be initialized with
+%% symbolic values $\alpha$ and $\beta$. Following the one-clock-cycle path from
+%% the initial state in which \texttt{enable} is high would end 
+%%
+%% the 4-clock cycle path in Figure~\ref{fig:toy1tree} in which information flows
+%% from \texttt{secret} to \texttt{led} has path constraint $\pi = ()$ and ends in symbolic
+%% state $\sigma = ()$. 
+%\cks{Kaki, please Double check that I'm not
+ %off by one.} 
+
+A single path through the IF graph can correspond to many paths
+through the symbolic execution tree. For example, \texttt{enable} can remain low
+for $0, 1, 2, \ldots$ clock cycles between each update to \texttt{state}. Each
+of these options represents a separate path through the symbolic execution
+tree. This example, although simple, is not all that contrived. It may be that
+state in another module of the design can take
+varying time to compute an action before \texttt{enable} becomes high again.
+%% \cks{and yay! static analysis enables the unsat core
+  %% heuristic and the segmenting by clock cycles, addressing both problems. Make
+  %% sure that is made clear later when we refer back to these problems}:
+Two problems become apparent:
+\begin{enumerate}[noitemsep]
+  \item The choice of path in the current clock cycle can determine
+    whether there exists a path in a future clock cycle that will allow the flow
+    of information to continue.
+  \item Once exploration starts down one path, it is not clear at what point -- after how many
+    clock cycles -- the current path should be abandoned as incorrect, and a new
+    path should be tried. For example, there are infinitely long paths in which
+    \texttt{prev} never gets to 3 and \texttt{enable} remains low.
+\end{enumerate}
+
+
+
+% Figure environment removed
+
+
+
+
+%% \cks{Some draft text moved from elsewhere}
+%% Taken as input from static analysis tool, e.g., Hyperflow
+%% Graph~\cite{andystool}. Shows direct, indirect flows of information with
+%% conditions under which the flow occurs. Specifically, each flow in the graph has metadata describing whether
+%% the flow happens in a continuous assignment or non-blocking assignment, and a list of the conditions that need to be
+%% satisfied for the flow to occur. These conditions are taken from the Verilog source and correspond to a line of code
+%% The conditions of the particular if/else statement of that particular line
+%% specify the particular flow conditions.
+
+%% \cks{Draft text moved from elsewhere} With each edge also gives information about the line
+%%     of code at which that particular flow occurs. E.g., for an edge connecting a
+%%     node for signal $x$ and a node for signal $y$, the edge will list the line
+%%     of code in which the direct flow $y := x$ represented by this particular
+%%     edge occurs. Different points of flow will result in different edges, even
+%%     between the same two nodes. Indirect flows are also represented by edges
+%%     between the two nodes.
+
+%%     \cks{Draft text moved from elsewhere}
+%%     \cks{Possible Framing: use the ideas of information flow~\cite{denning} and intransitive
+%%   flows of information~\cite{goguen1982security}. The static analysis finds all
+%%   points of information flow (connectivity) --
+%%   it exhaustively enumerates the pairs of signals in the binary information flow
+%%   relation, direct or indirect. (I think that all pairs found are true elements of the relation
+%%   assuming there is no dead, unreachable code in the design). The static
+%%   analysis then implicitly assumes the information flow relation is transitive,
+%%   building a path for every sequence of information-flow pairs. But the relation
+%%   is in fact intransitive -- not all paths are realizable paths through the
+%%   design. We use symbolic execution to enumerate the n-ary information flow
+%%   relation, using the statically built binary information flow relation as a
+%%   guide. The intransitive information flow relation as defined by Goguen isn't
+%%   quite the right fit -- that relation was intransitive b/c it allowed for a
+%%   mid-point in the flow to be trusted to ``downgrade'' information. What we're
+%%   talking about is that no such path exists. Maybe the hyperflow graph is better
+%% thought of as a binary path-segment relation, rather than information-flow relation. The hyperflow graph assumes the
+%% relation is transitive, but it is not and
+%% we use symbolic execution to build the true full paths. I changed the name of
+%% this section to match this framing. Let's see if that works.}
+
+%%\cks{Some ideas for names: Correlating syntactic flows with information flows, Correlating
+%%  syntactic data flows with symbolic information flows.}
+%% The goal of this work is to amplify the power of static analysis, which is
+%% fast/cheap and scales well~\cite{hyperflowgraphs}, but its usefulness to the
+%% engineer is limited by over-approximation and the gap between static analysis
+%% and generating test cases.
+
+%% To address this gap, we present a novel workflow
+%% that uses this information from static analysis to
+%% drive symbolic execution of the hardware. By
+%% steering execution towards an information flow,
+%% we are essentially able to generate a class of
+%% execution traces in which a flow into a particular
+%% sink is realizable on-the-fly. In other cases, we
+%% are able to prove that a given information flow is
+%% impossible. To achieve this, we present a novel
+%% algorithm to prioritize execution paths to explore and to efficiently search the symbolic execution
+%% tree for viable paths.
+
+
+%% \cks{The example should ideally have statically unrealizable paths, unrealizable
+%%   paths, realizable paths. It should also be the case that a single static path
+%%   corresponds to multiple paths through the symbolic execution tree.}
+%%   \kar{Realizable path: The single-cycle composite flow secret -> temp1 -> out1  is possible, since (enable \& out1\_visible \& enable) is satisfiable.\\
+%%       Unrealizable path: The composite flow secret -> guard -> out2 is impossible because of an invariant of execution. We always have prev = state - 1, but this flow
+%%        requires (state == 3) on one clock cycle and (prev == 1) on the next. \\
+%%        Statically unrealizeable: the flow from secret to temp1 to result (to led) is statically unrealizable, because it would require enable to be true and false at the same time.\\
+%%        Single static path \& multiple multiple se paths: when secret->temp1->out1 is the IF path, the second if/else statement could take the \texttt{then} or the \texttt{else} branch. This is simpler than showing across two modules... maybe we do want to show that to be more clear about that complexity?}
+%%   % Figure environment removed
+
+
+
+
+
+%% We model the information flow graph as a directed graph $\mathrm{IF} = (V, E)$,
+%% where
+%% \begin{itemize}[noitemsep]
+%%   \item $V$ is the set of vertices. Each is labeled with a state-holding
+%%     variable of the design. There is one vertex per variable. We overload $V$ to
+%%     be both the set of state-holding variables of the design and set of vertices
+%%     in the IF graph.
+%%   \item $E = \mathrm{Exp} \cup \mathrm{Imp}$ is the set of directed edges. Each
+%%     edge represents a potential flow of
+%%     information between vertices. Each edge is labled with the line of code at
+%%     which the flow takes place and the containing constraints. There exist two
+%%     types of edges, one representing potential explicit flows and one representing
+%%     potential implicit flows.
+%% \end{itemize}
+%% For example, in Figure~\ref{fig:toy1ifg}, the edge
+%% $(\mathtt{guard},\mathtt{led})$ is in $\mathrm{Exp}$ and the edge $(\mathtt{prev},
+%% \mathtt{led})$ is in $\mathrm{Imp}$.
+
+
+
+
+
+%Outline 0
+
+%% \item The goal is to determine whether the path is realizable or not. \cks{Need an example code with a IF path
+%%   that is statically feasible -- the conditions are SAT -- but which is
+%%   unrealizable.} Approach is to use symbolic execution to determine feasibility
+%%   of the information flow path.
+
+
+
+
+%% \cks{some text we didn't need for DAC, but may be useful here.}
+%% We model the symbolic execution of a hardware design in RTL Verilog as a
+%% tuple $M = (V, A, S, C, \Pi)$, where
+%% \begin{itemize}
+%%   \item $V = V_I \cup V_S \cup V_C$ The set of variables of the design
+%%     comprising input variables $V_I$, state-holding, sequential logic variables
+%%     (\texttt{regs} in Verilog) $V_S$, and non-state-holding
+%%     variables/combinationa logic signals (\texttt{wires} in Verilog)
+%%     $V_C$. Output signals are a subset of $V_S \cup V_C$. \cks{Is this true? Are
+%%       wires ever used as output signals?}
+%%     \item $A = \{0,1\}^* \cup \Sigma$. The alphabet of concrete values
+%%       $\{0,1\}^*$ and symbolic values $\Sigma$ (e.g., $\alpha, \beta$) that can
+%%       be assigned to variables.
+%%     \item $S: V \rightarrow \phi(A)$ The current state of the symbolic
+%%       execution, a mapping from variables in the design to expressions/formulas
+%%       containing/over both concrete and symbolic values/ An assignment of values
+%%       to the variables/Partial variable assignment. For example, the
+%%       variable $v \in V$ may have the current state $S(v) = \alpha + 1$. The
+%%       expressions/formulas use the standard logic, arithmetic, and bitwise
+%%       expressions defined in Verilog. \cks{use ``context'' instead of state?}
+%%       Boolean formulas over concrete and symbolic values/variable assignments.
+%%     \item $\Pi$ The path condition a set of conjuncts describing the
+%%       constraints over input and state variables. For example $\pi = \alpha <
+%%       10$ using standard propositional and first order logic expressions/formulas.
+%%     \item $C$ represents the RTL Verilog implementing/describing the
+%%       design. $C$ defines the transition function, which updates either the
+%%       state or the path condition at each line of code. Each line of code $C \in
+%%       C$ is either a branch point (e.g., the start of an
+%%       \texttt{if...then...else} construct) or non-branching. On branching code
+%%       the path condition $\Pi$ is checked. If $\Pi \rightarrow c$, the
+%%       \texttt{then} branch is taken. If $\Pi \rightarrow \neg c \not c$, the
+%%       \texttt{else} branch, if present, is taken. If neither is true, then both
+%%       branches must be explored in turn/creating two separate paths of
+%%       exploratin/forking the current ath into two, each of which must then be
+%%       explroed. To explore the first path, the path condition $\Pi$ is updated:
+%%       $\Pi:=\Pi \wedge c$, and execution continues down the \texttt{then}
+%%       branch. To explore the second path, the path condition is updated: $\Pi:=
+%%       \Pi \wedge \neg c \not c$, and execution continues down the \texttt{else} branch.
+%% \end{itemize}
+

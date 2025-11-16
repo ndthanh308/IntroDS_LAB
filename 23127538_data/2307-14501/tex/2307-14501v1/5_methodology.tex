@@ -1,0 +1,77 @@
+\section{Approach: Making Predictions about Unseen Space using Non-Local Information}\label{sec:eq-theory-non-local}
+We aim to improve navigation under uncertainty by estimating task-relevant properties of unseen space via non-locally observable information.
+Consistent with our discussion in Sec.~\ref{sec:lsp} for modelling uncertainty via POMDP, our robot relies on the LSP model-based planning abstraction of Stein et al.~\cite{pmlr-v87-stein18a} for high-level navigation through partially-revealed environments, for which learning is used to estimate the \emph{subgoal properties} ($P_S$, $R_S$, and $R_E$) used to determine expected cost via Eq.~\eqref{eq:lsp-planning}.
+
+We will use a Graph Neural Network (GNN) to overcome the limitations of making predictions using only local information (as discussed in Sec.~\ref{sec:example-case}) and thus improve both predictive power and planning performance.
+A graph-based representation of the environment captures both topological structure and also allows information to be retained and communicated over long distances~\cite{fengda2021, azizi2021}.
+A GNN is a deep-learning approach that allows predictions over graph data; to plan, we require estimates of the properties ($P_S$, $R_S$, and $R_E$) for each subgoal node and so our graph neural network will output estimates of these properties for each.
+In the following sections, we detail how we convert the environment into a graph representation (Sec.~\ref{sec:generate-graph}), how training data is generated (Sec.~\ref{sec:gen-train-data}), and the network and training parameters (Sec.~\ref{sec:gnn-parameters}).
+
+\subsection{Computing a High-level Graph Representation}
+\label{sec:generate-graph}
+% [TODO: structure. First talk about how you compute the graph itself and then talk about the node features.]
+While the occupancy grid of the observed region can be used as a graph representation of the environment, it has too many nodes for learning to be practical.
+Instead, we want to generate a simplified (few-node) graph of the environment that preserves high-level topological structure, so that nodes exist at (i) intersections, (ii) dead-ends, and (iii) subgoals.
+
+
+\textit{Graph Generation:}
+We create this graph via a process shown in Fig.~\ref{fig:masked-graph}.
+We first generate a skeleton~\cite{zhang1984,krishna2016} over a modified version of the map in which unknown space is marked as free yet where frontiers are masked as obstacles except for a single point near their center.
+We eliminate the skeleton outside known space and add nodes at all intersections and skeleton endpoints and finally use the skeleton to define the edges between them.
+We additionally add nodes corresponding to each subgoal and connect each new node to its nearest structural neighbor in the graph generated from the skeletonization process.
+Finally, we add a \emph{goal node} at the location of the goal that has an edge connection to every other node; this \emph{global node}~\cite{peter2018} allows for the propagation of information across the entire environment.
+
+% Figure environment removed
+
+\textit{Neural Network Input Features:}
+Structure alone is often insufficient to inform good predictions of unseen space. 
+As such, we seek to not only compute a topometric graph of the environment, but also associate semantic information with each node.
+Each graph node is given a local observation---a \emph{node feature}---from which the subgoal properties ($P_S$, $R_S$, and $R_E$ in Eq.~\eqref{eq:lsp-planning}) will be estimated via the graph neural network.
+Node features are 6-element vectors: (i) a 3-element one-hot semantic class (or color) at the location of the node, (ii) the number of neighbors of that node, (iii) a binary indicator of whether or not the node is a subgoal, and (iv) a binary indictor of whether the node is the goal node.
+% The node feature is composed of a 6-part vector for each node, consisting of (1-3) the color or semantic class of the node, (4) the number of connections or degree, (5) a binary indicator of whether the node is a subgoal, and (6) another binary indicator of whether it is a goal.
+We additionally include a single edge feature, associated with each edge in the graph: the geodesic distance between the nodes it connects.
+Owing to the presence of a goal node connected to every other node, the edge features provides each node its distance to the goal.
+To ensure a fair comparison with the LSP-Local planner, our learned baseline that does not consider edge information, the node features for LSP-Local are augmented to include the geodesic distance to the goal.
+Conditioned upon, correctly building the map the input is enough to ensure safety during navigation.
+Safety during navigation with the aforementioned inputs is ensured conditioned upon correctly building the maps.
+%For edge features, we use the length of the edges and include the distance to the goal since the goal node is connected to every other node in the graph. 
+% However, the LSP-Local planner, our learned baseline, doesn't use edges and cannot utilize the distance to the goal as an edge feature. 
+% To make a fair comparison, we include the distance to the goal as an input vector and embed it into the fully connected layers of the LSP-Local planner.
+
+
+\subsection{Graph Neural Network Structure and Training}
+\label{sec:gnn-parameters}
+We use the PyTorch~\cite{pytorch} neural network framework and Torch Geometric~\cite{torch-geometric} to define and train our graph neural network.
+The neural network begins with 3 locally-fully-connected layers, which are fully-connected layers that processes the features for each node in isolation, without considering the edges or passing information to neighbors; all three have hidden layer dimension of 8.
+Next, the network has 4 GATv2Conv~\cite{GATv2Conv} layers, each with hidden layer dimension of 8.
+Finally, a locally-fully-connected layer takes in the 8-dimensional node features as input and produces a three dimensional output: a logit corresponding to $P_S$ and the two cost terms $R_S$ and $R_E$.
+For the LSP-Local learned-baseline planner, we replace the GATv2Conv graph neural network layers with locally-fully-connected layers, eliminating sharing of information between nodes and thus its ability to use non-locally-available information to make predictions about unseen space.
+
+% \textit{Global Node:} 
+% To ensure the propagation of information throughout the graph despite having only a limited number of GNN layers, we add a \emph{global node}~\cite{peter2018} to the graph: an additional node that has an edge connection to every other node in the graph.
+
+
+\textit{Loss Function:}
+Our loss function matches the original LSP approach of Stein et al.~\cite{pmlr-v87-stein18a} adapted for our graph input data.
+For each subgoal node, we accumulate error according to a weighted cross-entropy loss (a classification objective) for $P_S$ and an L1-loss (a regression objective) for $R_S$ and $R_E$.
+Since only the properties of the subgoal nodes are needed, we mask the loss for non-subgoal nodes and only consider the subgoal nodes' contribution to the loss.
+
+\textit{Training Parameters:}
+We train a separate network (with identical parameters) for each environment. 
+Training proceeds for 50k steps.
+The learning rate begins at $10^{-3}$ and decays by a factor of 0.6 every 10k steps.
+
+\subsection{Generating Training Data}
+\label{sec:gen-train-data}
+To train our graph neural network, we require training data collected via offline navigation trials from which we can learn to estimate the subgoal properties ($P_S$, $R_S$, and $R_E$) for each subgoal node in the graph.
+During an offline training phase, we conduct trials in which the robot navigates from start to goal and generates labeled data at each time step.
+Training data consists of environment graphs $G$---with input features consistent with our discussion in Sec.~\ref{sec:generate-graph}---and labels associated with each subgoal node.
+
+To compute the labels for our training data, we use the underlying known map to determine whether or not a path to the goal exists through a subgoal.
+Using this information, we record a label for each subgoal that corresponds to a sample of the probability of success $P_S$ and from which we can learn to estimate $P_S$ using cross-entropy loss.
+Labels for the other subgoal properties are computed similarly: labels for the success cost $R_S$ correspond to the travel distance through unknown space to reach the goal, for when the goal can be reached, and the exploration cost $R_E$ is a heuristic cost corresponding to how long it will take a robot to realize a region is a dead end, approximated as the round-trip travel time to reach the farthest reachable point in unseen space beyond the chosen frontier.
+This data and collection process mirrors that of LSP~\cite{pmlr-v87-stein18a}; readers are referred to their paper for additional details.
+
+We repeat the data collection process for each step over hundreds of trials for each training environment.
+So as to generate more diverse data, we switch between the known-space planner and an optimistic (non-learned) planner to guide navigation during data generation.
+The details of each environment can be found in Sec.~\ref{sec:results}.

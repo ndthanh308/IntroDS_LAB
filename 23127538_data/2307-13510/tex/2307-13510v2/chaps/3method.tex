@@ -1,0 +1,169 @@
+
+% Figure environment removed
+
+\section{Method}\label{sec:method}
+
+In this work, we first present a theoretical analysis of depth modeling and height modeling, as they are the basis of 2D to 3D mapping. It could be demonstrated that they are equivalent to achieving mapping from image space to BEV space. Furthermore, we will introduce the pipeline of the proposed HeightFormer. We propose a self-recursive height predictor to estimate heights in BEV and refine them layer by layer. A segmentation-based query mask is also designed to drop background information to improve the efficiency and performance of the model.
+
+
+\subsection{Theoretical equivalence of depth and height}\label{sec:equivalence}
+
+In this part, we give proof of the equivalence between depth modeling and height modeling in 2D to 3D mapping, as shown in \cref{fig:main}. Meanwhile, the proof shows the feasibility of constructing high-quality BEV features by modeling heights accurately. 
+
+
+\paragraph{Precondition} We use two coordinate systems in our work: the image coordinate system and the \uwave{LiDAR coordinate system}. In the image frame, points are noted as $(u,v)$, while in the \uwave{LiDAR frame}$\footnote{Theoretically, there is a camera frame other than the LiDAR frame. Without losing generality, this manuscript does not distinguish between the camera frame and the LiDAR frame, because we assume that the extrinsic parameter matrix %which does transformation between the two frames 
+is an identity matrix.}$ points are noted as $(x,y,z)$. We use $(x,z)$ to denote a point or grid in the \uwave{2D BEV space} for convenience. Given an object in the 3D frame at $(x_{gt}, y_{gt}, z_{gt})$, its coordinate in the image frame is $(u_{gt},v_{gt})$, and its depth is defined as $d_{gt}\triangleq z_{gt}$. These variables satisfy:
+\begin{equation}
+    \begin{aligned}
+        \left[
+            \begin{array}{c}u_{gt}\cdot d_{gt} \\ v_{gt} \cdot d_{gt} \\ d_{gt} \end{array}
+        \right]      =K
+        \left[
+            \begin{array}{c}x_{gt} \\ y_{gt} \\ z_{gt} \end{array}
+        \right]                \\
+        \st
+        K  =\left[
+            \begin{array}{ccc}
+                f_x & 0   & u_0 \\
+                0   & f_y & v_0 \\
+                0   & 0   & 1
+            \end{array}
+            \right],
+    \end{aligned}
+    \label{eq:intrinsic}
+\end{equation}
+where $f_x,f_y,u_0,v_0$ are intrinsics of the camera. $K$ is the projection matrix that does coordinate transformations.
+
+\paragraph{Assumption} We assume that an object will be correctly detected if its feature is placed close to its ground truth position in the \uwave{2D BEV space}. Mathematically, ``close" is defined as being in the $\epsilon$-neighbourhood of $(x_{gt},z_{gt})$ grid. Here $\epsilon$ is the tolerance of the feature misplacement error. That is to say,
+\begin{equation}
+    | x - x_{gt} | + | z - z_{gt}| \le \epsilon,\quad \st \epsilon > 0,
+    \label{eq:assumption}
+\end{equation}
+where $(x,z)$ is the coordinate of \uwave{the object's feature in the 2D BEV space}. We simply use the Manhattan distance here to measure the feature misplacement error. 
+
+
+\paragraph{Depth error} Given the depth $d$ of the object, the depth error is $\delta_d=|d-d_{gt}|$. For simplicity, we use absolute error and ignore the relationship between error and depth because the depth of the object is fixed. The 3D position of the object will be modeled as $(x,y,z)$, which follows:
+\begin{equation}
+    \begin{aligned}
+        \left[
+            \begin{array}{c}x \\ y \\ z \end{array}
+        \right] & =K^{-1}\left[
+            \begin{array}{c}u_{gt}\cdot (d_{gt}\pm\delta_d) \\ v_{gt} \cdot (d_{gt}\pm\delta_d) \\ d_{gt}\pm\delta_d \end{array}
+        \right]
+        % & =\left[\begin{array}{c}x_{gt} \\ y_{gt} \\ z_{gt} \end{array}\right]\pm\delta_d\cdot K^{-1} \left[\begin{array}{c}u_{gt}\\v_{gt}\\1\end{array}\right]
+                .
+    \end{aligned}
+    \label{eq:depth}
+\end{equation}
+In this way, the feature of the object will fall at $(x,z)$ in the \uwave{2D BEV space}. Solving \cref{eq:depth} and \cref{eq:assumption},
+we can get the upper bound of the depth error$\footnote{Detailed derivation can be found in the appendix.}$:
+\begin{equation}
+    \delta_{d,max}=\epsilon \cdot \frac{f_x}{|u_{gt}-u_0|+f_x}.
+    \label{eq:deptherror}
+\end{equation}
+
+% \paragraph{Height error} Given a height function $y(x,z)$ defined in the $\epsilon$-neighbourhood of $(x_{gt},y_{gt})$, the function is targeted to model the height $y_{gt}$ of the object. The height error is $\delta_y(x,z)=|y(x,z)-y_{gt}|$. For all $(x,z)$ in the $\epsilon$-neighbourhood, we can calculate the corresponding sampling location set in the image space. We note this set as $S_{\epsilon}$, which follows:
+\paragraph{Height error} Given a BEV grid at $(x,z)$, the height error is $\delta_y=|y-y_{gt}|$. For all $(x,z)$ in an $\epsilon$-neighbourhood, we can calculate the corresponding sampling location set in the image space. We note this set as $S_{\epsilon}$, which follows:
+\begin{equation}
+    \begin{aligned}
+        S_{\epsilon}\triangleq\Bigg\{ (u,v)^T=&\frac{1}{z}\left[
+            \begin{array}{ccc}
+                f_x & 0   & u_0 \\
+                0   & f_y & v_0 \\
+            \end{array}
+            \right]\cdot
+        \left[ \begin{array}{c}x \\ 
+        y% y_{gt}\pm \delta_{y}(x,z) 
+        \\ 
+        z \end{array}\right] \\
+        \bigg|& \; |x-x_{gt}|+|z-z_{gt}| \le \epsilon \Bigg\}.
+    \end{aligned}
+\end{equation}
+% \begin{equation}
+%     \begin{aligned}
+%         S_{\epsilon}=\{ (u,v)|  \\
+%         &  |x-x_{gt}|+|z-z_{gt}| \le \epsilon, \\
+%             \st& (x,y(x,z),z)^T=K^{-1}(u,v,1)^T
+%         \}
+%     \end{aligned}
+% \end{equation}
+To make sure the mapped feature is correct, $(u_{gt},v_{gt})^T$ must be in $S_\epsilon$. That is to say,
+\begin{equation}
+    (u_{gt},v_{gt})^T\in S_\epsilon.
+    \label{eq:hpe}
+\end{equation}
+Solving \cref{eq:hpe},
+we will get the upper bound of the height error in the $\epsilon$-neighbourhood of $(x_{gt},z_{gt})$, which is$\footnote{Please refer to the appendix.}$:
+\begin{equation}
+    % \sup%_{|x-x_{gt}|+|z-z_{gt}| \le \epsilon}
+    % \delta y(x,z)= 
+    \delta_{y,max}=
+    \epsilon\cdot\frac{|v_{gt}-v_0|}{f_y}\cdot \frac{f_x}{|u_{gt}-u_0|+f_x}.
+    \label{eq:heighterror}
+\end{equation}
+
+\paragraph{Conclusion}
+According to \cref{eq:deptherror}, \cref{eq:heighterror}, and assumption \cref{eq:assumption},
+for the given feature misplacement error $\epsilon$,
+a depth prediction error of $\delta_{d,max}$ is equivalent to a height prediction error of $\delta_{y,max}$,
+because they are both proportional to $\epsilon$. 
+\uwave{As a result, considering two models, one models the height and the other models the depth. Their height or depth estimation error is proportional, and they yield features with similar misplacement error. Therefore, in terms of error modeling, they are considered equivalent.}
+% In conclusion, height estimation in the BEV space is equivalent to depth estimation in the image space, and both of them can solve the 2D to 3D mapping problem well.
+
+The previous analysis shows the equivalence between two solutions to the ill-posed 2D to 3D mapping problem as well as the feasibility of constructing BEV space by modeling heights. However, although these two solutions are equivalent, height estimation has advantages over depth estimation. \uwave{Height estimation is done in a unified BEV space}, while depth estimation needs to handle the manufacturing differences of cameras. \uwave{We will show the robustness of height-based method with regard to different camera configurations in our experiments. Besides, supervision on height modeling needs no extra data while supervision on depth modeling requires LiDAR information.}
+
+\subsection{Constructing BEV space by height modeling}\label{sec:a2b}
+
+% Figure environment removed
+
+Constructing \uwave{BEV features} from image features requires an elaborate feature sampling method. As shown in \cref{fig:main}(b), for a BEV grid, its position and heights can derive several 3D reference points. To acquire the features at these points, they are projected into images, and this step produces 2D reference points. %The features around 2D reference points are exactly what we want. 
+BEVFormer\cite{li2022bevformer} aggregates image features into BEV space with spatial cross-attention in its pipeline, and we will follow this practice in our work.
+
+In the vanilla spatial cross-attention, a set of anchor heights are pre-defined in a BEV voxel. The information about heights is implicitly encoded into attention weights. We choose one sample and use the attention weights to weigh those anchor heights. As shown in \cref{fig:hlidar}, the weighted average of anchor heights is structurally similar to the distribution of ground truth bounding boxes.
+
+
+
+% Figure environment removed
+
+Instead of adopting pre-defined anchor heights, we introduce two variables to model the height information about objects and to generate anchor heights. One variable stands for the height of object center $y_{xz}$, and the other stands for the length $h_{xz}$ of the object along the y-axis. As shown in \cref{fig:anchors} the anchor heights will be uniformly distributed in the range of $[ y_{xz} - h_{xz}/2, y_{xz} + h_{xz}/2 ]$. 
+
+
+As the variance of heights could be large, we introduce uncertainties to model the distribution of heights and optimize heights and uncertainties jointly. For convenience, we use an indicator $I_{x,z}$ to indicate if the grid at $(x,z)$ has any object in it. The heights and uncertainties are jointly supervised as follows:
+\begin{equation}
+    \begin{aligned}
+        L_h(x,z) & =\left\{\begin{array}{cc}
+                               \sqrt{2}\ \cfrac{|h_{xz}-h_{xz}^{gt}|}{\sigma_{h,xz}}+\log\sigma_{h,xz}, & I_{xz}=1 \\
+                               \cfrac{1}{\sigma_{h,xz}},                               & I_{xz}=0
+                           \end{array}\right.
+    \end{aligned}
+    \label{eq:loss0}
+\end{equation}
+where $\sigma_h$ indicates the uncertainty of the estimated height. This loss function adopts the Laplace prior\cite{chen2020monopair,kendall2017uncertainties} on the distribution of heights, which is modeled as $p(h)=\frac{1}{2\sigma_h}\exp(-\frac{|h-h_{gt}|}{\sigma_h})$. The loss function $L_y(x,z)$ for $y$ is similar to \cref{eq:loss0}.
+
+% \subsection{Formulation of ground truth heights}
+\subsection{Ground truth of heights in BEV}
+
+% Figure environment removed
+
+Different from depth supervision which requires LiDAR information, height supervision is easy to acquire and no extra data is directly required. In this work, we project the bounding boxes of objects into the 2D BEV space to format ground truth heights. As the height of the object center, $y_{xz}$ is acquired from the center coordinates of the bounding box in the BEV frame. The object height $h_{xz}$ is acquired from the size of the object. If multiple grids represent the same object, they will share the same heights. In this way, each object is represented with a planar quadrilateral in height maps. An example of the ground truth heights is shown in \cref{fig:gt}. 
+% There are 200 $\times$ 200 grids, and the grid size is 0.512 meters by 0.512 meters. For visualization, we plot a line for every 10.24m. 
+Bounding boxes marked as blue are projected into the BEV space, and the height of object center $y_{xz}$ is plotted in a heatmap. The range of $y_{xz}$ is from -5m to 3m in the LiDAR coordinate system.
+
+
+\subsection{Network design}
+The architecture of the proposed HeightFormer is shown in \cref{fig:arch}. We mainly introduce two components: the self-recursive height predictor and the segmentation-based query mask. Other modules will be introduced briefly.
+
+% Figure environment removed
+
+\paragraph{Self-recursive height predictor} As the BEV encoder is composed of several successive layers, we design a self-recursive height predictor to refine heights layer by layer and use height embeddings to preserve height information. The predictor takes height embeddings of the previous layer and BEV queries from the temporal fusion module as input and outputs height embeddings, which will be normalized to get the final heights and uncertainties. This process is noted as:
+\begin{equation}
+    % E_l=f_l(f_{l-1}(\cdots f_1(E_0,Q_0)\cdots),Q_{l-1}),Q_{l}),
+    E_l=f_l(f_{l-1}(\cdots f_1(E_0,Q_1)\cdots,Q_{l-1}),Q_{l}),
+\end{equation}
+where $E_l$ means height embeddings of layer $l$ and $E_0$ means initial height embeddings. $f_l(\cdot)$ stands for the predictor of layer $l$. $Q_l$ stands for BEV queries from the temporal fusion module of layer $l$.
+
+\paragraph{Initial height embeddings} are designed to make initial anchor heights uniformly distributed from the ground to the sky. For a BEV gird at $(x,z)$, its corresponding height embedding is initialized as $(0.5, 1.0, 0, 0, 0)$. The elements stand for $y$, $h$, $\log\sigma_y$, $\log\sigma_h$, $logit$. The last element $logit$ is used for segmentation.
+
+\paragraph{Segmentation-based query mask} \uwave{After statistical analysis, it is found that many queries do not contain any annotated object. For these queries, simply defining low heights may lead to inconsistent results for the ground, buildings, trees and other unannotated objects. As a result, the predicted heights of these queries are not constrained.} To avoid gathering irrelevant features from the background, we introduce the segmentation-based query mask. The self-recursive height predictor will predict an extra binary segmentation map, which indicates the probability of covering an object. The gathered features in queries that have low probability will be filtered.
+
+\paragraph{Other modules} \uwave{Temporal fusion modules\cite{li2022bevformer} fuse information from previous frames with Self Attention. In this module, the query is current BEV query, and the value is the concatenated (previous and current) BEV query.} DETR-style decoders are adopted to detect objects based on BEV features.

@@ -1,0 +1,91 @@
+\section{Iteration Time Modeling}
+\label{sec:sys-model}
+
+An accurate and detailed model provides fundamental guidance for choosing the right parallelization strategy and network design. Previous research has mathematically modeled the computational time and memory requirements for various LLM training parallelization strategies~\cite{shoeybi2020megatronlm, narayanan2021efficient, korthikanti2022reducing}. Nevertheless, these works omit a detailed derivation for communication time during a training iteration considering the network infrastructure. This section presents an analytical model of the training iteration time, incorporating both the parallelization strategy and the training infrastructure.  This formulation is the foundation for evaluating the rail-only network design in Section~\ref{sec:evaluation}. Table~\ref{tab:parameters} outlines the parameters used in this analysis. The section assumes mixed-precision training with 16-bit model parameters, activations, and gradients.\looseness=-1
+
+\subsection{Critical Path Analysis}
+
+Figure~\ref{fig:critical_path} displays the 1F1B pipeline schedule without interleaving. Given the uniform structure of LLMs under the PTD-P parallelism, both forward and backward execution times for each micro-batch across GPUs remain the same. This consistency allows us to identify a critical path in a training iteration, highlighted by a red arrow in Figure~\ref{fig:critical_path}. This path further decomposes into three parts: the pipeline bubble time, the computation and communication time in the last stage (LS) of the pipeline, and finally, the parameter synchronization time after the pipeline flush. Note that the bubbling and the last pipeline stage are strictly disjointed. 
+%The computation on the last pipeline stage can only begin after the first micro-batch arrives, and the backpropagation of the last micro-batch only starts after the last stage's computation finishes. 
+However, parameter synchronization traffic can start immediately for each transformer layer after the last micro-batch finishes processing, overlapping itself with the backward propagation. Another potential overlapping happens within the last stage, between the PP and TP traffic across different micro-batches. For simplicity, we provide conservative modeling of the iteration time, in which we start parameter synchronization after all computation finishes and disallow cross micro-batch TP and PP traffic overlapping.  
+
+With these observations, the iteration time is 
+\begin{equation} \label{eq:itertime}
+T_{iter}=T_{bubble}+T_{LS}+T_{sync}
+\end{equation}
+This model also holds for the interleaved schedule. Interleaved schedules reduce the pipeline bubble time while requiring additional communication within the last stage of the pipeline. We factor such cost into $T_{bubble}$ and $T_{LS}$ in Eq.~\ref{eq:itertime}. The rest of this section dissects each term with explicit computation and communication cost. \looseness=-1
+
+\begin{table}[t]
+\scriptsize
+\centering
+\vspace*{-1.5mm}
+\caption{Parameters utilized in the calculation in this section.}
+\newcommand{\centered}[1]{\begin{tabular}{l} #1 \end{tabular}}
+\renewcommand{\arraystretch}{0.92} 
+\linespread{1.05}\selectfont\centering
+    \begin{tabular}{|p{1cm}|p{6.5cm}|}
+    \hline
+    \textbf{Name} & \textbf{Description} \\ \hline
+    $p, t, d$        & Pipeline, Tensor and Data parallelism dimensions, respectively \\ \hline
+    % $p$              & Pipeline parallelism dimension \\ \hline 
+    % $d$              & Data parallelism dimension \\ \hline 
+    $p_h, t_h, d_h$   & The portion $p, t, d$ mapped into an HB domain, respectively \\ \hline
+    $p_l, t_l, d_l$   & The portion $p, t, d$ mapped into the network domain, respectively \\ \hline
+    $h$              & LLM Embedding dimension (hidden size) \\ \hline 
+    $s$              & Sequence length \\ \hline
+    $v$              & Number of interleaved stages \\ \hline  
+    $K$              & HB domain size\\ \hline
+    $l$              & Number of transformer block layers \\ \hline
+    $C_{F}$          & HB domain bandwidth \\ \hline
+    $C_{S}$          & GPU Network bandwidth \\ \hline
+    $S_T$            & Number of parameters in a transformer block \\ \hline 
+    $b$              & Micro-batch size per pipeline  \\ \hline 
+    $m$              & Number of micro-batches per iteration \\ \hline
+    \end{tabular}
+    \label{tab:parameters}
+    \vspace{-5mm}
+\end{table}
+
+\subsection{Analytical Iteration Time Modeling}
+This section provides a quantitative analysis, considering each term's computation and communication cost in Eq.~\ref{eq:itertime}.
+
+\para{Pipeline bubble time}. For the pipeline bubble time, we break down the cost into the communication and the computation as
+% \begin{equation}\label{eq:bubbletime}
+$T_{bubble} = T_{bubble}^{comp} + T_{bubble}^{comm}$.  
+% \end{equation}
+Assume a micro-batch size's total compute time (forward and backward pass) is $t(b)$. With interleaved scheduling of $v$, the computation time spent in the pipeline is 
+\begin{equation}\label{eq:bubblecomptime}
+    T_{bubble}^{comp} = \frac{(p-1)t(b)}{v}
+\end{equation}
+Narayanan et al. observed that the computational efficiency of GPU varies with $b$~\cite{narayanan2021efficient}; therefore, it is best to profile $t(b)$ for each micro-batch size in practice. For simplicity, we provide an alternative measurement analytically by modeling the computational requirement (FLOPs) of an LLM and GPU's computation speed in Appendix~\ref{appendix:mb_est}.
+
+For the communication, each micro-batch induces $D_{\mu b}^{p}={2bhs}/{t}$ bytes of traffic across two pipeline stages when sequence parallelism is enabled together with TP. Such transfer will happen for a total of $2(p-1)$ times throughout the pipeline filling and emptying, where $2(p_s-1)$ times will happen in the network domain and $2p_s(p_f-1)$ times in HB domains. Hence, the pipeline bubble communication time is \looseness=-1
+\begin{equation}\label{eq:bubblecommtime}
+T_{bubble}^{comm}=\frac{2(p_s-1) D_{\mu b}^{p}}{C_S} + \frac{2p_s(p_f-1) D_{\mu b}^{p}}{C_F}
+\end{equation}
+Unlike the computation time, the communication time for bubbling is unaffected by the interleaved scheduling. 
+
+\para{Last stage time.} Similar to the bubble time, we analyze the computation and computation costs separately in the last stage of the pipeline. The last stage has $m$ micro-batches going through it, and therefore the computational cost is  
+\begin{equation}\label{eq:lscomptime}
+T_{LS}^{comp}=mt(b)
+\end{equation}
+For communication, TP and PP both generate network traffic across GPUs. We first focus on the TP traffic: for each micro-batch, four AllGather and four ReduceScatter happen in total for each layer of the transformer layer when sequence parallelism is applied. Since ReduceScatter is the inverse of AllGather and generates the same amount of traffic, this analysis will focus on AllGather only. Recall $\mathtt{AGtime}(D, x, y, C_F, C_S)$ (Eq.~\ref{eq:agtime}) is the time of running AllGather on data of size $D$ bytes on an $x\times y$ grid of GPUs with HB domain and network bandwidth $C_F$, $C_S$ respectively. The amount of data to run AllGather for each micro-batch is $D_{\mu b}^{t}=2bhs$ per transformer block, and since each pipeline stage holds ${l}/{p}$ transformer blocks, the total runtime for all $m$ micro-batches is ${8lm\mathtt{AGtime}(D_{\mu b}^{t}, t_h, t_l, C_F, C_S)}/{p}$. 
+
+Next, we look at the pipeline traffic in the last stage. The pipeline traffic can overlap with the computation, even with interleaved scheduling; however, with conservative modeling, we assume that GPUs do not perform computation when sending and receiving pipeline parallel traffic. Each interleaved part of each micro-batch at least sends or receives ${D_{\mu b}^{p}}$ bytes of traffic both on the forward and backward pass and every micro-batch needs to traverse the network domain whenever $p_s>1$. Therefore, we model the pipeline communication overhead in the last stage as ${2mvD_{\mu b}^{p}}/{C_*}$ where $C_*=C_S$ if $p_s>1$, else $C_*=C_F$. Adding the tensor and pipeline communication time together,
+\begin{equation}
+\small
+T_{LS}^{comm} = \frac{8lm\mathtt{AGtime}(D_{\mu b}^{t}, t_h, t_l, C_F, C_S)}{p} + \frac{2mvD_{\mu b}^{p}}{C_*} \label{eq:lscommtime} 
+\end{equation}
+
+% Figure environment removed 
+
+\para{Parameter Synchronization.} Finally, we have the parameter synchronization time, consisting of an AllReduce operation of the model parameters in the first stage of the pipeline. We only model the communication time of the AllReduce operation since the computation of AllReduce incurs minimal overhead. We follow the same hierarchical collective algorithm described in Section~\ref{sec:system-arch}. For a $d=d_h\times d_l$ way DP, the amount of data to AllReduce is $D^{d}={2lS_T}/{pt}$. An AllReduce induces twice the runtime as an AllGather for the same amount of data; therefore,
+\begin{equation} 
+    T_{sync}=2\mathtt{AGtime}(D^d, d_h, d_l, C_F, C_S) \label{eq:dptime}
+\end{equation} 
+Together, Eq.~\ref{eq:bubblecomptime},~\ref{eq:bubblecommtime},~\ref{eq:lscomptime},~\ref{eq:lscommtime} and~\ref{eq:dptime} provide a closed-form expression for Eq.~\ref{eq:itertime} as the training iteration time for an LLM. While this section only presents the transmission delay, in our evaluation, we also consider the propagation delay (network latency) for the communication times to get the best iteration time accuracy. \looseness=-1
+
+\vspace*{-1mm}
+\subsection{Constraints in Choosing Parameters}
+In addition to the cost model, we derive the set of constraints of the hyperparameters that describe a complete parallelization strategy.
+We derive a program that exhaustively generates all the possible parallelization configurations in Appendix~\ref{appendix:constraints}. The iteration time model from Eq.~\ref{eq:itertime} then serves as the cost of an optimization problem to derive the optimal parallelization strategy. In the next section, we evaluate the accuracy of this modeling and use it as the basis for analyzing our rail-only network design for training LLMs. \looseness=-1

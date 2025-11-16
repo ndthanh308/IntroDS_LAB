@@ -1,0 +1,170 @@
+\vspacebeforesection
+\section{Censorship Attack Detection}
+\label{sec:detection}
+
+%
+%
+%
+%
+
+The first step in countering an attack is its reliable detection. It enables activating mitigation techniques only when needed and avoids unnecessary overhead when the network is not under attack. Importantly, the detection cannot simply rely on the unavailability of the \provider records as 
+this could be due to other reasons (e.g., the \provider records expired and the \provider did not renew them).
+%
+Moreover, the detection method should ideally expose
+%
+an attack as soon as the Sybil peers are added to the DHT, even though unavailability of the \provider records may only occur several hours ($\twarmup = 48$ hours) later
+(as described in \Cref{sec:attack-analysis}). This would help prevent downtime for the content.
+%
+
+%
+To execute the content censorship attack, the attacker must hijack all $\mathsf{PutProvider}$ advertisements for the target CID.
+To this end, the attacker must operate \numSybils~Sybil peers whose IDs are closer to the target CID than to any other honest peer.
+%
+%
+As a result, when an honest node queries the DHT for the target CID, the $20$ closest peer IDs it finds are closer to the CID than usual.
+%
+The node can thus use the observed peer IDs to detect whether the CID is censored or not.
+%
+
+%
+
+\para{Method Overview}
+We repurpose a statistical method originally developed by Cholez \emph{et al.}~\cite{cholez2010detection} for detecting eclipse attacks.
+%
+This method first obtains the $k=20$ closest peer IDs to the CID, using a DHT query, and computes the common prefix length of each peer ID with that CID (\ie the number of leading bits that match both the CID and the peer ID).
+It then compares the empirical distribution of the $20$ common prefix lengths with the `model' probability distribution that would result if all these peers were honest, \ie, if their peer IDs were chosen randomly and uniformly.
+%
+We compare the empirical distribution to the model distribution by computing the Kullback-Liebler (KL) divergence between the two distributions (also known as a G-test~\cite{g-test}).
+A large KL divergence indicates a mismatch between the empirical and model distributions, indicating an attack. On the other hand, a small KL divergence indicates a good match of the distributions, indicating no attack.
+This KL divergence-based has been shown to perform well under a small number of samples~\cite{bio-statistics}, which is our situation with only $20$ samples corresponding to the $20$ closest peers.
+
+%
+
+A challenge of implementing this detection method for the IPFS network is that it requires knowing the number of peers in the DHT to compute the model distribution.
+%
+%
+%
+%
+%
+We demonstrate how to adapt this detection mechanism to a DHT of dynamic size by using a network size estimator.
+%
+Based on the network size estimate, our detection method computes an estimate of the model distribution, which is then used for detection.
+%
+%
+%
+%
+Our detection method does not require any additional communication and requires little local computation.
+
+%
+
+\para{Method Details}
+Honest peers choose their peer IDs uniformly at random, and thus under no attack, peer IDs in the DHT are distributed uniformly across the hash space.
+%
+We thus expect the common prefix lengths of peer IDs with the target CID to follow a geometric distribution. That is, given a target CID, the probability that the common prefix length of a randomly chosen peer ID with the target CID equals $x$ is $0.5^{x+1}$ (effects of the finite length ($256$ bits) of IDs can be neglected as the probability of a common prefix length of $256$ bits is negligible).
+However, when a node queries the DHT for the target CID, it only obtains the $k=20$ closest peers to the target CID, and the distribution of their common prefix lengths is not geometric. Particularly, very small common prefixes are not observed as such peer IDs are far from the target ID (see~\Cref{fig:common-prefix-length-distribution}).
+In the work of Cholez \emph{et al.}~\cite{cholez2010detection}, this effect is modeled by using a geometric distribution conditioned on the common prefix length being greater than $L$, where $L$ is a parameter that is estimated using measurements from the network.
+If we adopted this approach, we would have to compute $L$ from a fixed, pre-determined network size estimate. We found that the model distribution computed using this method is highly susceptible to small variations in the network size estimate.
+Instead, in this work, we compute the model distribution dynamically, \ie, as it varies according to an estimation of the network size.
+
+% Figure environment removed
+
+We will first describe the method assuming that the network size $N$ is known. 
+Then, we will show how to adapt this method using an estimation of the network size.
+We recall that the common prefix length of a randomly chosen peer ID with the target CID is distributed geometrically.
+Now, in response to a lookup for the target CID, a node obtains the $k$ largest common prefix lengths (corresponding to the $k$ smallest distances). The cumulative distribution function of the $j$-th largest prefix length can be calculated as
+\begin{align}
+    \label{equ:cdf_j_best}
+	F_j(x) &\triangleq \mathrm{Pr}(X^{(j)} \leq x) \nonumber \\
+    &= \begin{cases} \sum_{i=0}^{j-1} {N \choose i} \left( 1-0.5^{x+1} \right)^{N-i} 0.5^{(x+1)i} & x \geq 0, \\ 0 & x < 0. \end{cases}
+\end{align}
+Since we only receive one sample for the $j$-th best peer ID for each $j$, we can compute an average probability mass function of the $k$ best common prefix lengths as
+\begin{equation}
+    \label{equ:pmf_avg}
+    p(x) = \frac{1}{k} \sum_{j=1}^{k} (F_j(x) - F_j(x-1)).
+\end{equation}
+This model distribution $p(x)$ is shown along with the empirical average distribution of common prefix lengths in \Cref{fig:common-prefix-length-distribution}. Note that the empirical distribution in case of no attack (all peer IDs generated randomly) exactly matches the model distribution, while the distribution under an attack ($\numSybils = 20$ Sybil peers closer than honest peer IDs) significantly differs from the model.
+Importantly, placing more than $20$ Sybils drives the ID distribution further away from the model, easing the detection.
+%
+Since $k=20$, the sums in \cref{equ:cdf_j_best,equ:pmf_avg} can be computed efficiently.
+
+The KL divergence is a tool used to quantify the difference between two probability distributions. For two discrete probability distributions $p(x)$ and $q(x)$ on a support set $\mathcal{X}$, the KL divergence from $p$ to $q$ is defined as
+\begin{equation}
+    \label{equ:kl-divergence-definition}
+    D\left(q \mathbin\Vert p \right) \triangleq \sum_{x \in \mathcal{X}} q(x) \ln\left( \frac{q(x)}{p(x)}\right).
+\end{equation}
+%
+In our case, $X$ is the random variable denoting the common prefix length between a peer ID and the target CID,
+$\mathcal{X} = \{0,...,256\}$, 
+%
+$p(x)$ is the model distribution and  
+\begin{equation}
+	\label{equ:pmf_emp}
+    q(x) \triangleq \frac{1}{k} \sum_{i=1}^{k} \mathbbm{1}\{X_i = x\}
+\end{equation} is the empirical distribution of common prefix lengths. 
+Note that the support of the empirical distribution $q(x)$ is a subset of the support of the model distribution $p(x)$, therefore the sum in the KL divergence is only computed over values of $x$ for which $q(x) > 0$.
+Now, a threshold $\threshold$ must be chosen so that the CID is flagged to be under an attack if and only if $D\left(q \mathbin\Vert p \right) > \threshold$.
+
+%
+
+\para{Adapting to Dynamic Network Sizes}
+%
+Computing the model distribution requires knowing the number of peers in the DHT ($N$) that is unknown to the DHT nodes.
+%
+%
+%
+%
+Instead, we substitute an estimate $\hat{N}$ of the network size obtained from the network size estimator we described in \Cref{sec:netsize}.
+A node can locally estimate the model distribution by substituting $\hat{N}$ instead of $N$ in \cref{equ:cdf_j_best,equ:pmf_avg}.
+%
+The complete censorship detection algorithm is specified in \Cref{alg:eclipse-detection-algorithm}.
+
+It is important to note that the network size estimate does not depend on the closest peer IDs for the CID for which censorship detection is being performed. Instead, it is computed using the closest peer IDs to randomly chosen keys. Therefore, recall from \Cref{sec:netsize} that the attacker would require a number of Sybil peers of the order of the network size to bias the estimator. As a result, the detection remains robust under the censorship attack. 
+%
+%
+%
+%
+
+%
+
+\para{Choosing a detection threshold}
+%
+The detection threshold $\threshold$ is a per-node constant value.
+%
+%
+%
+%
+A higher threshold results in more false negatives (some attacks go undetected, hence unmitigated) while a lower threshold results in more false positives (mitigation overhead when there is no attack).
+In \Cref{sec:evaluation}, we evaluate the false positive and false negative rates for different thresholds and recommend a threshold that favors reducing false negatives.
+Different nodes can however choose different thresholds according to their desired trade-off between the error rates.
+%
+%
+In \Cref{sec:evaluation}, we show that a constant threshold suffices even as the network size varies.
+
+
+%
+
+%
+%
+
+\begin{algorithm}[t]%
+    \caption{%
+        Censorship Detection Algorithm; $\threshold$ is a pre-decided detection threshold
+    }%
+    \label{alg:eclipse-detection-algorithm}%
+    \begin{algorithmic}[1]%
+        %
+        \Procedure{Detection}{$\key$}
+        \State $\algvar{peers} \gets \Call{Get20ClosestPeers}{\key}$
+        \State $q \gets \operatorname{numPeersPerCPL}(\algvar{peers})/20$ \Comment{\cref{equ:pmf_emp}}
+        \State $N \gets \Call{GetNetsizeEstimate}{ }$ \Comment{\cref{equ:avg-dist,equ:netsize-least-squares}}
+        \State $p \gets \operatorname{computeModelDist}(N)$ \Comment{\cref{equ:cdf_j_best,equ:pmf_avg}}
+        \State $\algvar{KL} \gets \operatorname{computeKL}(p, q)$ \Comment{\cref{equ:kl-divergence-definition}}
+        \State \Return $\algvar{KL} > \threshold$ \Comment{true indicates attack}
+        \EndProcedure
+    \end{algorithmic}%
+\end{algorithm}%
+
+%
+
+%
+%

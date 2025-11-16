@@ -1,0 +1,231 @@
+% This is samplepaper.tex, a sample chapter demonstrating the
+% LLNCS macro package for Springer Computer Science proceedings;
+% Version 2.20 of 2017/10/04
+%
+\documentclass[runningheads]{llncs}
+%
+\usepackage{graphicx}
+% Used for displaying a sample figure. If possible, figure files should
+% be included in EPS format.
+%
+% If you use the hyperref package, please uncomment the following line
+% to display URLs in blue roman font according to Springer's eBook style:
+\usepackage[colorlinks=true,linkcolor=blue]{hyperref}
+\renewcommand\UrlFont{\color{blue}\rmfamily}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\usepackage{array}
+\usepackage{multirow}
+% \usepackage{booktabs}
+
+\begin{document}
+%
+\title{MIM-OOD: Generative Masked Image Modelling for Out-of-Distribution Detection in Medical Images}
+%
+\titlerunning{MIM-OOD: Generative MIM for OOD in Medical Images}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\author{Sergio {Naval Marimont}\inst{1}\orcidID{0000-0002-7075-5586} \and Vasilis Siomos \inst{1} \orcidID{0009-0003-0985-2672} \and 
+Giacomo Tarroni\inst{1, 2}\orcidID{0000-0002-0341-6138}}
+%
+
+% index{Naval Marimont, Sergio} 
+% index{Siomos, Vasilis} 
+% index{Tarroni, Giacomo} 
+
+\authorrunning{S. Naval Marimont et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{CitAI Research Centre, City, University of London, London, UK \and
+BioMedIA, Imperial College, London, UK
+\email{\{sergio.naval-marimont,vasilis.siomos,giacomo.tarroni\}@city.ac.uk}}
+%
+\maketitle              % typeset the header of the contribution
+%
+\begin{abstract}
+Unsupervised Out-of-Distribution (OOD) detection consists in identifying anomalous regions in images leveraging only models trained on images of healthy anatomy. An established approach is to \textit{tokenize} images and model the distribution of tokens with Auto-Regressive (AR) models. AR models are used to 1) identify anomalous tokens and 2) in-paint anomalous representations with in-distribution tokens. However, AR models are slow at inference time and prone to \textit{error accumulation} issues which negatively affect OOD detection performance. Our novel method, MIM-OOD, overcomes both speed and error accumulation issues by replacing the AR model with two task-specific networks: 1) a transformer optimized to identify anomalous tokens and 2) a transformer optimized to in-paint anomalous tokens using masked image modelling (MIM). Our experiments with brain MRI anomalies show that MIM-OOD substantially outperforms AR models (DICE 0.458 vs 0.301) while achieving a nearly 25x speedup (9.5s vs 244s).
+
+\keywords{out-of-distribution detection \and unsupervised learning \and masked image modelling.}
+\end{abstract}
+%
+%
+%
+\section{Introduction}
+Supervised deep learning approaches achieve state of the art performance in many medical image analysis tasks \cite{Litjens2017}, but they require large amounts of manual annotations by medical experts. The manual annotation process is expensive and time-consuming, can lead to errors and suffers from inter-operator variability. Furthermore, supervised methods are specific to the anomalies annotated, which is in contrast with the diversity of naturally occurring anomalies. These limitations severely hinder applications of deep learning methods in the clinical practice. 
+
+Unsupervised Out-of-Distribution (OOD) detection methods propose to bypass these limitations by seeking to identify anomalies relying only on anomaly-free data. Generically, the so-called \textit{normative} distribution of healthy anatomy is modelled by leveraging a training dataset of healthy images, and anomalous regions in test images are identified if they differ from the learnt distribution. A common strategy consists in modelling the \textit{normative} distribution using generative models \cite{Baur2020}. In particular, recent two-stage approaches have shown promising results \cite{Wang2020,Naval2020,PinayaW2022a,PinayaW2022d}. In order to segment anomalies, a first stage encodes the image into discrete latent representations referred as \textit{tokens}, from a VQ-VAE \cite{Oord2017}. The second stage aims to model the likelihood of individual \textit{tokens}, so a low likelihood can be used to identify those tokens that are not expected in the distribution of normal anatomies. Auto-Regressive (AR) modelling is the most common approach to model latent representation distributions \cite{Oord2017}. Furthermore, once the anomalous \textit{tokens} are identified, the generative capabilities of the AR model allow to in-paint anomalous regions with in-distribution \textit{tokens}. By decoding the now in-distribution \textit{tokens}, it is possible to obtain \textit{healed} images, and anomalies can be localized with the pixel-wise residuals between original and \textit{healed} images \cite{Wang2020,Naval2020,PinayaW2022a,PinayaW2022d}. 
+
+Although this strategy is effective, AR modelling requires defining an artificial order for the \textit{tokens} so the latent distribution can be modelled as a sequence, and consequently suffer from two important drawbacks: 1) inference/image generation requires iterating through the latent variable sequence, which is computationally expensive, and 2) the fixed sequence order leads to error accumulation issues \cite{PinayaW2022d}. Error accumulation issues occur when AR models find OOD \textit{tokens} early on the sequence and the \textit{healed}/sampled sequence diverges from the original image, causing normal \textit{tokens} to also be replaced.
+
+\subsubsection{Contributions:} we propose MIM-OOD, a novel approach for OOD detection with generative models that overcomes the aforementioned issues to outperform equivalent AR models both in accuracy and speed. Our main contributions are:
+\begin{itemize}
+    \item Instead of a single model for both tasks, MIM-OOD consists of two bi-directional Transformer networks: 1) the \textbf{Anomalous Token Detector}, trained to identify anomalous \textit{tokens}, and 2) the \textbf{Generative Masked Visual Token Model (MVTM)}, trained using the masked image modelling (MIM) strategy and used to in-paint anomalous regions with in-distribution tokens. To our knowledge, it is the first time MIM is leveraged for this task. 
+    \item We evaluated MIM-OOD on brain MRIs, where it substantially outperformed AR models in detecting gliomas anomalies from BRATS dataset (DICE 0.458 vs 0.301) while also requiring a fraction of the inference time (9.5s vs 244s).
+\end{itemize}
+
+\section{Related Works} 
+
+Generative models have been at the core of the literature in unsupervised OOD detection in medical image analysis. Vanilla approaches using Variational Auto-Encoders (VAE) \cite{Kingma2013} are based on the assumption that VAEs trained on healthy data would not be able to reconstruct anomalous regions and consequently voxel-wise residuals could be used as Anomaly Score (AS) \cite{Baur2020}. In \cite{Zimmerer2019}, authors found that the KL-divergence term in the VAE loss function could be used to both detect anomalous samples and localise anomalies in pixel space using gradient ascent. Chen et al. \cite{Chen2020} suggested using the gradients of the VAE loss function w.r.t. pixels values to iteratively \textit{heal} the images and turn them into in-distribution samples, in a so-called \textit{restoration} process.  Approaches using Generative Adversarial Networks (GANs) \cite{Goodfellow2014} assume that anomalous samples are not encoded in the normative distribution and that AS can be derived from pixel-wise residuals between test samples and reconstructions \cite{Schlegl2019}. As introduced previously, the most recent approaches based on generative models rely on two-stage image modelling \cite{Wang2020,Naval2020,PinayaW2022a}: the first stage is generally a \textit{tokenizer} \cite{Oord2017} that encodes images in discrete latent representations (referred as \textit{tokens}), followed by a second stage that learns the \textit{normative} distribution of \textit{tokens} leveraging AR models. To overcome the limitations of AR modelling, Pinaya et al. \cite{PinayaW2022d} propose replacing AR with a latent diffusion model \cite{RombachR2022}.
+
+A novel and efficient strategy to model the latent distribution is generative masked image modelling (MIM), which has been used for image generation \cite{ChangH2022}. MIM consists in 1) dividing the variables of a multivariate joint probability distribution into masked and visible subsets, and in 2) modelling the probability of masked variables given visible ones. Masked Image Modelling strategy, when applied to latent visual \textit{tokens} is referred to as Masked Visual Token Modelling (MVTM). MVTM produces high quality images by iteratively masking and resampling the latent variables where the model is less confident. In \cite{Lezama2022}, authors improve the quality of the generated images by training an additional model, named \textit{Token Critic}, to identify which latent variables require resampling by the MVTM model. The Token Critic is trained to identify which \textit{tokens} are sampled from the model vs which tokens were in the original image. Token Critic and MVTM address the tasks of identifying inconsistent tokens and in-painting masks tokens, respectively, which are similar to the roles of AR models in the unsupervised OOD detection literature. We took inspiration from these efficient strategies to design our novel MIM-OOD method.
+
+\section{Method}
+\subsection{Vector Quantized Variational Auto-Encoders}
+
+Vector Quantized Variational Auto-Encoders (VQ-VAEs) \cite{Oord2017} encode images $x \in \mathbb{R}^{H \times W}$  into representations ${z_q \in \textbf{K}^{H / f \times W /f } }$ where $\textbf{K}$ is a set of discrete representations, referred as \textit{tokens}, and $f$ is a downsampling factor measuring the spatial compression between pixels and \textit{tokens}. A VQ-VAE first encodes the images to a continuous space  ${z_e \in \mathbb{R}^{D \times H / f \times W /f }}$. Continuous representations are then discretized using an embedding space with $\lvert \textbf{K} \rvert$ embeddings $e_k \in \mathbb{R}^D$. Specifically, \textit{tokens} are defined as the index of the embedding vector $e_k$ nearest to $z_e$: $z_q = argmin_j \lVert z_e-e_j \rVert_2$. For a detailed explanation, please refer to the original paper \cite{Oord2017}.
+
+\subsection{Generative Masked Visual Token Modelling (MVTM)} 
+Masked modelling consists in learning the probability distribution of a set of occluded variables based on a set of observed ones from a given multivariate distribution. Occlusions are produced by replacing the values of variables with a special $\left[ MASK \right]$ \textit{token}. Consequently, the task is to learn $p(y_M \mid y_U)$, where $y_M, y_U$ are the masked and unmasked exclusive subsets of $Y$. The binary mask $\textbf{m} = \left[ m_i \right]^N_{i=1}$  defines which variables are masked: if $i \in M$ then $m_i = 1$ and $y_i$ is replaced with $\left[ MASK \right]$. The training objective is to maximize the marginal cross-entropy for each masked \textit{token}:
+
+\begin{equation} \label{eq:2}
+    \mathcal{L}_{MVTM} = \sum_{ \forall y_i \in Y_M} \log p_{\phi}(y_i \mid Y_U)
+\end{equation} 
+
+In MVTM, $Y$ is the set of \textit{tokens} ${z_q \in \textbf{K}^{H / f \times W /f }}$ encoding image $x$. We use a multi-layer bi-directional Transformer to model the probability $p(y_i \mid Y_U)$ given the masked input. We optimize Transformer weights $\phi$ using back-propagation to minimize the cross-entropy between the ground-truth \textit{tokens} and predicted \textit{token} for the masked variables. The upper section in Figure \ref{fig1} describes the MVTM task. 
+
+% Figure environment removed
+
+The MVTM model can be leveraged to both in-paint latent regions using its generative capabilities and to identify anomalous \textit{tokens}. A naive approach to identify anomalous \textit{tokens} would be to use the predicted $p(y_i \mid Y_U)$ to identify \textit{tokens} with low likelihood. However, by optimising over the marginals for each masked \textit{token}, the model learns the distribution of each of the masked variables independently and fails to model the \textit{joint} distribution of masked \textit{tokens} \cite{Lezama2022}. Given the above limitation we introduce a second latent model specialized to identify anomalous \textit{tokens}.
+
+\subsection{Anomalous Token Detector (ATD)}
+The Anomalous Token Detector (ATD) is trained to identify local corruptions, similar to the task introduced in \cite{Tan2020} but in latent space instead of pixel-space. We create the corruptions by replacing the \textit{tokens} in mask $\textbf{m}$ with random \textit{tokens}. Consequently, our ATD bi-directional Transformer $\theta$ receives as input $ \tilde y = y \odot (1 - m) + r \odot m  $, where $r$ is a random set of \textit{tokens} and $\odot$ is element-wise multiplication. It is trained to minimize a binary cross-entropy objective: 
+
+\begin{equation} \label{eq:3}
+    \mathcal{L}_{TC} = \sum_{i}^{N} m_i \log  p_{\theta}(y_i) + (1-m_i) \log (1 - p_{\theta}(y_i))
+\end{equation} 
+
+The bottom section in Figure \ref{fig1} describes the proposed ATD task. Both the MVTM and ATD masks were generated by a random walk of a brush with a randomly changing width. 
+
+\subsection{Image restoration procedure}
+At inference time, our goal is to evaluate if an image is consistent with the learnt healthy distribution and, if not, heal it by applying local transformations that replace anomalies with healthy tissue to generate a \textit{restoration}. We can then localise anomalies by comparing the restored and original images. The complete MIM-OOD pipeline consists of the following steps:
+\begin{enumerate}
+    \item \textbf{Tokenise} the image using the VQ-VAE Encoder.
+    \item \textbf{Identify anomalous tokens} by selecting \textit{tokens} with an ATD prediction score greater than a threshold $\lambda$. Supplementary Materials include validation set results for different $\lambda$ values.
+    \item \textbf{Restore anomalous tokens} by in-painting anomalous \textit{tokens} with generative masked modelling. We sample tokens based on the likelihood assigned by MVTM: $ \hat y_t \sim p_{\phi}(y_t \mid Y_U)$ and replace original tokens with samples in masked positions: $ y_{t+1} = y_{t} \odot (1 - m) + \hat y_t \odot m  $.
+    \item \textbf{Decode} \textit{tokens} using the VQ-VAE Decoder to generate the restoration $x_T$.
+    \item \textbf{Compute the Anomaly Score (AS)} as the pixel-wise residuals between restoration $x_T$ and original image $x_0$: $AS = \lvert x_T - x_0 \rvert $. AS is smoothed to remove edges with $min$ and $average-pooling$ filters\cite{Naval2020}. 
+\end{enumerate}
+
+Note that sampling from MVTM is done independently for each \textit{token}, so it is possible that sampled \textit{tokens} are inconsistent with each other. To address this issue, we can iterate $T$ times steps 2 and 3. Additionally, we can also generate $R$ multiple restorations per input image (i.e., repeating for each restoration step 3). We evaluated different values of $T$ steps and $R$ restorations, and validation set results are included in the Supplementary Materials. Figure \ref{fig2} describes the end-to-end inference pipeline.
+
+
+% Figure environment removed
+
+\section{Experiments and Results}
+We evaluated MIM-OOD on brain MRIs (training on a dataset of normal images and testing on one with anomalies) and compared our approach to an AR benchmark thoroughly evaluated in the literature \cite{Naval2020,PinayaW2022a}. Two publicly available datasets were used:
+\begin{itemize}
+    \item The Human Connectome Project Young Adult (HCP) dataset \cite{VanEssen2012} with images of 1,113 young and healthy subjects which we split into a training set with 1013 images and a validation set with 100 images.
+    \item The Multimodal Brain Tumor Image Segmentation Benchmark (BRATS) \cite{Menze2014}, from the 2021 challenge. The dataset contains images with gliomas and comes with ground-truth segmentation masks highlighting their location. We randomly selected 100 images as validation set and 200 images as test set.
+\end{itemize}
+From both datasets we obtained pre-processed, skull-stripped T2-weighted structural images. We re-sampled both datasets to a common isotropic spacing of 1 mm and obtained random axial slices of 160x160 pixels. Intensity values were clipped to percentile 98 and normalized to the range [0,1]. Latent models were only trained with random flip and rotations augmentations. We included broader-than-usual intensity augmentations during VQ-VAE training.
+
+\subsubsection{Network architecture and implementation details:}
+For the VQ-VAE we used the architecture from \cite{EsserP2021} and trained with MAE reconstruction loss for 300k steps. We used a codebook with $\lvert \textbf{K} \rvert =256$ and $D=256$ and a downsampling factor $f=8$. For the AR, ATD and MVTM we used a vanilla Transformer \cite{Vaswani2017} with depth 12, layer normalization, and a stochastic depth of $0.1$. Both the ATD and the MVTM Transformers are bi-directional since there is no sequence order to be enforced, in contrast to AR models. Transformers were trained for 200k steps.
+
+We used AdamW with a cosine annealing scheduler, starting with learning rate of $5 \times 10^{-5}$ and weight decay $1 \times 10^{-5}$. Our MONAI \cite{monai} implementation and trained models are made publicly available in \footnote{\href{https://github.com/snavalm/MIM-OOD}{\texttt{https://github.com/snavalm/MIM-OOD}}}. 
+
+\subsubsection{Performance evaluation:} 
+The role of the latent models (AR and MVTM) is both to identify anomalous latent variables and to replace them with in-distribution values for restoration. To evaluate the identification task, we setup a proxy task of classifying as anomalous \textit{tokens} corresponding to image areas where anomalies are present. To this end, we downsample annotated ground-truth labels by the VQ-VAE scaling factor $f = 8$. Using \textit{token} likelihood as a Anomaly Score (AS) in latent space we computed the Average Precision (AP) and the Area Under the Receiver Operating Characteristic curve (AUROC). Table \ref{Table:tab1} summarizes the proxy task results on the validation set. Our proposed approach relying on the ATD substantially outperforms the competitors.
+
+\begin{table}
+\caption{Results for Anomalous Token identification in BRATS validation set.}\label{Table:tab1}
+\begin{tabular}{p{7cm} >{\centering\arraybackslash}p{2cm} >{\centering\arraybackslash}p{2cm}}
+\hline
+Method &  AP & AUROC \\
+% \midrule[1.5pt]
+\hline
+AR \cite{Naval2020} & 0.054 & 0.773 \\
+MVTM \cite{ChangH2022} & 0.084 & 0.827 \\
+MVTM + Token Critic \cite{Lezama2022} & 0.041 & 0.701 \\
+MIM-OOD (Ours) & \textbf{0.186} & \textbf{0.859} \\
+% \midrule[1.5pt]
+\end{tabular}
+\end{table}
+
+We then evaluate MIM-OOD's capability to localise anomalies in image space on the test set. We report the best achievable $\left[ DICE \right]$ score following the conventions in recent literature \cite{Baur2020,PinayaW2022a}. Additionally, we report AP, AUROC and inference time per batch of 32 images (IT (s)) using a single Nvidia RTX3090.
+
+\begin{table}
+\caption{Results for Pixel-wise Anomaly Detection in BRATS test set.}\label{Table:tab2}
+\begin{tabular}{p{6cm} >{\centering\arraybackslash}p{1.3cm} >{\centering\arraybackslash}p{1.3cm} >{\centering\arraybackslash}p{1.3cm} >{\centering\arraybackslash}p{1.3cm}}
+% \begin{tabular}{ m{3cm} m{1.2cm} m{2.1cm} m{0.9cm}  m{0.9cm} }
+% \toprule[1.5pt]
+\hline
+Method &  [DICE] & AP & AUROC & IT (s) \\
+% \midrule[1.5pt]
+\hline
+AR restoration $R=4$ ${}^{(1)}$ \cite{Naval2020} & 0.301 & 0.191 & 0.891 & 244 \\
+MVTM + Token Critic R=4 \cite{Lezama2022} & 0.201 & 0.131 & 0.797 & 5.4 \\
+MIM-OOD R=4 (Ours) ${}^{(2)}$ & 0.458 & 0.399 & 0.926 & 9.5 \\
+MIM-OOD R=8 (Ours) ${}^{(2)}$ & \textbf{0.461} & \textbf{0.404} & \textbf{0.928} & 19.9 \\
+% \midrule[1.5pt]
+\hline
+\multicolumn{5}{l}{1 - Implementation from \cite{Naval2020} with 4 restorations and $\lambda_{NLL} = 6$, using Transformer} \\
+\multicolumn{5}{l}{instead of PixelSNAIL AR architecture.} \\
+\multicolumn{5}{l}{2 - Our approach with 4 and 8 restorations respectively, $\lambda = 0.005$ and $T=8$.} \\
+\end{tabular}
+\end{table}
+
+The results in Table \ref{Table:tab2} show that MIM-OOD improves the $[DICE]$ score by 15 points (0.301 vs 0.458) when using the same number of restorations ($R=4$), while at the same time reducing the inference time (244s vs 9.5s for a batch of 32 images). These results are consistent with the previous anomalous \textit{token} identification task where we showed that our ATD model was able to better identify anomalous \textit{tokens} requiring restorations. Qualitative results are included in Figure \ref{fig3} and in Supplementary Materials. 
+
+It is worth noting that our AR baseline slightly underperforms compared to previous published results (DICE of 0.301 vs 0.328 in BRATS dataset \cite{PinayaW2022a,PinayaW2022d}) due to different experimental setups: different modalities (T2 vs FLAIR), training sets (HCP with N=1,013 vs UK Biobank with N=14,000) and pre-processing pipelines. While both T2 and FLAIR modalities are common in the OOD literature, T2 was chosen for our experiments because of the availability of freely accessible anomaly-free datasets. The differences in experimental setups makes results not directly comparable, however our approach shows promising performance and high efficiency when comparing with both AR Ensemble (\cite{PinayaW2022a} DICE 0.537 and 4,907 seconds per 100 image batch) and Latent Diffusion (\cite{PinayaW2022d} DICE 0.469 and 324 seconds per 100 image batch). 
+
+% Figure environment removed
+
+\section{Conclusion}
+
+We developed MIM-OOD, a novel unsupervised anomaly detection technique that, to our knowledge, leverages for the first time the concept of Generative Masked Modelling for this task. In addition, we introduce ATD, a novel approach to identify anomalous latent variables which synergizes with the MVTM to generate healed restorations. Our results show that our technique outperforms previous AR-based approaches in unsupervised glioma segmentation in brain MRI. In the future, we will perform further evaluations of our approach, testing it on data with other brain pathologies and using additional image modalities. 
+
+%
+% the environments 'definition', 'lemma', 'proposition', 'corollary',
+% 'remark', and 'example' are defined in the LLNCS documentclass as well.
+%
+
+%
+% ---- Bibliography ----
+%
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+%
+\bibliographystyle{splncs04}
+\bibliography{ref.bib}
+%
+
+\newpage
+\title{MIM-OOD: Generative Masked Image Modelling for Out-of-Distribution Detection in Medical Images}
+%
+\titlerunning{MIM-OOD: Generative MIM for OOD in Medical Images}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\author{Sergio {Naval Marimont}\inst{1}\orcidID{0000-0002-7075-5586} \and Vasilis Siomos \inst{1} \orcidID{0009-0003-0985-2672} \and 
+Giacomo Tarroni\inst{1, 2}\orcidID{0000-0002-0341-6138}}
+%
+
+% index{Naval Marimont, Sergio} 
+% index{Siomos, Vasilis} 
+% index{Tarroni, Giacomo} 
+
+\authorrunning{S. Naval Marimont et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{CitAI Research Centre, City, University of London, London, UK \and
+BioMedIA, Imperial College, London, UK
+\email{\{sergio.naval-marimont,vasilis.siomos,giacomo.tarroni\}@city.ac.uk}}
+%
+\maketitle              % typeset the header of the contribution
+%
+
+\section*{Supplementary Materials}
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+
+
+\end{document}

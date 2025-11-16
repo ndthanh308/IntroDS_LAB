@@ -1,0 +1,272 @@
+(** {1 BSML Standard Library} *)
+
+(** {2 Basic Utility Functions} *)
+
+module Base
+  use sequential.Int
+  use sequential.List
+  use sequential.Option
+  use bsml.BSML
+
+  (** {3 For programming and specification} *)
+
+  (** `procs()` is the list of all processor identifiers *)
+  let function procs() 
+    ensures { forall i:int. 0 <= i < bsp_p -> result[i] = i }
+    ensures { length result = bsp_p }
+  = from_to 0 (bsp_p-1)
+
+  (** `this()` is the parallel vector of processor identifiers. *)
+  let function this() 
+    ensures { forall i:int. 0 <= i < bsp_p -> get result i = i }
+  = mkpar(fun i->i)
+
+  (** {3 For programming only} *)
+
+  (** `replicate x` replicates value [x] on all the processors. *)
+  let replicate (x: 'a) : par 'a 
+    ensures { forall i:int. 0 <= i < bsp_p -> get result i = x }
+  = mkpar(fun _ -> x)
+
+  (** `parfun f` promotes a unary sequential function into a function on 
+      parallel vectors. *)  
+  let parfun (f : 'a -> 'b) (v: par 'a) : par 'b
+    ensures { forall i:int. 0 <= i < bsp_p -> 
+                       get result i = f (get v i) }
+  = apply (replicate f) v
+     
+  (** `parfun2 f` promotes a binary sequential function into a function on 
+      parallel vectors. *)   
+  let parfun2 (f : 'a -> 'b -> 'c) (u : par 'a) (v : par 'b) : par 'c
+    ensures { forall i:int. 0 <= i < bsp_p -> 
+                       get result i = f (get u i) (get v i) } 
+  = apply (parfun f u) v
+
+  (** `parfun3 f` promotes a ternary sequential function into a function on 
+      parallel vectors. *)   
+  let parfun3 (f : 'a->'b->'c->'d)(u : par 'a)(v: par 'b)(w: par 'c) : par 'd
+    ensures { forall i:int. 0 <= i < bsp_p -> get result i = f (get u i)(get v i)(get w i) } 
+  = apply ((parfun2 f u) v) w
+    
+  (** `list_of_par v` converts a parallel vector [v] into a list. 
+      This functions requires a full super-step to evaluate. *) 
+  let function list_of_par (v : par 'a) : list 'a 
+    ensures { forall i:int. 0 <= i < bsp_p -> result[i] = get v i }
+    ensures { length result = bsp_p }
+  = map (proj v) (procs())
+  
+  (** `apply2 f v1 v2` apply a function with two arguments to the values of each processors. 
+      The function of the processor n is applicated to the value of v1 and v2 *)
+  let apply2 (f : par ('a -> 'b -> 'c)) (v1 : par 'a) (v2 : par 'b) : par 'c
+    ensures { forall i : int. 0 <= i < bsp_p -> 
+                         get result i = (get f i) (get v1 i) (get v2 i) }
+  = apply (apply f v1) v2
+  
+  (** `applyif p f1 f2 v` applies `f1` if `p` is true for the `pid`, `f2` otherwise *)
+  let applyif (p : int -> bool) (f1 : 'a -> 'b) (f2 : 'a -> 'b) (v : par 'a) : par 'b  
+    ensures { forall i :int. 0 <= i < bsp_p -> 
+                        ( (p i) -> get result i = f1 (get v i) ) /\
+                        ( not (p i) -> get result i = f2 (get v i) ) }
+  = apply (mkpar(fun i->if (p i) then f1 else f2)) v
+
+  (** `applyat n f1 f2 v` applies `f1` at the processor `n`, otherwise applies `f2` *)
+  let applyat (n :int) (f1 : 'a -> 'b) (f2 : 'a -> 'b) (v : par 'a) : par 'b
+    ensures { forall i: int. 0 <= i < bsp_p -> 
+                        ( (n = i) -> get result i = f1 (get v i) ) /\
+                        ( (n <> i) -> get result i = f2 (get v i) ) }
+  = applyif (fun i->i=n) f1 f2 v
+  
+  (** `mask p v1 v2` if `(p pid)` is true, the value at processor `pid` is the 
+      value of parallel vector `v1` otherwise it is parallel vector `v2` *)
+  let mask (p : int -> bool) (v1 : par 'a) (v2 : par 'a) : par 'a
+    ensures { forall i: int. 0 <= i < bsp_p -> (
+                        (p i -> get result i = get v1 i) /\
+                        (not p i -> get result i = get v2 i)) }
+  = apply2 (mkpar(fun i x y->if (p i) then x else y)) v1 v2
+
+  (** {3 For specifications only} *)
+
+  (** `to_list v` converts a parallel vector of lists into a list.
+      This function can only be used in specifications. *) 
+  function to_list (v : par (list 'a)) : list 'a 
+  = flatten (list_of_par v)  
+    
+end
+
+(** {2 Pipeline and Composition } *)
+
+module Tool 
+
+  let function (|>) x f = f x
+
+  let function ($) (f: 'b->'c) (g: 'a->'b) (x: 'a) : 'c
+  = f (g x)
+
+end
+
+(** {2 Communication Schemes} *)
+
+module Comm 
+  use sequential.Int
+  use sequential.List
+  use sequential.Pair
+  use sequential.Option
+  use bsml.BSML
+  use Base
+  use Tool
+
+  (** {3 Shift} *)
+  
+  let function shift_pid (offset:int) (pid:int)
+  = if bsp_p <= pid + offset 
+    then pid + offset - bsp_p
+    else pid + offset 
+    
+  lemma shift_pid_lt:
+    forall offset pid: int. 
+     0 <= pid < bsp_p -> 
+     0 <= offset < bsp_p ->
+     pid + offset < bsp_p -> 
+     shift_pid offset pid = pid + offset
+     
+  lemma shift_pid_ge:
+    forall offset pid: int. 
+     0 <= pid < bsp_p -> 
+     0 <= offset < bsp_p ->
+     pid + offset >= bsp_p -> 
+     shift_pid offset pid = pid + offset - bsp_p 
+    
+  lemma shift_id :
+    forall offset pid: int. 
+      0 <= pid < bsp_p ->
+      0 < offset < bsp_p ->
+      shift_pid (bsp_p-offset) (shift_pid offset pid) = pid
+     
+  let shift (offset : int) (v: par 'a)
+    requires { 0 <= offset < bsp_p } 
+    ensures { offset > 0 -> forall i:int. 0 <= i < bsp_p ->
+                       get result i = get v (shift_pid (bsp_p - offset) i) }
+    ensures { offset = 0 -> result = v }
+  = if offset = 0
+    then v
+    else 
+      let senders = mkpar(fun pid->shift_pid (bsp_p-offset) pid) in
+      let make_msg = fun pid data dst -> 
+        if dst = shift_pid offset pid 
+        then Some data
+        else None in
+      let to_send = apply (mkpar make_msg) v in 
+      let received = put to_send in 
+      parfun remove_option (apply received senders)
+
+  let shift_right (v : par 'a) : par 'a 
+    ensures { forall i:int. 0 <= i < bsp_p ->
+                       get result i = get v (shift_pid (bsp_p-1) i) }
+  = if bsp_p > 1
+    then shift 1 v
+    else v
+
+  let shift_left (v : par 'a) : par 'a 
+    ensures { forall i:int. 0 <= i < bsp_p ->
+                       get result i = get v (shift_pid 1 i) }
+  = if bsp_p > 1
+    then shift (bsp_p-1) v
+    else v
+
+  (** {3 Total exchange} *)
+
+  (** `totex <v_0,...,v_{p-1}>` evaluates to `<f_0,...,f_{p-1}>`
+      such as `f_i j`= `v_j`. *) 
+  let totex (v: par 'a) : par(int -> 'a) 
+    ensures { forall i:int. 0 <= i < bsp_p -> 
+                forall j:int. 0 <= j < bsp_p -> get result i j = get v j }
+  = put(parfun (fun data _ -> data) v)
+
+  (** `total_exchange <v_0,...,v_{p-1}>` evaluates to 
+      `<l,...,l>` such as the `j^th` element of `l` is `v_j`. *)
+  let total_exchange (v: par 'a) : par (list 'a)
+    ensures { forall i: int. 0 <= i < bsp_p -> get result i = list_of_par v }
+  = let vprocs = replicate (procs()) in 
+    let to_fun = totex v in 
+    parfun2 map to_fun vprocs
+ 
+  (** {3 Broadcast} *)
+
+  exception Bcast
+
+  (** `bcast_proj n <v_0,...,v_{p-1}> = <v_n,...,v_n>` if
+	    `root` is a valid process number, otherwise `Bcast` is raised.
+	    The parallel cost is size*(p-1)*g+l}, where size is the
+	    size of the value `v_n`. *)  
+  let bcast_proj (root : int) (v : par 'a)
+    ensures { 0 <= root < bsp_p -> 
+              forall i:int. 0 <= i < bsp_p -> get result i = get v root }
+    raises { Bcast }
+  = if (0 <= root) && (root < bsp_p )
+    then 
+      let bcast_value = proj v root in 
+      replicate bcast_value
+    else raise Bcast
+    
+  (** `bcast_direct n <v_0,...,v_{p-1}> = <v_n,...,v_n>` if
+	    `root` is a valid process number, otherwise `Bcast` is raised.
+	    The parallel cost is size*(p-1)*g+l}, where size is the
+	    size of the value `v_n`. *)  
+  let bcast_direct (root : int) (v : par 'a)
+    ensures { 0 <= root < bsp_p -> 
+              forall i:int. 0 <= i < bsp_p -> 
+                       get result i = get v root }
+    raises { Bcast }
+  = if (0 <= root) && (root < bsp_p )
+    then
+      let make_msg src load = fun _ -> 
+          if src = root then Some load else None in 
+      let to_send  = apply (mkpar make_msg) v in 
+      let received = put to_send in 
+      let optional_result = apply received (replicate root) in 
+      parfun remove_option optional_result
+    else raise Bcast
+    
+  (** {3 Gather} *)
+  
+  exception Gather
+
+  (** `gather root vv` send values of all processors to the processor `root`,
+      where the results is a function *)
+  let gather (root : int) (vv : par 'a) : par (int -> option 'a) 
+    requires { 0 <= root < bsp_p }
+    ensures { forall i:int. 0 <= i < bsp_p -> (get result root) i = Some (get vv i)}
+    ensures { forall i j:int. 0 <= i < bsp_p /\ 0 <= j < bsp_p /\ j <> root -> 
+                         (get result j) i = None } 
+  = let mkmsg _ v dest = if dest=root then Some v else None in
+    put(apply (mkpar mkmsg) vv)
+
+  (** `gather_list root vv` send values of all processors to the processor `root`,
+      where the results is a function *)    
+  let gather_list (root : int) (vv : par 'a) : par (list 'a) 
+    requires { 0 <= root < bsp_p }
+    ensures { forall i:int. 0 <= i < bsp_p -> (get result root)[i] = get vv i }
+    ensures { forall i:int. 0 <= i < bsp_p /\ i <> root -> get result i = Nil }
+  = let procs_at_root = mkpar(fun i->if i=root then procs() else Nil) in
+    let to_list = parfun (($) remove_option) (gather root vv) in
+    parfun2 map to_list procs_at_root
+
+
+  (** {3 Scatter} *)
+
+  exception Scatter
+
+  let scatter (partition: 'a->int->'b) (root: int) (v: par 'a) : par 'b 
+    ensures { forall i: int. 0 <= i < bsp_p -> 
+                        0 <= root < bsp_p -> 
+                        get result i = partition (get v root) i }
+    raises { Scatter } 
+  = if not (0 <= root && root < bsp_p) 
+    then raise Scatter
+    else
+      let mkmsg = mkpar(fun pid data dst ->if pid=root 
+			  then Some(partition data dst) else None) in
+      let msg = put (apply mkmsg v) in
+	  parfun remove_option (apply msg (replicate root))
+
+end

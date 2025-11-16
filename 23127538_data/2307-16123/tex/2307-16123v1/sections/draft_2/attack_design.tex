@@ -1,0 +1,78 @@
+\section{Covert Channel Attack Design}
+\label{sec:attack_design}
+
+We concluded that the management policy of the write buffer is the cause of the high latency observed by the co-running CPU process. In this section, we explore different ways to exploit this phenomenon to leak secret information using covert channel attacks. 
+
+\begin{comment}
+One of the challenges in exploiting write memory requests at the write buffer level is that it is not known when dirty cache lines will be inserted in the write buffer. We explore two ways to force evictions of these cache lines by exploiting iGPU parallelism. 
+\end{comment}
+
+
+% Figure environment removed
+
+The attack first starts with handshaking between trojan (CPU-side) and spy. This can be done using traditional techniques (i.e. flush+reload, prime+probe) or by using the slowdown which can be caused using iGPU kernel memory write requests. \circled{1} Trojan CPU process indicates the start of the communication to leak secret information and launches a kernel on the iGPU to issue parallel memory write requests.%\hoda{please say that it (cpu process or iGPU kernel??) sends a synchronization bit sequence for handshaking, then the spy receives it in step 2.}
+\circled{2} Once the spy CPU process successfully detects the bit sequence as part of the handshaking process from trojan (CPU-side), it starts a continuous stream of memory read requests. We found that allocating a buffer with a size larger than the LLC size and accessing it at a stride of 64 cache lines is sufficient to ensure memory accesses during iGPU kernel execution without the need to use clflush instruction. This ensures continuous monitoring of the slowdown caused by the iGPU kernel. \circled{3} Cache lines in LLC will be updated based on iGPU kernel writes. %We noticed that \textit{write-no-allocate} is used for LLC since cache lines written with the same data are still added to the write buffer.
+
+\circled{4} When dirty cache lines are evicted from LLC, they are pushed into the write back buffer of LLC. \circled {5} Eventually, dirty cache lines in the write back buffer will be inserted to write buffer in the MC to be updated in main memory. We can control filling the write back buffer and write buffer in the MC by exploiting iGPU parallelism and writing to multiple cache lines in a short time. \circled{6} When the write buffer gets full, it has to be drained due to \textit{drain\_when\_full} management policy. During draining the write buffer, any spy read requests in the read buffer will be stalled until the write buffer is drained.
+
+To send bit "1", trojan has to do a lot of writes to different cache lines to fill and drain write buffer frequently resulting in stalling spy read requests. Writes have to be done to different cache lines to avoid the coalescing effect in iGPU. To send bit "0", trojan exploits coalescing effect, by doing the same number of writes, but to the same cache line to avoid filling the write buffer. This way, the trojan can leak secret information to the spy.
+
+%We mentioned that one of the challenges in exploiting memory write requests is that it is not known when dirty cache lines will be inserted in the write buffer. Consequently,
+We propose two different approaches to establish a covert channel which exploit the effect of write buffer management policy. The first is MC channel oblivious attack while the second attack targets one MC channel.
+
+
+\subsection{Attack Variant 1: MC Channel Oblivious Attack}
+\label{subsec:var1_design}
+
+% % Figure environment removed
+
+% Figure environment removed
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+The first attack variant we are proposing does not require spy and trojan to agree on a channel to access beforehand. Trojan (iGPU kernel) will write to different cache lines to avoid memory request coalescing. From Figure~\ref{fig:slowdown_b}, we can notice the slowdown abruptly appears when the number of write requests is $2^{19}$ memory requests when all cache lines are accessed. Consequently, the allocated buffer size should be 32MB since writes have to be done to different cache lines to avoid the coalescing effect. A buffer size of 32MB is double the size of LLC in our targeted system.
+
+Accessing different cache lines from the allocated 32MB buffer will increase the probability of dirty cache line evictions. Considering the parallelism of iGPU, this will speed up filling the write buffer in the memory controller to stall spy (CPU process) read requests. The drawback of this approach is that it requires iGPU kernel to access a large number of cache lines to evict dirty cache lines. This will lower the bit rate as we will show later. 
+
+To construct an efficient covert channel attack in terms of bit and error rates, we need to consider multiple attack parameters. Such parameters are the number of write requests, the number of local and global threads, and the iteration factor to send bit '0'. We investigated the role of these parameters as we show in Figure \ref{fig:zero_iter_factor} and Figure \ref{fig:glob_loc_threads}.
+
+%TODO: talk about zero iteration factor
+We mentioned that for the iGPU kernel to send bit '0', it does the same number of writes as in sending bit '1'. We noticed that based on the latency level observed by the spy process when sending bit '1', an iteration factor of one is not enough to send bit '0' after sending bit '1'. We investigated both secret detection time and error rate for different bit '0' iteration factors and different number of write requests as we depict in Figure \ref{fig:zero_iter_factor}.
+
+In Figure \ref{fig:zero_iter_factor}, local and global threads number is 256 and the size of secret is 1024 bits. Increasing the kernel buffer access stride, will decrease the number of write requests and thus decrease spy execution time. However, using larger strides to access iGPU kernel buffer leads to higher error rates since the number of evicted cache lines will be lower. Increasing bit '0' iteration factor shows to decrease the error rate because it makes bit '0' detectable. For this attack and from Figure \ref{fig:zero_iter_factor} we can observe that accessing iGPU kernel at a stride of eight cache lines and with bit '0' iteration factor of eight results in low error rate (~0.1\%) and small execution time.
+
+Furthermore, we investigated the role of number of local and global threads in attack's performance. Local work group size is equal to local threads and the total number of local work-groups is equal to the number of global threads divided by local work-group size. In Figure \ref{fig:local_threads}, the number of global threads is equal to 256 threads. We notice that increasing local threads decrease execution time for initial cases and starts increasing when the number of local threads is 64. In our targeted iGPU, the size of a wavefront (sub-work group size) can be 8,16, or 32. As we increase the number of local threads, the error rate decreases and this is because, with more local threads, more memory write requests are generated. Based on this experiment, we use a local work-group size of 128 threads because it achieves a low error rate and acceptable execution time compared to the case of 64 local threads which achieves ~10\% error rate.
+
+We also explored the role of increasing the number of global threads. The execution time initially decreases until the number of global threads reaches 2048. Error rate becomes ~100\% for global threads equal to or more than 2048 threads. When global threads are 128 or 256 threads, error rate is smaller than 0.2\%. Although 512 threads achieve execution time lower than 128 and 256 threads, it has a higher error rate (~22\%). Having a larger number of global threads, means lower number of writes per thread and this will lower latency overhead caused by iGPU kernel since all of these threads can't be scheduled at the same time. Also, there is the overhead of creating and scheduling these threads.
+
+Based on these experiments, we conclude the parameters required to achieve an efficient covert channel attack which is oblivious of accessed MC channel. iGPU kernel has to write to 32MB buffer at a stride of eight cache lines. Additionally, To make bit zero detectable by the spy process, its iteration factor must be eight considering iGPU kernel buffer size and stride. Also, the local work-group size should be 128 threads and the number of global threads should be 256. As a result, two local work-groups will be created by the kernel for this attack.
+
+\subsection{Attack Variant 2: Targeting Single MC Channel}
+\label{subsec:attack_var2}
+In our targeted system, CPU core and iGPU share dual channel MC. Each channel has its own read and write buffers. From reverse engineering of MC channel bit addressing, we noticed that the allocated buffer is distributed between these two channels. Considering this, it is possible for spy (CPU process) and trojan(iGPU kernel) to pre-agree on a channel such that single pair of read and write buffers are targeted. This will reduce the total number of writes required to cause spy slowdown and as a result, improve the bit rate. 
+
+% Figure environment removed
+
+Similar to the experiments we have performed in Section~\ref{subsec:var1_design}, we inferred the parameters required for this attack approach. The trojan buffer should be accessed at a stride of four rather than eight. This is because half of iGPU kernel writes will access targeted channel, and we need to ensure eviction of dirty cache lines. Note that the total number of iGPU kernel writes in this attack is similar to the previous attack. The difference is that iGPU kernel traffic is directed to one pre-agreed channel.
+In this attack, the iGPU kernel write requests are preceded with a buffer index read. This is the buffer index that iGPU kernel will be writing to next and which is targeting the same channel as spy reads. Because of this, the frequency of writes is lower than the previous attack and bit '0' iteration factor of two has better attack performance. Local threads of 128 and global threads of 256 achieved a good performance in terms of error and bit rates similar to previous attack.
+
+The bit rate in this attack is higher because bit '0' iteration factor is smaller. Additionally, frequency of write requests from iGPU kernel is lower and as result some of spy read requests will suffer lower latency than the latency we show in Figure~\ref{fig:latency_per_access}.
+
+\begin{comment}
+\subsection{Attack Variant 3: Deterministic Evictions of Dirty Cache lines}
+
+It is important to note that the size of LLC writeback buffer and write buffer in MC is smaller than $2^{19}$ entries. Meaning that smaller number of evicted dirty cache lines should be required to get the write back buffer filled. Accessing smaller number of cache lines to fill the write buffer will improve bit rate.
+
+To cause spy process slowdown by writing to smaller number of cache lines by the iGPU kernel, we need to find a collection of addresses which map to the same LLC set and slice (eviction set). Note that we can allocate a buffer which is shared between CPU core and iGPU. Such buffer can be allocated using Intel unified shared memory API which is part of OpenCL API \cite{unified}. Thus, we can find the eviction set on the CPU side of the trojan.
+
+The size of eviction set is dependent on the size of writeback buffer and write buffer. Note that in addition to evicting dirty cache lines from LLC, dirty cache lines has to be evicted from writeback buffer as well to eventually reach the write buffer in memory controller. 
+
+\subsubsection{Writeback and Write Buffers}
+In order to approximate the size of writeback and write buffers, we tested slowdown level for different eviction set sizes. We expect the sizes of these buffers to be between 64 and 256 entries.
+\ghadeer{continue this part based on reverse engineering results, eviction set}
+%TODO:
+
+\end{comment}

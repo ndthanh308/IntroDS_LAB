@@ -1,0 +1,55 @@
+\section{MovieChat}
+
+\subsection{Overview}
+Our proposed method, MovieChat, comprises several key components, including the frame-wise visual feature extractor, the short-term and long-term memory buffers, the video projection layer, and the Large Language Model (LLM), as illustrated in Figure~\ref{fig:overview}. MovieChat is designed for ultra-long videos ($\textgreater 10$K frames) understanding through interactive dialogue with the user. To address the impractical storage demands of concurrently storing a vast number of frames in both GPU memory and RAM, we employ a sliding window approach to efficiently process the video. MovieChat supports two inference modes: Breakpoint mode is used to understand a specific moment in the video, providing insights and answers based on that particular frame or scene; Global mode, on the other hand, is employed to comprehend the entire video as a whole, enabling a comprehensive understanding of the overall content and context.
+
+\subsection{Visual Feature Extraction}
+For visual feature extraction, instead of utilizing video-based foundational models such as ViViT~\cite{arnab2021vivit} or Video-Swin~\cite{liu2022video}, we simply use image-based model to get frame-wise feature in the form of tokens. To be specific, we utilize pre-trained models as our visual feature extractor, including the ViT-G/14 from EVA-CLIP~\cite{fang2022eva} and the Q-former from BLIP-2~\cite{li2023blip2}. This is mainly because 1) there is no video foundation model makes good alignment with text, and 2) our proposed memory mechanism can effectively capture temporal features. Given input video $\mathbf{v} \in \mathbb{Z}^{T \times 3 \times H \times W}$, a sequence of $T$
+RGB frames, with height and width $H$ and $W$, the visual feature extraction by sliding window approach could be formulated as
+\begin{equation}
+    \mathbf{x}_{i} = \mathcal{V}(\mathbf{v}_{i}), \mathbf{v}_{i} \in \mathbb{Z}^{C \times 3 \times H \times W}, i = 0,1,...,\lceil \frac{C}{T} \rceil,
+\end{equation}
+where $\mathcal{V}(\cdot)$ is the visual feature extractor, $\mathbf{v}_{i}$ are the RGB values of the video clip, $\mathbf{x}_{i} \in \mathbb{R}^{C \times N \times D}$ are the visual tokens, $N$ is the number of tokens, and $D$ is the feature dimension.
+
+\subsection{Short-term Memory}
+Short-term memory stores the visual tokens in a temporary buffer. The previously extracted visual features by sliding window $K$ times without further processing are used to construct short-term memory, which can be formulated by:
+\begin{equation}
+    \mathcal{S} = \{ \mathbf{x}_{i} \mid \forall i = 1, 2,...,K \},
+\end{equation}
+where $\mathcal{S}$ is short-term memory. Note that we set short-term memory to a fixed length since the role of short-term memory is to assist in understanding based on previous short-term contextual information. 
+The update strategy for short-term memory is similar to the First-in-First-out~(FIFO) queue. 
+When a new batch of visual tokens enter, we drop the earliest one that was present. The dropped tokens are further consolidated into long-term memory.
+
+\subsection{Long-term Memory}
+
+Long-term memory can effectively avoid the problem of catastrophic knowledge forgetting, which is crucial for processing long videos. The features stored in short-term memory are dense tokens, but due to GPU memory and computation cost limitations, directly storing all the tokens dropped from short-term memory into long-term memory buffer in sequence is unavailable. Besides, temporally adjacent frames may exhibit significant similarity in the video. To this end, we propose a method to merge temporally adjacent similar frames. This method transforms the dense tokens to the sparse memory and storing them in long-term memory. 
+
+\input{alg/longterm}
+
+To be specific, as shown in Algorithm~\ref{alg:longterm}, we conduct memory consolidation by merging the most similar tokens in the adjacent frames following ToMe~\cite{bolya2022token}. We found that the token enbedding in transformers already summarize the information of each frame for use in cos similarity $s$ as:
+\begin{equation}
+    s = \frac{1}{N} \sum_{j=1}^{N} \left [ \cos(\mathrm{x}_{i}^{j}, \mathrm{x}_{i+1}^{j}) \right ].
+\end{equation}
+We iteratively conduct this operation until the token count reaches the value set for each consolidation operation.
+
+\paragraph{Extend positional encoding.} For long-term memory, the number of tokens exceeds the maximum length of the pre-trained model positional encoding. Our model utilizes the positional encoding mechanism following BERT~\cite{kenton2019bert}, which results in a portion exceeding the length threshold $n$ without available positional encoding. In order to handle long enough long memory, we adopted the hierarchical decomposed positional encoding method proposed by Su~\etal~\cite{pos}, extending the absolute positional encoding of length $n$ to $n^2$.
+
+\subsection{Inference}
+
+Previous methods always use the representation of the whole video to conduct understanding and understanding and question-answering, which may fail in localizing specific moment especially in long videos. To this end, we propose two inference modes for long video understanding task as follows.
+
+\paragraph{Global mode.}
+
+Global mode is defined as the understanding and question-answering for the \textbf{whole} video. In this case, we only use long-term memory $\mathcal{L}$ as the video representation $\mathbf{V}$.
+
+\paragraph{Breakpoint mode.}
+
+Breakpoint mode is defined as understanding specific moments in a video. Since events have continuity, we need to consider not only the information directly related to the moments stored in short-term memory $\mathcal{S}$ but also the information indirectly related stored in long-term memory $\mathcal{L}$. Based on this, we hypothesize that when querying the movie at a specific moment, the video representation $\mathbf{V}$ should be the aggregation of $\mathcal{L}$, $\mathcal{S}$, and the current video clip feature $\mathbf{x}$. We found that simply concatenating these items yields excellent performance. We leave further exploration of additional aggregation choices for future work. future work.
+
+\vspace{10pt}
+
+After that, the video representation $\mathbf{V}$ goes through a q-former and a linear projection layer before being fed into the LLM, which can be formulated as:
+\begin{equation}
+    \mathbf{A} = \mathcal{L}(\mathbf{Q}, \mathcal{P} (\mathbf{V})),
+\end{equation}
+where $\mathcal{P}$ is the projection from visual space to text space, $\mathcal{L}$ is the large language model, $\mathbf{A}, \mathbf{Q}$ are the answer or instruction and the question.

@@ -1,0 +1,228 @@
+\section{Methodology}\label{sec:Method}
+
+% Figure environment removed
+
+We demonstrate the RL drag reduction framework on the flow past a 2D square bluff body at laminar regimes characterised by two-dimensional vortex shedding.
+We study the canonical flow behind a square bluff body due to the fixed separation of the boundary layer at the rear surface, which is relevant to road vehicle aerodynamics.
+Control is applied by two jet actuators at the rear edge of the body before the fixed separation and partial- or full-state observations are obtained from pressure sensors on the {downstream surface} or near wake region, respectively.
+The RL agent handles the optimisation, control and interaction with the flow simulation environment, as shown in figure \ref{fig:RL_framework}. The instantaneous signals $a_t$, $o_t$ and $r_t$ denote actions, observations and rewards at time step $t$.
+
+Details of the flow environment are provided in \S\ref{subsec:Flow}. The SAC and TQC RL algorithms used in this work are introduced in \S\ref{subsec:SACTQC}. The reward functions based on optimal energy efficiency are presented in \S\ref{subsec:Reward}. The method to convert a POMDP to an MDP by designing a dynamic  {feedback} controller for achieving nearly optimal RL control performance is discussed in \S\ref{subsec:PM_Dynamic}.
+
+
+
+\subsection{Flow environment}\label{subsec:Flow}
+The environment is a 2D Direct Numerical Simulation (DNS) of the flow past a square bluff body of height $B$. The velocity profile at the inflow of the computational domain is uniform with freestream velocity $U_\infty$.  {Length quantities are non-dimensionalised with the bluff body height $B$ and velocity quantities are non-dimensionalised with the freestream velocity $U_\infty$. Consequently, time is non-dimensionalised with $B/U_\infty$.} The Reynolds number, defined as $Re = U_{\infty} B/\nu$, is $100$. The computational domain is rectangular with boundaries at  $(-20.5,26.5)$ in the streamwise $x$ direction and $(-12.5,12.5)$ in the transverse $y$ direction. The centre of the square bluff body is at $(x,y) = (0,0)$. The flow velocity is denoted as $\boldsymbol{u} = (u,v)$ where $u$ is the velocity component in the $x$ direction and $v$ in the $y$ direction.
+
+The DNS flow environment is simulated using FEniCS and the Dolfin library \citep{logg_dolfin_2012}, based on the implementation of \cite{rabault_artificial_2019,rabault_accelerating_2019}. The incompressible unsteady Navier-Stokes equations are solved using a finite element method and the incremental pressure correction scheme \citep{goda_multistep_1979}. The DNS time step is $dt = 0.004$.  {More simulation details are presented in Appendix \ref{App:Sim_details}, including the mesh and boundary conditions.}
+
+Two blowing and suction jet actuators are placed on the top and bottom surfaces of the bluff body before separation. The velocity profile $\boldsymbol{U_{j}}$ of the two jets ($j=1, 2$; 1 for the top jet and 2 for the bottom jet) is defined as
+%
+\begin{equation}
+\boldsymbol{U_{j}} = \left(0, \quad \frac{3 Q_{j}}{2 w}\left[1-\left(\frac{2 x_j-L+w}{w}\right)^{2}\right]\right),
+\label{eq:jet_u}
+\end{equation}
+%
+where $Q_j$ is the mass flow rate of the jet $j$, and  {$L=B$ is the streamwise length of the body.  The width of the jet actuator is $w=0.1$, and the jets are located at $x_j \in [\frac{L}{2}-w,\frac{L}{2}]$, $y_j = \pm \frac{B}{2}$.}  
+A zero mass flow rate condition of the two jets enforces momentum conservation as
+\begin{equation}
+Q_{1}+Q_{2}=0.
+\label{eq:zero_mass}
+\end{equation}
+The mass flow rate of the jets is also constrained as $|Q_j|\leqslant0.1$ to avoid excessive actuation.
+
+In PM environments, $N$ vertically equispaced pressure sensors are placed on the  {downstream surface} of the bluff body, the coordinates of which are given by
+\begin{equation}
+\boldsymbol{P_{surf,k}}=\left(\frac{B}{2},\frac{-B}{2}+ k \frac{B}{N+1}\right),
+\label{eq:Probe_base}
+\end{equation}
+where $k = 1,2....,N$,  {and $N = 64$ unless specified.}
+In FM environments, $64$ pressure sensors are placed in the wake region with a refined bias close to the body. The locations of sensors in the wake are defined with sets $\boldsymbol{x_s} = \left[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0\right]$ and $\boldsymbol{y_s} = \left[-1.5, -1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 1.5\right]$, following the formula
+\begin{equation}
+\boldsymbol{P_{wake,i,j}}=\left(\frac{B}{2} + x_{s,i}, y_{s,j}\right),
+\label{eq:Probe_wake}
+\end{equation}
+where $i = 1,2....,8$ and $j = 1,2....,8$.
+
+The bluff body drag coefficient $C_{D}$ is defined as
+\begin{equation}
+C_{D}=\frac{F_{D}}{\frac{1}{2} \rho_{\infty} {U_{\infty}}^{2} B},
+\label{eq:CD}
+\end{equation}
+and the lift coefficient $C_{L}$ as
+\begin{equation}
+C_{L}=\frac{F_{L}}{\frac{1}{2} \rho_{\infty} {U_{\infty}}^{2} B},
+\label{eq:CL}
+\end{equation}
+where $F_{D}$ and $F_{L}$ are the drag and lift forces, defined as the surface integral of the pressure and viscous forces on the bluff body with respect to the $x$ and $y$ coordinates, respectively.
+
+%%%%% SAC&TQC %%%%%
+\subsection{Maximum entropy reinforcement learning of MDPs} \label{subsec:SACTQC}
+
+RL can be defined as policy search in a Markov Decision Process (MDP), with a tuple $(\mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R})$ where $\mathcal{S}$ is a set of states, and $\mathcal{A}$ is a set of actions. $\mathcal{P}\left(s_{t+1} \mid s_t, a_t\right)$ is a state transition function that contains the probability from current state $s_t$ and action $a_t$ to the next state $s_{t+1}$. $\mathcal{R}(s, a)$ is a reward function (cost function) to be maximised. The RL agent collects data as states $s_t \in \mathcal{S}$ from the environment, and a policy $\pi\left(a_t \mid s_t\right)$ executes actions $a_t \in \mathcal{A}$ to drive the environment to the next state $s_{t+1}$. 
+
+A state is considered to have the Markov property if the state at time $t$ retains all the necessary information to determine the future dynamics at $t+1$, without any information from the past \citep{sutton_reinforcement_2018}. This property can be presented as
+\begin{equation}
+\mathcal{P}\left\{r_{t+1}, s_{t+1} \mid s_{t}, a_{t}\right\} \equiv \mathcal{P}\left\{r_{t+1}, s_{t+1} \mid s_{0}, a_{0}, r_{1}, \ldots, s_{t-1}, a_{t-1}, r_{t}, s_{t}, a_{t}\right\}.
+\label{eq:markov_property}
+\end{equation}
+In the present flow control application, the control task can be regarded as an MDP if observations $o_t$ contain full-state information, i.e. $o_t = s_t$, and satisfy  \req{eq:markov_property}.
+
+SAC and TQC are two maximum entropy RL algorithms used in the present work. TQC is used by default since it is regarded as an improved version of SAC.
+The maximum entropy RL generally maximises
+\begin{equation}
+J\left(\pi\right) = \sum_{t=0}^T \mathbb{E} \left[r_t\left(s_t, a_t\right)+\alpha \mathcal{H}\left(\pi\left(\cdot \mid s_t\right)\right)\right],
+\label{eq:RL_Optimize}
+\end{equation}
+where $r_t$ is the reward (reward functions given in \S\ref{subsec:Reward}), and $\alpha$ is an entropy coefficient (known as ``temperature''), which controls the stochasticity (exploration) of the policy. For $\alpha=0$, the standard maximum reward optimisation in conventional reinforcement learning is recovered. The probability distribution (Gaussian distribution by default) of a stochastic policy is denoted by $\pi\left(\cdot \mid s_t\right)$. The entropy of $\pi\left(\cdot \mid s_t\right)$ is by definition \citep{shannon1948mathematical}
+\begin{equation}
+\mathcal{H}\left(\pi\left(\cdot \mid s_t\right)\right) = \mathbb{E} \left[ -\log\pi\left(\cdot \mid s_t\right)\right] = -\int_{\hat{a}_t} \pi\left(\hat{a}_t \mid s_t\right) \log \pi\left(\hat{a}_t \mid s_t\right) d \hat{a}_t,
+\label{eq:entropy}
+\end{equation}
+where the term $-\log\pi$ quantifies the uncertainty contained in the probability distribution, and $\hat{a}_t$ is a distribution variable of the action $a_t$. Therefore, by calculating the expectation of $-\log\pi$, the entropy increases when the policy has more uncertainties, i.e. the variance of $\pi\left(\hat{a}_t \mid s_t\right)$ increases.
+
+SAC is developed based on Soft Policy Iteration (SPI) \citep{haarnoja_soft_2018}. SPI uses a soft Q-function to evaluate the value of a policy and optimises the policy based on its value. The soft Q-function is calculated by applying a Bellman backup operator $\mathcal{T}^\pi$ as
+\begin{equation}
+\mathcal{T}^\pi Q\left({s}_t, {a}_t\right) \triangleq r_t\left({s}_t, {a}_t\right)+\gamma \mathbb{E}_{\mathbf{s}_{t+1} \sim \mathcal{P}}\left[V\left({s}_{t+1}\right)\right],
+\label{eq:Bellman}
+\end{equation}
+where $\gamma$ is a discount factor (here $\gamma=0.99$), and $V\left({s}_{t+1}\right)$ satisfies
+\begin{equation}
+V\left({s}_t\right)=\mathbb{E}_{{a}_t \sim \pi}\left[Q\left({s}_t, {a}_t\right)-\log \pi\left({a}_t \mid {s}_t\right)\right].
+\end{equation}
+The target soft Q-function can be obtained by repeating $Q = \mathcal{T}^\pi Q$, and the proof of convergence can be referred to as Soft Policy Evaluation (Lemma 1) in \cite{haarnoja_soft_2018}. With soft Q-function rendering values for the policy, the policy optimisation is given as Soft Policy Improvement (Lemma 2 in \cite{haarnoja_soft_2018}). 
+
+In SAC, a stochastic soft Q-function $Q_\theta\left({s}_t, {a}_t\right)$ and a policy $\pi_\phi\left({a}_t \mid {s}_t\right)$ are parameterised by artificial neural networks $\theta$ (critic) and $\phi$ (actor), respectively. 
+During training, $Q_\theta\left({s}_t, {a}_t\right)$ and $\pi_\phi\left({a}_t \mid {s}_t\right)$ are optimised with stochastic gradients ${\nabla}_{\theta}J_Q(\theta)$ and $\nabla_\phi J_\pi(\phi)$ designed corresponding to Soft Policy Evaluation and Soft Policy Improvement respectively (see equation (6) and (10) in \cite{haarnoja_soft_2018}). With these gradients, SAC updates the critic and actor networks by
+\begin{equation}
+\theta \leftarrow \theta-\lambda_Q {\nabla}_{\theta} J_Q\left(\theta\right),
+\label{eq:Q_update}
+\end{equation}
+\begin{equation}
+\phi \leftarrow \phi-\lambda_\pi \nabla_\phi J_\pi(\phi),
+\label{eq:Pi_update}
+\end{equation}
+where $\lambda_Q$ and $\lambda_\pi$ are the learning rates of Q-function and policy, respectively.
+Typically, two Q-functions are trained independently, and then the minimum of the Q-functions is brought into the calculation of stochastic gradient and policy gradient. This method is also used in our work to increase the stability and speed of training.
+SAC also supports automatic adjustment of temperature $\alpha$ by optimisation, 
+\begin{equation}
+\alpha^*=\arg \min _{\alpha} \mathbb{E}_{{a}_t \sim \pi^*}\left[-\alpha \log \pi^*\left({a}_t \mid {s}_t ; \alpha\right)-\alpha \overline{\mathcal{H}}\right].
+\label{eq:temp_optimize}
+\end{equation}
+This adjustment transforms a hyperparameter-tuning challenge into a trivial optimisation problem  \citep{haarnoja_soft_2018}.
+
+TQC \citep{kuznetsov_controlling_2020} can be regarded as an improved version of SAC as it alleviates the overestimation bias of the Q-function on the basic algorithm of SAC. 
+TQC adapts the idea of distributional reinforcement learning with quantile regression, i.e. QR-DQN \citep{dabney_distributional_2018}, to format the return function $R(s, a):=\sum_{t=0}^{\infty} \gamma^t r_t\left(s_t, a_t\right)$ into a distributional representation with Dirac delta functions as 
+\begin{equation}
+R_{\psi}(s, a):=\frac{1}{M} \sum_{m=1}^M \delta\left(z_{\psi}^m(s, a)\right),
+\label{eq:R_distribution}
+\end{equation}
+where $R(s, a)$ is parameterised by $\psi$, and $R_{\psi}(s, a)$ is converted into a summation of $M$ ``atoms'' as $z_{\psi}^m(s, a)$. Here only one approximation of $R(s, a)$ is used for demonstration.
+Then, only $k$ smallest atoms of $z_{\psi}^m(s, a)$ are preserved as a truncation to obtain
+truncated atoms 
+\begin{equation}
+y_i(s, a):=r(s, a)+\gamma\left[z_{\psi}^i\left(s^{\prime}, a^{\prime}\right)-\alpha \log \pi_\phi\left(a^{\prime} \mid s^{\prime}\right)\right], \quad i \in[1 . . k],
+\label{eq:truncated_atoms}
+\end{equation}
+where $s^{\prime} \sim \mathcal{P}(\cdot \mid s, a)$ and $ a^{\prime} \sim \pi\left(\cdot \mid s^{\prime}\right)$. The truncated atoms form a target distribution as 
+\begin{equation}
+Y(s, a):=\frac{1}{k} \sum_{i=1}^{k} \delta\left(y_i(s, a)\right),
+\label{eq:target_distribution}
+\end{equation}
+and the algorithm minimises the 1-Wasserstein distance between the original distribution $R_{\psi}(s, a)$ and the target distribution $Y(s, a)$ to obtain a truncated quantile critic.
+Further details, such as the design of loss functions and the pseudocode of TQC, can be found in \cite{kuznetsov_controlling_2020}.
+
+In this work,  {SAC and TQC are implemented based on Stable-Baselines3 and Stable-Baselines3-Contrib \citep{stable-baselines3}.} The RL interaction runs on a longer time step $t_a = 0.5$ compared to the numerical time step $dt$. This means RL-related data $o_t$, $a_t$ and $r_t$ are sampled every $t_a$ time interval. With a different numerical step and an RL step, control actuation $c_{n_s}$ for every numerical step should be distinguished from action $a_t$ in RL. There are $\frac{t_a}{dt}=125$ numerical steps between two RL steps, and control actuation is applied based on a first-order-hold function as
+\begin{equation}
+c_{n_s}= a_{t-1} + (a_t - a_{t-1})\frac{n_s dt}{t_a},
+\label{eq:FOH_action}
+\end{equation}
+where $n_s$ denotes the number of numerical steps after generating the current action $a_t$ and before the next action $a_{t+1}$ generated. Equation \req{eq:FOH_action} smooths the control actuation with linear interpolation to avoid numerical instability.
+Unless specified, the neural network configuration is set as 3 layers of 512 neurons for both actor and critic. The entropy coefficient in \req{eq:RL_Optimize} is initialised to $0.01$ and automatically tuned based on \req{eq:temp_optimize} during training.  {See Table \ref{tab:hyperparams} in Appendix \ref{App:Hyperparameters} for more details of RL hyperparameters.}
+
+
+\subsection{Reward design for optimal energy efficiency} \label{subsec:Reward}
+
+We propose a hyperparameter-free reward function based on net power saving to discover energy-efficient flow control policies, calculated as the difference between the power saved from drag reduction $\Delta P_{D}$ and the power consumed from actuation $P_{act}$. Then, the power reward (``PowerR'') at the RL control frequency is
+%
+\begin{equation}
+r_t= \underbrace{\Delta P_{D}}_{\textrm{power saved}}- \underbrace{P_{act}}_{\textrm{power spent}}.
+\label{eq: PowerR}
+\end{equation}
+%
+The power saved from drag reduction is given by 
+\begin{equation}
+\Delta P_{D} = P_{D0}-P_{Dt} = \left(\left\langle F_{D0}\right\rangle_T - \left\langle F_{Dt}\right\rangle_a\right) U_{\infty},
+\label{eq: Drag Power Saving}
+\end{equation}
+where $P_{D0}$ is the time-averaged baseline drag power without control, and $\left\langle F_{D0}\right\rangle_T$ is the time-averaged baseline drag over a sufficiently long period. $P_{Dt}$ denotes the time-averaged drag power calculated from the time-averaged drag $\left\langle F_{Dt}\right\rangle_a$ during one RL step $t_a$. Specifically, $\langle ~ 
+ \rangle_a$ quantities are calculated at each RL step using 125 DNS samples. 
+The jet power consumption of actuation $P_{act}$ \citep{barros_bluff_2016} is defined as
+\begin{equation}
+P_{act}=\sum_{j=1}^2\left|\rho_{\infty} \langle U_{j} \rangle_a^{3} S_{j}\right| = \sum_{j=1}^2\left|\frac{ \left\langle a_{t}\right\rangle_a^{3}}{\rho_{\infty}^{2} S_{j}^{2}}\right|,
+\label{eq: Actuation Power}
+\end{equation}
+where $\langle U_{j} \rangle_a$ is the average jet velocity, and $S_j$ denotes the area of one jet. 
+
+The reward function given by  \req{eq: PowerR} quantifies the control efficiency of a controller directly. Thus, it guarantees the learning of a control strategy which simultaneously maximises the drag reduction and minimises the required control actuation. Additionally, this energy-based reward function avoids the effort of hyperparameter tuning.
+
+All the cases in this work use the power-based reward function defined in \req{eq: PowerR} unless otherwise specified. For comparison, a reward function based on drag and lift coefficient (``ForceR'') is also implemented, as suggested by \citep{rabault_artificial_2019} with a pre-tuned hyperparameter $\epsilon=0.2$, as
+\begin{equation}
+r_t^a= C_{D0} - \left\langle C_{Dt}\right\rangle_a - \epsilon\left| \left\langle C_{Lt}\right\rangle_a\right|,
+\label{eq: DragR}
+\end{equation}
+where $C_{D0}$ and $\left\langle C_{Dt}\right\rangle_a$ are calculated from a constant baseline drag and RL-step-averaged drag and lift. The RL-step-averaged lift $\left| \left\langle C_{Lt}\right\rangle_a\right|$ is used to penalise the amplitude of actuation on both sides of the body, avoiding excessive lift force (i.e. the lateral deflection of the wake reduces the drag but increases the side force), and indirectly penalising control actuation and the discovery of unrealistic control strategies. $\epsilon$ is a hyperparameter designed to balance the penalty on drag and lift force. 
+
+The instantaneous versions of these two reward functions are also investigated for practical implementation purposes (both experimentally and numerically) because they can significantly reduce memory used during computation and also support a lower sampling rate. These instantaneous reward functions are computed only from observations at each RL step. In comparison, the reward functions above take into account the time history between two RL steps, while the instantaneous version of the power reward (``PowerInsR'') is defined as
+\begin{equation}
+r_{t,ins}= \Delta P_{D,ins}-P_{act,ins},
+\label{eq: InsPowerR}
+\end{equation}
+where $\Delta P_{D,ins}$ is given by
+\begin{equation}
+\Delta P_{D,ins}= \left(\left\langle F_{D0}\right\rangle_T -  F_{Dt}\right) U_{\infty},
+\label{eq: Ins Drag Power}
+\end{equation}
+and $P_{act,ins}$ is defined as 
+\begin{equation}
+P_{act,ins}=\sum_{j=1}^2\left|\rho_{\infty} \overline{U_{j}}^{3} S_{j}\right| = \sum_{j=1}^2\left|\frac{ a_{t}^{3}}{\rho_{\infty}^{2} S_{j}^{2}}\right|.
+\label{eq: Ins Actuation Power}
+\end{equation}
+Notice that the definition of reward in \req{eq: InsPowerR} - \req{eq: Ins Actuation Power} is similar to \req{eq: PowerR} - \req{eq: Ins Actuation Power}, and the only difference is that the average operator $\langle ~ 
+ \rangle_a$ is removed.
+Similarly, the instantaneous version of the force-based reward function (``ForceInsR'') is defined as
+\begin{equation}
+r_{t,ins}^a= C_{D0} - C_{Dt} - \epsilon\left| C_{Lt}\right|.
+\label{eq: InsDragR}
+\end{equation}
+In \S\ref{subsec:Rewards_Study}, we present results on the study of different reward functions and compare the RL performance.
+
+\subsection{POMDP and dynamic  {feedback} controllers}\label{subsec:PM_Dynamic}
+
+In practical applications, the Markov property \req{eq:markov_property} is often not valid due to noise, broken sensors, partial state information and delays. This means the observations available to the RL agent do not provide full or true state information, i.e. $o_t \neq s_t $, while in MDP $o_t = s_t $. Then, RL can be generalised as POMDP  defined as a tuple $(\mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \mathcal{Y}, \mathcal{O})$, where $\mathcal{Y}$ is a finite set of observations $o_t$ and $\mathcal{O}$ is an observation function that relates observations to underlying states.
+
+With only PM available in the flow environments (sensors on the  {downstream surface} of the body instead of in the wake), the spatial information is missing along the streamwise direction. Takens' embedding theorem \citep{takens_detecting_1981} states that the underlying dynamics of a high-dimensional dynamical system can be reconstructed from low-dimensional measurements with their time history. Therefore, past measurements can be incorporated into a sufficient statistic. Furthermore, convective delays may be introduced in the state observation since the sensors are not located in the wavemaker region of the flow. According to \cite{altman1992closed}, past actions are also required in the state of a delayed problem to reduce it into an undelayed problem. This is because a typical delayed-MDP (DMDP) implicitly subverts the Markov property, as the past measurements and actions only encapsulate partial information. 
+
+Therefore, combining the ideas of augmenting past measurements and past actions, we form a sufficient statistic \citep{bertsekas_dynamic_2012} for reducing the POMDP problem to an MDP, defined as
+\begin{equation}
+I_k= [p_0,...,p_k, a_0,...,a_{k-1}],
+\label{eq:Sufficient_statistic}
+\end{equation}
+which consists of the time history of pressure measurements $p_0,...,p_k$ and control actions $a_0,...,a_{k-1}$ at time steps $0,...,k$. This enlarged state at time $k$ contains all the information known to the controller at time $k$. 
+
+However, the size of the sufficient statistic in \req{eq:Sufficient_statistic} grows over time, leading to a non-stationary closed-loop system and introducing a challenge in RL since  the number of inputs to the networks varies over time. This problem can be solved by reducing \req{eq:Sufficient_statistic} to a finite-history approximation \citep{white_iii_finite-memory_1994}. The controller using this finite-history approximation of the sufficient statistic is usually known as a ``finite-state'' controller, and the error of this approximation converges as the size of the finite history increases \citep{yu_near_2008}. The trade-off is that the dimension of the input increases based on the history length required.  
+The nonlinear policy, which is parameterised by a neural network controller, has an algebraic description 
+\begin{equation}
+a_t \sim \pi_{\phi} \left(a_t \mid \underbrace{a_{t-1}, a_{t-2}, \ldots, a_{t-N_{fs}-1}}_{\text{past actions}}, p_t, \underbrace{p_{t-1}, p_{t-2}, \ldots, p_{t-N_{fs}}}_{\text{past measurements}} \right),
+\label{eq:NARX}
+\end{equation}
+where $p_t$ represents pressure measurements at time step $t$, and $N_{fs}$ denotes the size of the finite history. The above expression \label{eq:NARX} is equivalent to a nonlinear autoregressive exogenous model (NARX). 
+
+A ``frame stack'' technique is used to feed the ``finite history sufficient statistic'' to the RL agent as input to both the actor and critic neural networks. Frame stack constructs the observation $o_t$ from the latest actions and measurements at step $t$ as a ``frame'' $ o_t = (a_{t-1}, p_t)$, and piles up the finite history of $N_{fs}$ frames together into a stack. The number of stacked frames is equivalent to the size of the finite history $N_{fs}$. 
+
+The neural network controller trained as a NARX model benefits from past information to approximate the next optimised control action since the policy has been parameterised as a nonlinear transfer function. Thus, a controller parameterised as a NARX model is denoted as a ``dynamic  {feedback}'' controller because the time history in the NARX model contains dynamic information of the system. Correspondingly, a controller fed with only the latest actions  {$a_{t-1}$} and  {current} measurements  {$p_t$} is denoted as a ``static  {feedback}'' controller  {because no past information from the system is fed into the controller}. 
+
+% Figure environment removed
+
+Figure \ref{fig:Case_Demo} demonstrates three cases with both FM and PM environments which will be investigated. In the FM environment, sensors are located in the wake as $\boldsymbol{P_{surf}}$ given by \req{eq:Probe_base}. In the PM environment, sensors are placed only on the back surface of the body as $\boldsymbol{P_{wake}}$  given by \req{eq:Probe_wake}. The static  {feedback} controller is employed in the FM environment, and both static and dynamic  {feedback} controllers are applied in the PM environment.
+Results will be shown with $N_{fs} = 27$, and in \S\ref{subsec:Nfs}, a parametric study of the effect of the finite history length is presented.

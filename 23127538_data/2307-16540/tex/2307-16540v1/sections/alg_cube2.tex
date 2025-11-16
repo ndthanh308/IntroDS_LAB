@@ -1,0 +1,97 @@
+\subsection{Avoiding Redundant Work}
+\label{sub:cubes}
+
+\begin{algorithm}[t!]
+\caption{Managing cubes representing unprocessed join input.\label{alg:cubes}}
+\renewcommand{\algorithmiccomment}[1]{// #1}
+\begin{small}
+\begin{algorithmic}[1]
+\State $U\gets\emptyset$ \Comment{Global variable representing unprocessed cubes}
+\vspace{0.25cm}
+\State \textbf{Input:} Query $q$, number of threads $n$.
+\State \textbf{Effect:} Initialize set of unprocessed cubes.
+\Procedure{TM.Init}{$q, n$}
+\State $A\gets$ attributes that appear in $q$ in equality join conditions
+\State $[l_a,u_a]\gets$ attribute value ranges for all attributes $a\in A$
+\State \Comment{Identify attribute with largest value domain}
+\State $a^*\gets\arg\max_{a\in A}(u_a-l_a)$
+\State \Comment{Use full value range for all but that attribute}
+\State $f\gets\times_{a\in A:a\neq a^*}[l_a,u_a]$
+\State \Comment{Divide largest value domain into per-thread ranges}
+\State $\delta\gets (u_{a^*}-l_{a^*})/n$
+\State \Comment{Form one unprocessed cube per thread}
+\State $U\gets\{f\times [l_{a^*}+i\cdot\delta,l_{a^*}+(i+1)\cdot\delta|0\leq i<n]\}$
+\EndProcedure
+\vspace{0.25cm}
+\State \textbf{Output:} Returns an unprocessed hypercube.
+\Function{TM.Retrieve}{}
+\State \Return Randomly selected cube from $U$
+\EndFunction
+\vspace{0.25cm}
+\State \textbf{Input:} Target cube $c$ to subtract, processed cube set $P$.
+\State \textbf{Effect:} Updates set of unprocessed cubes.
+\Procedure{TM.Remove}{$c, P$}
+\State \Comment{Subtract target cube from unprocessed cubes}
+\State $U \gets U \setminus c$
+\State \Comment{Add complement of processed cubes as unprocessed}
+\For{$p \in P$}
+\State \Comment{Get dimensions where $p$ fully covers $c$}
+\State $F\gets$ indexes $i$ s.t.\ $p.l_i=c.l_i$ and $p.u_i=c.u_i$
+\State \Comment{Get dimensions where $p$'s bounds collapse}
+\State $S\gets$ indexes $i$ s.t.\ $p.l_i=p.u_i$
+\State \Comment{Get single remaining dimension}
+\State $d\gets$ single remaining dimension not in $F$ or $S$
+\State Create new cube $u$ s.t.\
+\State $\quad$ $u_{d}=(p.u_d,c.u_d]$; $\forall f\in F:u_f=p_f$; $\forall s\in S:u_s=p_s$
+\State \Comment{Add newly created cube to unprocessed cubes}
+\If{$u$ is not empty}
+\State $U\gets U\cup\{u\}$
+\EndIf
+\EndFor
+\EndProcedure
+\vspace{0.25cm}
+\State \textbf{Output:} True iff no unprocessed cubes are left.
+\Function{TM.Finished}{}
+\State \Return{\textbf{true} iff $U=\emptyset$}
+\EndFunction
+\end{algorithmic}
+\end{small}
+\end{algorithm}
+
+ADOPT changes between different attribute orders over the course of query processing. This creates the risk of redundant work across different orders. ADOPT avoids redundant work by keeping track of cubes, in the space of join attribute values, that have not been considered yet. More precisely, ADOPT keeps track, at any point in time, of remaining, i.e.\ unprocessed, cubes. Whenever one of the processing threads requests a new cube to work on, ADOPT returns an unprocessed cube, thereby avoiding redundant work.
+
+
+
+Algorithm~\ref{alg:cubes} gives functions used to manipulate cubes. At the beginning (Procedure~\textproc{TM.Init}), it initializes the set of unprocessed cubes to cover the entire attribute space. To do so, ADOPT first retrieves all join attributes \revision{(Line~5)}, then their value ranges \revision{(Line~6)}. Forming one single cube (i.e., the Cartesian product of all value ranges) diminishes chances for parallelization, at least at the start of query processing. Hence, ADOPT divides the attribute value space into equal-sized cubes with one cube per thread \revision{(Lines~7 to 14)}. To do so, it uses the attribute with maximal value domain, dividing its range equally across threads \revision{(Line~12)}. \revision{Note that, as discussed in the following, threads are not restricted to processing cubes initially assigned to them over the entire course of query evaluation. Instead, at the end of each episode, unprocessed parts of cubes assigned to a specific thread may get re-assigned to other threads.}
+
+Whenever a worker threads requests a cube to work on \revision{(Line~13 in Algorithm~\ref{alg:anytimeLFTJ})}, a randomly selected cube from the set of unprocessed cubes is returned \revision{(Line~18 in Algorithm~\ref{alg:cubes})}. Note that the pseudo-code is slightly simplified, compared to the implementation, by omitting checks used to avoid concurrent changes to the set of unprocessed cubes (by multiple threads). 
+
+Whenever a worker threads finished processing, it registers a set of cubes that was processed. It calls Procedure~\textproc{TM.Remove} to update the set of unprocessed cubes. This function takes two parameters, representing the set of processed cubes as well as the target cube, as input. All processed cubes are contained within the target cube and have a special structure, explained in the following. As a first step, ADOPT removes the target cube from the set of unprocessed cubes \revision{in Line24} (the target cube was selected by an invocation of the \textproc{TM.Retrieve} function and is therefore contained in the set $U$). If the set of processed cubes, in aggregate, do not cover the target cube (in general, that is the case), the set of unprocessed cubes is now missing all cubes contained in the target cube but not covered by the processed cubes. Hence, ADOPT adds more unprocessed cubes to reflect the difference.
+
+Each processed cube has a special form, due to the structure of the join algorithm generating it (Lines~23 to 28 in Algorithm~\ref{alg:joinOneCube}). All processed cubes are generated according to the same attribute order and based on the same, final values selected for each attribute. Consider one single processed cube, using the selected attribute values $v_s$ for a prefix $S$ of the attribute order, the range of values up to the selected value $v_d$ for a single attribute $d$, and the full target cube range for the remaining attributes $F$. Clearly, given the selected values for attributes $S$, none of the values greater than $v_d$ for attribute $d$ has been considered by the join algorithm (instead, such value combinations would have been considered later by the join algorithm). Hence, the corresponding cube is added to the set of unprocessed cubes \revision{(Line~37)}. Also note that these unprocessed cubes cannot overlap (as, for each pair of unprocessed cubes, there is at least one attribute $a$ for which one cube fixes a value $v_a$, the other cube covers only values greater than $v_a$). This preserves the invariant that elements of $U$, representing unprocessed cubes, do not overlap. It also means that work done by different threads does not overlap. The processing finishes (Procedure~\textproc{TM.Finished}) whenever no unprocessed cubes are left.
+
+\tikzstyle{values}=[only marks, mark=x, draw=black, mark size=6, ultra thick]
+\tikzstyle{processedcube}=[fill=blue!20]
+\tikzstyle{unprocessed}=[ultra thick, draw=red]
+
+% Figure environment removed
+
+% % Figure environment removed
+
+\begin{example}
+\label{ex:cube-removal}
+\rm
+Figure~\ref{fig:removal} illustrates the processing of a target cube $([1,5], [1,5], [1,5])$ for an attribute order ($A_0$,$A_1$,$A_2$). In each sub-plot, the x-axis represents attributes while the y-axis represents attribute values.  Assume the timeout for this episode occurs after considering the values $(5,3,4)$ (marked by X). This means that we managed to process the following sub-cubes, left: $([1-4], [1-5], [1-5])$, middle: $(5, [1-2], [1-5])$, right: $(5, 3, [1-4])$. We infer the remaining unprocessed sub-cubes that complement these processed sub-cubes with respect to the target cube, left: $(5, [1-5], [1-5])$, middle: $(5, [4-5], [1-5])$, right:$(5, 3, 5)$.
+
+\nop{
+A timeout occurs during join processing after considering values (5,3,4) for the three attributes (in attribute order, selected values are marked by X). 
+Each of the three sub-plots, from left to right, represents one of the processed cubes generated in that order via the loop from Lines~30 to 36 in Algorithm~\ref{alg:joinOneCube}. The extent of processed cubes, for each attribute, is marked up in blue. E.g., for the left-most plot, the processed cube is defined as $[1,4]\times[1,5]\times[1,5]$. For each processed cube, an unprocessed cube is added in Lines~26 to 39 in Algorithm~\ref{alg:cubes}, such that the unprocessed cubes together cover all unprocessed values. The value ranges of unprocessed cubes are marked as red rectangles. 
+}
+
+% For instance, in the left-most plot, the associated, unprocessed cubes is empty.
+\end{example}
+
+% \begin{example}
+% Figure~\ref{fig:removal} illustrates removal of processed cubes. We consider a query with three attributes. In each sub-plot, the x-axis represents the attribute while the y-axis represents attribute value ranges. Hence, each sub-plot describes a cube which corresponds to the Cartesian product of the value ranges colored in blue. E.g., the plot in the left-upper corner represents the cube $[1,4]\times[1,5]\times[1,5]$.
+% A timeout occurs during join processing after selecting values (5,3,4) for the three attributes (in attribute order). The upper row in Figure~\ref{fig:removal} shows the three processed cubes that result from this final state. From left to right, processed cubes are generated in that order via the loop from Lines~30 to 36 in Algorithm~\ref{alg:joinOneCube}. The cubes on the bottom represent the corresponding complement of unprocessed cubes. Note that the left-most cube is empty (it is therefore not added to the unprocessed cubes). The right-most unprocessed cube, for instance, captures, for fixed values in the first two attributes, the fact that value five for the last attribute was not considered yet.
+% \end{example}

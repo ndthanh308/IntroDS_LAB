@@ -1,0 +1,85 @@
+\section{3D-to-2D Generative Pre-training}
+\subsection{Preliminary: Generative Pre-training}
+
+Generative pre-training is a fundamental branch of pre-training methods that aims at reconstructing integral and complete data given partial or disrupted input. Mathematically, suppose $x$ is a sample from raw data with no annotation. The pre-processing step $T(\cdot)$ either erases part of $x$ randomly or splits $x$ into pieces and intermingles them to get $\tilde{x}=T(x)$. The generative pre-training model $M$ is designed to restore from those broken input $\hat{x}=M(T(x))$ and the training loss function is designed to measure the reconstruction distance $\mathcal{L}=D(\hat{x}, x)$.
+In point cloud object analysis, earlier generative pre-training methods propose various pretext tasks as $T$, including deformation~\cite{achituve2021self}, jigsaw puzzles~\cite{Jigsaw3D} and depth projection~\cite{occo} to produce disarrayed or partial point clouds. Recently, inspired by MAE~\cite{mae} in the image domain, generative pre-training in 3D domain mainly focuses on implementing random masking as $T$ and utilizing Transformers model as $M$ for reconstruction~\cite{yu2022point, pang2022masked, liu2022masked, pointm2ae}. The reconstruction distance $D$ is usually measured by the classical $l_2$ Chamfer Distance:
+\begin{equation}
+    D(\hat{x},x)=\frac{1}{\lvert \hat{x}\rvert}\sum_{a\in \hat{x}}\min_{b\in x}\lVert a-b \rVert_2^2 + \frac{1}{\lvert x\rvert}\sum_{b\in x}\min_{a\in \hat{x}}\lVert a-b \rVert_2^2
+\label{eq:chamfer}
+\end{equation}
+Besides Chamfer Distance between point clouds, some methods also exploit feature distance between latents~\cite{yu2022point} or occupancy value distance~\cite{liu2022masked} as the loss function. 
+
+The exact reason why generative pre-training would help enhance the representation ability of backbone models still remains an open question. However, abundant experimental results have conveyed that predicting missing parts according to known parts demands high reasoning ability and global comprehension capacity of the model. What's more, generative pre-training is more efficient and suitable for point cloud object analysis than contrastive pre-training, given that contrastive pre-training typically requires a large amount of training data to avoid trivial overfitting solutions but there has always been a data-starvation problem in point cloud object research field. 
+
+\subsection{Overall Pipeline}
+
+Different from the aforementioned generative pre-training methods that focus on uni-modal point cloud reconstruction, we propose a novel cross-modal pre-training approach of generating view images from instructed camera poses. 
+
+The overall architecture of our proposed TAP pre-training model is depicted in Figure~\ref{fig:pipeline}. Our model takes as an input point cloud $P\in \mathbb{R}^{N\times 3}$, where $N$ is the number of points in the input point cloud. The basic building block of TAP mainly consists of: 1) a \textit{3D Backbone} that extracts 3D geometric features $F_\textrm{3d}\in \mathbb{R}^{n\times C_\textrm{3d}}$, where $n$ is the number of downsampled center points and $C_\textrm{3d}$ is the geometric feature dimension; 2) a \textit{pose-dependent Photograph Module} that takes as inputs $F_\textrm{3d}$ and pose matrix $R\in \mathbb{R}^{3\times 3}$, and predicts view image features $F_\textrm{2d}^R\in \mathbb{R}^{h\times w\times C_\textrm{2d}}$ conditioned on $R$, where $h, w$ are height and width of predicted view image feature map; 3) an \textit{2D Generator} that decodes $F_\textrm{2d}^R$ into an RGB image $I^R_\textrm{gen}\in \mathbb{R}^{H\times W\times 3}$, where $H, W$ are height and width of the output view image. 
+
+As we place no restriction on $F_\textrm{3d}$, the \textit{3D Backbone} can be arbitrarily chosen and adopted. Therefore, our TAP is more flexible and compatible than existing generative pre-training methods that are limited to Transformer-based architecture. Experimental results in Section~\ref{sec:exp} will later verify that TAP brings consistent improvement to all kinds of point cloud models. The technical designs of the \textit{pose-dependent Photograph Module} will be thoroughly discussed in Section~\ref{sec:photo_module}. The \textit{2D Generator} consists of four Transpose Convolution layers to progressively upsample image resolution and decode RGB colors of each pixel.
+
+\subsection{Photograph Module}
+\label{sec:photo_module}
+
+\noindent\textbf{Architectural Design.} As illustrated in Figure~\ref{fig:pipeline}, we leverage cross-attention mechanism from Transformers~\cite{vaswani2017attention} to build our \textit{pose-dependent Photograph Module}.
+\begin{equation}
+    \textrm{Attention}(Q,K,V) = \textrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\end{equation}
+where $d_k$ is the scaling factor, and $Q,K,V$ are quries, keys and values matrix. More specifically, we design a Query Generator $\Phi$ to encode camera pose conditions into query tokens: $Q=\Phi(R)\in \mathbb{R}^{hw\times C_\textrm{2d}}$. We also design a Memory Builder $\Theta$ to construct $K$ and $V$ from 3D geometric features: $K=V=\Theta(F_\textrm{3d})\in \mathbb{R}^{m\times C_\textrm{2d}}$, where $m$ is the number of memory tokens. The output sequence of the cross attention layers will be rearranged from $hw \times C_\textrm{2d}$ to $h\times w \times C_\textrm{2d}$, forming the predicted view image features $F_\textrm{2d}^R$.
+
+During the cross-attention calculation process, we do not explicitly provide any projection clues of which 3D points would project to which 2D pixel. Instead, the Photograph Module learns by itself how to arrange unordered 3D feature points to ordered 2D pixel grids, purely based on semantic similarities between 3D geometric features and our delicately-designed queries that reveal pose information. Since one sample will only have one set of memory tokens in 3D space but its view images from different poses are quite distinct from each other, learning to predict precise view images from instructed poses in a data-driven manner is not a trivial task. Therefore, during the end-to-end optimization process, the 3D backbone is trained to have a stronger perception of the object's overall geometric structure and gain a higher representative ability of the stereoscopic relations. In this way, our proposed 3D-to-2D generative pre-training would help exploit the potential and enhance the strength of 3D backbone models.
+
+\vspace{5pt}
+\noindent\textbf{Query Generator.} The query generator $\Phi$ is designed to encode pose condition $R$ into 2D grid of shape $h\times w$. In object analysis, common practice is leveraging parallel light shading to project 3D objects onto 2D grids, and pose matrix $R$ here is used to rotate objects into desired angles before projection. Therefore, each 2D grid actually represents an optical line that starts from infinity, passes through 3D objects and ends at the 2D plane. As a consequence, we choose the direction and the origin points that the optical line goes through as the delegate of the query grid. 
+
+Before deriving formulations of optical lines for each grid, let us first revisit the parallel light shading process for better comprehension. Given 3D coordinates $\mathbf{x}=(x,y,z)$ of a point cloud $P$ and pose matrix $R$, rotation is first performed to align the object to the ideal pose position:
+\begin{equation}
+    \mathbf{x'}=(x',y',z')=R\mathbf{x}
+\label{eq:rotate}
+\end{equation}
+Then we just omit the final dimension $z'$ and evenly split the first two dimensions $(x',y')$ into 2D grids $(u,v)$:
+\begin{equation}
+\begin{aligned}
+    u = \frac{x'-x_0}{g_h} + o_h, \quad
+    v = \frac{y'-y_0}{g_w} + o_w
+\label{eq:proj}
+\end{aligned}
+\end{equation}
+where $(x_0, y_0)$ is the minimum value of $(x',y')$, $(g_h, g_w)$ is the grid size, $(o_h, o_w)$ is the offset value to place the projected object at the center of the image. $0\leq u \leq h-1, 0\leq v \leq w-1$ and $(u,v)$ is a sampled pixel coordinate from the 2D grid.
+
+Now let us begin to derive formulations of the optical line that passes through the query grid. We only know $(u,v)$ for each grid and we want to reversely trace which 3D points $(x,y,z)$ are on the same optical line during parallel light projection. According to Eq.~\ref{eq:proj}:
+\begin{equation}
+\begin{aligned}
+    x' &= g_h u + x_0 - o_h = \Psi_h(u) \\
+    y' &= g_w v + y_0 - o_w = \Psi_w(v)
+\end{aligned}
+\end{equation}
+If we denote $A=R^{-1}$ and $A_{ij}$ as the element at $i^{th}$ row and $j^{th}$ column, then according to Eq.~\ref{eq:rotate}:
+\begin{equation}
+\begin{aligned}
+    x &= A_{11}\Psi_h(u) + A_{12}\Psi_w(v) + A_{13}z' = \Omega_x(u,v) + A_{13}z' \\
+    y &= A_{21}\Psi_h(u) + A_{22}\Psi_w(v) + A_{23}z' = \Omega_y(u,v) + A_{23}z' \\
+    z &= A_{31}\Psi_h(u) + A_{32}\Psi_w(v) + A_{33}z' = \Omega_z(u,v) + A_{33}z' 
+\label{eq:line}
+\end{aligned}   
+\end{equation}
+According to the definition of line's parametric equation, Eq.~\ref{eq:line} represents a line passing through the origin point $O:(\Omega_x(u,v), \Omega_y(u,v), \Omega_z(u,v))$ with optical line direction $\mathbf{d}=(A_{13}, A_{23}, A_{33})$, where $\Omega_x, \Omega_y, \Omega_z$ are $xyz$ coordinates of $O$ and their formulations are conditioned on $u,v$. Therefore, we concatenate the coordinate of origin point $O$, normalized direction $\mathbf{d}^\dagger = \mathbf{d} / \lVert \mathbf{d} \rVert_2$ and normalized position $(u/h,v/w)$ as positional embedding together to be the initial state of our query. A multi-layer-perceptron (MLP) module is later leveraged to map the 8-dim initial query to higher dimensional space.
+
+\vspace{5pt}
+\noindent\textbf{Memory Builder.} The memory builder takes $F_\textrm{3d}$ as input to prepare for initial state of $K, V$ in cross-attention layers. We first concatenate aligned 3D coordinate $P_\textrm{3d}$ with 3D features to enhance the geometric knowledge of $F_\textrm{3d}$:
+\begin{equation}
+    \hat{F}_\textrm{3d} = \mathrm{MLP}(\mathrm{cat}(F_\textrm{3d}, P_\textrm{3d}))
+\end{equation}
+Additionally, we initialize a learnable memory token $T_\textrm{pad}$ as the pad token and concatenate it with $\hat{F}_\textrm{3d}$ to obtain the initial state of $K, V$. The reason for concatenating a learnable pad token $T_\textrm{pad}$ is that there are white background areas on the projected image (as shown in Figure~\ref{fig:pipeline}). As $F_\textrm{3d}$ only encodes foreground objects, we further need a learnable pad token to represent background regions. Otherwise, the cross-attention layers will be confused to learn how to combine foreground tokens into background features and this will inevitably diminish the pre-training effectiveness.
+
+\subsection{Objective Function}
+
+We perform per-pixel supervision with Mean Squared Error (MSE) loss between generated view image $I^R_\textrm{gen}$ and ground truth image $I^R_\textrm{gt}$, aligned by camera pose $R$. For simplicity, we will omit $R$ in later formulations. As the background of the rendered ground truth images is all white and reveals little information, we further design a compound loss to balance the weight between foreground regions and background regions:
+\begin{equation}
+    \mathcal{L}(I_\textrm{gen}, I_\textrm{gt}) = w^\textrm{fg} \mathcal{D}^\textrm{fg} + w^\textrm{bg} \mathcal{D}^\textrm{bg}
+\end{equation}
+\begin{equation}
+    \mathcal{D}^{k}(I^{k}_\textrm{gen}, I^{k}_\textrm{gt}) = \frac{1}{HW}\sum_{h,w}(I^{k}_{\textrm{gen}}(h,w) - I^{k}_{\textrm{gt}}(h,w))^2
+\end{equation}
+where $k=\textrm{fg (foreground)}, \textrm{bg (background)}$ and $w^\textrm{fg}, w^\textrm{bg}$ are loss weights for foreground and background, respectively. Such per-pixel supervision is more precise than the ambiguous set-to-set Chamfer Distance introduced in Eq.~\ref{eq:chamfer}. 

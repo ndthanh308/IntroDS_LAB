@@ -1,0 +1,375 @@
+\hpc\ performs three ``phases'' of checking when it is run on a
+document. The zeroth phase is a syntactic check to ensure that the
+given proof follows the proof format described by our grammar, as
+shown in Figure~\ref{fig:grm}. This check does not require making
+calls to the underlying theorem prover. The first phase consists of
+checks intended to identify semantic issues and produce useful output
+for the user. After the syntax and semantics of a proof are validated,
+the second phase checks its correctness by transforming each of the
+given proofs into a sequence of instructions appropriate for use with
+ACL2's \proofbuilder\ system. We then run each of these proofs through
+ACL2s with the generated instructions and confirm that they pass.
+
+A benefit of our multi-phase approach is the separation of concerns
+enjoyed by the different phases of checking. The first two phases
+interact with the user, focusing on giving actionable feedback, so as
+to ensure that the given proof makes sense. The third phase interacts
+with the underlying theorem prover for proving and generating
+theorems. An example of why this is good, is that, in the absence of
+contract completions, the behavior of the first phase does not affect
+the argument for the correctness of \hpc, since the tool only reports
+that a conjecture is valid if ACL2 can prove it. Before we describe
+the three phases in detail, we discuss relevant background.
+
+\noindent \textbf{ACL2 Theories}
+A common way of controlling ACL2's behavior is by modifying the set of
+\emph{rules} that it is allowed to use. There are various kinds of
+rules, including general \codify{:rewrite} rules,
+\codify{:type-prescription} rules that add type information that is
+implied by the hypotheses that might be available at a particular
+point in a proof, and \codify{:executable-counterpart} rules that
+allow ACL2 to evaluate a function application when all of its
+arguments have concrete values. ACL2 allows one to define and use sets
+of rules, which it calls \emph{theories}. We make extensive use of
+theories in \hpc, and describe the theories that we generate and use
+as follows:
+\begin{itemize}
+\item \codify{arith-5} is the set of rules that are added after
+  including the \codify{"arithmetic-5/top"} book in a vanilla ACL2
+  instance. Put simply, this is a library developed by the ACL2
+  community and distributed alongside ACL2 that contains rules for
+  reasoning about arithmetic.
+\item \codify{min} which consists of ACL2's minimal theory (which
+  includes only rules about basic built-in functions like \codify{if}
+  and \codify{cons}) plus \codify{(:executable-counterpart
+    acl2::tau-system)}, \\ \codify{(:compound-recognizer
+    booleanp-compound-recognizer)}, and \codify{(:definition
+    not)}. The former of these three rules enables ACL2 to perform
+  some type-based reasoning, and the latter two are often useful for
+  reasoning about propositional logic.
+\item \codify{arith} which consists of some basic facts about
+  \codify{+} and \codify{*}.
+\item \codify{type-prescription} which consists of any rules of
+  type \codify{:type-prescription}
+\item \codify{executable} which consists of any rules of type
+  \codify{:executable-counterpart}.
+\item \codify{contract} which is \codify{min} plus
+  \codify{type-prescription} and any rules with names ending in
+  \codify{"CONTRACT"} or \codify{"CONTRACT-TP"}.
+\item \codify{min-executable} which is the union of the rules
+  in \codify{min} and \codify{executable}.
+\end{itemize}
+
+The latter four theories are redefined every time \hpc\ checks a
+conjecture, to ensure that any functions that may have been defined
+since the last conjecture check are accounted for. Note that ACL2's
+functions that operate on theories typically take in \emph{theory
+  expressions}. For our purposes, a theory expression is either a list
+of rule names, \codify{(theory '}$x$\codify{)} where $x$ is the name
+of a previously defined theory or \codify{(union-theories }$x$
+$y$\codify{)} which is a union of rules in theories $x$ and $y$.
+
+\noindent \textbf{Guard Obligations and Type Checking} ACL2 is an
+untyped language. However, it is possible to specify function
+\emph{guards}, which are preconditions on the inputs to a
+function. Violating function guards results in an error during
+evaluation. Under certain circumstances ACL2 will attempt to prove
+that the guards of a function will always hold in a particular context
+(for example, when a function is called in the body of another
+function with more restrictive guards). For the purpose of
+explanation, ACL2s' type system hooks into the guard system in such a
+way that a function defined using \codify{definec} (the standard way
+to define functions in ACL2s) will have guards that assert that
+provided inputs satisfy their specified types. The $\mathit{guard\
+obligations}$ for an expression are the set of conditions that must be
+true to satisfy the guards for every function call inside that
+expression. We define a built-in function $\mathit{guards}$ such that,
+$\go{e}$ is the conjunction of guard obligations for each function
+call within an ACL2s expression $e$. Every ACL2s type has a
+\emph{recognizer} function associated with it: a predicate of one
+argument that returns \codify{true} when given a member of the
+associated type, and \codify{false} otherwise. We refer to these
+functions as \emph{type predicates} below.
+
+\noindent \textbf{Contract Completion} We require that the statement a
+user is trying to prove have an empty set of guard obligations
+(equivalently, the guard obligations are all satisfied). To ensure
+this in class exercises, we ask students to perform \emph{contract
+completion} on given statements, before proving them.  Contract
+completion refers to the process of determining the guard obligations
+for a statement and adding appropriate hypotheses to satisfy
+them. This of course changes the logical meaning of the proof
+statement. From a pedagogical standpoint, we want to highlight the
+correspondence between the statements we're proving and the code (the
+executable bodies of the functions in the statement). By ensuring
+contract completion, we eliminate all errors or counterexamples due to
+guard violations.
+
+Of course, it is always better if the original statement is already contract
+completed. However, by doing a contract completion inside of \hpc\
+first, we can confirm that it was done appropriately, \eg\ that only
+the necessary hypotheses were added to satisfy the guard
+obligations. After a contract completion is provided and validated, we
+expect that the user will replace the original statement with the
+contract completed one. We remind the user to do this by producing a
+warning whenever they provide a \emph{non-trivial contract completion}
+--- that is, a contract completed statement that is not syntactically
+equivalent to the exported statement (if provided) or original
+statement (if no exported statement was provided).
+
+When the user provides a non-trivial contract completion for a
+conjecture, we do not guarantee its correctness. Instead of generating
+instructions to prove the conjecture inside of ACL2s, we tell ACL2s to
+assume that the contract completed statement is true, which may cause
+unsoundness issues if that is not the case. This design decision for
+Phase I checks enables us to give more useful feedback regarding any
+of the following proofs. For example, assume Conjecture A is followed
+by Conjecture B and A has a nontrivial contract completion and it
+passes Phase I checking. If we tell ACL2s to assume the contract
+completed form of Conjecture A as valid, we can check Conjecture B and
+see if it would pass our checks if the user replaced Conjecture A's
+statement with its contract completed form.
+
+\noindent \textbf{Hints}
+Table~\ref{tab:hints} lists several types of hints for justifying
+reasoning steps. Some hints have several aliases---for example,
+\codify{algebra} and \codify{arith} are both aliases for
+\codify{arithmetic}. Others are useful for improving readability of
+the proof step. For example, \codify{MP} (\codify{Modus Ponens}) does
+not add additional rules or hypotheses when checking a step or derived
+context item, but we add it to indicate that a step or derived context
+item is justified by the conclusion of an implication after satisfying
+that implication's hypotheses. Each hint for a proof step gives rise
+to zero or more of hypotheses ($\hyps$), $\rules$ and
+$\varname{Lemma\ instantiations}$, used in proving the proof step. We
+define functions $\mathrm{hyps}(h)$, $\mathrm{rules}(h)$ and
+$\mathrm{instances}(h)$ to be the set of hypotheses, rules and lemma
+instantiations (in a format amenable to ACL2) that a hint $h$ gives
+rise to, respectively.  We also define function $\hinteff(h)$ which,
+given a hint $h$, returns a triple
+$(\mathrm{hyps}(h),\mathrm{rules}(h),\mathrm{instances}(h))$ as described
+in Table~\ref{tab:hints}.
+
+\begin{table}[]
+\begin{tabular}{c|c|c|c|l}
+  Hint & Hypotheses  & Rules & Lemmas & Comments \\
+  \hline
+  $\codify{C}i$ & \checkmark & \xmark  & \xmark  &  Context items\\
+  \codify{D}$i$ & \checkmark & \xmark  & \xmark  &  Derived Context items\\
+  \codify{def }$\mathit{foo}$ & \xmark & \checkmark  & \xmark  & Enables rules regarding the Definition of $\mathit{foo}$ \\
+  \codify{cons axioms} & \xmark & \checkmark  & \xmark  &  Enables Lemmas related to lists\\
+  \codify{arithmetic}  & \xmark & \checkmark  & \xmark  & Enables Lemmas
+                                                 related to arithmetic \\
+  \codify{evaluation}  & \xmark & \checkmark  & \xmark  &  \\
+  \codify{lemma }$\mathit{foo}$  & \xmark & \xmark  & \checkmark & A substitution may be provided
+  \\
+  \codify{MP }  & \xmark & \xmark  & \xmark & improves readability \\
+  \codify{PL }  & \xmark & \xmark  & \xmark & improves readability
+\end{tabular}
+\caption{A table showing what is returned by each hint.}
+\label{tab:hints}
+\end{table}
+
+\noindent \textbf{Phase 0}:
+Phase 0 consists entirely of syntactic checks. As we will discuss in
+more detail in the Architecture section~\ref{sec:architecture}, we use
+the Xtext~\cite{xtext} system to generate a parser from our proof
+format grammar (described in the previous section). Xtext
+automatically generates many syntactic checks and provides
+error-handling capabilities, but we extend these checks to produce
+specialized error messages in certain situations.
+
+\noindent \textbf{Phase I}: We describe Phase I checks using algorithms
+that generate helpful error messages, given semantically incorrect
+proofs. We use the $\textit{chk}_e$ function to denote checking if a
+Boolean ACL2s expression is true, otherwise returning an appropriate
+error. $\varname{guards}$ returns the guard obligations of its
+argument. $\varname{type-predicatep}$ tells whether an expression is
+an ACL2s function application term where the function is a type
+recognizer. $\mathit{given}$ checks if its argument has been provided
+in the proof. $\mathit{export}$ exports an ACL2s
+expression. $\varname{contract-completed}$ checks if the given ACL2s
+expression's contracts appear in its hypothesis.
+$\vdash_{\mathit{th}}s$ checks whether $s$ is can be proved by ACL2s in
+theory $\mathit{th}$. Each of the functions described above is defined
+in ACL2s. Phase I is intended to identify errors with enough
+specificity to allow us to generate clear, actionable and useful error
+messages.
+
+\begin{algorithm}
+  \small
+  \caption{Semantic checks for a single proof step or derived context item}
+    \label{alg:proof-step}
+  \Fn{\CheckProofStep{$\cts$, $\hints$, $\lhs$, $\rhs$, $\rel$}}{
+    \KwIn{$\cts$ is a set of context items, $\hints$ is a set of
+      hints, $\lhs,\rhs \in \mathcal{E}$ are both ACL2 expressions, and
+      $\rel \in \mathcal{R}$ is an ACL2 relation.}
+    $\hyps,\rules,\uinst \gets \hinteff(\hints)$\;
+    $R \gets \{ c \ |\ c \in \cts \wedge \varname{type-predicatep}(c)\}$ \;
+    $G \gets \go{ \hyps \wedge R\ \Rightarrow \lhs\ \rel\ \rhs}$ \;
+    $\chke{\vdash_{\codify{min+contract+}\rules\codify{+}\uinst} G\ \wedge
+      \rules\ \wedge \hyps\ \wedge R\ \Rightarrow \lhs\, \rel\, \rhs}$
+    \tcp*[l]{Proving a step with calculated guard obligations relieves
+      the user from the need to provide type hints}
+    $\chke{\vdash_{\codify{full}} \wedge \cts \Rightarrow \wedge G}$\; }
+        \normalsize
+\end{algorithm}
+
+Algorithm~\ref{alg:proof-step} can be considered to be the heart of
+\hpc. It checks whether $\lhs$ is related to $\rhs$ using relation
+$\rel$ in a given context $\cts$ and with hints $\hints$. This
+algorithm is used to check the validity of each derived context item
+as well as each proof step. Any context items specifying type
+information (variable $R$ in the algorithm) are automatically assumed,
+so the user need not provide type justification hints. We tell
+students that once they have performed contract checking for the
+conjecture, they no longer obligated to justify types for terms
+occurring in function contracts, lemma instantiations or implications,
+which mimics Dijkstra's style of proofs. Notice that we subsequently
+determine the guard obligations of the step (after adding type
+recognizer applications), add the guard obligations as an additional
+hypothesis when proving the step holds and afterwards ask ACL2s to
+prove that they hold given all of the context and derived context
+items. This helps us identify cases where the user does something
+incorrect from a ``types'' perspective, while also freeing the user
+from having to justify types, enabling them to focus on the key ideas
+of the proof.
+\begin{algorithm}[]
+        \small
+  \label{alg:semantics-simple-phase1}
+  \caption{Semantic checks on a simple proof.}
+    \label{alg:semantics-simple-phase1}
+  \Fn{\CheckNonInductiveProof{$\pr$}}{ \KwIn{$\pr$ is a non-inductive
+      (simple) proof. $\cts$ is a set of context items. $\dts$ is a
+      set of pairs of derived context items and corresponding set of
+      hints. $S$ is the proof statement, whose exportation (if given)
+      is $E$. $C$ (if given) is the contract completion of $E$ (if
+      given) otherwise $S$. $G$ is the goal.
+      $P \in \langle Seq \rangle$ is the sequence of proof steps separated by
+      relations (relating proof steps) and hints (justifying each
+      step). $(\lhs,\rel,H,\rhs) \in P$ is a single proof step in $P$. }
+    
+    \tcc{Exportation Checks}
+    \eIf
+    {$\given{E}$ \tcp*[h]{E is given?}}  {
+      $\chke{\vdash_{\codify{min}}E \equiv S}$ \tcp*[l]{E is proved equivalent
+        to S in min-theory?}  }{ $E \gets S$\; }
+    $\chke{\export{E} \equiv E}$ \tcp*[l]{E is fully exported?} 
+    \tcc{Contract Completion Checks}
+    \eIf{$\given{C}$ \tcp*[h]{C is given?}}{
+    %$\chke{\vdash_{\codify{min}}E \equiv CC}$ \tcp*[l]{E is proved equivalent to CC?}
+    $\hyp{E},\conc{E} \gets E$ \tcp*{Split E into a set of hypotheses and a conclusion}
+    $\hyp{C},\conc{C} \gets C$ \tcp*{Split C into a set of hypotheses and a conclusion}    
+    $\chke{\conc{C} \equiv \conc{E}}$ \;
+    $\chke{\hyp{C} \subseteq \hyp{E}}$
+    $\chke{\vdash_{\codify{min}} \wedge \hyp{C} \equiv (\hyp{E} \wedge \go{E}) }$ 
+    \tcp*[l]{Contract completion hyps equivalent to guard
+      obligation and hyps of E?}
+  }{
+    $C \gets E$\;
+    $\hyp{C},\conc{C} \gets C$ \tcp*[h]{Split C into a set of hypotheses and a conclusion}    
+  }
+  $\chke{\cc{C}}$ \tcp*[l]{C is contract completed?}
+  \If{$\given{G}$}{
+    $\chke{\vdash_{\codify{min}}\conc{C} \equiv G}$ \tcp*[l]{Conclusion is proved equivalent to Goal?}
+  }
+  \tcc{Context Checks}
+  $\chke{\vdash_{\codify{min}} (\wedge \cts \Rightarrow G ) \equiv C }$ \;
+  \tcc{Derived Context Checks}
+  \ForEach{$(d,H) \in \dts$} {
+     \tcc{Each Derived Context item is checked to be equivalent to true}
+    $\CheckProofStep{$\cts$,H,d,\codify{true},\codify{equal}}$ \;
+    $\cts \gets \cts \cup \{ d \}$ \;
+  }
+  \If{$(\nil,\_) \in \dts \vee G \in \dts$}{
+    \Return \tcp*[l]{Exit early because hypotheses are UNSAT or they imply G}
+  }
+  $\chke{\given{G}}$ \tcp*[l]{otherwise G must be provided}
+
+  \tcc{Proof Step Checks}
+  \ForEach{$(\lhs,\rel,H,\rhs) \in P$} {
+    $\CheckProofStep{$\cts$,H,$\lhs$,$\rhs$,$\rel$}$\;
+  }
+  $\chke{\vdash_{\codify{min}}\bigwedge\limits_{(\lhs,\rel,H,\rhs)\in P}\lhs \Rightarrow G}$ \tcp*{Final check that Proof steps imply the Goal}
+  }
+        \normalsize
+\end{algorithm}
+Algorithm~\ref{alg:semantics-simple-phase1} checks a non-inductive
+(simple) proof. For the purpose of presentation, we are showing only
+the core set of checks it performs. The implementation does additional
+boilerplate checking to make sure that the types of expressions we are
+dealing with are correct, as well as certain additional checks to
+identify potential issues.  For example in our implementation, unless
+the user derives \codify{nil}, we check whether the conjunction of the
+context items is SAT, since an unsatisfiable set of hypotheses likely
+indicates a mistake when it's not used to trivially prove the proof
+statement.
+
+For inductive proofs, it is important to make sure that given an
+induction term, the proof obligations fulfilled by the user correspond
+exactly to the proof obligations generated internally in ACL2. We
+check this by searching for a bijection between the two sets of proof
+obligations with respect to propositional equality. Once a bijection
+is shown, we check each of the proofs using
+Algorithm~\ref{alg:semantics-simple-phase1}.
+
+\noindent \textbf{Phase II}:
+If a proof passes through Phase I without generating any errors, we
+attempt to either generate instructions that tell ACL2 how to prove
+the conjecture, or if it has a non-trivial contract completion, we
+tell ACL2 to assume that the conjecture holds. We'll focus here on the
+former case, since the latter is only intended to provide best-effort
+feedback and we make no claims about correctness if a conjecture has a
+non-trivial contract completion anyways. Before we can discuss
+generating instructions, we need to present some background about the
+ACL2 \proofbuilder.
+
+\noindent \textbf{ACL2 \proofbuilder}: ACL2 is designed to be highly
+automatic; when it fails to prove a theorem, the user typically proves
+helpful lemmas or provides hints that modify or override its
+behavior. This mode of operation is not ideal in the context of proof
+checking, since we already have a detailed outline for a proof, and we
+want ACL2 to stick to that outline. For this reason, we use ACL2's
+\proofbuilder\ functionality, which allows us to command the theorem
+prover's behavior at a much lower level. The \proofbuilder\ operates
+in a manner similar to an interactive proof assistant like
+Coq~\cite{coqart} or Isabelle~\cite{isabelle-hol}: there is a
+\emph{proof state} consisting of a stack of goals, each of which
+contains a set of hypotheses and a statement to be proved, and one
+provides \emph{instructions} that operate on the goal stack. These
+instructions range in fineness, with coarse instructions like
+\codify{prove} (attempt to prove the current goal entirely
+automatically with ACL2's full power) to fine instructions like
+\codify{dive} (look at a subexpression in the current statement to be
+proved). ACL2's documentation provides information about many of the
+available \proofbuilder\
+instructions~\cite{xdoc-proof-builder-commands}.  For \hpc\ we
+developed several new \proofbuilder\ instructions, many of which are
+variants of existing instructions that succeed where the existing
+instructions would fail. For example, \codify{:retain-or-skip} is
+exactly like the built-in \codify{:retain} instructions, except that
+it will succeed even when all of the existing hypotheses are retained
+(producing no change in the \proofbuilder\ state). Many instructions
+have similar behavior that is desirable when a human is interacting
+directly with the \proofbuilder, but that is not when automatically
+generating instructions.
+
+\noindent \textbf{Generating Instructions}: To check a calculational
+proof, we generate a sequence of \proofbuilder\ instructions based on
+the given proof. We ask ACL2s to prove the proof statement using this
+sequence of instructions. This is useful in two ways. First, the
+soundness of \hpc\ is reduced to the soundness of ACL2's
+\proofbuilder\ system. Second, this means that in principle, one can
+perform a proof in \hpc\ that might be challenging to do in ACL2s, by
+taking the generated proof form and using it in ACL2s. Recall the
+structure of a calculational proof: we have a statement, an
+exportation (if needed), context (if needed), derived context items
+(if generated) and a sequence of steps separated by relations and
+justifications. The order in which \proofbuilder\ instructions are
+generated mirrors this structure.
+
+The generated \proofbuilder\ instructions are executed in ACL2 which
+will either produce an error or run smoothly, thereby turning the
+proof conjecture into an ACL2s property. In the latter case, the
+generated \proofbuilder\ instructions act as a witness to the validity
+of the conjecture.

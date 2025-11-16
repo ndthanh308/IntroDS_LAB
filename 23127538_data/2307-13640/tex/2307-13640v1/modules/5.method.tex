@@ -1,0 +1,128 @@
+\section{Method}
+
+\subsection{Motivation}
+
+Our approach stems from a simple assumption: \textit{Pixels that share similar motion (i.e., optical flow) are likely to belong to the same object, and vice versa.} While this assumption has been thoroughly studied in previous works such as CrossPixel~\cite{mahendran2019cross}, there are several limitations in those works:
+
+\begin{enumerate}
+    \item Two pixels having similar motion may not belong to the same object if they are far apart. 
+    
+    \item For pixels with static motion, it cannot be determined whether they belong to the same object or not. 
+    
+    \item Camera-motion may induce a similar motion at every pixel, including foreground and background pixels.
+\end{enumerate}
+
+%These limitations indicate the absence of a strong causal relationship between object appearance and motion, i.e., object motion is determined by external or internal control rather than its visual appearance.
+To address the limitations, we refine the assumption with the following constraints 
+that impose a reliable correlation between motion and appearance.
+\begin{enumerate}
+    \item Pixels sharing a similar motion are presumed to belong to the same object only if they are within the same local neighborhood.
+    
+    \item Objectness learning is focused on pixels with substantial motion. That is, learn only from regions where significant motion actually occurs.
+    
+    \item Optical flow is normalized to reduce the effect of background motion, which results from camera-motion.
+\end{enumerate}
+
+%A close analogy can be drawn between our idea and the principles of Lucas-Kanade method~\cite{lucaskanade1981iterative}. Lucas-Kanade method assumes that flow remains constant within a local neighborhood and only consider flows at interest points determined by visual features. 
+The locality assumption goes back to the earlier works of Lucas and Kanade~\cite{lucaskanade1981iterative}, which assumed that optical flow remains constant within a local neighborhood, and can be represented by flows at a small number of interest points determined by visual features. 
+ We focus here on a local vicinity and only learn from pixels with substantial flow.
+In our proposed approach, detailed in the following section, we train a ViT to return similar visual features for pixels that have similar motion. 
+
+\subsection{Approach}
+
+We start by extracting optical flow from a video using an off-the-shelf model, and normalizing the optical flow to remove the effect of background motion. Next, we divide both the feature map and the flow map into local patches, and compute for each patch a loss that encourages feature similarity among pixels that share similar motions.
+Lastly, we calculate a weighted average of patch-level losses with the local flow norm serving as the patch's weight to ensure that we only learn from patches with significant motion. In the following, we denote optical flow as 
+$\mathbf{v} \in \mathbb{R}^{2\times H \times W}$, and feature map as $\mathbf{f} \in \mathbb{R}^{C\times H \times W}$. The overall workflow of the proposed approach is illustrated in Figure~\ref{fig:main}.
+
+
+
+% We train a segmentation network to partition an image into K components without manual annotations. Our model is trained using individual frames from video as input and pre-computed optical flow as supervision. The predicted segments are used to approximate the input flow with piecewise quadratic flow models and the training loss is formulated as the error between the reconstructed and the input flow. Appearance features from the backbone are used to merge the predicted K segments into foreground and background components. Motion information is not required at test time and inference can be performed on still images. Optical flow is colorized for visualization only.
+
+
+Given that optical flow can only be estimated from a pair of adjacent video frames, it cannot be obtained from standard image-based datasets. To overcome this challenge, we rely on unlabeled videos to augment existing standard image-based datasets.
+The dataset preparation procedure is detailed in Section~\ref{sec:exp}. 
+
+
+\vspace{1em}
+
+% , i.e., some background pixels move faster than others due to perspective transformation
+\noindent \textbf{Background motion removal.} 
+We empirically found that simply subtracting the average flow significantly reduces the background motion. We further normalize the flow and project it to $[-1, 1]$ by dividing it by the maximum norm, as shown in Equation~\ref{eq:bmotion_removal}. We denote the stabilized and normalized flow as $\tilde{\mathbf{v}}$. 
+We discuss the limitation of this approach in Section~\ref{sec:discussion}. Examples are shown in Figure~\ref{fig:motion_removal}.
+
+
+% Figure environment removed
+
+
+
+\begin{equation}
+\tilde{\mathbf{v}} = \frac{\mathbf{v} - \overline{\mathbf{v}}}{\parallel \mathbf{v} - \overline{\mathbf{v}} \parallel_\infty}   
+ \label{eq:bmotion_removal}
+\end{equation}
+
+\vspace{0.5em}
+
+\noindent \textbf{Split local patches.} We divide feature map $\mathbf{f}$ and flow $\tilde{\mathbf{v}}$ into patches with sliding windows. We denote the feature patches as $\mathbf{f}_p \in \mathbb{R}^{C\times K \times K}$ and flow patches as  $\mathbf{v}_p \in \mathbb{R}^{2\times K \times K}, p \in \{1,...,L\}$, where $K$ denotes patch size and $L$ denotes the number of patches.
+
+\vspace{0.8em}
+
+\noindent \textbf{Intra-patch similarity match.} For each patch, we calculate $K\times K$ similarity matrices for both feature and optical flow by measuring the similarity between the most salient pixel and other $K\times K$ locations. The most salient pixel is selected as the one with the strongest self-attention received at class token.
+Specifically, we flatten and denote the feature and flow similarity matrices to be vectors $\mathbf{z}_{f,p}, \mathbf{z}_{v,p} \in \mathbb{R}^{K^2}$. We denote by $\mathbf{f}_{p,i} \in \mathbb{R}^C$ and $\mathbf{v}_{p,i} \in \mathbb{R}^2$, where $i \in \{1,..,K^2\}$, the feature and flow vectors at location $i$ within patch $p$. We denote the most salient location in patch $p$ as $s_p$. 
+The feature similarity vector $\mathbf{z}_{f,p}$ is computed with the cosine similarity, i.e., the dot product of features after normalizing them to a unit length, as shown in Equation~\ref{eq:f_z}.
+
+\vspace{-0.4em}
+
+\begin{equation}
+\mathbf{z}_{f,p} = [..., \mathbf{f}_{p, s_p} \cdot \mathbf{f}_{p,i},...]^\top\quad i \in \{1, ..., K^2\}
+\label{eq:f_z}
+\end{equation}
+
+The flow similarity vector $\mathbf{z}_{v,p}$ is computed with a customized RBF kernel function $S_f$, as shown in Equation~\ref{eq:v_z}.
+\begin{equation}
+\mathbf{z}_{v,p} = [..., S_f(\mathbf{v}_{p, s_p}, \mathbf{v}_{p,i}),...]^\top \quad i \in \{1, ..., K^2\}
+\label{eq:v_z}
+\end{equation}
+The RBF kernel function $S_f$ is given in Equation~\ref{eq:Sf}, where $cos(x, y)$ denotes cosine similarity with the output saturated to $[0, 1]$, and $\sigma$ is the RBF's radius parameter. The exponential term is multiplied by $\parallel\mathbf{y}\parallel_2$ to separate stationary pixels, which form clear boundaries between foreground and background. 
+
+\begin{equation}
+S_f (\mathbf{x}, \mathbf{y}) = \parallel \mathbf{y} \parallel_2 \exp ((\cos(\mathbf{x} , \mathbf{y}) - 1)  / \sigma )
+\label{eq:Sf}
+\end{equation}
+
+Next, we transform the feature and flow similarity to a probability distribution using softmax as shown in Equation~\ref{eq:softmax}, where $\tau$ is a temperature parameter. We denote the flow and feature distributions as  $\mathbf{p}_{v,p}$ and $\mathbf{p}_{f,p}$, respectively.
+
+\begin{equation}
+\mathbf{p}_{\cdot,p} = \text{softmax}( \mathbf{z}_{\cdot, p} / \tau)
+\label{eq:softmax}
+\end{equation}
+
+
+Then, we minimize the KL divergence between $\mathbf{p}_{v,p}$ and $\mathbf{p}_{f,p}$ in Equation~\ref{eq:Lp} to encourage features of pixels with similar motions to become closer and vice versa.
+We denote the KL divergence loss of patch $p$ as $\mathcal{L}_p$, given as
+\begin{equation}
+\mathcal{L}_p = D_{KL}(\mathbf{p}_{v,p} \parallel \mathbf{p}_{f,p}).
+\label{eq:Lp}
+\end{equation}
+
+\noindent \textbf{Reweighting loss terms across patches with motion.} To concentrate the learning on areas with significant motion, the weight $w_p$ of patch $p$ is the proportion of patch $p$'s motion relative to the motions of all the patches in the given frame, as outlined in Equation~\ref{eq:w_p}.
+
+\vspace{-0.5em}
+
+\begin{equation}
+w_p = \frac{\parallel \mathbf{v}_p \parallel_2}{\sum_{p=1}^L \parallel \mathbf{v}_p \parallel_2}.
+\label{eq:w_p}
+\end{equation}
+
+
+Finally, the overall loss is given as a weighted average of the local patch losses, as described in Equation~\ref{eq:L}. 
+
+\vspace{-0.5em}
+
+\begin{equation}
+\mathcal{L} =  \sum_{p=1}^L w_{p} \mathcal{L}_p.
+\label{eq:L}
+\end{equation}
+
+\vspace{-0.5em}
+
+We use this optical flow loss in combination with the original self-supervised learning loss to train our vision transformer network, as depicted in Figure~\ref{fig:main}.

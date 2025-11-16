@@ -1,0 +1,172 @@
+\section{Background}
+\label{sec:background}
+\subsection{Machine Model}
+\label{sec:backgroundonmachinemodel}
+
+In typical system configurations, all memory addresses seen by programs running on modern computers are \emph{virtualized}: the address observed by a running program generally will not correspond directly to the physical location in memory, and may not even correspond to a physical location that \emph{exists} in the machine. Instead, these \emph{virtual} addresses are translated to \emph{physical} addresses that correspond directly to locations in RAM. On most modern architectures, this translation is performed through cooperation of the hardware and OS kernel: while executing an instruction that dereferences a (virtual) address, the CPU's \emph{memory management unit} (\textsc{MMU}) implements an architecture-specific process of \emph{address translation}, resulting in a physical address used to access the cache\footnote{Technically, for performance reasons most caches are indexed with parts of the virtual address, but tagged with the physical data addresses, so cache lookups and address translations can proceed in parallel.} and/or memory-bus.
+
+% Figure environment removed
+
+On the x86-64 architecture, the input to the \textsc{MMU}'s address translation is a sparse hierarchical set of tables 
+called \emph{page tables} (referring to pages of memory). As Figure \ref{fig:pagetables} (based on Figure 5-17 of the 
+AMD64 architecture manual~\cite{amd64_manual_vol2}\footnote{While x86 up through its 32-bit incarnation were due to Intel,
+the x86-64 architecture as a 64-bit extension to x86 was originally due to AMD. As a result, it is sometimes also referred to as the \texttt{amd64} architecture.}) shows, 
+address translation proceeds by repeatedly taking designated slices of the virtual address and indexing into a table.
+The final lookup in the page tables gives the base physical address of a page of physical memory, to which the low-order
+bits of the accessed virtual address are added to determine the actual physical address retrieved. 
+On x86-64, standard configurations use 4 levels of page tables, labelled levels 4 through 1, with lookups in the level 
+1 page table resulting in the actual page of physical memory holding the requested data, and the low-order 12 bits 
+being used to index into this page.\footnote{Technically levels 1--3 have designated names originating when there were 
+fewer levels. We omit those names to avoid confusion for those not already steeped in the arcana of x86 history,
+ and for greater consistency with the recent addition of a 5th level 
+on the most recent processors, where levels 4 and 5 are simply known by their numbers. Our formalization
+only deals with 4-level page tables, but is straightforwardly extensible to 5.}  
+Because address translation 
+traverses a series of tables, the translation process or algorithm is sometimes referred to as a \emph{page-table walk}. 
+While Figure \ref{fig:pagetables} and most of our details are specific to the x86-64 architecture, ARMv8 (a.k.a.\ 
+\texttt{aarch64}), RISC-V, and PowerPC use similar hierarchical page tables for address translation.
+
+The entries of each table are 64 bits wide, but each points to a physical address aligned to 4KB (4096 byte) boundaries, which leaves 12 bits to spare to control a validity bit (called the \emph{present} bit), a read-write bit (which permits write access through the entry if and only if it is set), and a range of additional bits which can be used to control caching, write-through, and more. This paper will only consider the present bit (0), the read-write bit (1), and the accessed bit (5), which is set to 1 by the hardware every time an entry is used, allowing the OS to determine which pieces of memory are used or unused.
+
+The page tables mapping virtual addresses to physical addresses are managed by the OS. Typically each process has its own 
+virtual-to-physical mappings represented by its own page table, which the OS registers with the CPU by storing the (page-aligned)
+physical address of the root of the page table tree (in our context, the start of the L4 table) in a 
+specific register (\texttt{cr3}) as part of switching to a new process. 
+Using different mappings, which map only disjoint portions of physical memory (with some exceptions in the next section) 
+is how the OS ensures memory isolation between processes.
+
+If an instruction is executed that accesses a virtual address that either has no mapping, or does not have a mapping permitting the kind of access that was performed (e.g., the instruction was a memory write, but the relevant address range was marked read-only in the relevant page table entry), the hardware triggers a \emph{page fault}, transferring control to a \emph{page fault handler} registered with the hardware by the OS, allowing it to take corrective action (described in the next section).
+
+\subsection{Virtual Memory Managers}
+\label{sec:backgroundonvmm}
+Most OS kernels have a component called a \emph{Virtual Memory Manager} (VMM)\footnote{Not to be confused with Virtual 
+Machine Monitor. In this paper we focus on non-hypervisor scenarios, but hardware virtualization extensions for both 
+x86-64 and ARM make use of an additional set of page tables translating what a \emph{guest} considers to be its 
+(virtualized) physical memory to actual physical memory. Our contributions should offer value in this scenario as well.}
+which is responsible for setting up page table mappings and for taking action when a page fault occurs. Often, a page 
+fault indicates a bug in a program --- for example, a null pointer dereference crashes a program not because the hardware
+ designates it an error, but because most OSes refuse to map the first 4K worth of virtual addresses, so dereferencing 
+\texttt{NULL} results in a page fault. In such cases, the OS will terminate the program.
+
+In other cases the OS uses page faults to implement specialized functionality and optimizations. A key example of this is 
+(confusingly) called \emph{paging}: saving room in physical RAM and avoiding unnecessary IO 
+by waiting until memory addresses for code are accessed 
+before copying them to RAM (in particular, saving process startup time); 
+or copying memory that has not recently been accessed to disk 
+(i.e., in a \emph{swap} file or partition) and marking those page table entries invalid so a future page fault will give 
+the OS the chance to copy the relevant data back into memory when the program tries to access it again.
+
+The key pieces of functionality a VMM must implement itself, or have available in another OS component (depending on 
+design), are
+adding a new page mapping (whether the mapped page contains zeros, file data, or swap data), and removing an existing 
+page mapping.
+While this initially sounds like relatively modest functionality whose implementation may be complicated by hardware 
+subtleties, even these basic operations are actually quite intrictate.
+Most notably, updates to the page tables are performed as writes to memory --- which are themselves subject to address translation.
+In the case of changing the mappings for the currently-active set of page tables, the OS kernel is modifying the tables involved in its
+own access of the tables.
+
+% \todo[inline]{Colin says: we should chat about the paragraph below. We don't want to advertise too many
+% challenges of VMM verification that we don't actually solve (or rather, we'd push them to the and of the paper
+% as future work). But some of these I think we could split the difference with, for example by defining
+% a variant of virtual-pointsto that allowed virtual address aliasing, but not actually verifying any code examples
+% with it (just showing it's compatible with our approach).
+% }
+% For one, virtual addresses may \emph{alias} when more than one is mapped to the same physical memory. 
+% This can occur when a process requests it (e.g., via \texttt{mmap} or \texttt{shm\_open} on UNIX-style kernels). 
+% It also occurs automatically in most general-purpose kernels: while for normal programs the OS uses the MMU to isolate 
+% and abstract physical memory, the kernel's own functionality is often easier to implement if the kernel can directly 
+% access memory given its physical address, for example when interacting with hardware devices. For this reason, most 
+% kernels contain an \emph{identity map} of all physical memory in a machine. 
+% \todo[inline]{We should try defining an identity map on a whiteboard and see what breaks. If it's feasible we should
+% tweak and get a definition in the paper. If not, we should cut the identity map discussion.}
+% In some cases this is a literal identity map, 
+% where for every virtual address $p$, interpreting $p$ as a virtual address instead will map back to $p$ as a physical 
+% address. In other cases there is an offset involved, where to access physical address $p$ the kernel can access virtual
+%  address $p+\mathit{offset}$. This identity map saves the kernel the performance cost of having to continually add and
+%  remove transient mappings simply to briefly access a specific physical memory region. But this coexists with additional
+%  virtual addresses (those used by most kernel code and data structures), in a form of virtual address aliasing. Note 
+% that virtual address aliasing is both prevalent in general-purpose kernels, and violates the core assumption of most 
+% memory models assumed by verified compilers like CompCert, which assume no virtual address aliasing.
+
+% \todo[inline]{Colin says: Again, let's chat about the next paragraph. This might be another where we can
+% split the difference on extension by defining something and proving a $\ast-\ast$ kind of result for sharing
+% page table fragments, rather than actually proving any new code. I'm less sure about this one, though.
+% }
+% Another complicating factor is that portions of page tables can be shared, i.e., trees of page tables can overlap and
+% become forests. 
+% One common way this used to happen was for one subtree of page tables to map the kernel if linked in appropriately to 
+% a higher-level page table, and then to reuse that kernel mapping portion in every process's page tables. This was mostly 
+% phased out in the wake of Spectre, but remains relevant on correctly-implemented hardware.
+
+Virtual memory concerns propagate to the OS scheduler, which is responsible for dealing with multiple 
+address spaces, so must keep track of which virtual addresses are valid (and in what way) in which address spaces. 
+Some virtual addresses are valid in only a single address space (e.g., a code address for a particular usermode 
+process), while others are valid in all address spaces (e.g., kernel data structure pointers). 
+The VMM must maintain some of these assumptions on behalf of the rest of the kernel, for example by guaranteeing that 
+a certain range of virtual addresses (corresponding to the kernel's code and data) are valid in every address space.
+
+\subsection{Modal Logic}
+\label{sec:backgroundonmodallogic}
+The problem of needing to keep track of things being true in some contexts and not in others is hardly unique to virtual 
+memory management, and is the general insight behind most flavors of modal logic.
+
+Most modal logics use unary operators on propositions to express that a logical claim $P$ is \emph{contingently} true 
+in certain other circumstances, such as in other times~\cite{pnueli1977temporal} or places~\cite{gordon2019modal}. That is, for 
+different modal operators $M$, $M(P)$ may mean that $P$ is true in another time or place (which may be a physical place 
+like another network node~\cite{murphy2008type,gordon2019modal} or a conceptual place like a person's 
+mind~\cite{hintikka1962knowledge}). A unifying concept across any modality is that they behave as applicative functors, 
+typically satisfying (directly, or as a derived law, depending on the modality):
+\[ (P\rightarrow Q) \rightarrow M(P) \rightarrow M(Q)\]
+%\todo[inline]{Ismail, I think this means we have pure intro, $\square P \mathrel{-\ast} [r](\square P)$ if I'm using the right symbol for pure assertions }
+%\todo[inline,color=red]{The above todo comment isn't quite right.
+%Purity is about being able to duplicate. You had defined another typeclass/property-of-assertions that meant it didn't
+%care what address space it was in (like physical pointstos). That's orthogonal to purity.
+%}
+Many modalities, so-called \emph{normal} modalities also possess introduction rules of the form $P\rightarrow M(P)$, 
+the classic example being that if $P$ is true, then $P$ is \emph{necessarily} true with the contingency picked up.%($\square P$).
+
+Of particular interest for reasoning about virtual memory are modalities that permit \emph{naming} the alternate 
+circumstances, prominently \emph{hybrid} modal logics~\cite{blackburn1995hybrid,areces2001hybrid}, which come equipped 
+with assertions of the form $[\ell](P)$ indicating that $P$ is true in the specific alternate circumstance (Kripke world)
+ named by the \emph{nominal} $\ell$. Note that a distinctive property of hybrid logics is that, rather than hiding
+the points at which a modal assertion is evaluated inside the modality's definition, the choice of what world a modalized
+assertion should be true in is chosen \emph{in the assertion itself}. This allows assertions to talk about not simply whether some other assertion
+is true in some possible future or past world related in a fixed way to the current world, but to talk about \emph{arbitrary}
+other worlds. This explicit naming of alternate worlds increases the power of modal logics~\cite{blackburn1995hybrid}, and is actually
+necessary for completeness in classical separation logics~\cite{brotherston2014parametric}.
+
+For our purposes, these are natural candidates to adapt for virtual memory management. We can reinterpret the notion of 
+naming an alternate world slightly more loosely, and instead name \emph{address spaces} by the physical address of the 
+page table root, since these structures are the physical representations of page tables. Thus in this paper we develop 
+the notion that we can represent contingent truth of an assertion via $[r](P)$ indicating that $P$ holds in the address 
+space rooted at physical address $r$.
+The typical hybrid modality introduction rule, that $P$ and $\ell$ (indicating the current world is $\ell$) imply 
+$[\ell](P)$, has a natural analogue: knowing $P$ and that the current address space is $r$ (i.e., that $r$ is the 
+current \texttt{cr3} value) suggests a way to construct $[r](P)$. By the choice of \texttt{cr3} identifying the contingency, we can identify a fact
+\begin{itemize}
+  \item as a \textit{context} fact if its validity depends on \texttt{cr3} when it is outside the modality (i.e. modal context), and made \texttt{cr3} independent as a part of custom-tailored modal logic for virtual-memory: a truth representing a virtual-memory addressing depends \texttt{cr3} due to address-translation operation, is dependent on \texttt{cr3} in the ambient-logic (e.g. separation-logic), and is made \textit{independent} of the facts related to \texttt{cr3} by being introduced into the modal context under the assumption that it exhibits the knowledge on its validity with respect to \texttt{cr3} in the ambient logic.
+  \item as a \textit{pure} fact as long as it does not \textit{necessarily} depend on any fact related to \texttt{cr3}: a truth representing a raw physical memory addressing, unlike virtual-address translation, does not need the \textit{knowledge} of \texttt{cr3}, therefore it can be introduce into the modal context as a pure fact
+\end{itemize}
+
+A relatively under-explored space of modal logics is the interaction of modal and substructural logics, 
+in particular hybrid-style modalities in substructural logics, which has seen only minimal exploration~\cite{dovsen1992modal,restall1993modalities,d1997grafting,kamide2002kripke,licata2017fibrational} and no prior 
+application. We develop our ideas in the Iris program logic~\cite{jung2018iris}, as a result exploring additional subtleties 
+that arise where the modality itself may entail ownership of resources, as well as interactions between our hybrid-style 
+modality and substructural rules.  For example, Iris contains a number of modalities that distribute over separating 
+conjunction, or for which resources can freely move into the modality 
+(e.g., $\blacktriangleright(P)\ast Q \wand \blacktriangleright(P\ast Q)$). In our setting some of these rules 
+apply while others do not. For example, in our setting, an assertion that involves no modalities is interpreted as 
+holding in the current (active-on-the-CPU) address space, so clearly cannot move into arbitrary other address spaces 
+--- unless guarded by another address space modality.
+%
+%
+%Work on modal logic extends back for decades with many widely-varied variations; we discuss here only the pieces most relevant to our work.
+%Broadly speaking modal logics incorporate \emph{modal operators}, which take as arguments a proposition expected to be true in another time~\cite{pnueli1977temporal}, place~\cite{gordon2019modal}\todo{other cites}, or circumstance~\cite{hintikka1962knowledge,halpern1985guide}, and result in a proposition true in the \emph{current} time, place, or circumstance at which the truth of the use of the modal operator is being evaluated. Classic examples include modal necessity $\square P$ describing that $P$ is \emph{necessarily} true, $\mathsf{G}~P$ meaning $P$ is true \emph{globally} (i.e., forever from this time onwards), or $K_i(P)$ describing that a particular participant $i$ \emph{knows} that $P$ is true. The latter is an example of of \emph{multimodal} logic, where there is an indexed family of modalities (modal operators) parameterized by some dimension of interest (there, participants).
+%A closely related variant of multimodal logic is \emph{dynamic logic}~\cite{pratt1976semantical}, a logic of weakest preconditions~\cite{dijkstra-75} which works with modalities of the form $[p](P)$, which states that \emph{in the current program state}, \emph{if} program $p$ is run then afterwards $P$ will hold (modulo non-termination).
+%This same idea is used to encode Hoare triples in the Iris program logic~\cite{krebbers2017essence}, using the same encoding as in Pratt's original presentation, where a Hoare triple $\{P\}C\{Q\}$ is encoded as $P\rightarrow[C](Q)$. Unlike classic work on dynamic logic~\cite{harel2000dynamic}, Iris applies these ideas in a \emph{substructural} setting (separation logic) where distributivity laws over substructural connectives must be considered. For both the dynamic modality and the later modality $\blacktriangleright$ used for guarded recursive predicates, these modalities satisfy axioms of the form $M(P)\ast Q\vdash M(P\ast Q)$, but not the reverse.
+%Iris is not the first combination of modal and substructural logic~\cite{dovsen1992modal,restall1993modalities,d1997grafting,kamide2002kripke,licata2017fibrational}, but is certainly the most heavily tested.
+%A hallmark of a unary logical operator $M$ being a modality is if $M$ satisfies an property akin to $(\upvarphi\rightarrow\psi)\rightarrow M(\upvarphi)\rightarrow\psi$, which roughly states that modus ponens holds under the modality.\footnote{Afficionados of modal logic will note that this property is not quite Axiom K (which requires the initial implication to also hold under $M$), but follows from K and a necessitation rule $\upvarphi\rightarrow M(\upvarphi)$. Non-necessitive modalities typically satisfy the weaker property we call out above.}
+%Another pillar of our work is hybrid logic, a branch of modal logic with \emph{names} (called \emph{nominals} for states in Kripke models~\cite{blackburn1995hybrid,goranko1996hierarchies,areces2001hybrid,gargov1993modal}, in contrast to the typical flavor of modality which refers to an \emph{unspecified} (in the assertion) set of alternative circumstances. 
+%
+%Our work draws on ideas from hybrid modal logics, applied in the context of Iris's higher-order separation logic~\cite{jung2018iris}. We define our modalities and prove their rules directly within Iris, so there is no model-theoretic novelty in our work. Instead, we show that targeted use of modalities combining the ideas of \emph{named resources} with the power of substructural reasoning enable clear specification of general reasoning principles for data structures. Along the way we take advantage of the fact that modalities need not be injections between the \emph{same} logics, but in fact the propositions that modal operators contextualize can come from \emph{other} logics; in our case we exploit the fact that Iris itself is parameterized by a choice of step-indexed~\cite{ahmed-appel-virga-02} \textsf{BI}-algebra~\cite{ohearn1999bunched} to allow convenient specifications in embedded data-structure-relative logics.

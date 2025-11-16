@@ -1,0 +1,128 @@
+\section{Inverse Rendering}
+\label{sec:inverse}
+
+In this section, we apply our mesh density adaptation to the inverse rendering problem. 
+Specifically, given a set of multi-view images, we reconstruct the 3D shape that matches the input images. We follow the experimental setup in Nicolet \Etal\ \shortcite{nicolet2021large}; we use a sphere as a template mesh and deform the sphere to a 3D shape that generates the target renderings at multiple views.
+
+A fundamental challenge in this setup is the absence of correspondences between the template sphere and the input images. Then, approximated correspondences are used based on the intermediate registration results, and the correspondences are updated at each iteration.
+Nicolet \Etal\ \shortcite{nicolet2021large} maintain smooth intermediate results during the updates using diffusion re-parameterization. The smoothness provided with diffusion re-parameterization helps obtain a rough global shape stably. However, because of no explicit constraint on the mesh density, results may suffer from loss of details due to under-sampling near complex structures.
+
+
+
+In this paper, we improve inverse rendering by applying our mesh density adaptation. In the original article~\cite{nicolet2021large}, the under-sampling was resolved with periodic remeshing of intermediate results. Remeshing changes the mesh connectivity and increases the number of vertices in the template mesh.
+In contrast, we propose a simple modification of the original energy to control mesh density and resolve the under-sampling problem without remeshing. Remeshing incurs recomputation of $(\mathbf{I} + \lambda \mathbf{L})^{-1}$ in \Eq{re-parameterization} and a change in the number of optimized variables. By retaining the initial mesh, inverse rendering benefits from a lower computational burden and a simpler formulation.
+
+We briefly overview the framework for inverse rendering in \cite{nicolet2021large}. The shape is optimized by minimizing a loss that measures the discrepancy between the observed images and the rendered images using the 3D shape $\mathbf{p}$. Given a set of rendered images $\mathcal{I}$ with the corresponding camera poses $\mathcal{P}$ and the differentiable rendering function $\mathcal{R}$ \cite{laine2020modular}, the photometric loss $E_{p}$ is defined by
+\begin{equation}
+    E_{p}(\mathbf{p}, \mathcal{I}) = \sum_i \lVert \mathcal{R}(\mathbf{p}, \mathcal{P}_i) - \mathcal{I}_i \rVert_1.
+\end{equation} 
+The loss is minimized by optimizing the diffusion re-parameterization $\mathbf{u}$,
+and the optimization problem is formulated as 
+\begin{equation}
+    \underset{\mathbf{u}}{\text{minimize }} E_{p}(\mathbf{p}(\mathbf{u}), \mathcal{I}).
+    \label{eq:inverse-original}
+\end{equation}
+
+\subsection{Density Adaptation}
+\label{sec:inverse-density-adaptaion}
+We incorporate our adaptation energy $E_a$ in \Eq{adaptation-re-parameterization} into the original formulation in \Eq{inverse-original}. We add two terms with different goals in the density adaptation. One term is for enforcing the uniform density and the other is for enforcing adaptive high density near complex structures. Using intermediate shape $\mathbf{p}'$ obtained at the previous iteration in the optimization process, new optimization problem is
+\begin{equation}
+    \underset{\mathbf{u}}{\text{minimize }}  E_{p}(\mathbf{p}(\mathbf{u}), \mathcal{I}) + w_u E_{a}(\mathbf{p}(\mathbf{u}), \mathbf{l}'_u(\mathbf{p}'))+ w_k E_{a}(\mathbf{p}(\mathbf{u}), \mathbf{l}'_k(\mathbf{p}')),
+    \label{eq:inverse-new}
+\end{equation} 
+where $\mathbf{l}'_u(\mathbf{p}')$ and $\mathbf{l}'_k(\mathbf{p}')$ encode the uniform and adaptive mesh densities, respectively. 
+Each of $\mathbf{l}'_u(\mathbf{p}')$ and $\mathbf{l}'_k(\mathbf{p}')$ contains the desired mean edge length per vertex that is calculated using $\mathbf{p}'$.
+$w_u$ and $w_k$ are the weights for the adaptation energy. By increasing $w_u$, the shape $\mathbf{p}$ computed at the current iteration would possess more uniform mesh density. By increasing $w_k$, the shape $\mathbf{p}$ would have higher densities around detailed structures. The control and the role of the two weights are discussed in detail in \Sec{scheduling}.
+
+We design $\mathbf{l}'_u(\mathbf{p}')$ to enforce uniform mesh density. That is, all desired mean edge lengths for vertices are the same:
+\begin{equation}
+    \mathbf{l}'_u(\mathbf{p}') = l_m(\mathbf{p}'),
+\end{equation} 
+where $l_m(\mathbf{p}')$ is the average of mean edge lengths of vertices in $\mathbf{p}'$.
+
+We design $\mathbf{l}'_k$ to increase the mesh density in the regions with complex structures that require relatively large numbers of vertices for accurate reconstruction.
+We measure the structure complexity using the magnitude of Laplacian computed from $\mathbf{p}'$. Our assumption is that complex structures exhibit high mean curvatures, which is proportional to the magnitude of the Laplacian \cite{botsch2010polygon-curvature}. For a more detailed discussion, refer to \Sec{discussion-curvature}.
+
+We first calculate the norm of Laplacians $\mathbf{K} \in \mathbb{R}^{N}$ from the intermediate shape $\mathbf{p}'$. The values are scaled with the average of mean edge lengths of vertices:
+\begin{equation}
+    K_i = \dfrac{1}{l_m(\mathbf{p}')}\lVert(\mathbf{L}\mathbf{p}')_i\rVert_2,
+\end{equation} 
+where the discrete Laplace operator $\mathbf{L}$ uses the uniform weight.
+We then smooth out $\mathbf{K}$ over the surface to reduce noise using diffusion with one step of the backward Euler's method \cite{baraff1998large}. 
+The smoothed value $\mathbf{S} \in \mathbb{R}^{N}$ is obtained by
+\begin{equation}
+    \mathbf{S} = (\mathbf{I} + \lambda_s\mathbf{L})^{-1}\mathbf{K},
+\end{equation} 
+where $\lambda_s$ is the time step that determines the degree of diffusion. We use $\lambda_s = 1$. 
+We define the desired mean edge length $\mathbf{l}'_k$ by scaling the current mean edge length $\mathbf{l}$ using $\mathbf{S}$:
+\begin{equation}
+    \mathbf{l}'_k(\mathbf{p}') = \mathbf{l}(\mathbf{p}') \odot \textit{clamp}\left(\bar{S}\oslash\mathbf{S}\right),
+    \label{eq:density-curvature}
+\end{equation} 
+where $\odot$ is element-wise multiplication, $\oslash$ is element-wise division, $\bar{S}$ is the average of scalar values in $\mathbf{S}$, 
+and $\textit{clamp}(\cdot)$
+clips the values in a vector to $[0,1]$.
+As a result, the target mean edge lengths in $\mathbf{l}'_k$ are scaled down from the current values in $\mathbf{l}$ for the vertices whose Laplacian magnitudes are larger than the average. For other vertices, the target mean edge lengths in $\mathbf{l}'_k$ are the same as the values in $\mathbf{l}$.
+
+\setcounter{figure}{1}% Figure environment removed
+
+\subsection{Weight Scheduling}
+\label{sec:scheduling}
+
+
+In the iterative optimization process for inverse rendering, we schedule the two weights $w_u$ and $w_k$ of the adaptation energy in \Eq{inverse-new}.
+We obtain the rough global shape by using uniform mesh density in the early stages and recover shape details by using adaptive mesh density in the later stages.
+
+In the first quarter of iterations, we use non-zero constant $w_u$ and zero $w_k$ to enforce uniform mesh density during the early development of shape from the sphere. In this early stage, the sphere is deformed to express a rough outline of the target shape,
+and $\mathbf{p}'$ does not possess much meaningful shape information for inferring the adaptive mesh density. So, we prevent unnecessary adjustment in mesh density by enforcing uniform density. 
+In the second quarter, we use zero $w_u$ and non-zero constant $w_k$ to apply density adaptation to push vertices towards complex structures. Finally, in the last half of iterations, we set both $w_u$ and $w_k$ to zero to focus on lowering the data loss $E_p$ in \Eq{inverse-new}. The effect of the weight scheduling is visualized in \Fig{vis-mean-area}.
+    
+\footnotetext{\url{https://youtu.be/L-WNBUNyP-Y}}
+
+\subsection{Results}
+\label{sec:inverse-rendering-results}
+
+In \Fig{inverse-rendering}, we compare our results with Laplacian regularizations and \cite{nicolet2021large}.
+Regularizations with Laplacian and Bi-Laplacian energy terms are unstable due to the difficulty of balancing between reconstruction accuracy and surface smoothness.
+For each scene, all methods use the same template mesh with limited vertex budget. We compare ours with the result of \cite{nicolet2021large} without remeshing.
+
+
+Laplacian-regularized baselines use fine-tuned small regularization weights to focus on reconstruction accuracy, and the results exhibit noisy surfaces and irregular meshing. Results of \cite{nicolet2021large} show much smoother shapes, but they show loss of details due to under-sampling on complex structures and highly extruded regions. Our method assigns a proper amount of vertices to a region depending on the structure complexity and nicely recovers shape details, including highly extruded regions.
+
+\Tbl{inverse-rendering-error} presents quantitative evaluation results for the T-shirt, Suzanne, Plank, Bob, and Bunny scenes from \cite{nicolet2021large}, measuring Chamfer distance and mean squared error of normal vectors between the ground-truth meshes and registration results. The Cranium scene is excluded because invisible surfaces beneath visible ones result in invalid Chamfer distances. We also report errors using only the top 5\% and 20\% salient vertices from ground-truth meshes, with saliency values calculated using \cite{lee2005mesh}. The results show that our density adaptation accurately reconstructs salient structures. For implementation details on the inverse rendering, refer to the supplementary document.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{table}
+\caption{
+Comparison of reconstruction errors for the inverse rendering. In each cell, Left: Chamfer distance. Right: mean squared error of normal vectors. The averages of the five scenes are presented, along with the average errors for the top 20\% and 5\% salient vertices of the ground-truth meshes.
+}
+\label{tbl:inverse-rendering-error}
+\resizebox{.65\linewidth}{!}{
+\begin{tabular}{ccc}
+    & \cite{nicolet2021large} &Ours \\
+    \hline
+    T-shirt         &0.0073/0.0107   &0.0073/0.0106   \\
+    Suzanne         &0.0082/0.0153   &0.0080/0.0129   \\
+    Plank           &0.0081/0.0071   &0.0081/0.0072   \\
+    Bob             &0.0109/0.0061   &0.0107/0.0058   \\
+    Bunny           &0.0092/0.0210   &0.0083/0.0167   \\
+    \hline
+    Average            &0.0087/0.0120   &\textbf{0.0085/0.0106}   \\
+    top 20\% sal.   &0.0089/0.0219   &\textbf{0.0087/0.0205}   \\
+    top 5\% sal.    &0.0093/0.0391   &\textbf{0.0089/0.0375}   \\
+\end{tabular}
+}
+\end{table}

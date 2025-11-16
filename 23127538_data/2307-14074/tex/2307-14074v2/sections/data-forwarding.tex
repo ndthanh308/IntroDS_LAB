@@ -1,0 +1,66 @@
+% -------------------------------------------------------
+\subsection{Multicast Group Registration} \label{data-forward}
+% -------------------------------------------------------
+The multicast forwarding of \sys is based on forwarding table that installed on switches. Table-based forwarding is a commonly adopted approach by existing multicast solutions, \eg, the IP multicast \cite{crowcroft1988multicast}. \sys's forwarding table is indexed by \textit{multicast group IP address} (\aka, GroupIP), and \sys follows the indexed introduction to copy packets and forward them to specific output ports. Through the GroupIP-based multicast forward is similar, \sys has primary difference with the traditional IP multicast. 
+
+%\textsf{test} \texttt{test} \textsl{test} \textit{test}
+
+% Figure environment removed
+
+% Figure environment removed
+
+The first difference is that, the multicast forwarding table registration of \sys is centralized, while the IP multicast performs a distributed registration algorithm. The key insight pushing registration from distributed to centralized is that the datacenter is highly autonomous and the multicast membership is highly controlled. This centralized approach is used in various datacenter application and frameworks \cite{shahbaz2019elmo, diab2022orca}. Secondly, the IP multicast only registers layer-3 states to switches; thus only support the best-efford delivery. \sys, on the other hand, registers both layer-3 and layer-4 states to switches for the following connectivity and reliability supports.
+
+We describe the group registration of \sys here. The registration is centralized, and mainly supported by an application-assigned master node. The master node in the multicast group collects the connection states (including the layer-3 IP and layer-4 IB information) of all other multicast nodes through an out-of-band protocol (\eg, TCP). After information collection, the master node fits those connection states into the packet format of the self-developed \envelope protocol, which is illustrated in Fig. \ref{fig:envelope-packet}. In \envelope pakcet, the IP option is GroupIP followed by a specific UDP option. The palyload contains metadata and detailed connection states of each node. In addition to node IP, the states of each node also include QPN which is used for connectivity building afterward. The metadata contains connection statistics, where $seq$ and $total$ indicate the sequence and total number of \envelope packets. Limited to MTU, one \envelope packet contains at msot 96 nodes, thus the connection states of a multicast group with more than 96 members must span of multiple \envelope packets.
+
+%forwarding format
+%After the \envelope packet preparation, master node sends \envelope packet out, and letting swithes build their multicast forwarding data and multicast member confirm their paticipation. 
+The multicast forwarding of \sys is based on the forwarding table that installed on switches. We enrich the native IP multicast forwarding table by adding layer-4 information, including connection and ACK/NACK states, for connectivity and reliability supports. The enriched multicast forwarding table of \sys is illustrated in Fig. \ref{fig:table}. This table is indexed with GroupIP, and every GroupIP associates with an array with $n$ ( \# of switch ports) entries. $entry_i$ reprensets the action taken in $port_i$. Each entry has three types: $connected$, $forward$, and $excluded$, where $excluded$ means that this port isn't included in multicast tree. $Connected$ means that this port is directly connected to a multicast node, and $forward$ means that the downstream device is a switch. Each entry contains layer-3 IP address, layer-4 connection states, and ACK/NACK statistics. $\S$\ref{connection-handle} and $\S$\ref{ack-aggregation} introduce that how to support optimal distribution, connectivity and reliability, based on entry states.
+
+%forward envelope and determine forwarding port.
+Upon receiving the \envelope packet, switch builds its local forwarding table and send one or more new \envelope pakcets to downstream devices. Algorithm \ref{alg:three} illustrates the behavior of \sys switch. A \envelope packet $p$ carries a GroupIP and an array of multicast member connection states ($p.array$). The switch generates a forwarding table indexed by $p.groupIP$, and initiate all entry types to $excluded$. Then the switch iterates over $p.array$ to fill forwarding table. For every node in array, the switch find the node routing information through the normal unicast forwarding table. If this node is directly connected to $port_i$, then mark the type of $entry_i$ in forwarding table to $connected$, and fill this node's connection states into $entry_i$. Otherwise, this node isn't directly connected, then the switch find the set of accessible ports ($set_p$). If one port in $set_p$ has been marked as $forward$, the switch select this port again to optimally distribute data. If not, the switch selects the least utilized port among $set_p$ to perform a group-level load balancing. 
+
+After processing \envelope packet and filling forwarding table, the switch generate one or more new \envelope packet to ports with types as $forward$ or $connected$. The metadata of \envelope packet is unmodified while the contained nodes is changed. The \envelope packet that sent through each port only contains nodes that selects this port. We show the actions that taken by $S_1$ through Fig. \ref{fig:envelope-transmission}, and the whole topology is shown in Fig. \ref{fig:overview}. The \envelope packet that $S_1$ receives contains $R_1$, $R_2$, and $R_3$. As instructed by Algorithm \ref{alg:three}, $S_1$ should forward an copy to $port_{L_2}$ (eventually accessing $R_1$), and an copy to $port_{C_2}$ (eventually accessing $R_2$ and $R_3$). Thus the \envelope packets forwarded to $port_{L_2}$ and $port_{C_2}$ contains information of $\{R_1\}$ and $\{R_2, R_3\}$, respectively, to let the downstream switch build its local forwarding table.
+   
+Finally, if one node receives an \envelope packet, and its IP address is included in the packet, this node answer ACK back to the master node to confirm its participation. After the master node collects all nodes' confirmation ACK, the multicast transmission can start. 
+
+
+\begin{algorithm}[t]
+\caption{Multicast Forwarding Table Registration}\label{alg:three}
+\begin{algorithmic}[1]
+
+%\Function{Receive}{$p$}\Comment{$p$: \envelope packet}
+\State $p\gets $ received \envelope packet
+\State $T\gets $ multicast forwarding table
+\State $n\gets$ the number of switch ports
+\State $R[n]\gets \{ 0 \}$ \Comment{for creating \envelope packets}
+\State $key\gets p.groupIP$
+\State create $T[key]$, and initiate type of all entry to $excluded$
+%\State $array[n]\gets MFT[p.groupIP]$
+\State \textcolor{pink}{// loop over nodes and build $T$}
+\For{$node$ contained in $p$}%\Comment{loop over nodes and build $T$}
+	\If{$node$ is directly connected to port $i$}
+		\State $out \gets i$
+		\State $T[key][out].type \gets connected$
+		\State $T[key][out].vaue \gets $ node connection states
+	\Else
+		\State $S\gets $ the set of accessible ports
+		\If{port $j\in S$ is marked as $forward$}
+			\State $out \gets j$
+		\Else
+			\State $out \gets $ least utilized port in $S$
+			\State $T[key][out].type \gets forward$
+		\EndIf
+	\EndIf
+	\State update port utilization
+	\State $R[out].append(node)$
+\EndFor
+\State \textcolor{pink}{// create \envelope packets and send out}
+\For{port $i\gets 0,$ $n-1$}%\Comment{create \envelope packets}
+	\State create \envelope packet $p$ based on $R[i]$
+	\State send $p$ through port $i$
+\EndFor
+%\EndFunction
+
+\end{algorithmic}
+\end{algorithm}

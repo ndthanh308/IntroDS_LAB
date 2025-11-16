@@ -1,0 +1,457 @@
+% !TEX root = paper.tex
+
+\section{Asynchronous Effects in Action}
+\label{sec:applications}
+
+We now show examples of the kinds of programs one can write in \lambdaAEff.
+Similarly to \autoref{sec:overview:runningexample}, we again allow ourselves access to 
+mutable references as a matter of convenience. We use these references only for 
+(function call) counters and for communicating data between different parts of a program---passing data between 
+subsequent reinstalls of the same interrupt handler is dealt with using the stateful reinstallable 
+interrupt handlers introduced in \autoref{sec:extensions:stateful-reinstallable-interrupt-handlers}. 
+
+In addition to the generic versions of constructs defined in \autoref{sec:overview:runningexample}, 
+we further use
+%
+\begin{align*}
+    \tmspawngen{M} &~\defeq~ \tmspawn{M}{\tmreturn \tmunit} \\
+    \tmunboxgen{V} &~\defeq~ \tmunbox{V}{x}{\tmreturn x}
+\end{align*}
+
+\subsection{Guarded Interrupt Handlers}
+\label{sec:applications:guarded-handlers}
+
+Before diving into the examples, we note that we often want the 
+triggering of interrupt handlers to be 
+conditioned on not only the names of interrupts, but also on the payloads that they carry.
+In order to express such more fine-grained interrupt handler triggering behaviour, we shall use a
+\emph{guarded interrupt handler}: 
+\begin{aeffbox}
+\begin{lstlisting}
+promise (op x r s when guard |-> comp) @ v
+\end{lstlisting}
+\end{aeffbox}
+which is simply a syntactic sugar for the following stateful interrupt handler that reinstalls 
+itself until the boolean \ls$guard$ becomes true, in which case it executes the handler code \ls$comp$:
+\begin{aeffbox}
+\begin{lstlisting}
+promise (op x r s |-> if guard then comp else r s) @ v
+\end{lstlisting}
+\end{aeffbox}
+where \ls$x$ and \ls$s$ are bound both in \ls$guard$ and 
+\ls$comp$. This means that the handler triggering can be conditioned both on the payload 
+and state values. Meanwhile, \ls$r$ is bound only in \ls$comp$.
+Also, note that regardless whether \ls$guard$ is true, every interrupt gets propagated into \ls$cont$.
+
+As guarded interrupt handlers repeatedly reinstall themselves, they get assigned 
+recursive effect annotations, as discussed in \autoref{sec:extensions:reinstallable-interrupt-handlers}.
+For example, if \ls$comp$ has type $\tycomp{\typromise X}{(\o,\i)}$, then the corresponding
+guarded interrupt handler gets assigned the type $\tycomp{\typromise X}{(\emptyset, \i_h)}$, where
+\[
+  \i_h = \{ \op \mapsto (\o, \i \sqcup \{ \op \mapsto (\o, \i \sqcup \{ \op \mapsto (\o, \cdots) \}) \}) \}
+\]
+is the least fixed point of the continuous map $\i' \mapsto \{ \op \mapsto (\o, \i \sqcup \i') \} : I \to I$.
+As such, the type $\tycomp{\typromise X}{(\emptyset, \i_h)}$ specifies that the installation of the 
+guarded interrupt handler does not issue any signals by itself, and that the arrival of any 
+$\opsym{op}$ interrupt causes either the effects $(\o,\i)$ of \ls$comp$ to happen, 
+or the interrupt handler to be reinstalled. Observe that as a consequence, some of the 
+recursive encoding leaks via $\i_h$ into the type of guarded interrupt handlers.
+
+Similarly to reinstallable interrupt handlers, we write \ls$promise (op x r when guard |-> comp)$ 
+when the state associated with the guarded interrupt handler is trivial and can be omitted.
+
+\subsection{Pre-Emptive Multi-Threading}
+\label{sec:applications:multithreading}
+
+Multi-threading remains one of the most exciting applications of algebraic effects, with the possibility of modularly
+and user-definably expressing 
+many evaluation strategies being the main reason for the extension of \pl{OCaml} with effect handlers~\cite{OCaml:ReleaseNotes}.
+%
+These evaluation strategies are however \emph{cooperative} in nature, where each thread needs to explicitly yield back 
+control, stalling other threads until then. 
+
+While it is possible to simulate \emph{pre-emptive multi-threading} within the usual treatment of algebraic effects, 
+it requires a low-level access to the specific runtime environment, so as to inject 
+yields into the currently running computation.
+%
+In contrast, implementing pre-emptive multi-threading in \lambdaAEff~is quite straightforward, and importantly, 
+possible within the language itself---the injections into the running computation 
+take the form of incoming interrupts.
+
+For the purpose of modelling pre-emptive multi-threading, let us consider two interrupts, 
+$\opsym{stop} : \tyunit$ and $\opsym{go} : \tyunit$, that communicate to a thread whether 
+to \emph{pause} or \emph{resume} execution. For example, these interrupts might originate 
+from a timer process being run in parallel.
+
+At the core of our implementation of pre-emptive multi-threading is
+the computation term \ls$waitForStop ()$ that is defined as the following reinstallable interrupt handler:
+\begin{aeffbox}
+\begin{lstlisting}
+let waitForStop () = 
+    promise (stop _ r |->
+        let p = promise (go _ |-> return <<()>>) in
+        await p;
+        r ()
+    )
+\end{lstlisting}
+\end{aeffbox}
+which first installs an interrupt handler for $\opsym{stop}$, letting subsequent computations run their course. Once 
+a $\opsym{stop}$ interrupt arrives, the interrupt handler for it is triggered and the next one for $\opsym{go}$ is 
+installed. In contrast to the interrupt handler for $\opsym{stop}$, we now start awaiting 
+the promise \ls$p$. This means that any subsequent computations are blocked until a $\opsym{go}$ interrupt 
+is received, after which we reinstall the interrupt handler for $\opsym{stop}$ and repeat the cycle.
+
+To \emph{initiate the pre-emptive behaviour} for some computation \ls{comp}, we run the program
+\begin{aeffbox}
+\begin{lstlisting}
+waitForStop (); comp
+\end{lstlisting}
+\end{aeffbox}
+The algebraicity reduction rules for interrupt handlers ensure that they propagate out of \ls{waitForStop} 
+and eventually encompass the entire composite computation, including \ls{comp}.
+%
+It is important to note that in contrast to the usual effect handlers based encodings of multi-threading, \ls$waitForStop$ does 
+not need any access to a thunk \lstinline{fun () |-> comp} representing the threaded computation. 
+In particular, the computation \ls$comp$ that we want to pre-empt can be completely unaware of the multi-threaded behaviour, 
+both in its definition and type.
+
+This approach can be easily extended to multiple threads, by using interrupts' payloads to communicate thread IDs. To this end, 
+we can consider interrupts $\opsym{stop} : \tyint$ and $\opsym{go} : \tyint$, and use guarded interrupt handlers to define  
+a thread ID sensitive version of \ls$waitForStop$:
+\begin{aeffbox}
+\begin{lstlisting}
+let waitForStop threadID =
+    promise (stop threadID' r when threadID = threadID' |->
+        let p = promise (go threadID' when threadID = threadID' |-> return <<()>>) in
+        await p;
+        r ()
+    )
+\end{lstlisting}
+\end{aeffbox}
+with the triggering of the interrupt handlers being conditional on the received thread IDs.
+
+\subsection{Remote Function Calls}
+\label{sec:applications:remotecall}
+
+One of the main uses of asynchronous computation is to offload the execution of 
+\emph{long-running functions} to remote processes. Below we show how to implement this
+in \lambdaAEff~in a way that requires minimal cooperation from the remote process.
+
+For a simpler exposition, we assume a fixed (mobile) result type $A$ shared by all functions 
+that we may wish to execute remotely. For communicating a function to be executed to 
+the remote process, we assume a signal $\opsym{call} : \tybox{\tyunit \to \tycomp{\tyunit}{(\o, \i)}}$. 
+Finally, for communicating the remote function call's $A$-typed result back to the caller, we assume 
+a signal $\opsym{result} : \typrod{A}{\tysym{int}}$.
+
+The caller then calls functions \ls$f$ remotely through a wrapper function, \ls$remoteCall$,
+which issues a \ls$call$ signal, installs a handler for a \ls$result$ 
+interrupt, and returns a thunk that can be used to block the caller program's 
+execution and await the remote function's result:
+%
+\begin{aeffbox}
+\begin{lstlisting}
+let remoteCall f =
+    let callNo = !callCounter in callCounter := !callCounter + 1;
+    let task = [| fun _ -> let g = unbox f in
+                                let res = g () in 
+                                send result (res, callNo) |] 
+    in
+    send call task;
+    let resultPromise = promise (result (y, callNo') when callNo = callNo' |-> return <<y>>) in
+    let awaitResult () = await resultPromise in
+    return awaitResult
+\end{lstlisting}
+\end{aeffbox}
+
+Observe that the function \ls$f$ is not sent directly in the payload of the \ls$call$ signal
+to the remote process. Instead, \ls$call$'s payload combines the task of executing 
+\ls$f$ with issuing a \ls$result$ signal with the function's result. This ensures 
+that the result is always sent back to the caller, and the callee process can have a very 
+simple implementation (see below). In addition, this combination explains why the signature
+of \ls$call$ does not mention $A$. Further, we note that in order to ensure that the payload is a 
+boxed value, as required by \ls$call$'s signature, the function \ls$f$ has to be 
+passed to \ls$remoteCall$ in a boxed form (notice the use of \ls$unbox$ 
+in \ls$task$).
+
+To avoid the results of earlier remote function calls from fulfilling the promises of later ones, 
+we assign to each call a unique identifier, which we implement using a counter local to the caller 
+process. The identifier is passed together with the result and a guarded interrupt handler is used 
+to ensure that only the result of the correct call is awaited. Note that this policy is again enforced 
+by the caller and does not require any cooperation from the callee.
+
+We also note that the effect annotation $(\o, \i)$ in \ls$call$'s signature can 
+be used to  limit the effects the caller may trigger in the callee process---it also
+influences the effects of functions \ls$f$ that one can call the 
+\ls$remoteCall$ wrapper with. In order to be able to communicate 
+the remote function's result back to the caller in \ls$task$, $\o$ should include at 
+least the \ls$result$ signal.
+
+For instance, one may then call remote functions in their code as follows:
+\begin{aeffbox}
+\begin{lstlisting}
+let subtally = remoteCall [| fun () -> query "SELECT count(col) FROM table WHERE cond" |] in
+let tally = remoteCall [| fun () -> query "SELECT count(col) FROM table" |] in
+printf "Percentage: %d" (100 * subtally () / tally ())
+\end{lstlisting}
+\end{aeffbox}
+
+In the \emph{callee process}, we simply install an interrupt handler that spawns a new process for 
+executing the received function and then immediately recursively reinstalls itself, as follows:
+\begin{aeffbox}
+\begin{lstlisting}
+promise (call boxedTask r |-> 
+    spawn (let f = unbox boxedTask in 
+              f ()); 
+    r ()
+)
+\end{lstlisting}
+\end{aeffbox}
+Observe that as the payload of the \ls$call$ interrupt is received in a boxed form, 
+it has to be unboxed before we are able to execute its underlying function. Here it is 
+important that this unboxing happens inside the argument of \ls$spawn$ and not
+before the call to \ls$spawn$. Namely, as the argument of 
+\ls$spawn$ has to be mobile, its context is delimited by $\ctxlock$ (as discussed 
+in \autoref{sec:extensions:dynamic-process-creation}) and therefore it can only refer 
+to variables with mobile types bound outside of it, and whereas the type of 
+\ls$boxedTask$ is mobile, the type of the underlying function is not.
+
+This example can be naturally generalised to allow the remotely executed functions to take
+non-unit arguments: on the one hand, simply by passing arguments to the callee using the \ls$remoteCall$ 
+wrapper function, or on the other hand, by defining separate wrapper functions for communicating the 
+function and a particular call's arguments to the callee one at a time. We omit this generalisation here, but 
+refer the reader to our original work~\cite{Ahman:POPL} for an example of remote function 
+calls being triggered by passing a particular call's arguments to the callee. 
+%
+However, it is important to highlight that whereas in our original work we were limited to only 
+sending arguments to a fixed remote function, the modal boxed types adopted in this paper  
+would enable the caller to dynamically also pass functions to the callee.
+
+Unlike effect handlers, our interrupt handlers have very limited control over the execution of 
+their continuation. Regardless, we can still simulate \emph{cancellations of asynchronous 
+computations} using the ideas behind our implementation of pre-emptive multithreading that we 
+described in \autoref{sec:applications:multithreading}. Specifically, we modify the \ls$remoteCall$ wrapper
+function so that it returns an additional \emph{cancellation thunk}, which can be used to cancel the computation:
+\begin{aeffbox}
+\begin{lstlisting}
+let remoteCancellableCall f =
+    let callNo = !callCounter in callCounter := !callCounter + 1;
+    let task = [| fun _ -> waitForCancel callNo; 
+                                let g = unbox f in 
+                                let res = g () in 
+                                send result (res, callNo) |]
+    in
+    send call task;
+    let resultPromise = promise (result (y, callNo') when callNo = callNo' |-> return <<y>>) in
+    let awaitResult () = await resultPromise in
+    let cancelCall () = send cancel callNo in
+    return (awaitResult, cancelCall)
+\end{lstlisting}
+\end{aeffbox}
+and where the function used to implement cancellations in the payload of \ls$call$ is defined as
+\begin{aeffbox}
+\begin{lstlisting}
+let waitForCancel callNo =
+  promise (cancel callNo' when callNo = callNo' ->
+    let p = promise (impossible _ -> return <<()>>) in
+    await p;
+    return <<()>>
+  )
+\end{lstlisting}
+\end{aeffbox}
+for which we assume two additional signals: $\opsym{cancel} : \tyint$ and $\opsym{impossible} : \tyempty$.
+
+The callee code remains unchanged. Running each remote call in a separate process ensures
+that each \ls$cancel$ interrupt affects only one remote function call. In our original
+work~\cite{Ahman:POPL}, where all remote calls were executed in a single process,
+we additionally needed an auxiliary reinvoker process to continue executing the non-cancelled 
+remote function calls.
+
+Finally, we observe that the cancelled computation is only \emph{perpetually stalled} 
+(indefinitely awaiting the \ls$impossible$ interrupt, which can never be propagated to the process due to 
+its $\tyempty$-typed signature) but not discarded completely, leading to a memory leak. 
+We conjecture that extending \lambdaAEff~with interrupts and interrupt handlers that have greater 
+control over their continuations could lead to a more efficient, memory leak-free code for the callee site.
+
+\subsection{Runners of Algebraic Effects}
+\label{sec:applications:runners}
+
+Next, we show how to use \lambdaAEff~to implement a parallel variant 
+of \emph{runners of algebraic effects} \cite{Ahman:Runners}. These are a 
+natural mathematical model and programming abstraction for resource management based on 
+algebraic effects, and correspond to effect handlers that resume continuations (at most) 
+once in a tail call position.
+
+In a nutshell, for a signature of operation 
+symbols $\op : A_\op \to B_\op$, a \emph{runner} $\mathcal{R}$ comprises a family of stateful functions 
+$\overline{\op}_{\mathcal{R}} : A_\op \times R \to B_\op \times R$, 
+called \emph{co-operations}, where $R$ is the type of \emph{resources} that the particular runner manipulates.
+In the more general setting, the co-operations also model other, external 
+effects, such as native calls to the operating system, and can furthermore raise  
+exceptions---all of which we shall gloss over here.
+
+Given a runner $\mathcal{R}$, the programmer is provided with a construct
+\[
+\tmkw{using}~\mathcal{R}~\tmkw{@}~V_{\text{init}}~\tmkw{run}~M~\tmkw{finally}~\{ \tmreturn x ~\tmkw{@}~ r_{\text{fin}} \mapsto N  \}
+\]
+which runs $M$ using $\mathcal{R}$, with resources initially set to $V_{\text{init}}$; and 
+finalises the return value (bound to $x$) and final resources (bound to $r_{\text{fin}}$) using the computation $N$, e.g., 
+ensuring that all file handles get closed. This is a form of effect handling: it executes $M$ by invoking 
+co-operations in place of operation calls, while doing resource-passing under the hood. 
+Below we show by means of examples how one can use \lambdaAEff~to naturally separate $\mathcal{R}$ and $M$ 
+into different processes.
+%
+For simplicity, we omit the initialisation and finalisation phases.
+
+For our first example, let us consider a runner that implements a \emph{pseudorandom number generator} 
+by providing a co-operation for ${\opsym{random} : \tyunit \to \tyint}$, which we can implement as 
+\begin{aeffbox}
+\begin{lstlisting}
+let linearCongruenceGeneratorRunner modulus a c initialSeed =
+    promise (randomReq callNo r seed |->
+        let seed' = (a * seed + c) mod modulus in
+        send randomRes (seed, callNo); 
+        r seed'
+    ) @ initialSeed
+\end{lstlisting}
+\end{aeffbox}
+%
+It is given by a recursive interrupt handler, which listens for $\opsym{randomReq} : \tysym{int}$ requests 
+issued by clients, and itself issues $\opsym{randomRes} : \typrod{\tysym{int}}{\tysym{int}}$ responses. 
+The resource that this runner manages is the seed, which it passes between subsequent co-operation 
+calls using the state-passing features provided by our reinstallable interrupt handlers. The seed is originally set 
+to \ls$initialSeed$, recalculated during each execution of the interrupt handler, and passed to the next 
+co-operation call by reinstalling the interrupt handler with the updated seed value.
+
+In the client, we implement operation calls \ls$random ()$ as discussed in \autoref{sec:overview:signals}, 
+by decoupling them into signals and interrupt handling. We use guarded interrupt handlers and call identifiers to 
+avoid a response to one operation call fulfilling the promises of other ones. 
+
+\begin{aeffbox}
+\begin{lstlisting}
+let random () =
+    let callNo = !callCounter in callCounter := callNo + 1;
+    send randomReq callNo;
+    let p = promise (randomRes (n, callNo') when callNo = callNo' |-> return <<n mod 10>>) in
+    await p
+\end{lstlisting}
+\end{aeffbox}
+
+As a second example of runners, we show that this parallel approach to runners naturally 
+extends to multiple co-operations. Specifically, we implement a \emph{runner for a heap}, 
+which provides co-operations for the following three operation symbols:
+\[
+    \opsym{alloc} : \tysym{int} \to \tysym{loc} \qquad
+    \opsym{lookup} : \tysym{loc} \to \tysym{int} \qquad
+    \opsym{update} : \tysym{loc} \times \tysym{int} \to \tyunit
+\]
+We represent the co-operations using a signal/interrupt pair $(\opsym{opReq},\opsym{opRes})$ with 
+respective payload types $\typrod{\tysym{payloadReq}}{\tysym{int}}$ and 
+$\typrod{\tysym{payloadRes}}{\tysym{int}}$, tagged with call identifiers, and where
+%
+\begin{aeffbox}
+\begin{lstlisting}
+type payloadReq = AllocReq of int | LookupReq of loc | UpdateReq of loc * int
+type payloadRes = AllocRes of loc | LookupRes of int | UpdateRes of unit
+\end{lstlisting}
+\end{aeffbox}
+
+\noindent
+The resulting runner is implemented by pattern-matching on the payload value as follows:
+\begin{aeffbox}
+\begin{lstlisting}
+let heapRunner initialHeap =
+    promise (opReq (payloadReq, callNo) r heap |->
+        let heap', payloadRes =
+            match payloadReq with
+            | AllocReq v |-> 
+                  let heap', l = allocHeap heap v in 
+                  return (heap', AllocRes l)
+            | LookupReq l |-> 
+                  let v = lookupHeap heap l in 
+                  return (heap, LookupRes v)
+            | UpdateReq (l, v) |-> 
+                  let heap' = updateHeap heap l v in 
+                  return (heap', UpdateRes ())
+        in
+        send opRes (payloadRes, callNo); 
+        r heap'
+    ) @ initialHeap
+\end{lstlisting}
+\end{aeffbox}
+%
+The resource that this runner manages is the heap---it is initially set to \ls$initialHeap$, and then 
+updated and passed between subsequent co-operation calls analogously to the seed in the previous example. 
+On the client side, the operation calls for allocation, lookup, and update are also implemented similarly 
+to how \ls$random ()$ was defined in the previous example.
+
+Finally, we note that we could have instead used three signal/interrupt pairs and split \ls$heapRunner$ 
+into three distinct reinstallable interrupt handlers, one for each of the three co-operations. However, then we would 
+not have been able to use the state-passing provided by our interrupt handlers and we would 
+have had to store the heap in the memory instead.
+
+\subsection{Non-Blocking Post-Processing of Promised Values}
+\label{sec:applications:chaining}
+
+As discussed in \autoref{sect:overview:promising}, interrupt handlers differ
+from ordinary operation calls by allowing user-side post-processing of received data in the handler code. 
+In this example, we show that \lambdaAEff~is flexible enough to modularly perform \emph{further 
+non-blocking post-processing} of this data anywhere in a program.
+
+For instance, let us assume we are writing a program that contains an interrupt handler (for some $\op$)
+that promises to return us a list of integers. Let us further assume that at some later point 
+in the program we decide that we want to further process this list 
+if and when it becomes available, 
+e.g., by using some of its elements to issue an outgoing signal. 
+%
+Of course, we could do this by going back and changing the definition of the original interrupt handler, 
+but this would not be very modular; 
+%
+nor do we want to block the entire program's execution (using \ls$await$) until the $\op$ interrupt
+arrives and the concrete list becomes available.
+
+Instead, we can define a generic combinator for \emph{non-blocking post-processing} of  
+promises
+\begin{aeffbox}
+\begin{lstlisting}
+process$_{\op}$ p with (<<x>> |-> comp)
+\end{lstlisting}
+\end{aeffbox}
+that takes an earlier made promise \ls$p$ (which we assume originates 
+from handling the specified interrupt $\op$), 
+and makes a new promise to
+execute the post-processing code \ls$comp[v/x]$ once \ls$p$ gets fulfilled with some value \ls$v$.
+Under the hood, \ls{process$_{\op}$} is simply a syntactic sugar for
+\begin{aeffbox}
+\begin{lstlisting}
+promise (op _ |-> let x = await p in let y = comp in return <<y>>)
+\end{lstlisting}
+\end{aeffbox}
+%
+While \ls{process$_{\op}$} involves an \ls$await$, it gets 
+exposed only after  
+\ls$op$ is received, but by that time \ls$p$ will have been fulfilled with some  
+\ls$v$ by an earlier interrupt handler, and thus \ls$await$ can reduce.
+
+Returning to post-processing a list of integers promised by some interrupt
+handler, below is an example showing the use of the \ls{process$_{\op}$}
+combinator and how to \emph{chain together multiple post-processing
+computations} (filtering, folding, and issuing a signal), in the same spirit as
+how one is taught to program compositionally with futures and
+promises~\cite{Haller:Futures}:
+\begin{aeffbox}
+\begin{lstlisting}
+let p = promise (op x |-> initialHandler) in 
+...
+let q = process$_{\op}$ p with (<<is>> |-> filter (fun i |-> i > 0) is) in 
+let r = process$_{\op}$ q with (<<js>> |-> fold (fun j j' |-> j * j') 1 js) in 
+process$_{\op}$ r with (<<k>> |-> send productOfPositiveElements k);
+...
+\end{lstlisting}
+\end{aeffbox}
+%
+For this to work, it is crucial that incoming interrupts behave 
+like (deep) effect handling and propagate into continuations (see \autoref{sec:basic-calculus:semantics:computations})
+so that all three post-processing computations get executed, in their program order, 
+when an interrupt \ls$op$ is propagated to the program.
+
+

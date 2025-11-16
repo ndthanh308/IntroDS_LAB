@@ -1,0 +1,265 @@
+\section{Scientific Machine Learning} \label{appendix:sciml-appendix}
+
+\subsection{\update{Benchmark Models}} \label{appendix:sciml-benchmark-models}
+
+\update{
+We focus on two classes of neural PDE solvers: Image-to-image models and neural operators. The Image-to-image models are variants of UNet, which are commonly used in computer vision tasks, such as image segmentation. These models are not always suitable as neural PDE solvers, where training data generated from numerical simulations may require using different resolutions. However, modern versions of UNet are still competitive in many benchmarks \cite{gupta2022towards, lippe2023modeling}.
+}
+
+\begin{enumerate}
+    \item \textbf{UNet}$_{\text{bench}}$ is a simple variant of the original UNet architecture from 2015, which was modified in PDEBench \cite{PDEBench2022} to use batch normalization. We also replace the tanh activation with GELU \cite{PDEBench2022, unet2015, hendrycks2016gaussian}.
+    \item \update{\textbf{UNet}$_{\text{mod}}$ is a modern variant of UNet that gets impressive as a PDE solver. It has been modified to use wide residual connections and group normalization \cite{gupta2022towards, wu2018group, zagoruyko2016wide}.}
+\end{enumerate}
+
+\update{
+Neural operators have found great success as PDE solvers \cite{kovachki2023neural}. Typically, given an initial condition $u_0$, a neural operator is a function $\mathcal{M} : [0, t_{max}] \times \mathcal{A} \rightarrow \mathcal{A}$, where $\mathcal{A}$ is an infinite dimensional function space, that satisfies $\mathcal{M}(t, u_0) = u_t$ \cite{ li2021fourier, kovachki2023neural}. I.e., they  map some initial condition to any (discretized) time up to $t_{max}$. Training a model in this form demands many valid initial conditions and solved simulations to form a large training set. However, generating such a dataset proves infeasible in the case of BubbleML due to the complexity and computational cost of the simulations. To overcome this obstacle, we adopt the autoregressive approach, even for neural operators, a practice that is also observed in \cite{lippe2023modeling, mccabe2023towards, brandstetter2022message}.
+}
+
+\begin{enumerate}
+    \item \textbf{FNO} is the Fourier Neural Operator \cite{li2021fourier, kovachki2023neural}. FNO learns weights in Fourier space to act as a resolution-invariant global convolution. This  seminal work has been extended by many other neural operators. One notable downside is the memory requirements: each of the Fourier domain weight matrices consume $\mathcal{O}(H^2M^D)$, where $H$ is the hidden size, $M$ is the number of Fourier modes used after truncating high frequencies, and $D$ is the problem dimension. In the case of BubbleML, $D$ is 2 or 3.
+    \item \textbf{UNO} is a U-shaped variant of FNO \cite{rahman2023uno}. This mimicks the skips connections of a standard UNet, but replaces the convolutional layers with Fourier blocks. We use an 8 layer architecture that mimicks the vanilla UNet. The encoder reduces the input size and Fourier modes, but increases the number of channels. The decoder increases the input size and Fourier modes, while decreasing the number of channels. Since the number of Fourier modes decreases, much of the network only accounts for very low frequencies.
+    \item \update{\textbf{F-FNO} is the Factorized Fourier Neural Operator \cite{tran2023factorized}.
+    As the name suggests, F-FNO factorizes the Fourier transform over problem dimensions. This reduces the number of parameters per Fourier space weight matrix to $\mathcal{O}(H^2MD)$. This enables using more modes, scaling to deeper models, or learning higher dimensional problems. Further, F-FNO suggests changing the structure of the residual connections, so that they are applied after the non-linearity.}
+    \item \update{\textbf{G-FNO} is the Group-Equivariant Fourier Neural Operator \cite{helwig2023group}, which  extends group convolutions to the frequency domain. The proposed G-Fourier layers are equivariant to rotation, reflection, and translation. They keep the resolution invariance of neural operators. While this model has many advantages, it also has substantial memory requirements that we found limited its suitability for high-resolution data. The Fourier space weight matrix uses $\mathcal{O}(H^2 M^D S)$, where $S$ is the number of elements in the ``stabilizer'' of the group under consideration \cite{helwig2023group}. We also note that the BubbleML simulations are \emph{not} rotation or vertical reflection equivariant due to the effects of temperature and gravity. However, the simulations are horizontal reflection and translation equivariant. In spite of this partial incompatibility, we think G-FNO is interesting to experiment with. It is fairly common that models that bake in some form equivariance work well, even if the assumption of equivariance is not totally valid. 
+    }
+\end{enumerate}
+
+\subsection{\update{Training Strategies}} \label{appendix:sciml-training-strategies}
+
+We implement several popular training strategies designed to make neural PDE solvers robust to instability during rollout. One source of this instability is \emph{distribution shift}, which occurs when the model takes its prior outputs as input. The errors in the model's predictions accumulate, and the model is likely to diverge from the ground-truth during long rollouts.
+
+\update{\textbf{Teacher-forcing} is the default training strategy \cite{williams1989teacherforcing}. The input to the model is always the ground-truth of the previous timesteps. I.e., to predict the solution $u(t)$, the model input is the ground-truth solutions $u([t-k, t-1])$.}
+
+\update{\textbf{Gaussian noise} is applied on iterations that the pushforward trick is unused. Several papers claim that adding noise is a simple method to help the model become more robust to distribution shift during longer rollouts \cite{tran2023factorized, pfaff2021learning, sanchez2020learning}. Similar to F-FNO, when used, we add noise with zero mean and standard deviation of $0.01$.} As Gaussian noise is spread uniformly across frequencies, it may also help the model account for high frequencies \cite{lippe2023modeling}.
+
+\update{\textbf{Pushforward trick.} Algorithm \ref{alg:push-forward-trick} shows sample pseudo-code for the pushforward trick \cite{brandstetter2022message}. The model is trained by performing multiple inferences for successive timesteps. Similar to using Gaussian noise, this trick helps the model be robust to distribution shift during rollouts. The advantage is that the errors introduced during the pushforward steps better match the distribution of errors that accumulate during rollouts. Thus, we are essentially training the model to correct for its own distribution shift during rollout. We use a ramp-up when applying the pushforward trick: the percentage of training iterations completed is used as the likelyhood that we perform pushforward steps. So, initially there is a $0\%$ chance of pushing forward. After $50\%$ of training iterations, there is a $50\%$ chance of applying the pushforward trick. We found this to be necessary and that applying the pushforward trick on every iteration would fail.
+} 
+
+\begin{algorithm}
+    \caption{Pushforward Trick.}
+    \label{alg:push-forward-trick}
+    \begin{algorithmic}[1]
+    \Require input is the model's input; $N$ is the number of pushforward steps
+    \For{$n \in \{0, \dots, N\}$}
+        \State $\text{input} \leftarrow \text{model}(\text{input})$ \Comment{Step though $N$ timesteps}
+    \EndFor
+    \State $\text{input} \leftarrow \text{model}(\text{input})$ \Comment{Track gradients for only the final forward pass.}
+    \end{algorithmic}
+\end{algorithm}
+
+\update{\textbf{Temporal bundling} is used so that the model outputs the solution for multiple future timesteps with one inference \cite{brandstetter2022message}. By having the model output the solution for multiple future timesteps, we can reduce the number of times the model is used. Since some error is introduced by each inference during rollout, temporal bundling should reduce the rate that error is accumulated. This is again beneficial for maintaining accuracy and stability during long rollouts. With a temporal bundle of size $k$, the forward propagator outputs a vector $\mathcal{F}(u([t_{n-k}, t_{n-1}])) = u([t_n, t_{n+k-1}])$.
+}
+
+\begin{algorithm}
+    \caption{Main Training Loop, with Pushforward Trick.}
+    \label{alg:alg-train}
+    \begin{algorithmic}[1]
+    \Require data, the set of simulations; $N$, the number of pushforward steps
+    \State sample $t$ from $\{t_k, t_{max}\}$
+    \State $\text{input} \leftarrow \text{data}
+([t-k\Delta t, t-\Delta t])$ \Comment{Sample $k$ timesteps to use as input}
+    \If{$N = 0$}
+        \State $\text{input} \leftarrow \text{input} + \mathcal{N}(0, 0.01)$ \Comment{Add Gaussian noise when \emph{not} ``pushing forward.''}
+    \EndIf
+    \State output = PushForwardTrick(input, $N$)
+    \State $\text{target} \leftarrow \text{data}([t+ Nk, t+(N+1)k - 1])$ \Comment{Grab target for result of $N$ pushforward steps}
+    \State $\text{loss}(\text{output}, \text{target})$
+    \end{algorithmic}
+\end{algorithm}
+
+\subsection{\update{Hyperparameter Settings}} \label{appendix:sciml-hyperparameter-settings}
+
+\update{We mostly use generic hyperparameter settings that we found work well across all models. Each model has its own parameters (hidden channels, Fourier modes, etc) tuned based on these settings. The settings for the temperature and flow experiments can be found in Tables \ref{tab:temp-generic-hyperparameters} and \ref{tab:vel-generic-hyperparameters}. All models are trained using AdamW \cite{loshchilov2019decoupled}. For each temperature model, we use 3\% of the total iterations for learning rate warmup to reach the base learning rate. For the remaining iterations, we apply a learning rate decay. For UNet$_{\text{mod}}$, we reduce the base learning rate to 5e-4 in order to avoid instability we experienced during some training runs. We also perform gradient clipping to clip the gradient norm to be at most one. For data augmentation, we perform horizontal reflections only for pool boiling.}
+
+\update{The Fourier models that are resolution invariant are trained at half resolution and evaluated at full resolution. We found that training at the full resolution gave similar results, but took much longer or required distributed training. The Fourier models all take the $xy$-coordinate grid as input \cite{helwig2023group}. So, the input is $(x, y, T([t-k, t-1]), v([t-k,t-1]))$, where $T$ is the temperature map and $v$ is the velocity map. Each Fourier model uses the 64 lowest frequency modes, except UNO, which uses the 32 lowest frequencies in the bottom of the ``U'' where the resolution is too small to use 64 modes. As the domain is non-periodic, we do Fourier continuation by padding the domain with zeros \cite{li2021fourier}. For G-FNO, due to memory constants, we are forced to use fewer Fourier modes (32) and downsample the domain to quarter of its original size during training. The G-FNO models are trained on an NVIDIA A100 with 80 GB of memory.}
+
+\begin{table}[]
+    \centering
+    \caption{Generic hyperparameter settings for the temperature experiments.}
+    \begin{tabular}{c|c}
+        \hline
+        Hyperparameter & Value \\
+        \hline
+        Number of Epochs & 250 \\
+        Batch Size & 8 \\
+        Optimizer & AdamW \\
+        Weight Decay & 0.01 \\
+        Base LR & 1e-3 (or 5e-4) \\
+        LR Warmup & Linear, 3\% \\
+        LR Scheduler & Step \\
+        Step Factor & 0.5 \\
+        Step Patience & 75 Epochs \\
+        History Size & 5 \\
+        Future Size & 5 \\
+        \hline
+    \end{tabular}
+    
+    \label{tab:temp-generic-hyperparameters}
+\end{table}
+
+\begin{table}[]
+    \centering
+    \caption{Generic hyperparameter settings for the flow experiments.}
+    \begin{tabular}{c|c}
+        \hline
+        Hyperparameter & Value \\
+        \hline
+        Number of Epochs & 25 \\
+        Batch Size & 16 \\
+        Optimizer & AdamW \\       
+        Weight Decay & 1e-4 \\
+        Base LR & 5e-4 \\
+        LR Warmup & Linear, 3\% \\
+        LR Scheduler & Cosine Annealing \\
+        Min LR & 1e-6 \\
+        History Size & 5 \\
+        Future Size & 5 \\
+        \hline
+    \end{tabular}
+    
+    \label{tab:vel-generic-hyperparameters}
+\end{table}
+
+
+\subsection{Learning Temperature Dynamics Results} \label{appendix:sciml-temp-results}
+
+We show the full listing of results for predicting temperature dynamics in Tables \ref{tab:pb-sub}, \ref{tab:pb-sat}, \ref{tab:pb-grav}, \ref{tab:fb-grav}, and \ref{tab:fb-vel}. \update{As a general trend, we see that UNet$_\text{bench}$ consistently performs the best. In some metrics, UNet$_\text{mod}$ closely matches or is better than UNet$_\text{bench}$ but it tends to have higher errors at bubble interfaces and domain boundaries. The FNO variants perform well, but slightly worse. The good performance of UNet architecture might stem from the nature of convolutions to function as effective edge detectors. Thus, the UNet variants can handle sharp interfaces between liquid and vapor. Since the Fourier-layers implicitly assume periodicity, they tend to act as ``smoothers''. Qualitatively, they appear to soften the sharp interfaces, resulting in errors along the region surrounding the bubbles. This likely contributes to the consistent higher maximum, interface, and boundaries errors observed for the FNO variants. There is existing work that makes similar observations \cite{gupta2022towards, mccabe2023towards}. It's important to highlight G-FNO's particularly poor performance. This is likely due to two reasons: (a) the substantial memory requirements prevented us from using the same resolution and Fourier modes as the other models. (b) BubbleML violates some of the assumptions that G-FNO makes. Specifically, the simulations are not invariant to vertical reflections due to the effects of temperature and gravity. For instance, if the heater was on the top of the domain, we would not see a reflection of the phenomena that we do when it is at the bottom.}
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Temperature Prediction: Pool Boiling Subcooled.}}
+    \begin{tabular}{c|c|c|c|c|c|c}
+         & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & FNO & UNO & FFNO & GFNO \\
+         \hline
+        Rel. Err. & \textbf{0.036} & 0.051 & 0.052 & 0.062 & 0.050 & 0.071 \\
+        RMSE & \textbf{0.035} & 0.049 & 0.050 & 0.059 & 0.048 & 0.068 \\
+        BRMSE & \textbf{0.073} & 0.146 & 0.118 & 0.145 & 0.124 & 0.209 \\
+        IRMSE & \textbf{0.113} & 0.157 & 0.189 & 0.220 & 0.155 & 0.290 \\
+        Max Err. & 2.1 & \textbf{1.937} & 2.32 & 2.659 & 2.21 & 2.882 \\
+        F. Low & \textbf{0.281} & 0.348 & 0.373 & 0.440 &  0.472 & 0.557 \\
+        F. Mid & \textbf{0.266} & 0.386 & 0.390 & 0.453 & 0.375 & 0.547 \\
+        F. High & \textbf{0.040} & 0.059 & 0.055 & 0.068 & 0.057 & 0.090 \\
+    \end{tabular}
+    \label{tab:pb-sub}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Temperature Prediction: Pool Boiling Saturated.}}
+    \begin{tabular}{c|c|c||c|c|c|c}
+         & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & FNO & UNO & FFNO & GFNO \\
+         \hline
+        Rel. Err. & \textbf{0.035} & 0.039 & 0.052 & 0.072 & 0.053 & 0.066 \\
+        RMSE &  \textbf{0.035} & 0.039 & 0.052 & 0.071 & 0.052 & 0.065 \\
+        BRMSE & \textbf{0.082} & 0.147 & 0.165 & 0.214 & 0.163 & 0.218 \\
+        IRMSE & \textbf{0.052} & 0.083 & 0.125 & 0.116 & 0.095 & 0.152 \\
+        Max Err. & \textbf{1.701} & 1.785 & 2.055 & 2.23 & 1.788 & 1.793 \\
+        F. Low & 0.257 & \textbf{0.241} & 0.373 & 0.568 & 0.416 & 0.463 \\
+        F. Mid & \textbf{0.268} & 0.273 & 0.377 & 0.532 & 0.399 & 0.496 \\
+        F. High & \textbf{0.023} & 0.042 & 0.053 & 0.069 & 0.052 & 0.070 \\
+    \end{tabular}
+    
+    \label{tab:pb-sat}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Temperature Prediction: Pool Boiling Gravity.}}
+    \begin{tabular}{c|c|c||c|c|c|c}
+         & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & FNO & UNO & FFNO & GFNO \\
+         \hline
+        Rel. Err. & \textbf{0.042} & 0.051 & 0.062 & 0.081 & 0.061 & 0.124 \\
+        RMSE &  \textbf{0.040} & 0.049 & 0.062 & 0.077 & 0.058 & 0.118 \\
+        BRMSE &  \textbf{0.070} & 0.139 & 0.150 & 0.184 & 0.131 & 0.642 \\
+        IRMSE &  \textbf{0.108} & 0.201 & 0.266 & 0.335 & 0.239 & 0.424 \\
+        Max Err. & 2.92 & \textbf{2.846} & 3.626 & 3.667 & 3.22 & 4.0 \\
+        F. Low &  0.491 & \textbf{0.466} & 0.500 & 0.746 & 0.578 & 1.095 \\
+        F. Mid &  \textbf{0.275} & 0.326 & 0.440 & 0.548 & 0.423 & 0.760 \\
+        F. High & \textbf{0.033} & 0.049 & 0.054 & 0.077 & 0.049 & 0.171 \\
+    \end{tabular}
+    
+    \label{tab:pb-grav}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Temperature Prediction: Flow Boiling Gravity.}}
+    \begin{tabular}{c|c|c||c|c}
+         & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & FNO & UNO \\
+         \hline
+        Rel. Err. & \textbf{0.055} & 0.095 & 0.134 & 0.157 \\
+        RMSE & \textbf{0.051} & 0.088 & 0.123 & 0.144 \\
+        BRMSE & \textbf{0.080} & 0.240 & 0.267 & 0.301 \\
+        IRMSE & \textbf{0.091} & 0.214 & 0.351 & 0.379 \\
+        Max Err. & \textbf{2.560} & 2.800 & 3.951 & 3.990\\
+        F. Low & \textbf{0.263}  & 0.388 & 0.591 & 0.602 \\
+        F. Mid & \textbf{0.281} & 0.419 & 0.551 & 0.692 \\
+        F. High & \textbf{0.149} & 0.276 & 0.389 & 0.449 \\
+    \end{tabular}
+    
+    \label{tab:fb-grav}
+\end{table}
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Temperature Prediction: Flow Boiling Inlet Velocity.} All models have substantially higher error compared to the other datasets. This is likely caused by the higher velocity. Since the temporal discretization is quite coarse, each bubble will take a large ``jump'' between frames that is difficult to capture accurately.}
+    \begin{tabular}{c|c|c||c|c}
+         & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & FNO & UNO \\
+         \hline
+        Rel. Err. & \textbf{0.106} & 0.122 & 0.202 & 0.225  \\
+        RMSE & \textbf{0.097} & 0.111 & 0.184 & 0.205 \\
+        BRMSE & \textbf{0.271} & 0.315 & 0.486 & 0.471 \\
+        IRMSE & \textbf{0.178} & 0.193 & 0.252 & 0.319 \\
+        Max Err. & 2.900 & \textbf{2.862} & 3.527 & 3.992 \\
+        F. Low & \textbf{0.571} & 0.584 & 1.061 & 0.981 \\
+        F. Mid & \textbf{0.511} & 0.566 & 1.084 & 1.334 \\
+        F. High & \textbf{0.264} & 0.315 & 0.494 & 0.523 \\
+    \end{tabular}
+    
+    \label{tab:fb-vel}
+\end{table}
+
+
+\subsection{Learning Flow Dynamics Results} \label{appendix:sciml-flow-results}
+
+\update{Table \ref{tab:flow-pb-sub-0.1} shows the predicted temperature, $x$ velocity, and $y$ velocity during rollout of 200 timesteps on the Subcooled Pool Boiling study. We opted to exclude G-FNO from this experiment due to its immense memory requirements. We observe an interesting phenomenon: UNet$_\text{bench}$ goes from being the best model at predicting temperature, to being among the worst. This is the simplest model, so it is understandable that its limited capaticity prevents it from learning more complex functions. In comparison, UNet$_\text{mod}$ performs incredibly well. Surprisingly, the FNO variants perform quite well. The best performing model is P-UNet$_\text{mod}$, which was trained using the pushforward trick. It achieves the best score in all metrics, except, surprisingly, for the maximum error. UNO experiences some divergence. Initially, it makes good predictions (perhaps better than the UNet architectures), but over long rollouts, its predictions tend towards infinity. Since UNO is the model that experiences the most striking divergence, we compare its 1D radially averaged power spectrum with UNet$_\text{mod}$ and P-UNet$_\text{mod}$ in Figure \ref{fig:freq-spectrum}. We are able to reproduce findings that show that autoregressive Fourier models experience aliasing errors, causing them to diverge \cite{mccabe2023towards}.}
+
+% Figure environment removed
+
+
+\begin{table}[h!]
+    \centering
+    \caption{\textbf{Coupled Velocity and Temperature Prediction: Pool Boiling Subcooled$_{0.1}$.} P-UNet$_\text{mod}$ was trained using the pushforward trick. It gets the best results during rollout. Notably, FFNO perform better than UNet$_\text{bench}$ and UNet$_\text{mod}$. This is a sharp contrast to the temperature predictions, where the UNet variants were far better. UNO diverged during rollout. This is likely because is mostly uses low frequencies. The error in the high frequencies accumulates during rollout, and it diverges.}
+    \begin{tabular}{c|c|c|c|c||c|c|c}
+        & Metric & UNet$_{\text{bench}}$ & UNet$_{\text{mod}}$ & P-UNet$_{\text{mod}}$ & FNO & UNO & FFNO \\
+         \hline
+        \multirow{8}{*}{Temp.} & Rel. Err. & 0.108 & 0.074 & \textbf{0.040} & 0.066 & 0.322 & 0.067 \\
+                               & RMSE & 0.105 & 0.072 & \textbf{0.039} & 0.064 & 0.051 & 0.065 \\
+                               & BRMSE & 0.248 & 0.211 & \textbf{0.113} & 0.142 & 0.050 & 0.237 \\
+                               & IRMSE & 0.178 & 0.191 & \textbf{0.129} & 0.212 & 0.077& 0.201 \\
+                               & Max Err. & 2.83 & \textbf{2.340} & 2.741 & 2.566 & 7.492 & 2.488\\
+                               & F. Low &  1.407 & 0.495 & \textbf{0.244} & 0.531 & 4.902 & 0.498 \\ 
+                               & F. Mid &  0.740 & 0.583 & \textbf{0.280} & 0.518 & 1.594 & 0.507 \\
+                               & F. High & 0.090 & 0.076 & \textbf{0.051} & 0.061 & 0.442 & 0.083 \\
+        \hline
+     \multirow{8}{*}{$x$ Vel.} & Rel. Err. & 0.681 & 0.553 & \textbf{0.429} & 0.642 & 1.834 & 0.547 \\
+                               & RMSE & 0.021 & 0.015 & \textbf{0.012} & 0.018 & 0.051 & 0.015 \\
+                               & BRMSE & 0.023 & 0.023 & \textbf{0.022} & 0.023 & 0.050 & 0.024 \\
+                               & IRMSE & 0.051 & 0.049 & \textbf{0.043} & 0.049 & 0.077 & 0.050 \\
+                               & Max Err. & \textbf{0.294} & 0.320 & 0.353 & 0.32 & 0.574  & 0.334 \\
+                               & F. Low & 0.329 & 0.225 & \textbf{0.142} & 0.258 & 0.677 & 0.189 \\
+                               & F. Mid & 0.115 & 0.105 & \textbf{0.079} & 0.110 & 0.328 & 0.107 \\
+                               & F. High & 0.012 & 0.012 & \textbf{0.011} & 0.012 & 0.092 & 0.012 \\
+        \hline
+     \multirow{8}{*}{$y$ Vel.} & Rel. Err. & 0.563 & 0.400 & \textbf{0.311} & 0.415 & 1.170 & 0.397 \\
+                               & RMSE & 0.021 & 0.015 & \textbf{0.012} & 0.016 & 0.044 & 0.015 \\
+                               & BRMSE & 0.015 & 0.012 & \textbf{0.010} & 0.011 & 0.035 & 0.013 \\
+                               & IRMSE & 0.046 & 0.046 & \textbf{0.038} & 0.045 & 0.066 & 0.047 \\
+                               & Max Err. & 0.292 & \textbf{0.272} & 0.280 & 0.290 & 0.288 & 0.289 \\
+                               & F. Low & 0.387 & 0.190 & \textbf{0.132} & 0.180 & 0.660 & 0.176 \\
+                               & F. Mid & 0.128 & 0.112 & \textbf{0.085} & 0.111 & 0.240 & 0.106 \\
+                               & F. High & 0.011 & 0.010 & \textbf{0.009} & 0.010 & 0.067 & 0.010 \\
+    \end{tabular}
+    
+    \label{tab:flow-pb-sub-0.1}
+\end{table}

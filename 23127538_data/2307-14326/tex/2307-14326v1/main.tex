@@ -1,0 +1,547 @@
+\documentclass{article}
+\setlength{\footnotesep}{0pc}
+\usepackage{times}
+
+\usepackage[preprint]{corl_2023} %
+\usepackage[numbers]{natbib}
+\usepackage{multicol}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{bbm}
+\usepackage[algo2e,algoruled,boxed,lined,noend]{algorithm2e}
+\usepackage{wrapfig}
+\usepackage{float}
+
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=orange,
+    filecolor=magenta,      
+    urlcolor=orange,
+    citecolor=orange,
+}
+\usepackage[capitalise, nameinlink]{cleveref}
+
+\usepackage{titlesec}
+\titlespacing*{\subsection}{0pt}{0.1\baselineskip}{0.05\baselineskip}
+\titlespacing*{\section}{0pt}{0.2\baselineskip}{0.1\baselineskip}
+
+\include{macro}
+
+\title{Waypoint-Based Imitation Learning for Robotic Manipulation}
+
+
+
+
+\author{%
+Lucy Xiaoyang Shi\thanks{{Equal contribution.}} \quad Archit Sharma\footnotemark[1] \quad Tony Z. Zhao \quad Chelsea Finn \\
+Department of Computer Science\\
+Stanford University\\
+\texttt{\{lucyshi,architsh,tonyzhao,cbfinn\}@stanford.edu}
+}
+
+
+\newcommand{\ours}[0]{\textsc{AWE}\xspace}
+\newcommand{\todo}[0]{{\color{red} todo}\xspace}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{argmin}
+
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+While imitation learning methods have seen a resurgent interest for robotic manipulation, the well-known problem of \textit{compounding errors} continues to afflict behavioral cloning (BC). Waypoints can help address this problem by reducing the horizon of the learning problem for BC, and thus, the errors compounded over time. However, waypoint labeling is underspecified, and requires additional human supervision. Can we generate waypoints automatically without any additional human supervision? Our key insight is that if a trajectory segment can be approximated by linear motion, the endpoints can be used as waypoints. We propose \textit{Automatic Waypoint Extraction} (\ours) for imitation learning, a preprocessing module to decompose a demonstration into a minimal set of waypoints which when interpolated linearly can approximate the trajectory up to a specified error threshold. \ours can be combined with any BC algorithm, and we find that \ours can increase the success rate of state-of-the-art algorithms by up to 25\% in simulation and by 4-28\% on real-world bimanual manipulation tasks, reducing the decision making horizon by up to a factor of 10. 
+Videos and code are available at \href{https://lucys0.github.io/awe/}{https://lucys0.github.io/awe/}
+\end{abstract}
+
+\keywords{imitation learning, waypoints, long-horizon} 
+
+
+\section{Introduction}
+\begin{wrapfigure}{r}{0.55\textwidth}
+\vspace{-0.1in}
+    \centering
+    % Figure removed
+    \caption{Our approach reduces the horizon of imitation learning by extracting waypoints from demonstrations.} 
+    \label{fig:real_task}
+    \vspace{-1em}
+\end{wrapfigure}
+The simple supervised learning approach of behavioral cloning (BC) has enabled a compelling set of robotic results, from self-driving vehicles~\citep{pomerleau1988alvinn} to manipulation~\citep{zhang2018deep, zeng2020tossingbot,shridhar2023perceiver,chi2023diffusion,zhao2023learning}.
+However, due to the lack of corrective feedback, errors grow quadratically in the length of the episode for behavior cloning (BC) algorithms~\citep{ross2010efficient,ross2011reduction}, colloquially known as the \textit{compounding errors} problem.
+Waypoints~\cite{hsiao2006imitation,akgun2012keyframe,shridhar2023perceiver,james2022q} are a relevant proposition in this context: breaking the demonstration into a subset of ``key'' states reduces the effective length of the decision-making problem, addressing the compounding errors problem while still allowing the use of simple methods such as BC.
+However, labeling waypoints is both an underspecified problem and requires additional human supervision.
+
+Our objective is to develop a method for selecting waypoints for a given demonstration without any additional human supervision.
+For a robot arm, if a trajectory segment can be approximated linearly, a low-level controller can reliably imitate the segment without explicitly learning the intermediate states.
+Thus, we can represent that segment just by the endpoints. Extending this argument to arbitrary trajectories, we can use a subsequence of states as waypoints to represent the trajectory if the trajectory can be approximated well by linearly interpolating between the selected waypoints. The BC prediction problem then transforms from predicting the next action to the next waypoint.
+
+How do we select the waypoint sequence that approximates a given a trajectory? Given a budget for the reconstruction error, where the error is defined as the \textit{maximum} proprioceptive distance between the actual and reconstructed trajectory, we want to select the \textit{shortest} subsequence of states for which the reconstruction error is within budget. This can be posed as a standard dynamic programming problem, by iteratively choosing an intermediate state as the waypoint and recursively selecting waypoints for the two resulting trajectory segments.
+The recursion terminates whenever the reconstruction error for the linearly interpolated trajectory between the endpoints is already within the budget.
+Importantly, finding the sequence of waypoints relies only on the robot's \textit{proprioceptive} information, which is already collected during teleoperation. \ours makes no additional assumption about the extrinsic environment (state estimation, point clouds, etc.) and requires no additional label information from humans.
+
+Overall, our work proposes \textit{Automatic Waypoint Extraction} (\ours), a preprocessing module that breaks an expert demonstration into sequence of waypoints. \ours requires minimal additional information, and thus, can easily be plugged into current BC pipelines. We combine \ours with two state-of-the-art imitation learning methods, diffusion policy~\cite{chi2023diffusion} and action-chunking with transformers (ACT)~\cite{zhao2023learning}, and study its performance when learning from human-teleoperated demonstrations. On two existing simulated imitation learning benchmarks and multiple real bi-manual manipulation tasks, we find that \ours consistently improves performance, with up to 25\% increase in success rate in simulation and 4-28\% increase in success rate on real-world tasks.
+
+\section{Related Work}
+
+Imitation learning is a long-studied approach to training robotic control policies from demonstrations~\cite{pomerleau1988alvinn,schaal1999imitation,argall2009survey}. A central challenge facing imitation learning methods is when compounding errors cause the policy to drift away from states seen in the demonstration data~\cite{ross2011reduction}, leading to poor performance with small demonstration datasets. Prior approaches have aimed to improve imitation learning performance by developing new policy architectures~\cite{shafiullah2022behavior,james2022q,brohan2022rt,zhu2022viola}, using policies with expressive distribution classes~\cite{robomimic2021,florence2022implicit,chi2023diffusion}, introducing modified action spaces~\cite{zeng2021transporter,wang2021generalization,johns2021coarse,shridhar2022cliport,shridhar2023perceiver}, constructing modified training objectives~\cite{zhang2018deep,zhao2023learning}, utilizing particular visual representations~\cite{florence2019self,pari2021surprising}, incorporating data augmentation~\cite{jia2022seil,zhou2023nerf}, or collecting online data~\cite{ross2011reduction,laskey2016shiv,jang2022bc}. We instead aim to tackle the challenge of compounding errors by extracting waypoints that shorten the horizon. Our approach is orthogonal to and complementary to many of these prior developments; indeed, our experiments show that \ours can be combined with two recent, representative methods~\cite{chi2023diffusion,zhao2023learning} to improve their performance.
+
+
+Similar to our goal, prior works have also aimed to reduce the horizon of imitation learning. 
+Some works reduce the horizon using hand-defined high-level primitive actions~\cite{zeng2021transporter,shridhar2022cliport, morrison2018closing, zeng2018learning, wu2020spatial, zakka2019form2fit, zeng2019tossingbot, zeng2017robotic}, %
+whereas we operate on demonstrations collected with high-frequency low-level actions, enabling a range of motions to be demonstrated and avoiding the need to define high-level actions.
+Another related line of work involves the extraction of waypoints.
+\citet{belkhale2023hydra} proposes a hybrid action space that incorporates both sparse waypoints and dense actions, to effectively reduce the policy horizon. While the hybrid action space is innovative and inspiring, it requires humans to label waypoints either during data collection or post-processing, which may limit its scalability.
+Other recent works extract waypoints using various heuristics~\cite{hsiao2006imitation,akgun2012keyframe,shridhar2023perceiver,james2022q}, such as selecting waypoints at timesteps when the robot is at zero-velocity or actuating the gripper~\cite{shridhar2023perceiver}. We are inspired by the success of these methods: they provide dramatic performance and data-efficiency improvements in some settings. However, we find that the heuristics do not apply in general, leading to low success on imitation learning benchmarks and fine manipulation tasks (Sec~\ref{sec: experiments:analysis}).
+In contrast to these methods, we circumvent the need for human waypoint labelling or heuristics  Our approach instead automatically extracts a set of waypoints that minimize the trajectory reconstruction cost, which yields improvements on two existing simulated manipulation benchmarks and multiple real robot tasks.
+
+
+
+
+\section{Preliminaries}
+\textbf{Problem Setup}. We assume an expert collected dataset of demonstrations $\mathcal{D} = \{\tau_0, \tau_1 \ldots \tau_n\}$, where each trajectory $\tau_i = \{(o_j, x_j)\}$ is a sequence of paired raw visual observations $o$ and proprioceptive information $x$. The proprioceptive information can either be the end-effector pose or joint angles, and includes the gripper width. In this work, we use position-control for the action space, i.e., proprioceptives $x$ are the action outputs as well. Next, we briefly review two recent successful methods for BC, which we will use in our experiments.
+
+\textbf{Diffusion Policy}. Diffusion policy~\citep{chi2023diffusion} models the conditional action distribution as a denoising diffusion probabilistic model (DDPM)~\citep{ho2020denoising}, allowing for better representation of the multi-modality in human-collected demonstrations. Specifically, diffusion policy uses DDPM to model the action sequence $p(A_t \mid o_t, x_t)$, where $A_t = \{a_t, \ldots a_{t+C}\}$ represents a chunk of next $C$ actions. The final action is output of the following denoising process~\citep{welling2011bayesian}:
+\begin{align}
+    A_t^{k-1} = \alpha\left(A_t^k - \gamma \epsilon_\theta(o_t, x_t, A_t^k, k) + \mathcal{N}(0, \sigma^2 I)\right),
+    \label{eq:ddpm_denoising}
+\end{align}
+where $A_t^k$ is the denoised action sequence at time $k$. Denoising starts from $\mathcal{A}_t^K$ sampled from Gaussian noise and is repeated till $k=1$. In Eq~\ref{eq:ddpm_denoising}, $(\alpha, \gamma, \sigma)$ are the parameters of the denoising process and $\epsilon_\theta$ is the score function trained using the MSE loss ${\ell(\theta) = (\epsilon_k - \epsilon_\theta(o_t, x_t, A_t^k + \epsilon_k, k))^2}$. The noise at step $k$ of the diffusion process, $\epsilon_k$, is sampled from a Gaussian of appropriate variance~\citep{ho2020denoising}.
+
+\textbf{Action Chunking with Transformers}. Action chunking with transformers (ACT)~\citep{zhao2023learning} models the policy distribution $p(A_t \mid o_t, x_t)$ as conditional VAE~\citep{kingma2013auto, sohn2015learning}, using a transformer based encoder and decoder. The decoder output is a chunk of actions of size $C$. Chunking is particularly important for high-frequency fine-grained manipulation tasks, with chunk sizes $C$ being as high as $100$~\cite{zhao2023learning}.
+
+
+\section{Automatic Waypoint Extraction for Imitation Learning}
+The goal of this section is to develop our method for Automatic Waypoint Extraction (\ours). First, we define an objective that assesses the quality of the reconstructed trajectory for a given sequence of waypoints. Next, we show how a simple dynamic programming algorithm can be used to select the minimal number of waypoints that have a reconstruction error below a specified threshold. Finally, we discuss how to preprocess a demonstration dataset using \ours before plugging into the BC algorithm, along with the some practical considerations when training and evaluating a waypoint-based policy.
+
+\textbf{Reconstruction Loss}. For an expert demonstration $\tau$, define the sequence of proprioceptives as ${\tau_p = \{x_j\}_{j=0}^{\left|\tau\right|-1}}$ and let $\mathcal{W}$ denote a sequence of waypoints such that $\mathcal{W} = \{w_0, \ldots w_L\}$, where $w_i$ denotes the proprioceptive information in the waypoint. We reconstruct an approximate trajectory $\hat{\tau}$ by interpolating between the waypoints, i.e. $\hat{\tau} = f(\mathcal{W})$ for an interpolation function $f$. While we restrict to linear interpolation in this work, the framework can be extended to incorporate splines.
+
+\begin{wrapfigure}{r}{0.4\textwidth}
+\vspace{-0.2in}
+    \centering
+    % Figure removed
+    \caption{Visualizing the loss $\mathcal{L}$.\label{fig:loss_fn}} 
+    \vspace{-0.2cm}
+\end{wrapfigure}
+To measure how well a sequence of waypoints approximates the true trajectory, we want to measure how much the interpolated trajectory deviates from the true trajectory. We define the reconstruction loss as the maximum distance of any state in the original trajectory from the reconstructed trajectory, that is,
+\begin{align}
+    \mathcal{L}(\hat{\tau}, \tau) = \max_{x \in \tau_p} \min_{\hat{x} \in \hat{\tau}} \ell(x, \hat{x})
+\end{align}
+where $\ell(\cdot, \cdot)$ is some distance function (for example, Euclidean $\ell_2$ distance). The $\min_{\hat{x} \in \hat{\tau}} \ell(\cdot, \hat{x})$ denotes shortest distance of a proprioceptive state to the interpolated trajectory $\hat{\tau}$. How do we aggregate projection errors for proprioceptives in the true trajectory? While there are several options, for example, mean projection error over $\tau_p$, we define the reconstruction loss as the maximum projection error over all proprioceptives in $\tau_p$. The success of a trajectory often relies on reaching key states, and the mean error can be low while having a high projection error for those key states. While a low reconstruction loss with maximum projection error also does not guarantee downstream success, it encourages minimizing outlier projection errors potentially critical for a successful execution. The reconstruction loss $\mathcal{L}$ is visualized in Figure~\ref{fig:loss_fn}.
+
+\textbf{Waypoint Selection via Dynamic Programming}. Given the reconstruction loss, how do we use it to optimize waypoints? We consider the following optimization problem:
+\begin{align}
+    \min_\mathcal{W} \left|\mathcal{W}\right| \quad \text{s.t.} \quad \mathcal{L}(f(\mathcal{W}), \tau) \leq \eta,
+\end{align}
+i.e., minimize the number of selected waypoints such that the reconstruction loss is below the budget $\eta$.
+As presented, waypoints can be arbitrary points in the proprioceptive space, but we will restrict waypoint selection to the states visited in the expert trajectory $\tau$. The problem simplifies to finding the shortest subsequence of $\tau_p$ such that the reconstruction loss is less than $\eta$, which can be solved efficiently with dynamic programming (DP). For a trajectory segment, either linearly interpolating between the endpoints sufficiently reconstructs the segment (i.e, reconstruction loss less than $\eta$), in which case the endpoints are returned as waypoints. Or for every intermediate state between the endpoints: (1) break the trajectory into two segments at that intermediate state and, (2) recursively find the shortest subsequence for each segment. Finally, choose the intermediate state resulting in the shortest subsequence when the waypoints from its two trajectory segments are merged, and return the merged waypoints. The pseudocode for selecting waypoints with DP is in Algorithm~\ref{alg:dp_wil}.
+
+\textbf{Preprocessing Demonstrations}. For an expert trajectory $\tau = \{(o_0, x_0), \ldots (o_T, x_T)\}$, denote the selected waypoints as $\mathcal{W} = \{(w_0, t_0) \ldots (w_L, t_L)\}$, where $w_i$ denotes the waypoint and $t_i$ denotes the time index in $\tau$. The training problem for a BC algorithm changes from predicting the next proprioceptive state to next waypoint. However, if done na\"ively, the training dataset of next waypoints will be much smaller. But, we can use all observations in $\tau$ between two consecutive waypoints by labeling them with closest waypoint after the observation. This follows from the intuition that following the waypoints implies the robot tries to reach $w_{k+1}$ from $w_k$, and therefore, should target $w_{k+1}$ from intermediate states between them as well. The final dataset can be written as $\mathcal{D}_\text{waypoint}^\tau = \{(o_t, x_t, w_{\text{\texttt{\tiny next\_wp}}(t)})\}_{t=0}^{T-1}$ where $\text{\small \texttt{next\_wp}}(t) = \argmin_{j \in \{0, 1, \ldots L\}}$ such that $t_j > t$. The process of selecting waypoints and constructing the augmented dataset is repeated for every expert demonstration $\tau \in \mathcal{D}$, and the resulting datasets are merged to get the final training dataset.
+
+\textbf{Overview and Practical Considerations}. We have proposed \ours, a simple method that can preprocess a demonstration into sequence of waypoints without any additional supervision. The training dataset can be relabeled with the next waypoint instead of next propriopceptive state, and plugged into a BC pipeline. The choice of policy distribution class used with \ours is important; waypoints introduce additional multi-modality into the conditional action distribution as different demonstrations may be processed into different waypoints. Using more expressive policy classes capable of representing multi-modal action distributions is critical, as introducing waypoints can make the performance \textit{worse} for less expressive policy classes (Figure~\ref{fig:ablation_expressive}).
+
+Why does \ours return meaningful waypoints? An intuitive notion of waypoints relies on registering important events happening in the extrinsic environment (grasping a cup, opening a door, etc.) while \ours uses just the proprioceptive information to select waypoints. \ours relies on the idea that the expert demonstrations will naturally deviate from linear motion during such key events. For simpler parts of the task, such as free-space reaching, demonstrations are more likely to be approximated by linear motion, resulting in fewer waypoints. Moreover, decreasing the budget $\eta$ allows for selecting more waypoints in general, and thus, better reconstruction as visualized in Figure~\ref{fig:vis_waypoint}.
+
+An important consideration at test-time is to allow more time for position-control to reach waypoints, as waypoints are farther apart compared to proprioceptive positions in the original expert demonstrations. The exact instantiation for the low-level controller depends on the whether the robot is operating in the joint space or end-effector space, which we discuss in Appendix~\ref{sec:controller}.
+
+\section{Experiments}
+Our experiments seek to answer the following questions: (1) How well does \ours combine with representative behavioral cloning methods? (2) Can it be used to tackle standard imitation learning benchmarks with real human demonstrations? (3) Can it be effective on a real-robot? (4) How does the parameterization of the policy affect the performance? (5) How do the selected waypoints and downstream performance change as we vary the hyperparameters? To answer these questions, we compare the performance of recent state-of-the-art BC methods with and without \ours on 8 tasks and 10 datasets. First, we evaluate \ours on a set of simulation environments, specifically two bimanual manipulation tasks from \citet{zhao2023learning} and three manipulation tasks from the RoboMimic benchmark~\citep{robomimic2021}. We evaluate \ours on a set of three bimanual manipulation tasks on the real robot: \textit{coffee making}, \textit{wiping the table} and \textit{screwdriver handover}. Hyperparameter and implementation details can be found in Appendix~\ref{app:hparams} and \ref{app:implementation} respectively.
+
+
+\subsection{Bimanual Simulation Suite}
+The bimanual simulation suite contains two fine-grained long-horizon manipulation tasks in MuJoCo \cite{mujoco}.
+The observation space includes a $480\times640$ image and the current joint positions for both robots. 
+The 14-dimensional action space corresponds to the target joint positions.
+Demonstrations are $400$ to $500$ steps at a control frequency of $50$Hz.
+In the \textbf{Cube Transfer} task, the right robot arm needs to pick up the cube from a random position on the table, and then hand it to the left arm mid-air.
+For \textbf{Bimanual Insertion}, both the peg and the socket are placed randomly on the table. The arms need to first pick them up respectively, then insert the peg into the socket mid-air.
+Both tasks require delicate coordination between the two arms and closed-loop visual feedback: error in grasping can directly lead to failure of handover or insertion.
+
+\input{table/act_sim}
+
+Two datasets are available for each task: one collected with a scripted policy, and one collected by human demonstrators, both with 50 demonstrations.
+As shown in Table~\ref{table:act_sim}, \ours outperforms competitive BC baselines on all tasks and datasets in the bimanual simulation suite, where some of the baselines completely fail due to task difficulty. 
+\ours can increase the success rate of ACT, the state-of-the-art method on this benchmark 17\% on an average, and up to 25\% on the scripted bimanual insertion. The effective length of the training demonstrations reduce by a factor of $7\times$ to $10\times$, even allowing for improvements on human data which is fairly multi-modal to begin with.
+Notably, the performance improves by 50\% when imitating human demonstrations on the bimanual insertion task. Overall, this suggests that the benefit from reducing the effective training horizon exceeds any potential downside from the increased multi-modality introduced by AWE.
+
+
+\subsection{RoboMimic Suite}
+Next, we evaluate on three simulated tasks from the \textbf{RoboMimic}~\citep{robomimic2021} manipulation suite:
+\textbf{Lift} where the robot arm has to pick up a cube from the table, \textbf{Can} where the robots are required to pick up a soda can from a large bin and place it into a smaller target bin, and \textbf{Square} where robots are tasked to pick up a square nut and place it on a rod. It is challenging due to the high precision needed to pick up the handle and insert it into a tightly-fitted rod.
+Episodes start with randomly initialized object configuration and terminate upon successfully completing the task or exceeding pre-defined horizons. All environments return RGB observations and the action space is the 6DoF end-effector pose, with an additional degree for the gripper.
+
+\input{table/robomimic}
+
+We combine \ours with the state-of-the-art method on this benchmark, Diffusion Policy~\citep{chi2023diffusion}. Since diffusion policy achieves a near-perfect success rates on \textbf{Lift}, \textbf{Can}, and \textbf{Square} when training on a dataset with $200$ proficient-human demonstrations, we focus our evaluation on how the performance scales with the number of demonstrations, both with and without \ours.
+The results in Table~\ref{table:robomimic} suggest that \ours consistently improves the performance of diffusion policy as the number of demonstrations is scaled from $30$ to $200$, while both of them outperform LSTM-GMM and implicit BC~\citep{florence2021implicit} with half the demonstration data, or even less.
+The improvements are larger when the number of demonstrations is smaller or the task is longer-horizon, for example, an 18\% increase in the success rate when using $30$ demonstrations on the \textbf{Square} task.
+
+
+
+\subsection{Real-World Bimanual Tasks}
+For real-robot evaluations, we use ALOHA~\cite{zhao2023learning}, a low-cost open-source bimanual hardware setup.
+The setup consists of two leader arms and two follower arms, where the joint positions are synchronized between the leaders and followers during teleoperation.
+The observation space consists of RGB images from $4$ cameras: two are mounted on the wrist of the follower robots, allowing for close-up views of objects for fine-manipulation, and the other two are mounted on the front and at the top respectively.
+The demonstration data consists of 4 camera streams and the joint positions for each robot at $50$Hz.
+We refer readers to the original paper for more hardware details.
+
+We experiment with three long-horizon tasks, each requiring precise coordination between the two arms, illustrated in Figure~\ref{fig:real_task}.
+For \textbf{Screwdriver Handover}, the right arm needs to pick up the screwdriver that is randomly initialized in a $15$cm $\times 20$cm rectangular region (\#1) and hand it to the left arm mid-air (\#2), followed by the left arm dropping it into the cup (\#3).
+For \textbf{Wiping the Table}, a roll of paper towels is randomly placed in a $15$cm $\times 10$cm region. The opening of the roll always faces the right side, with naturally occurring variations in length and spacing. The left arm presses on the roll to prevent it from moving (\#1), while the right arm tears off one segment of the paper towel (\#2) and places it on a fixed location to absorb the spilled liquid (\#3).
+For \textbf{Coffee Making}, a small coffee pod is randomized in a $15$cm $\times 10$cm region. The left arm needs to pick it up (\#1), followed by the right arm opening the coffee machine (\#2). The left arm then carefully inserts the coffee pod into the slot (\#3), with the right arm closing the lid (\#4). Next, the right arm grasps a transparent cup with upto $2$cm randomization in the position and places it under the coffee outlet (\#5).
+
+The three tasks emphasize precision and coordination, and involve deformable or transparent objects that can be hard to perceive or simulate.
+For example, placing the coffee pod into the machine requires high precision. It is easy for the gripper or coffee pod to collide with the machine due to the small clearance.
+The screwdriver handover task emphasizes the coordination between two arms. %
+Grasping the paper towel requires accurate perception of the deformable material, which also has low-contrast against itself. The gripper needs to move accurately so as to only grasp the opening but not collide with the roll and push it away.
+
+As shown in Table~\ref{fig:real_task}, \ours achieves substantial success on each task. It consistently improves over ACT by 8\%, 4\%, and 28\% on Screwdriver handover, Wiping table, and Coffee Making, respectively. 
+We observe that the most common failure case for ACT is inaccurate action prediction, which results from compounding errors on these long-horizon tasks. 
+For example, the robot may make a wrong prediction at the beginning and grasp the coffee pod at an inconvenient position. The subsequent predictions become increasingly incorrect, and thus the robot fails to insert the coffee pod into the machine.
+On the other hand, \ours can more accurately grasp the coffee pod due to a smaller decision horizon, resulting in more successful insertions into the coffee machine. Leveraging the low-level controller to execute linear motions instead of relying on accurate policy predictions can reduce the errors compounded over time.
+By accurately detecting waypoints for a successful handover, for tearing, and for inserting, \ours decreases the policy horizon and consistently improves performance.
+
+\input{fig/real_task}
+\input{table/real}
+
+\subsection{Analysis}
+\label{sec: experiments:analysis}
+
+% Figure environment removed
+
+\textbf{Waypoint selection for different error budgets.}
+We visualize a ground truth trajectory of end-effector positions and the EE trajectory reconstructed using \ours for the \textbf{Can} task in Figure~\ref{fig:vis_waypoint}. As the the error budget $\eta$ is reduced, the reconstructed trajectory tracks the original trajectory better. Importantly, as the budget is decreased, waypoints are added to harder segments of the task, as they are less linear while the number of waypoints for simpler, linear paths stays similar.
+Smaller error thresholds lead to gradual increases in the number of selected waypoints.
+We also measure performance with varying error thresholds (the only hyperparameter), for \ours+DiffusionPolicy on the Can task with 50 demonstrations. Figure~\ref{fig:threshold_ablation} shows that when the $\eta$ is too high (too few waypoints) or too low (too many waypoints), the agent does not take full advantage of \ours.
+
+% Figure environment removed
+
+\textbf{On the importance of modeling multi-modality for \ours.} The usage of waypoints can increase the multimodality of the target conditional action distribution. We compare the performance of \ours when trained with mean-squared error (MSE) loss (i.e, a unimodal Gaussian with identity covariance) and a more expressive Gaussian mixture model (GMM) with $5$ modes.
+As shown in Figure~\ref{fig:ablation_expressive}, GMM policies can benefit from \ours, as they can represent multimodal action distributions. However, vanilla BC with a MSE loss degrades in performance. BC has a mode-covering behavior, and insufficient representative power of unimodal Gaussian can cause the performance to degrade.
+
+
+
+
+
+
+
+\textbf{Comparison to heuristics.}
+Prior works~\cite{hsiao2006imitation,akgun2012keyframe,shridhar2023perceiver,james2022q} have been successful by extracting waypoints using simple heuristics. Are simple heuristics enough for extracting important waypoints? We experiment with two heuristics. The first one is similar to~\citet{shridhar2023perceiver}, labeling timesteps as waypoints when the end-effector velocity is close to zero, or when the binary gripper state changes. The second heuristic selects waypoints with fixed intervals. For \ours and both heuristics, we extract waypoints for all 200 trajectories in the RoboMimic \textbf{Lift} dataset, and measure the success rate when replaying the demonstration, i.e. following the extracted waypoints starting from the demonstration trajectory's initial state. We adjust the selection threshold or interval to generate similar numbers of waypoints across methods for comparable results. Results in Figure~\ref{fig:ablation_heuristic} show that these two heuristics do not lead to satisfactory success rates even when simply replaying the trajectories. %
+
+\vspace{-2mm}
+\section{Conclusion}
+\vspace{-2mm}
+We presented a method for extracting waypoints from demonstrations of robotic manipulation tasks, therefore reducing the horizon of imitation learning problems. We found that our automatic waypoint extraction method (\ours) can be combined with state-of-the-art imitation learning methods such as diffusion policy and ACT to improve performance, especially in data limited settings where the task performance is not already saturated. AWE also consistently improved performance on three real-world dexterous manipulation tasks. Finally our analysis indicated the importance of the \ours optimization compared to naive or heuristic waypoint selection methods, as well as the effect of the error budget and policy distribution class on performance.
+
+\textbf{Limitations.} \ours leverages proprioceptive information to reparameterize demonstration trajectories in end-effector or joint space, an approach that may not be applicable to torque-controlled robot arms, tasks requiring forceful manipulation, or other robotics problems such as purely visual navigation or legged locomotion. Furthermore, for tasks that require a great deal of precision at certain times, we expect that \ours would require a tight error budget, which would in turn reduce the effect of using waypoints compared to the original demonstration. This limitation of \ours might be resolved by identifying when such precision is needed, either automatically or by incorporating some human supervision, and subsequently modifying the \ours optimization objective.
+
+
+
+\acknowledgments{
+This work was supported by Schmidt Futures and ONR grants N00014-20-1-2675 and N00014-21-1-2685. We would like to thank Suneel Belkhale and Chen Wang for helpful discussions, and all members of the IRIS lab for constructive feedback.
+}
+
+% \bibliography{ref}
+\begin{thebibliography}{41}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Pomerleau(1988)]{pomerleau1988alvinn}
+D.~A. Pomerleau.
+\newblock Alvinn: An autonomous land vehicle in a neural network.
+\newblock \emph{Advances in neural information processing systems}, 1, 1988.
+
+\bibitem[Zhang et~al.(2018)Zhang, McCarthy, Jow, Lee, Chen, Goldberg, and
+  Abbeel]{zhang2018deep}
+T.~Zhang, Z.~McCarthy, O.~Jow, D.~Lee, X.~Chen, K.~Goldberg, and P.~Abbeel.
+\newblock Deep imitation learning for complex manipulation tasks from virtual
+  reality teleoperation.
+\newblock In \emph{2018 IEEE International Conference on Robotics and
+  Automation (ICRA)}, pages 5628--5635. IEEE, 2018.
+
+\bibitem[Zeng et~al.(2020)Zeng, Song, Lee, Rodriguez, and
+  Funkhouser]{zeng2020tossingbot}
+A.~Zeng, S.~Song, J.~Lee, A.~Rodriguez, and T.~Funkhouser.
+\newblock Tossingbot: Learning to throw arbitrary objects with residual
+  physics.
+\newblock \emph{IEEE Transactions on Robotics}, 36\penalty0 (4):\penalty0
+  1307--1319, 2020.
+
+\bibitem[Shridhar et~al.(2023)Shridhar, Manuelli, and
+  Fox]{shridhar2023perceiver}
+M.~Shridhar, L.~Manuelli, and D.~Fox.
+\newblock Perceiver-actor: A multi-task transformer for robotic manipulation.
+\newblock In \emph{Conference on Robot Learning}, pages 785--799. PMLR, 2023.
+
+\bibitem[Chi et~al.(2023)Chi, Feng, Du, Xu, Cousineau, Burchfiel, and
+  Song]{chi2023diffusion}
+C.~Chi, S.~Feng, Y.~Du, Z.~Xu, E.~Cousineau, B.~Burchfiel, and S.~Song.
+\newblock Diffusion policy: Visuomotor policy learning via action diffusion.
+\newblock \emph{arXiv preprint arXiv:2303.04137}, 2023.
+
+\bibitem[Zhao et~al.(2023)Zhao, Kumar, Levine, and Finn]{zhao2023learning}
+T.~Z. Zhao, V.~Kumar, S.~Levine, and C.~Finn.
+\newblock Learning fine-grained bimanual manipulation with low-cost hardware.
+\newblock \emph{arXiv preprint arXiv:2304.13705}, 2023.
+
+\bibitem[Ross and Bagnell(2010)]{ross2010efficient}
+S.~Ross and D.~Bagnell.
+\newblock Efficient reductions for imitation learning.
+\newblock In \emph{Proceedings of the thirteenth international conference on
+  artificial intelligence and statistics}, pages 661--668. JMLR Workshop and
+  Conference Proceedings, 2010.
+
+\bibitem[Ross et~al.(2011)Ross, Gordon, and Bagnell]{ross2011reduction}
+S.~Ross, G.~Gordon, and D.~Bagnell.
+\newblock A reduction of imitation learning and structured prediction to
+  no-regret online learning.
+\newblock In \emph{Proceedings of the fourteenth international conference on
+  artificial intelligence and statistics}, pages 627--635. JMLR Workshop and
+  Conference Proceedings, 2011.
+
+\bibitem[Hsiao and Lozano-Perez(2006)]{hsiao2006imitation}
+K.~Hsiao and T.~Lozano-Perez.
+\newblock Imitation learning of whole-body grasps.
+\newblock In \emph{2006 IEEE/RSJ international conference on intelligent robots
+  and systems}, pages 5657--5662. IEEE, 2006.
+
+\bibitem[Akgun et~al.(2012)Akgun, Cakmak, Jiang, and Thomaz]{akgun2012keyframe}
+B.~Akgun, M.~Cakmak, K.~Jiang, and A.~L. Thomaz.
+\newblock Keyframe-based learning from demonstration: Method and evaluation.
+\newblock \emph{International Journal of Social Robotics}, 4:\penalty0
+  343--355, 2012.
+
+\bibitem[James and Davison(2022)]{james2022q}
+S.~James and A.~J. Davison.
+\newblock Q-attention: Enabling efficient learning for vision-based robotic
+  manipulation.
+\newblock \emph{IEEE Robotics and Automation Letters}, 7\penalty0 (2):\penalty0
+  1612--1619, 2022.
+
+\bibitem[Schaal(1999)]{schaal1999imitation}
+S.~Schaal.
+\newblock Is imitation learning the route to humanoid robots?
+\newblock \emph{Trends in cognitive sciences}, 3\penalty0 (6):\penalty0
+  233--242, 1999.
+
+\bibitem[Argall et~al.(2009)Argall, Chernova, Veloso, and
+  Browning]{argall2009survey}
+B.~D. Argall, S.~Chernova, M.~Veloso, and B.~Browning.
+\newblock A survey of robot learning from demonstration.
+\newblock \emph{Robotics and autonomous systems}, 57\penalty0 (5):\penalty0
+  469--483, 2009.
+
+\bibitem[Shafiullah et~al.(2022)Shafiullah, Cui, Altanzaya, and
+  Pinto]{shafiullah2022behavior}
+N.~M. Shafiullah, Z.~Cui, A.~A. Altanzaya, and L.~Pinto.
+\newblock Behavior transformers: Cloning $ k $ modes with one stone.
+\newblock \emph{Advances in neural information processing systems},
+  35:\penalty0 22955--22968, 2022.
+
+\bibitem[Brohan et~al.(2022)Brohan, Brown, Carbajal, Chebotar, Dabis, Finn,
+  Gopalakrishnan, Hausman, Herzog, Hsu, et~al.]{brohan2022rt}
+A.~Brohan, N.~Brown, J.~Carbajal, Y.~Chebotar, J.~Dabis, C.~Finn,
+  K.~Gopalakrishnan, K.~Hausman, A.~Herzog, J.~Hsu, et~al.
+\newblock Rt-1: Robotics transformer for real-world control at scale.
+\newblock \emph{arXiv preprint arXiv:2212.06817}, 2022.
+
+\bibitem[Zhu et~al.(2022)Zhu, Joshi, Stone, and Zhu]{zhu2022viola}
+Y.~Zhu, A.~Joshi, P.~Stone, and Y.~Zhu.
+\newblock Viola: Imitation learning for vision-based manipulation with object
+  proposal priors.
+\newblock \emph{arXiv preprint arXiv:2210.11339}, 2022.
+
+\bibitem[Mandlekar et~al.(2021)Mandlekar, Xu, Wong, Nasiriany, Wang, Kulkarni,
+  Fei-Fei, Savarese, Zhu, and Mart\'{i}n-Mart\'{i}n]{robomimic2021}
+A.~Mandlekar, D.~Xu, J.~Wong, S.~Nasiriany, C.~Wang, R.~Kulkarni, L.~Fei-Fei,
+  S.~Savarese, Y.~Zhu, and R.~Mart\'{i}n-Mart\'{i}n.
+\newblock What matters in learning from offline human demonstrations for robot
+  manipulation.
+\newblock In \emph{arXiv preprint arXiv:2108.03298}, 2021.
+
+\bibitem[Florence et~al.(2022)Florence, Lynch, Zeng, Ramirez, Wahid, Downs,
+  Wong, Lee, Mordatch, and Tompson]{florence2022implicit}
+P.~Florence, C.~Lynch, A.~Zeng, O.~A. Ramirez, A.~Wahid, L.~Downs, A.~Wong,
+  J.~Lee, I.~Mordatch, and J.~Tompson.
+\newblock Implicit behavioral cloning.
+\newblock In \emph{Conference on Robot Learning}, pages 158--168. PMLR, 2022.
+
+\bibitem[Zeng et~al.(2021)Zeng, Florence, Tompson, Welker, Chien, Attarian,
+  Armstrong, Krasin, Duong, Sindhwani, et~al.]{zeng2021transporter}
+A.~Zeng, P.~Florence, J.~Tompson, S.~Welker, J.~Chien, M.~Attarian,
+  T.~Armstrong, I.~Krasin, D.~Duong, V.~Sindhwani, et~al.
+\newblock Transporter networks: Rearranging the visual world for robotic
+  manipulation.
+\newblock In \emph{Conference on Robot Learning}, pages 726--747. PMLR, 2021.
+
+\bibitem[Wang et~al.(2021)Wang, Wang, Mandlekar, Fei-Fei, Savarese, and
+  Xu]{wang2021generalization}
+C.~Wang, R.~Wang, A.~Mandlekar, L.~Fei-Fei, S.~Savarese, and D.~Xu.
+\newblock Generalization through hand-eye coordination: An action space for
+  learning spatially-invariant visuomotor control.
+\newblock In \emph{2021 IEEE/RSJ International Conference on Intelligent Robots
+  and Systems (IROS)}, pages 8913--8920. IEEE, 2021.
+
+\bibitem[Johns(2021)]{johns2021coarse}
+E.~Johns.
+\newblock Coarse-to-fine imitation learning: Robot manipulation from a single
+  demonstration.
+\newblock In \emph{2021 IEEE international conference on robotics and
+  automation (ICRA)}, pages 4613--4619. IEEE, 2021.
+
+\bibitem[Shridhar et~al.(2022)Shridhar, Manuelli, and Fox]{shridhar2022cliport}
+M.~Shridhar, L.~Manuelli, and D.~Fox.
+\newblock Cliport: What and where pathways for robotic manipulation.
+\newblock In \emph{Conference on Robot Learning}, pages 894--906. PMLR, 2022.
+
+\bibitem[Florence et~al.(2019)Florence, Manuelli, and
+  Tedrake]{florence2019self}
+P.~Florence, L.~Manuelli, and R.~Tedrake.
+\newblock Self-supervised correspondence in visuomotor policy learning.
+\newblock \emph{IEEE Robotics and Automation Letters}, 5\penalty0 (2):\penalty0
+  492--499, 2019.
+
+\bibitem[Pari et~al.(2021)Pari, Shafiullah, Arunachalam, and
+  Pinto]{pari2021surprising}
+J.~Pari, N.~M. Shafiullah, S.~P. Arunachalam, and L.~Pinto.
+\newblock The surprising effectiveness of representation learning for visual
+  imitation.
+\newblock \emph{arXiv preprint arXiv:2112.01511}, 2021.
+
+\bibitem[Jia et~al.(2022)Jia, Wang, Su, Klee, Zhu, Walters, and
+  Platt]{jia2022seil}
+M.~Jia, D.~Wang, G.~Su, D.~Klee, X.~Zhu, R.~Walters, and R.~Platt.
+\newblock Seil: Simulation-augmented equivariant imitation learning.
+\newblock \emph{arXiv preprint arXiv:2211.00194}, 2022.
+
+\bibitem[Zhou et~al.(2023)Zhou, Kim, Wang, Florence, and Finn]{zhou2023nerf}
+A.~Zhou, M.~J. Kim, L.~Wang, P.~Florence, and C.~Finn.
+\newblock Nerf in the palm of your hand: Corrective augmentation for robotics
+  via novel-view synthesis.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition}, pages 17907--17917, 2023.
+
+\bibitem[Laskey et~al.(2016)Laskey, Staszak, Hsieh, Mahler, Pokorny, Dragan,
+  and Goldberg]{laskey2016shiv}
+M.~Laskey, S.~Staszak, W.~Y.-S. Hsieh, J.~Mahler, F.~T. Pokorny, A.~D. Dragan,
+  and K.~Goldberg.
+\newblock Shiv: Reducing supervisor burden in dagger using support vectors for
+  efficient learning from demonstrations in high dimensional state spaces.
+\newblock In \emph{2016 IEEE International Conference on Robotics and
+  Automation (ICRA)}, pages 462--469. IEEE, 2016.
+
+\bibitem[Jang et~al.(2022)Jang, Irpan, Khansari, Kappler, Ebert, Lynch, Levine,
+  and Finn]{jang2022bc}
+E.~Jang, A.~Irpan, M.~Khansari, D.~Kappler, F.~Ebert, C.~Lynch, S.~Levine, and
+  C.~Finn.
+\newblock Bc-z: Zero-shot task generalization with robotic imitation learning.
+\newblock In \emph{Conference on Robot Learning}, pages 991--1002. PMLR, 2022.
+
+\bibitem[Morrison et~al.(2018)Morrison, Corke, and
+  Leitner]{morrison2018closing}
+D.~Morrison, P.~Corke, and J.~Leitner.
+\newblock Closing the loop for robotic grasping: A real-time, generative grasp
+  synthesis approach.
+\newblock \emph{Robotics: Science And Systems}, 2018.
+\newblock \doi{10.15607/RSS.2018.XIV.021}.
+
+\bibitem[Zeng et~al.(2018)Zeng, Song, Welker, Lee, Rodriguez, and
+  Funkhouser]{zeng2018learning}
+A.~Zeng, S.~Song, S.~Welker, J.~Lee, A.~Rodriguez, and T.~Funkhouser.
+\newblock Learning synergies between pushing and grasping with self-supervised
+  deep reinforcement learning.
+\newblock \emph{Ieee/rjs International Conference On Intelligent Robots And
+  Systems}, 2018.
+\newblock \doi{10.1109/IROS.2018.8593986}.
+
+\bibitem[Wu et~al.(2020)Wu, Sun, Zeng, Song, Lee, Rusinkiewicz, and
+  Funkhouser]{wu2020spatial}
+J.~Wu, X.~Sun, A.~Zeng, S.~Song, J.~Lee, S.~Rusinkiewicz, and T.~Funkhouser.
+\newblock Spatial action maps for mobile manipulation.
+\newblock \emph{Robotics: Science And Systems}, 2020.
+\newblock \doi{10.15607/RSS.2020.XVI.035}.
+
+\bibitem[Zakka et~al.(2019)Zakka, Zeng, Lee, and Song]{zakka2019form2fit}
+K.~Zakka, A.~Zeng, J.~Lee, and S.~Song.
+\newblock Form2fit: Learning shape priors for generalizable assembly from
+  disassembly.
+\newblock \emph{Ieee International Conference On Robotics And Automation},
+  2019.
+\newblock \doi{10.1109/ICRA40945.2020.9196733}.
+
+\bibitem[Zeng et~al.(2019)Zeng, Song, Lee, Rodriguez, and
+  Funkhouser]{zeng2019tossingbot}
+A.~Zeng, S.~Song, J.~Lee, A.~Rodriguez, and T.~Funkhouser.
+\newblock Tossingbot: Learning to throw arbitrary objects with residual
+  physics.
+\newblock \emph{Ieee Transactions On Robotics}, 2019.
+\newblock \doi{10.1109/TRO.2020.2988642}.
+
+\bibitem[Zeng et~al.(2017)Zeng, Song, Yu, Donlon, Hogan, Bauza, Ma, Taylor,
+  Liu, Romo, Fazeli, Alet, Dafle, Holladay, Morona, Nair, Green, Taylor, Liu,
+  Funkhouser, and Rodriguez]{zeng2017robotic}
+A.~Zeng, S.~Song, K.-T. Yu, E.~Donlon, F.~R. Hogan, M.~Bauza, D.~Ma, O.~Taylor,
+  M.~Liu, E.~Romo, N.~Fazeli, F.~Alet, N.~C. Dafle, R.~Holladay, I.~Morona,
+  P.~Q. Nair, D.~Green, I.~Taylor, W.~Liu, T.~Funkhouser, and A.~Rodriguez.
+\newblock Robotic pick-and-place of novel objects in clutter with
+  multi-affordance grasping and cross-domain image matching.
+\newblock \emph{arXiv preprint arXiv: 1710.01330}, 2017.
+
+\bibitem[Belkhale et~al.(2023)Belkhale, Cui, and Sadigh]{belkhale2023hydra}
+S.~Belkhale, Y.~Cui, and D.~Sadigh.
+\newblock Hydra: Hybrid robot actions for imitation learning.
+\newblock \emph{arXiv preprint arXiv: 2306.17237}, 2023.
+
+\bibitem[Ho et~al.(2020)Ho, Jain, and Abbeel]{ho2020denoising}
+J.~Ho, A.~Jain, and P.~Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock \emph{Advances in Neural Information Processing Systems},
+  33:\penalty0 6840--6851, 2020.
+
+\bibitem[Welling and Teh(2011)]{welling2011bayesian}
+M.~Welling and Y.~W. Teh.
+\newblock Bayesian learning via stochastic gradient langevin dynamics.
+\newblock In \emph{Proceedings of the 28th international conference on machine
+  learning (ICML-11)}, pages 681--688, 2011.
+
+\bibitem[Kingma and Welling(2013)]{kingma2013auto}
+D.~P. Kingma and M.~Welling.
+\newblock Auto-encoding variational bayes.
+\newblock \emph{arXiv preprint arXiv:1312.6114}, 2013.
+
+\bibitem[Sohn et~al.(2015)Sohn, Lee, and Yan]{sohn2015learning}
+K.~Sohn, H.~Lee, and X.~Yan.
+\newblock Learning structured output representation using deep conditional
+  generative models.
+\newblock \emph{Advances in neural information processing systems}, 28, 2015.
+
+\bibitem[Todorov et~al.(2012)Todorov, Erez, and Tassa]{mujoco}
+E.~Todorov, T.~Erez, and Y.~Tassa.
+\newblock Mujoco: A physics engine for model-based control.
+\newblock In \emph{2012 IEEE/RSJ International Conference on Intelligent Robots
+  and Systems}, pages 5026--5033, 2012.
+\newblock \doi{10.1109/IROS.2012.6386109}.
+
+\bibitem[Florence et~al.(2021)Florence, Lynch, Zeng, Ramirez, Wahid, Downs,
+  Wong, Lee, Mordatch, and Tompson]{florence2021implicit}
+P.~R. Florence, C.~Lynch, A.~Zeng, O.~Ramirez, A.~Wahid, L.~Downs, A.~S. Wong,
+  J.~Lee, I.~Mordatch, and J.~Tompson.
+\newblock Implicit behavioral cloning.
+\newblock \emph{Conference On Robot Learning}, 2021.
+
+\end{thebibliography}
+
+
+\clearpage
+\appendix
+\include{appendix}
+
+
+\end{document}

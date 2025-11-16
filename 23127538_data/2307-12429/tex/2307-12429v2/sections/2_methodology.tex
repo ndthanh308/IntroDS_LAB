@@ -1,0 +1,161 @@
+
+\vspace{-5.3mm}
+\section{Methodology} \label{sec:2}
+\vspace{-2.1mm}
+
+\input{figures/fig1}
+
+The core idea of SwIPE (overviewed in Fig.~\ref{fig:1}) is to use patch-wise 
+%implicit neural representations (INRs) 
+INRs for semantic segmentation.
+To formulate this, we first discuss the shift from discrete to implicit segmentation, then delineate the intermediate representations needed for such segmentation, and overview the major components involved in obtaining these representations.
+Note that for the remainder of the paper, we present formulations for 2D data but the descriptions are conceptually congruous in 3D.
+
+In a typical discrete segmentation setting with $C$ classes, an input image $\textbf{X}$ is mapped to class probabilities with the same resolution $f: \textbf{X} \in \mathbb{R}^{H \times W \times 3} \rightarrow \hat{\textbf{Y}} \in \mathbb{R}^{H \times W \times C}$. 
+Segmentation with INRs, on the other hand, maps an image $\textbf{X}$ and a continuous image coordinate $\textbf{p}_i = (x, y)$, $x, y \in [-1,1]$, to the coordinate's class-wise occupancy probability $\hat{\textbf{o}}_i \in \mathbb{R}^C$, yielding $f_\theta: (\textbf{p}_i, \textbf{X}) \rightarrow \hat{\textbf{o}}_i$, where $f_\theta$ is parameterized by a neural network with weights $\theta$.
+As a result, predictions of arbitrary resolutions can be obtained by modulating the spatial granularity of the input coordinates.
+This formulation also enables the direct use of discrete pixel-wise losses like Cross Entropy or Dice with the added benefit of boundary modeling.
+Object boundaries are represented as the zero-isosurface in $f_\theta$'s prediction space or, more elegantly, $f_\theta$'s decision boundary.
+% As a result, from a fixed size $X$, predictions of arbitrary resolutions can be obtained by modulating the spacial granularity of input coordinates.
+% This formulation also allows for seamless integration with existing discrete pipelines with pixel-wise losses like Cross Entropy or Dice, but with the added benefit of robust boundary modeling in the form of the zero-isosurface from $D$'s prediction space.
+% Thus, on a high level, our method operates on point and class-occupancy pairs via $f_\theta$ rather than pixel-wise correspondences between discrete images and masks.
+
+SwIPE builds on the INR segmentation setting (e.g., in~\cite{Khan2022IOSNet}), but operates on patches rather than on points or global embeddings (see Tab.~\ref{tab:1} \& left of Tab.~\ref{tab:3} for empirical justifications) to better enable both local boundary details and global shape coherence.
+This involves two main steps: (1) encode shape embeddings from an image, and (2) decode occupancies for each point while conditioning on its corresponding embedding(s).
+In our case, $f_\theta$ includes an encoder $E_b$ (or backbone) that extracts multi-scale feature maps from an input image, a context aggregation module $E_n$ (or neck) that aggregates the feature maps into vector embeddings for each patch, and MLP decoders $D^\mathbb{P}$ (decoder for local patches where $\mathbb{P}$ is for patch) \& $D^\mathbb{I}$ (decoder for entire images where $\mathbb{I}$ is for image) that output smoothly-varying occupancy predictions given embedding \& coordinate pairs.
+To encode patch embeddings in step (1), $E_b$ and $E_n$ map an input image $\textbf{X}$ to a global image embedding $\textbf{z}^\mathbb{I}$ and a matrix $\textbf{Z}^\mathbb{P}$ containing a local patch embedding $\textbf{z}^\mathbb{P}$ at each planar position. 
+For occupancy decoding in step (2), $D^\mathbb{P}$ decodes the patch-wise class occupancies $\textbf{o}_i^\mathbb{P}$ using relevant local and global inputs while $D^\mathbb{I}$ predicts occupancies $\textbf{o}_i^\mathbb{I}$ for the entire image using only image coordinates $\textbf{p}_i^\mathbb{I}$ and the image embedding $\textbf{z}^\mathbb{I}$.
+% For occupancy decoding in (2), $D^\mathbb{P}$ decodes a patch coordinate $\textbf{p}_i^\mathbb{P}$ and its corresponding patch embedding $\textbf{z}_i^\mathbb{P}$ to patch class occupancies $D^\mathbb{P}: \textbf{p}_i^\mathbb{P}, \textbf{z}_i^\mathbb{P} \rightarrow \hat{\textbf{o}}_i^\mathbb{P}$. 
+% Similarly, image occupancy decoding can be written as $D^\mathbb{I}: \textbf{p}_i^\mathbb{I}, \textbf{z}_i^\mathbb{I} \rightarrow \hat{\textbf{o}}_i^\mathbb{I}$ and serves as an auxiliary task to learn global shapes across patches.
+Below, we detail the encoding of image \& patch embeddings (Sec.~\autoref{sec:2-1}), the point-wise decoding process (Sec.~\autoref{sec:2-2}), and the training procedure for SwIPE (Sec.~\autoref{sec:2-3}). 
+
+
+
+% Since our method operates on patch embeddigns
+% $f_\theta$ in SwIPE consists of an encoder $E_b$ (or backbone) that extracts multi-scale feature maps from an input image, a context aggregation module $E_n$ (or neck) that aggregates the feature maps into vector embeddings for each patch, and a decoder $D$ that outputs smoothly-varying occupancy predictions for each patch.
+
+% Below, we detail the components used to extract patch embeddings from image $X$ (see~\autoref{sec:2-1}), the mechanisms for decoding patch shapes from patch embeddings (see~\autoref{sec:2-2}), and the training procedure for SwIPE (see~\autoref{sec:2-3}). 
+
+
+\vspace{-4mm}
+\subsection{Image Encoding and Patch Embeddings} \label{sec:2-1}
+\vspace{-1.5mm}
+
+The encoding process utilizes the backbone $E_b$ and neck $E_n$ to obtain a global image embedding $\textbf{z}^\mathbb{I}$ and a matrix $\textbf{Z}^\mathbb{P}$ of patch embeddings.
+% $E_n \circ E_b: \textbf{X} \rightarrow \textbf{z}^\mathbb{I}, \textbf{Z}^\mathbb{P}$.
+We define an image patch as an isotropic grid cell (i.e., a square in 2D or a cube with identical spacing in 3D) of length $S$ from non-overlapping grid cells over an image.
+Thus, an image $\textbf{X} \in \mathbb{R}^{H \times W \times 3}$ with a patch size $S$ will produce $\ceil[\big]{\frac{H}{S}} \cdot \ceil[\big]{\frac{W}{S}}$ patches.
+For simplicity, we assume that the image dimensions are evenly divisible by $S$.
+% written as $E_n \circ E_b: \textbf{X} \rightarrow \textbf{z}^\mathbb{I}, \textbf{Z}^\mathbb{P}$. where $d$ is the embedding dimension, $\textbf{z}^\mathbb{I} \in \mathbb{R}^d$, and $\textbf{Z}^\mathbb{P} \in \mathbb{R}^{\frac{H}{S} \times \frac{W}{S} \times d}$.
+% $\textbf{z}_{rc} \in \textbf{Z}$ indexes the patch embedding at the $r$th row and $c$th column.
+
+A fully convolutional \textbf{encoder backbone} $E_b$ (e.g., Res2Net-50~\cite{gao2019res2net}) is employed to generate multi-scale features from image $\textbf{X}$.
+The entire image is processed as opposed to individual crops \cite{jiang2020localimplicitgrid,chabra2020deeplocalshape,Reich2021OSSNetME} to leverage larger receptive fields and integrate intra-patch information.
+Transformers \cite{hassani2021CCT} also model cross-patch relations and naturally operate on patch embeddings, but are data-hungry and lack helpful spatial inductive biases (we affirm this in Sec.~\autoref{sec:3-5}).
+$E_b$ outputs four multi-scale feature maps from the last four stages, $\{\textbf{F}_n\}_{n=2}^{5}$ ($\textbf{F}_n \in \mathbb{R}^{C_n \times H_n \times W_n}$, $H_n = \frac{H}{2^n}$, $W_n = \frac{W}{2^n}$).
+% To obtain $\textbf{Z}^\mathbb{P}$, we prioritize data efficiency and contextual understanding in our encoder design for accurate segmentation with limited medical data.
+% For $E_b$ and $E_n$, we elect to use fully convolutional encoder components that operate on the entire input image to encode patch embeddings.
+% We avoid directly inputting crops like other patch-based 3D reconstruction approaches~\cite{jiang2020localimplicitgrid,chabra2020deeplocalshape} since they preclude helpful context beyond patches.
+% For better, context modeling, Transformers \cite{hassani2021CCT} were also considered since they innately represent image patches as vector embeddings and are effective in modeling long-range relations, but self-attention requires abundant data and lack helpful spacial inductive biases (see backbone studies in Section~\autoref{sec:3-5}).
+% Thus, we employ a multi-stage convolutional \textbf{encoder backbone} $E_b$ to generate multiple levels of features $\{\textbf{F}_n\}_{n=2}^{5}$ from image $\textbf{X}$ where $\textbf{F}_n \in \mathbb{R}^{C_n \times H_n \times W_n}$, $H_n = \frac{H_n}{2^n}$.
+
+The \textbf{encoder neck} $E_n$ aggregates $E_b$'s multi-scale outputs $\{\textbf{F}_n\}_{n=2}^{5}$ to produce $\textbf{z}^\mathbb{I}$ (the shape embedding for the entire image) and $\textbf{Z}^\mathbb{P}$ (the grid of shape embeddings for patches).
+The feature maps are initially fed into a modified Receptive Field Block \cite{liu2018receptivefieldblockRFB} (dubbed RFB-L or RFB-Lite) that replaces symmetric convolutions with a series of efficient asymmetric convolutions 
+(e.g., $(3\times3)$ $\rightarrow$ $(3\times1) + (1\times3)$).
+% Like modern object detection schemas \cite{zhu2021tphyolov5}, 
+The context-enriched feature maps are then fed through multiple cascaded aggregation and downsampling operations (see $E_n$ in Fig.~\ref{fig:1}) to obtain four multi-stage intermediate embeddings with identical shapes, $\{\textbf{F}_n'\}_{n=2}^{5} \in \mathbb{R} ^ {\frac{H}{32} \times \frac{W}{32} \times d}$.
+% Similar to modern object detection schemas \cite{zhu2021tphyolov5}, we adopt an \textbf{encoder neck} $E_n$ to aggregate multi-scale features and improve contextual understanding (see Figure~\ref{fig:1}).
+% All multiscale feature maps $\{\textbf{F}_n\}_{n=2}^{5}$ from $E_b$ are initially fed into a modified Receptive Field Block \cite{liu2018receptivefieldblockRFB} (dubbed RFB-L or RFB-Lite) that replaces symmetric convolutions with a series of efficient asymmetric convolutions 
+% (e.g., $(3\times3)$ $\rightarrow$ $(3\times1) + (1\times3)$).
+% % (e.g., $(3\times3)$ $\rightarrow$ $(3\times1) + (1\times3)$, or $(3\times3\times3)$ $\rightarrow$ $(3\times1\times1) + (1\times3\times1) + (1\times1\times3)$).
+% The resulting augmented feature maps are then fed through multiple cascaded aggregation and downsampling operations to obtain four multi-stage feature maps with identical shapes $\{\textbf{F}_n'\}_{n=2}^{5} \in \mathbb{R} ^ {\frac{H}{32} \times \frac{W}{32} \times d}$.
+% The vector at each planar position of $\textbf{F}_n'$ represents an intermediate embedding for a shape centered at that feature map position. 
+
+To convert the intermediate embeddings $\{\textbf{F}_n'\}_{n=2}^{5}$ to patch embeddings $\textbf{Z}^\mathbb{P}$, we first resize them to $\textbf{Z}^\mathbb{P}$'s final shape via linear interpolation to produce $\{\textbf{F}_n''\}_{n=2}^{5}$, which contain low-level ($\textbf{F}_2''$) to high-level ($\textbf{F}_5''$) information.
+Resizing enables flexibility in designing appropriate patch coverage, which may differ across tasks due to varying structure sizes and shape complexities.
+Note that this is different from the interpolative sampling in~\cite{Khan2022IOSNet} and more similar to~\cite{hu2022ifanet}, except the embeddings' spatial coverage in SwIPE are larger and adjustable.
+To prevent the polarization of embeddings toward either local or global scopes, we propose a \textbf{multi-stage embedding attention} (MEA) module to enhance representational power and enable dynamic focus on the most relevant abstraction level for each patch. 
+Given four intermediate embedding vectors $\{\textbf{e}_n\}_{n=2}^{5}$ from corresponding positions in $\{\textbf{F}_n''\}_{n=2}^{5}$, we compute the attention weights via $\mathcal{W} = Softmax(MLP_1(cat(MLP_0(\textbf{e}_2), MLP_0(\textbf{e}_3), MLP_0(\textbf{e}_4), MLP_0(\textbf{e}_5))))$, where $\mathcal{W} \in \mathbb{R}^{4}$ is a weight vector, $cat$ indicates concatenation, and $MLP_0$ is followed by a ReLU activation. 
+The final patch embedding is obtained by $\textbf{z}^\mathbb{P} = MLP_{2}(\sum^{5}_{n=2}  \textbf{e}_n + \sum^{5}_{n=2} w_{n-2} \cdot \textbf{e}_n)$, where $w_i$ is the $i$th weight of $\mathcal{W}$.
+Compared to other spatial attention mechanisms like CBAM~\cite{woo2018cbam}, our module separately aggregates features at each position across multiple inputs and predicts a proper probability distribution in $\mathcal{W}$ instead of an unconstrained score. 
+The output patch embedding matrix $\textbf{Z}^\mathbb{P}$ is populated with $\textbf{z}^\mathbb{P}$ at each position and models shape information centered at the corresponding patch in the input image (e.g., if $S=32$, $\textbf{Z}^\mathbb{P}[0,0]$ encodes shape information of the top left patch of size $32\times32$ in $\textbf{X}$).
+Finally, $\textbf{z}^\mathbb{I}$ is obtained by average-pooling $\textbf{F}'_5$ into a vector.
+% $\textbf{e} = MLP_2(\sum_{n=2}^{5} \textbf{e_n} + \mathcal{W}T )$.
+% Note that this is similar in spirit to spatial attention in CBAM~\cite{woo2018cbam}, but with probability distribution $\mathcal{W}$ modeling multi-stage relevancy and involving multiple feature sources.
+
+
+
+% For $E_d$ and $E_n$, we elect to use fully convolutional encoder components that operate on the entire input image to encode patch embeddings.
+% However, there are other approaches to obtaining a descriptive embedding $\textbf{z}$. 
+% Recent patch-based methods for 3D reconstruction \cite{jiang2020localimplicitgrid,chabra2020deeplocalshape} directly feed in local patches after cropping to extract embeddings.
+% However, this faces similar limitations as the local encodings method in OSSNet \cite{Reich2021OSSNetME} by failing to leverage helpful context beyond the patch. 
+% To improve context across patches, another natural approach is to adopt Transformers which already model image patches as vector embeddings and are effective in modeling long-range relations.
+% Given limited medical image data, however, the self-attention mechanism lacks helpful inductive biases such as local bias, equivariant processing, and weight-sharing (we empirically affirm this in our backbone studies, see~\autoref{sec:3-5}). 
+% Thus, we find a convolutional backbone to be the most suitable given their data, parameter, and computational efficiency.
+
+\vspace{-3mm}
+\subsection{Implicit Patch Decoding} \label{sec:2-2}
+\vspace{-1.5mm}
+
+% To predict patch-wise occupancies with decoder $D^\mathbb{P}$ ($\mathbb{P}$ for patch), 
+Given an image coordinate $\textbf{p}^\mathbb{I}_i$ and its corresponding patch embedding $\textbf{z}_i^\mathbb{P}$, the patch-wise occupancy can be decoded with decoder $D^\mathbb{P}: (\textbf{p}^\mathbb{P}_i, \textbf{z}_i^\mathbb{P}) \rightarrow \hat{\textbf{o}}_i^\mathbb{P}$, where $D^\mathbb{P}$ is a small MLP and 
+$\textbf{p}^\mathbb{P}_i$ is the patch coordinate with respect to the patch center $\textbf{c}_i$ associated with $\textbf{z}_i^\mathbb{P}$ and is obtained by $\textbf{p}^\mathbb{P}_i = \textbf{p}^\mathbb{I}_i - \textbf{c}_i$.
+But, this design leads to poor global shape predictions and discontinuities around patch borders.
+% Despite good local precision, decoding each patch independently in this manner leads to poor global shape coherence and discontinuities around patch borders.
+
+To encourage better \textbf{global shape coherence}, we also incorporate a global image-level decoder $D^\mathbb{I}$.
+This image decoder, $D^\mathbb{I}: (\textbf{p}^\mathbb{I}_i, \textbf{z}^\mathbb{I}) \rightarrow \hat{\textbf{o}}_i^\mathbb{I}$, predicts occupancies for the entire input image.
+To distill higher-level shape information into patch-based predictions, we also condition $D^\mathbb{P}$'s predictions on $\textbf{p}_i^\mathbb{I}$ and $\textbf{z}^\mathbb{I}$. 
+Furthermore, we find that providing the \textbf{source coordinate} gives additional spatial context for making location-coherent predictions.
+In a typical segmentation pipeline, the input image $\textbf{X}$ is a resized crop from a source image and we find that giving the coordinate $\textbf{p}_i^\mathbb{S}$ ($\mathbb{S}$ for source) from the original uncropped image improves performance on 3D tasks since the additional positional information may be useful for predicting recurring structures.
+Our enhanced formulation for patch decoding can be described as $D^\mathbb{P}: (\textbf{p}^\mathbb{P}_i, \textbf{z}^\mathbb{P}_i, \textbf{p}^\mathbb{I}_i, \textbf{z}^\mathbb{I}, \textbf{p}^\mathbb{S}_i) \rightarrow \hat{\textbf{o}}_i^\mathbb{P}$. 
+% To encourage better \textbf{global shape coherence}, we also incorporate a global image-level decoder $D^\mathbb{I}$.
+% The image decoder, $D^\mathbb{I}: \textbf{p}^\mathbb{I}_i, \textbf{z}^\mathbb{I} \rightarrow \hat{\textbf{o}}_i$, predicts occupancies for the entire input image given an image coordinate $\textbf{p}^\mathbb{I}_i$ and a global embedding $\textbf{z}^\mathbb{I}$ where $\textbf{z}^I$ is obtained by average-pooling $\textbf{F}'_5$ into a vector.
+% To distill higher-level shape information into patch-based prediction, we also condition $D^\mathbb{P}$ predictions on $\textbf{p}_i^\mathbb{I}$ and $\textbf{z}^\mathbb{I}$. 
+% Furthermore, we find that providing the \textbf{source coordinate} gives additional spacial context for making location-coherent predictions.
+% In usual data pipelines, the input image $\textbf{X}$ is a resized crop from a source image and giving the coordinate $p_i^\mathbb{S}$ ($\mathbb{S}$ for source) from the original image particularly helps for 3D tasks.
+% Finally, we have $D^\mathbb{P}: \textbf{p}^\mathbb{P}_i, \textbf{z}^\mathbb{P}, \textbf{p}^\mathbb{I}_i, \textbf{z}^\mathbb{I}, \textbf{p}^\mathbb{S} \rightarrow \hat{\textbf{o}}_i$. 
+
+To address discontinuities at patch boundaries, we propose a training technique called \textbf{Stochastic Patch Overreach} (SPO) which forces patch embeddings to make predictions for coordinates in neighboring patches.
+For each patch point and embedding pair ($\textbf{p}^\mathbb{P}_i, \textbf{z}^\mathbb{P}_i$), we create a new pair ($\textbf{p}^\mathbb{P}_i{}', \textbf{z}^\mathbb{P}_i{}'$) by randomly selecting a neighboring patch embedding and updating the local point to be relative to the new patch center.
+This regularization is modulated by the set of valid choices to select a neighboring patch (\textit{connectivity}, or \textit{con}) and the number of perturbed points to sample per batch point (\textit{occurrence}, or $N_{\text{SPO}}$).
+$con$=$4$ means all adjoining patches are neighbors while $con$=$8$ includes corner patches as well. 
+Note that SPO differs from the regularization in \cite{chabra2020deeplocalshape} since no construction of a KD-Tree is required and we introduce a tunable stochastic component which further helps with regularization under limited-data settings.
+
+
+% \subsubsection{Improving Boundaries}
+
+% The duality of boundary decoding: 1) unsmooth at patch boundaries, 2) too smooth near object boundaries within the patch. 
+
+% To achieve robust patch prediction with adequate global shape regularization, we propose three mechanisms. Firstly, we introduce a stochastic patch overreach scheme to alleviate boundary discontinuity between patches and facilitate contextual understanding beyond a local scope. Secondly, we condition local patches on global embeddings. Lastly, we apply multi-scale self-supervision to improve local and global shape consistency.
+
+
+\input{tables/table1}
+
+\vspace{-3mm}
+\subsection{Training SwIPE} \label{sec:2-3}
+\vspace{-1.5mm}
+
+To optimize the parameters of $f_\theta$, we first sample a set of point and occupancy pairs $\{\textbf{p}^\mathbb{S}_i, \textbf{o}_i\}_{i \in \mathcal{I}}$ for each source image, where $\mathcal{I}$ is the index set for the selected points.
+We obtain an equal number of points for each foreground class using Latin Hypercube sampling with 50\% of each class's points sampled within 10 pixels of the class object boundaries. 
+The \textbf{point-wise occupancy loss}, written as 
+$\mathcal{L}_\text{occ}(\textbf{o}_i, \hat{\textbf{o}}_i) = 0.5 \cdot \mathcal{L}_\text{ce}(\textbf{o}_i, \hat{\textbf{o}}_i) + 0.5 \cdot \mathcal{L}_\text{dc}(\textbf{o}_i, \hat{\textbf{o}}_i)$,
+is an equally weighted sum of Cross Entropy loss $\mathcal{L}_\text{ce}(\textbf{o}_i, \hat{\textbf{o}}_i) = -\log \hat{o}_i^c$ and Dice loss $\mathcal{L}_\text{dc}(\textbf{o}_i, \hat{\textbf{o}}_i) = 1 - \frac{1}{C} \sum_{c} \frac{2 \cdot o_i^c \cdot \hat{o}_i^c + 1}{(o_i^c)^2 + (\hat{o}_i^c)^2 + 1}$, where $\hat{o}_i^c$ is the predicted probability for the target occupancy with class label $c$.
+Note that in practice, these losses are computed in their vectorized forms; for example, the Dice loss is applied with multiple points per image instead of an individual point (similar to computing the Dice loss between a flattened image and its flattened mask).
+% The class occupancy loss for a point consists of an equally weighted sum of Cross Entropy loss $\mathcal{L}_\text{ce}$ and Dice Loss $\mathcal{L}_\text{dc}$ and can be written as  
+% where }_i^c$ is the predicted probability for the target occupancy target with class label $c$.
+% The class occupancy loss for a point consists of an equally weighted sum of Cross Entropy loss $\mathcal{L}_\text{ce}$ and Dice Loss $\mathcal{L}_\text{dc}$ and can be written as  
+% $\mathcal{L}_\text{occ}(\textbf{o}_i, \hat{\textbf{o}}_i) = 0.5 \cdot \mathcal{L}_\text{ce}(\textbf{o}_i, \hat{\textbf{o}}_i) + 0.5 \cdot \mathcal{L}_\text{dc}(\textbf{o}_i, \hat{\textbf{o}}_i)$, 
+% where 
+% $\mathcal{L}_\text{ce}(\textbf{o}_i, \hat{\textbf{o}}_i) = -log \hat{o}_i^c$,  
+% $\mathcal{L}_\text{dc}(\textbf{o}_i, \hat{\textbf{o}}_i) = 1 - \frac{1}{C} \sum_{c} \frac{2 \cdot o_i^c \cdot \hat{o}_i^c + 1}{(o_i^c)^2 + (\hat{o}_i^c)^2 + 1}$, 
+% and $\hat{o}_i^c$ is the predicted probability for the target occupancy target with class label $c$.
+The \textbf{loss for patch and image decoder} predictions is $\mathcal{L}_{\mathbb{P}\mathbb{I}}(\textbf{o}_i, \hat{\textbf{o}}_i^\mathbb{P}, \hat{\textbf{o}}_i^\mathbb{I}) = \alpha \mathcal{L}_\text{occ}(\textbf{o}_i, \hat{\textbf{o}}_i^\mathbb{P}) + (1 - \alpha) \mathcal{L}_\text{occ}(\textbf{o}_i, \hat{\textbf{o}}_i^\mathbb{I})$, where $\alpha$ is a local-global balancing coefficient.
+Similarly, the \textbf{loss for the SPO} occupancy prediction $\hat{\textbf{o}}_i'$ is $\mathcal{L}_{\text{SPO}}(\textbf{o}_i, \hat{\textbf{o}}_i') = \mathcal{L}_\text{occ}(\textbf{o}_i, \hat{\textbf{o}}_i')$. 
+Finally, the \textbf{overall loss} for a coordinate is formulated as 
+$\mathcal{L} = \mathcal{L}_{\mathbb{P}\mathbb{I}} + \beta \mathcal{L}_{\text{SPO}} + \lambda(||\textbf{z}_i^\mathbb{P}||_2^2 + ||\textbf{z}_i^\mathbb{I}||_2^2)$, where $\beta$ scales SPO and the last term (scaled by $\lambda$) regularizes the patch \& image embeddings, respectively.
+% $\mathcal{L} = \mathcal{L}_{\mathbb{P}\mathbb{I}} + \beta \mathcal{L}_{\text{SPO}} + \lambda(||\textbf{z}_i^\mathbb{P}||_2^2 + ||\textbf{z}_i^\mathbb{I}||_2^2 + ||\textbf{z}_i^`||_2^2)$, where $\beta$ scales SPO and the last term regularizes the patch, image, and SPO patch embeddings, respectively.
+
+
+
+

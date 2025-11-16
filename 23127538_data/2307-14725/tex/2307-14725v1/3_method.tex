@@ -1,0 +1,47 @@
+
+\section{Method}
+\label{seq:method}
+
+In a nutshell, \texttt{vox2vec} pre-trains a neural network to produce similar representations for the same voxel placed in different contexts (positive pairs) and predict distinctive representations for different voxels (negative pairs). In the following Sections~\ref{subseq:method:sampling},~\ref{subseq:method:architecture},~\ref{subseq:method:loss}, we describe in detail the main components of our method: 1) definition and sampling of positive and negative pairs of voxels; 2) modeling voxel-level representations via a neural network; 3) computation of the contrastive loss. The whole pre-training pipeline is schematically illustrated in Figure~\ref{fig:method}. We also describe the methodology of the evaluation of the pre-trained representations on downstream segmentation tasks in Section~\ref{subseq:method:evaluation}.
+
+% Figure environment removed
+
+\subsection{Sampling of Positive and Negative Pairs}
+\label{subseq:method:sampling}
+
+We define a \textit{positive pair} as any pair of voxels that correspond to the same location in a given volume. Conversely, we call a \textit{negative pair} any pair of voxels that correspond to different locations in the same volume as well as voxels belonging to different volumes.
+
+Figure~\ref{fig:method} (left) illustrates our strategy for positive and negative pairs sampling. For a given volume, we sample two overlapping 3D patches of size $(H, W, D)$.
+We apply color augmentations to them, including random gaussian blur, random gaussian sharpening, adding random gaussian noise, clipping the intensities to the random Hounsfield window, and rescaling them to the $(0, 1)$ interval. 
+Next, we sample $m$ different positions from the patches' overlapping region. Each position yields a pair of voxels --- one from each patch, which results in a total of $m$ positive pairs of voxels. At each pre-training iteration, we repeat this procedure for $n$ different volumes, resulting in $2 \cdot n$ patches containing $N = n \cdot m$ positive pairs.
+Thus, each sampled voxel has one positive counterpart and forms negative pairs with all the remaining $2N - 2$ voxels.
+
+In our experiments we set $(H, W, D) = (128, 128, 32)$, $n = 10$ and $m = 1000$.
+
+We exclude the background voxels from the sampling and do not penalize their representations. We obtain the background voxels by using a simple two-step algorithm: 1) thresholding voxels with an intensity less than $-500$ HU; 2) keep voxels from the same connected component as the corner voxel of the CT volume, using a flood fill algorithm.
+
+\subsection{Architecture}
+\label{subseq:method:architecture}
+A standard architecture for voxel-wise prediction is 3D UNet \cite{unet}. UNet's backbone returns a feature map of the same resolution as the input patch. However, our experiments show that this feature map alone is insufficient for modeling self-supervised voxel-level representations. The reason is that producing a feature map with more than $100$ channels in full resolution is infeasible due to memory constraints. Meanwhile, to be suitable for many downstream tasks, representations should have a dimensionality of about $1000$, as in \cite{simclr}.
+
+To address this issue, we utilize a 3D FPN architecture instead of a standard 3D UNet. FPN returns voxel-level representations in the form of a feature pyramid. The pyramid's base is a feature map with $16$ channels of the same resolution as the input patch. Each next pyramid level has twice as many channels and two times lower resolution than the previous one. Each voxel's representation is a concatenation of the corresponding feature vectors from all the pyramid levels. We use FPN with six pyramid levels, which results in $1008$-dimensional representations. See Figure~\ref{fig:method} (right) for an illustration.
+
+\subsection{Loss Function}
+\label{subseq:method:loss}
+
+At each pre-training iteration, we fed $2 \cdot n$ patches to the FPN and obtain the representations for $N$ positive pairs of voxels. We denote the representations in $i$-th positive pair as $h_i^{(1)}$ and $h_i^{(2)}$, $i = 1, \ldots, N$. Following \cite{simclr}, instead of penalizing the representations directly, we project them on $128$-dimensional unit sphere via a trainable $3$-layer perceptron $g(\cdot)$ followed by l$2$-normalization: $z_i^{(1)} = g(h_i^{(1)}) / \|g(h_i^{(1)})\|$, $z_i^{(2)} = g(h_i^{(2)}) / \|g(h_i^{(2)})\|$, $i = 1, \ldots, N$. Similar to \cite{simclr} we use the InfoNCE loss as a contrastive objective: $\mathcal{L} = \sum_{i = 1}^{N} \sum_{k \in \{1, 2\}}\mathcal{L}_i^{k}$, where
+$$
+\mathcal{L}_i^{k} = -\log\frac{\exp(\langle z_i^{(1)}, z_i^{(2)} \rangle / \tau)}{\exp(\langle z_i^{(1)}, z_i^{(2)} \rangle / \tau) + \sum_{j \in \{1, \ldots, N\} \setminus \{i\}} \sum_{l \in \{1, 2\}} \exp(\langle z_i^{(k)}, z_j^{(l)} \rangle / \tau)}.
+$$
+
+\subsection{Evaluation protocol}
+\label{subseq:method:evaluation}
+We evaluate the quality of self-supervised voxel-level representations on downstream segmentation tasks in three setups: 1) linear probing, 2) non-linear probing, and 3) end-to-end fine-tuning.
+
+Linear or non-linear probing means training a voxel-wise linear or non-linear classifier on top of the frozen representations. If the representations are modeled by the UNet model, such classifier can be implemented as one or several $1 \times 1$ convolutional layers with a kernel size $1$ on top of the output feature map.
+A linear voxel-wise head (linear FPN head) can be implemented as follows. Each pyramid level is separately fed to its own convolutional layer with kernel size 1. Then, as the number of channels on all pyramid levels has decreased, they can be upsampled to the full resolution and summed up. This operation is equivalent to applying a linear classifier to FPN voxel-wise representations described in Section~\ref{subseq:method:architecture}. Linear FPN head has four orders of magnitude fewer parameters than FPN.
+The architecture of the non-linear voxel-wise head replicates the UNet's decoder but sets the kernel size of all convolutions to $1$. It has 50 times fewer parameters than the entire FPN architecture.
+
+In the end-to-end fine-tuning setup, we attach the voxel-wise non-linear head, but in contrast to the non-linear probing regime, we also train the backbone. 
+
+

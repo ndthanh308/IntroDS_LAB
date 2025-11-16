@@ -1,0 +1,78 @@
+
+\section{Methodology}
+In this section, we will consider the four components of our paper. First, we detail how drug synergy tuples are input to encoder-only language models (§~\ref{method:encoder}). Next, we extend this idea to the few-shot ICL setting and propose training methodologies to do so (§~\ref{method:synergpt}). We then discuss optimization of the ``prompt'' used for ICL (§~\ref{method:training_strategy}). Finally, we extend our methodology to inverse drug design (§~\ref{method:inverse_design}).  
+
+\subsection{Input for encoder-only language models}
+\label{method:encoder}
+Initially, we explore the efficacy of BERT-style language models \cite{devlin2019bert, beltagy2019scibert, yasunaga2022linkbert} for drug synergy prediction. We modify the task input to be in natural language using a simple formulation:
+\centerline{[CLS] $d^1$ [SEP] $d^2$ [SEP] $c$ [SEP]} 
+where $d^1$ and $d^2$ are drug names (e.g., \emph{imatinib}, \emph{5-FU}), 
+and $c$ is the name of a cell line (e.g., \emph{MCF2}, \emph{Ishikawa}). The model is then trained to predict the output value $y$ from the \textbf{[CLS]} token representation. 
+
+We also investigate to what extent pretraining knowledge is responsible for the model's performance. To do so, we evaluate the impact on performance when the drug and cell names are replaced with `random' tokens. Given the ordered (by frequency) %
+vocabulary $\mathcal{V}$ of the LM, we select the tokens $\{v_i \in \mathcal{V} \mid i \in \left[k..(k+|\mathcal{C}|+|\mathcal{D}|)\right]\}$ to represent our drug and cell lines. Note we start at a threshold $k$ to avoid the most common tokens which might have specialized representations in the language model's latent space. %
+We uniquely map each cell line and drug to a token in this set, which we use as input to the BERT LM. Essentially, this experiment is used to determine whether knowledge from pretraining or the transformer architecture itself is responsible for performance on the drug synergy task.
+An example input from this strategy is: {[CLS] rabbit [SEP] fish [SEP] book [SEP]}.
+ 
+
+
+\subsection{SynerGPT: In-Context Learning for Few-Shot Synergy Prediction}
+\label{method:synergpt}
+
+\subsubsection{In-Context Learning for Function Classes: Background}
+Recent work trained transformer models to ``in-context learn'' function classes \cite{garg2022can}. A function class is a set of functions that satisfy specific properties, such as linear functions or neural networks. In-context learning of a function class $\mathcal{F}$ is defined as being able to approximate $f(x_\textrm{query})$ for ``most'' functions $f \in \mathcal{F}$ given a new query $x_\textrm{query}$ when conditioned on a prompt sequence $(x_1, f(x_1), \ldots, x_n, f(x_n), x_\textrm{query})$. We define a prompt prefix $P^n \coloneqq (x_1, f(x_1), \ldots, x_n, f(x_n), x_{n+1})$ as the first $n$ in-context examples followed by the $n+1$th input. A model $M_\theta$ parameterized by $\theta$ is trained to minimize the loss averaged over all prefixes
+\begin{equation} 
+\min_\theta \mathbb{E} \left[ \frac{1}{n+1} \sum_{i=0}^n w_i \ell \left( M_\theta (P^i), f(x_{i+1})\right) \right] 
+\label{training_eq}
+\end{equation}
+given some appropriate loss function $\ell$. Weights $w_n := 1$ unless otherwise noted. %
+
+
+\subsubsection{Predicting Drug Synergy In-Context} \label{method:incontext}
+For in-context prediction of drug synergy, we redefine 
+$$P^n = (d_1^1, d_1^2, c_1, y_1, \ldots, d_n^1, d_n^2, c_n, y_n, d_{n+1}^1, d_{n+1}^2, c_{n+1})$$
+as the prompt prefix (as discussed in Section \ref{sec:problem_setting}, we refer to this as the ``context'' or ``input context''). Here, $y$ can be considered the output of a function measuring synergy on $(d^1, d^2, c)$. %
+As in \cite{garg2022can}, we consider a GPT-2 family \cite{radford2019language} decoder-only language model, which we call SynerGPT. Here, the prediction of the synergy value $y_{j}$ is made using a linear transformation of the contextualized output representation of $c_{j}$ (note that this includes $d_j^1$ and $d_j^2$ due to self-attention). %
+Model inputs--drugs $d$, cell lines $c$, and labels $y$--are initialized using a learnable embedding layer (i.e. no external features). %
+To evaluate the model's ability to predict synergies of unknown drugs or cells, we hold out either $m$ drugs or $m$ cells and remove their synergy relations from the training set (see Section \ref{sec:results}). We use a subset of the held out tuples as a pool of context examples. %
+We now turn to the question of how to select the context (prompt prefix) from this pool in a manner that increases predictive performance. %
+
+
+
+
+\subsubsection{How to sample the context?}
+\label{method:training_strategy}
+
+A central question about using language models without external features---including textual names---is how to teach the model to understand unknown drugs or cell lines. We propose using a masking strategy---every unknown drug $d^h$ or cell $c^h$ is represented by \textbf{[UNKNOWN]} and the model must use in-context learning to understand it based on contextually-related known drugs and cell lines. In this setting, we assume that we are given a set of synergy tuples to sample from to construct a prompt. During training, it's simply the training set. During evaluation, we consider a special held-out ``context'' set $\mathfrak{D}^c \subset \mathfrak{D}$ (thus named because we sample the context/prompt $P^n$ from this set). To sample from this context set, we propose a context-selection strategy based on constructing a graph $\mathcal{G}$ on this $\mathfrak{D}^c$. %
+Specifically, we construct $\mathcal{G}$ by creating a node for every synergy tuple $x := (d^1, d^2, c, y) \in \mathfrak{D}^c$. We construct a drug edge $e^d$ between two nodes $x_1$ and $x_2$ if they share drug $d$ (i.e. $d \in x_1 \wedge d \in x_2$). Similarly, we construct a cell line %
+edge $e^c$ if they share cell line $c$. See Figure \ref{fig:incontext_graph} for an example and Appendix Figure \ref{fig:incontext_archi} for more details. 
+We employ the following context selection strategies %
+to sample a context with $n$ examples given some node $x$ containing unknown $h$ which is either drug $d^h$ or cell $c^h$: 
+
+\begin{enumerate}[wide, labelwidth=!,itemindent=!,labelindent=0pt]
+    \item \textbf{Random}: Uniformly select $n$ context examples from $\mathfrak{D}^c$. 
+    \item \textbf{Graph}: Uniformly select examples from the nodes adjacent to $x$ in $\mathcal{G}$. %
+    \item \textbf{Unknown-First}: Uniformly select nodes adjacent to $x$ which share an edge of type $e^{h}$, i.e. prioritizing selection of nodes that contain the masked unknown $h$. %
+\end{enumerate}
+Note that these strategies are hierarchical-- \textbf{Unknown-First} falls back to \textbf{Graph} when there aren't enough examples which falls back to \textbf{Random}. Examples from \textbf{Random} are put earlier in the context than \textbf{Graph} which is again put before \textbf{Unknown-First}. In order to train the model to correctly use the \textbf{[UNKNOWN]} token, we need to artificially create unknown drugs or cells during training. Given training example $x$, we uniformly select $d^1 \in x$ or $d^2 \in x$ to be the hidden drug $d^h$. For the unknown cell line setting, $c \in x$ is always set to $c^h$ because there is just one cell line per example. We replace all occurrences of $h$ in the prompt with \textbf{[UNKNOWN]}.
+
+
+\subsubsection{Optimizing the Context} \label{method:context_optim}
+
+We further study whether the context can be optimized to best enable predictions for some unknown drug or cell line $h$ (see Figure \ref{fig:contextoptim} for an example). The purpose of these experiments is to enable the eventual development of a standardized assay for drug synergy prediction. Thus, as output, these optimization algorithms produce a set of context tuples for each $h$. To do this optimization, we assume that we have four splits of data, which are constructed as follows. Given a set of $p$ ``unknown'' drugs/cells $H$, all synergy tuples not containing any $h \in H$ are put into a training set $\mathfrak{D}^{Tr}$. The remaining tuples are randomly partitioned into three equal sized sets: a context bank $\mathfrak{D}^c$, a validation set $\mathfrak{D}^v$, and a test set $\mathfrak{D}^{Te}$. %
+We first train a model on $\mathfrak{D}^{Tr}$ following the \textbf{Unknown-First} strategy (where contexts are sampled from $\mathfrak{D}^{Tr}$ itself). Following this, for each unknown entity $h_i$, we select $n$ context examples from $\mathfrak{D}^c$ which maximize the model's score on the validation set $\mathfrak{D}^v$. This is a combinatorial optimization problem which can be considered related to the best subset selection problem \cite{bertsimas2016best, miller2002subset}. We consider a genetic algorithm \cite{gad2021pygad}: %
+a metaheuristic method which is useful for black box optimization of systems containing complex interacting parts \cite{mitchell2007machine}, %
+which is suitable for the complex interactions between cellular pathways required for drug synergy prediction. As output, we get a set of context tuples for each $h$. Optimization algorithm details are given in Appendix \ref{appendix:optimization}. %
+
+
+\subsection{In-Context Learning for Inverse Design}
+\label{method:inverse_design}
+
+To train the model to retrieve relevant drug structures in-context, we use the same architecture as for synergy prediction (§~\ref{method:incontext}), so that we can use the same data split and optimized contexts from Section \ref{method:context_optim} to understand how the model interprets them. For effective retrieval, we need a strong base molecular representation that makes it possible to effectively distinguish molecules. %
+So, we choose to use MegaMolBARTv2 \cite{megamolbartv2} representations, which were trained on 1.45 billion molecular SMILES strings and thus have a relatively comprehensive (in terms of drug classes) latent space. We train a SynerGPT model from scratch %
+to predict representations using a linear transformation on the output \textbf{[UNKNOWN]} representation. We use this final representation to retrieve the desired drug using cosine similarity with the MegaMolBARTv2 representations of the drugs in our synergy dataset. The training context is selected using the \textbf{Unknown-First} strategy. Finally, we train the model using a minibatch contrastive loss \cite{radford2021learning, edwards2021text2mol} between the L2-normalized ground truth representations $D^g$ (here MegaMolBartv2) and predicted representations $D^p$ (output from our model's prediction head):
+\begin{equation} \label{clip_loss}
+\ell(D^g,D^p) = CE(e^\tau D^g{D^p}^T, I_b) + CE(e^\tau D^p{D^g}^T, I_b)
+\end{equation}
+where $CE$ is categorical cross-entropy loss, $b$ is the mini-batch size, $I_b$ is the identity matrix, and $\tau$ is a learnable temperature parameter. We use this loss for $\ell$ in equation \ref{training_eq}. 
+

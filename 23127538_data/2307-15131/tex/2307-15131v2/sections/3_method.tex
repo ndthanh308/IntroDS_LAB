@@ -1,0 +1,367 @@
+We introduce Seal-3D, an interactive pixel-level editing method for neural radiance fields. The overall pipeline is illustrated in \cref{fig-framework}, which consists of a pixel-level proxy mapping function, a teacher-student training framework, and a two-stage training strategy for the student NeRF network under the framework. Our editing workflow starts with the proxy function which maps the query points and ray directions according to user-specified editing rules. Then a NeRF-to-NeRF teacher-student distillation framework follows, where a teacher model with editing mapping rules of geometry and color supervises the training of a student model (\cref{sec-teacher}).  
+The key to interactive fine-grained editing is the two-stage training for the student model (\cref{sec-train}). In an extra pretraining stage, the points, ray directions, and inferred ground truth inside edit space from the teacher model are sampled, computed, and cached previously; only parameters with locality are updated and the parameters causing global changes are frozen. After the pretraining stage, the student model is finetuned with a global training stage.
+
+% \subsection{NeRF Preliminaries and Challenges of Editing}
+\subsection{Overview of NeRF-based Editing Problem}
+We first make a brief introduction to neural radiance fields and then analyze the challenges of NeRF-based editing problems and the limitations of existing solutions.
+
+\subsubsection{NeRF Preliminaries}
+
+Neural radiance fields (NeRFs) provide implicit representations for a 3D scene as a 5D function: $f: (x,y,z,\theta,\varphi)\mapsto(c,\sigma)$, where $\mathbf{x}=(x,y,z)$ is a 3D location and $\mathbf{d}=(\theta,\phi)$ is the view direction, while $c$ and $\sigma$ denote color and volume density, respectively. The 5D function is typically parameterized as an MLP $f_\theta$.
+
+To render an image pixel, a ray $\mathbf{r}$ with direction $\mathbf{d}$ is shot from the camera position $\mathbf{o}$ through the pixel center according to the intrinsics and extrinsics of the camera. $K$ points $\mathbf{x}_i = \mathbf{o} + t_i\mathbf{d}, i=1,2,\ldots,K$ are sampled along the ray, and the network $f_\theta$ is queried for their corresponding color and density:
+\begin{equation}
+    (c_i,\sigma_i) = f_\theta(\mathbf{x}_i,\mathbf{d})
+\end{equation}
+Subsequently, the predicted pixel color $\hat{C}(\mathbf{r})$ and depth value $\hat{D}(\mathbf{r})$ are computed by volume rendering:
+\begin{align}
+    \hat{C}(\mathbf{r}) &= \sum_{i=1}^K{T_i\alpha_i{c}_i}, &\hat{D}(\mathbf{r}) &=  \sum_{i=1}^K{T_i\alpha_i t_i} \label{eq-render}\\
+    T_i &= \prod_{j<i}(1-\alpha_j), &\alpha_i &= 1 - \exp{(\sigma_i\delta_i)}
+\end{align}
+where $\alpha_i$ is the alpha value for blending, $T_i$ is the accumulated transmittance, and $\delta_i = t_{i+1} - t_i$ is the distance between adjacent points. NeRF is trained by minimizing the photometric loss between the predicted and ground truth color of pixels.
+
+% Hence, pixel-wise NeRF editing remains a challenging open problem.
+
+% NeRF-like methods use implicit representation and no explicit mapping between the editing operation on the 2D pixel/3D space and the parameters of the model to be updated can be found, thus pixel-wise NeRF editing is still an open challenge.
+
+In this paper, we build our interactive NeRF editing system upon Instant-NGP~\cite{mueller2022instant}, which achieves nearly real-time rendering performance for NeRF. Although our implementation of instant interactive editing relies on hybrid representations for NeRF
+% NeRF backbone with feature grid volumes 
+to achieve the best speed performance, our proposed editing framework does not rely on a specific NeRF backbone and can be transplanted to other frameworks as long as they follow the aforementioned volume rendering pipeline.
+
+\subsubsection{Challenges of NeRF-based Editing}
+
+NeRF-like methods achieve the state-of-the-art quality of scene reconstruction. However, the 3D scene is implicitly represented by network parameters, which lacks interpretability and can hardly be manipulated. In terms of scene editing, it is difficult to find a mapping between the \textit{explicit} editing instructions and the \textit{implicit} update of network parameters. Previous works attempt to tackle this by means of several restricted approaches:
+
+% Existing methods~\cite{Yuan22NeRFEditing,neumesh} require a mesh scaffold as a geometry proxy to assist the editing. Despite the simplicity, geometry proxies restrict the editing categories, making it difficult to perform arbitrary out-of-proxy edits. Instead, our method does not require any proxy structure, but a \emph{proxy function} (\cref{sec-teacher}) that maps \emph{implicitly} to guide the editing. As shown in \cref{tab-baseline}, existing NeRF-based editing methods suffer from several limitations in edit capabilities.
+
+NeRF-Editing~\cite{Yuan22NeRFEditing} and NeuMesh~\cite{neumesh} introduce a mesh scaffold as a geometry proxy to assist the editing, which simplifies the NeRF editing task into mesh modification. Although conforming with existing mesh-based editing, the editing process requires extracting an additional mesh, which is cumbersome.  In addition, the edited geometry is highly dependent on the mesh proxy structure, making it difficult to edit spaces that are not easy or able to be represented by meshes while representing these spaces is one key feature of the implicit representations.
+Liu \etal~\cite{liu2021editing} designs additional color and shape losses to supervise the editing. However, their designed losses are only in 2D photometric space, which limits the editing capability of a 3D NeRF model. Furthermore, their method only supports editing of semantic-continuous geometry in simple objects, instead of arbitrary pixel-level complex editing.
+
+% In addition, the edited geometry is highly dependent on the mesh proxy structure, making it difficult to perform arbitrary out-of-proxy edits while one key feature of implicit repsentations enable  
+
+
+% representing  which limits the scalability.
+% These mesh-based methods make the edit process highly dependent on the mesh proxy, which limits flexibility and scalability
+% they introduce an additional pipeline of mesh editing pipeline limits flexibility and scalability.
+% The user needs to edit the proxy mesh in an additional pipeline, so the the edit instructions
+% , and makes the instant update and preview impossible.  
+% \Skip{However, relying on mesh editing makes instant preview and update of the NeRF model relatively difficult and less extensive.} 
+
+% implements the model optimization step by designing additional color and shape losses as supervision. 
+% However, the design of editing loss for some editing cases is difficult or even impossible, which limits the applicable scenarios of their method. \yq{not clear enough to make sense. Explain why mesh limits in flexibility and scalability and preview impossible. similar to Liu. If detialed explanation in related work, echo it using keywords}
+
+Moreover, to the best of our knowledge, existing methods have not realized interactive editing performance considering both quality and speed. Liu \etal~\cite{liu2021editing} is the only existing method that completes optimization within a minute (37.4s according to their paper), but their method only supports extremely simple objects and does not support fine-grained local edits (see \cref{fig-editnerf} for details).
+% , with PSNR of only 24.57, according to their paper\zjs{update this according to our experiments}. 
+Other editing methods (\eg NeuMesh~\cite{neumesh}) usually require hours of network optimization to obtain edit results. 
+% Therefore, arbitrary pixel-level editing method free from constructing explicit proxies of NeRF supporting instant preview (in seconds) with high quality remains an open problem.
+
+In this paper, we implement an interactive pixel-level editing system, which can be extended to new editing types easily using similar editing strategies as the traditional explicit 3D representation editing. Our method does not require any explicit proxy structure (instead, a proxy function, see \cref{sec-teacher}) and can define various pixel-level editing effects without an explicit geometry proxy. It also enables \emph{instant preview} ($\approx$1s) (see \cref{sec-train}). \cref{tab-baseline} compares the edit capabilities between our method and previous methods.
+
+% Moreover, to the best of our knowledge, all of existing methods require minutes or even hours of \zjs{To be confirmed: the speed of NeRF-Editing and Liu \etal} network optimization to obtain edit results. Therefore, arbitrary pixel-level proxy-free editing of NeRF supporting instant preview (in seconds) remains an open problem.
+
+\begin{table}[ht]
+    \centering
+    \setlength{\tabcolsep}{3pt}
+    \small
+    \resizebox{\columnwidth}{!}{
+    \begin{tabular}{c|cccc}
+        Method & w/o Explicit Proxy &  Pixel-Level & Interactive & Time \\\hline
+        Ours & \cmark & \cmark & \cmark & seconds \\
+        NeuMesh~\cite{neumesh} & \xmark & (partial) & \xmark & hours \\
+        NeRF-Editing~\cite{Yuan22NeRFEditing} & \xmark & \xmark & \xmark & hours \\
+        % Liu \etal~\cite{liu2021editing} & \cmark & \xmark & \xmark & seconds \\
+    \end{tabular}
+    }
+    \caption{\textbf{Comparison with recent methods in edit capabilities.} Our method supports arbitrary editing, does not require any explicit geometry proxy, and achieves interactive editing in seconds.}
+    \label{tab-baseline}
+\end{table}
+
+% In contrast, our method does not require any proxy structure (instead a proxy function, see \cref{sec-teacher}), and achieves \emph{instant preview} (in seconds) and unlimited pixel-level editing categories. \cref{tab-baseline} compares the edit capabilities between our method and previous methods.
+
+% \subsection{Pixel-Level Editing Framework via Distillation}
+
+% However, the editing type is limited, as designing loss for different editing types is indirect or even impossible in some cases.
+
+% To overcome these deficiencies, we design a full-flow framework that  achieve scalability and instant preview. 
+
+
+% Previous works have observed solutions to this problem. NeRF-Editing~\cite{Yuan22NeRFEditing} and NeuMesh~\cite{neumesh} simplify the guidance generation step into mesh modification. Despite a mature and simple method, the mesh editing pipeline limits flexibility and scalability, and makes the instant update and preview impossible.  \Skip{However, relying on mesh editing makes instant preview and update of the NeRF model relatively difficult and less extensive.} Liu \etal~\cite{liu2021editing} implements the model optimization step by designing additional color and shape losses as supervision. However, the design of editing loss for some editing cases is difficult or even impossible, which limits the applicable scenarios of their method.
+% % However, the editing type is limited, as designing loss for different editing types is indirect or even impossible in some cases.
+
+% To overcome these deficiencies, we design a full-flow framework that takes into account both steps to achieve scalability and instant preview. Our framework implements a real-time pixel-level editing system and can be extended to any editing type easily using similar editing strategies as the traditional explicit 3D representation editing. 
+
+
+
+% % Figure environment removed
+
+% Figure environment removed
+
+\subsection{Editing Guidance Generation}
+\label{sec-teacher}
+
+% Distillation strategy~\cite{hinton2015distilling} is first introduced to NeRF by KiloNeRF~\cite{Reiser2021ICCV}. 
+Our design implements NeRF editing as a process of knowledge distillation. Given a pretrained NeRF network fitting a particular scene that serves as a teacher network, we initialize an extra NeRF network with the pretrained weights as a student network. The teacher network $f_\theta^T$ generates editing guidance from the editing instructions input by the user, while the student network $f_\theta^S$ is optimized by distilling editing knowledge from the editing guidance output by the teacher network. In the subsection, editing guidance generation for the student model supervision is introduced and illustrated on the left of \cref{fig-framework}.
+
+% To solve the problem of scene editing in NeRF, we decompose the pixel-level editing task into two core stages: 1) Editing Guidance Generation: generating the guidance for scene editing from the user input; 2) Target Network Optimization: optimizing the novel implicit neural network for a target scene under the supervision of the editing guidance from the original 3D scene models. 
+
+% \paragraph{Eidting Guidance Generation.} 
+% We denote the source space of edit as $\mathbb{S}\subset\mathbb{R}^3$ and the target space as $\mathbb{T}\subset\mathbb{R}^3$. 
+Firstly, the user edit instructions are read from the interactive NeRF editor as pixel-level information. The source space $\mathcal{S}\subset\mathbb{R}^3$ is the 3D space for the original NeRF model and the target space $\mathcal{T}\subset\mathbb{R}^3$ is the 3D space for the NeRF model after editing. The target space $\mathcal{T}$ is warped to the original space  $\mathcal{S}$ by  $\msymbol{mapper_func}: \mathcal{T}\mapsto\mathcal{S}$.
+$\msymbol{mapper_func}$ transforms points within 
+the target space and their associated directions according to editing rules which are exemplified below. 
+With the function, the ``pseudo'' desired edited effects  $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$ for each 3D point and view direction in the target space can be acquired by querying the teacher NeRF model $f_\theta^T$: the transformed points and directions (in source space) are fed into the teacher network get the color and density. The process can be expressed as 
+% and define the edit bounding (\ie spatial regions where the edit is performed) $\msymbol{points_raw}\subset\mathbb{R}^3$ from pixels. 
+% Then, we modify the inference process of the teacher network by a mapping function $\msymbol{mapper_func}: \mathcal{T}\mapsto\mathcal{S}$, and the modified inference process will produce the ``pseudo'' desired edited result $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$. $\msymbol{mapper_func}$ acts as a geometry proxy that transforms points within 
+% the target space and their associated directions according to specific editing rules. 
+% The transformed points and directions (in source space) are subsequently fed into the teacher network as an original inference process:
+% \scriptsize
+\begingroup
+% \everymath{\scriptsize}
+% \scriptsize
+\begin{align}
+    \mathbf{x}^{s},\mathbf{d}^{s} &= \msymbol{mapper_func}(\mathbf{x}^{t},\mathbf{d}^{t}), \mathbf{x}^{s}\in\mathcal{S}, \mathbf{x}^{t}\in\mathcal{T}, \\
+    \msymbol{point_color_mapped},\msymbol{point_sigma_mapped} &= f_\theta^T(\mathbf{x}^{s},\mathbf{d}^{s})
+\end{align}
+\endgroup
+
+Where $\mathbf{x}^s, \mathbf{d}^s$ denotes source space point position and direction and $\mathbf{x}^t, \mathbf{d}^t$ denotes target space point position and direction.
+
+For brevity, we define the entire process as \textit{teacher inference process} $F^t \defeq f_\theta^T\circ\msymbol{mapper_func}: (\mathbf{x}^{t},\mathbf{d}^{t})\mapsto(\msymbol{point_color_mapped},\msymbol{point_sigma_mapped})$. The inference result $\msymbol{point_color_mapped},\msymbol{point_sigma_mapped}$ mimics the edited scene and acts as the teacher label, the information of which is then distilled by the student network in the network optimization stage.
+
+The mapping rules of $\msymbol{mapper_func}$ can be designed according to arbitrary editing targets. In particular, we implement 4 types of editing as examples.
+% , as shown in \cref{fig-tools}:
+
+\begin{itemize}
+    \item Bounding shape tool, which supports common features in traditional 3D editing software including copy-paste, rotation, and resizing. The user provides a bounding shape to indicate the original space $\mathcal{S}$ to be edited and rotates, translates, and scales the bounding box to indicate the target effects. The target space $\mathcal{T}$ and mapping function $F^m$ are then parsed by our interface
+    % relative to the bounding shape center $\mathbf{c}$:%
+    % The source space $\mathbf{S}$ is provided as a bounding shape by user, 
+% and all positions inside it are transformed according to user instructions (\eg rotation $R$, translation $t$, and scaling $s$):
+\begingroup
+% \everymath{\scriptsize}
+% \scriptsize
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_pos}^{s} = & S^{-1} \cdot R^T \cdot (\msymbol{point_pos}^{t} - \mathbf{c}^{t})  + \mathbf{c}^{s}, 
+        \\ \msymbol{point_dir}^{s} = & R^T \cdot \msymbol{point_dir}^{t}\\
+        % \msymbol{point_pos}^T & = R \cdot ((\msymbol{point_pos} - \mathbf{c}) \cdot s + \mathbf{c}_B) + t, \\
+        % \msymbol{point_dir}^s & = R^T \cdot \msymbol{point_dir}^t,\\
+        F^m \defeq & (\msymbol{point_pos}^{t}, \msymbol{point_dir}^{t})
+        \mapsto 
+        \left\{
+        \begin{array}{ll}
+            (\msymbol{point_pos}^{s}, \msymbol{point_dir}^{s}) &, \text{if}\ \msymbol{point_pos}^{t}\in \mathcal{T}\\
+            (\msymbol{point_pos}^{t}, \msymbol{point_dir}^{t}) &, \text{otherwise}
+        \end{array}
+        \right.
+    \end{aligned}\notag
+    \end{equation}
+    \endgroup
+    where $R$ is rotation, $S$ is scale, and $\mathbf{c}^{s},\mathbf{c}^{t}$ are the center of $\mathcal{S},\mathcal{T}$, respectively. 
+
+    With this tool, we even support cross-scene object transfer, which can be implemented by introducing the NeRF of the transferred object as an additional teacher network in charge of part of the teacher inference process within the target area. We give a result in \cref{fig-bbox-baby}.
+    \item Brushing tool, similar to the sculpt brush in traditional 3D editing that lifts or descends the painted surface. The user scribbles with a brush and $\mathcal{S}$ is generated by ray casting on brushed pixels. The brush normal $\mathbf{n}$, and pressure value $\mathrm{p}(\cdot) \in [0, 1]$ are defined by user, which determines the mapping:
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_pos}^{s} & =\msymbol{point_pos}^{t} - \mathrm{p}(\msymbol{point_pos}^{t}) \mathbf{n},\\
+        F^m &\defeq (\msymbol{point_pos}^{t}, \msymbol{point_dir}^{t}) \mapsto (\msymbol{point_pos}^{s}, \msymbol{point_dir}^{t})
+    \end{aligned}\notag
+    \end{equation}
+
+
+% Figure environment removed
+
+    \item Anchor tool, where the user defines a control point $\mathbf{x}^c$ and a translation vector $\mathbf{t}$.
+    The region surrounding $\mathbf{x}^c$ will be stretched by a translation function $\mathrm{stretch}(\cdot ;\mathbf{x}^c, \mathbf{t})$. Then the mapping is its inverse:
+    % and stretches it with its surrounding points. Let $\mathbf{t}$ be the translation of the control point, $\mathrm{stretch}(\msymbol{point_pos}, \mathbf{t})$ computes the stretching vector that translates points near the control point.
+    \begin{equation}
+    \begin{aligned}
+        % \msymbol{point_pos}^m & =\msymbol{point_pos} + growth(\msymbol{point_pos}, \Vec{t})\\
+        \msymbol{point_pos}^{s} &= \mathrm{stretch}^{-1}(\msymbol{point_pos}^{t};\mathbf{x}^c, \mathbf{t}) \\
+        \msymbol{mapper_func} & \defeq (\msymbol{point_pos}^{t}, \msymbol{point_dir}^{t}) \to (\msymbol{point_pos}^{s}, \msymbol{point_dir}^{t})
+    \end{aligned}\notag
+    \end{equation}
+    please refer to the supplementary material for the explicit expressions of $\mathrm{stretch}(\cdot;\mathbf{x}^c, \mathbf{t})$.
+
+    \item Non-rigid transform tool, which allows for the accurate and flexible transformation of selected space.
+
+% \begingroup
+% \everymath{\scriptstyle}
+% \scriptsize
+%your equation
+\begin{equation}
+\begin{aligned}
+        \mathbf{x}^{s}&=R \cdot \mathbf{x}^{t} + t,\\
+        \mathbf{d}^{s}&=R \cdot \mathbf{d}^{t}, \\
+    F^m \coloneqq (\mathbf{x}^{t}, \mathbf{d}^{t}) &\mapsto (\mathbf{x}^{s}, \mathbf{d}^{s}) 
+\end{aligned}\notag
+\end{equation}
+% \endgroup
+
+\noindent Where $R, t$ are interpolated from the transform matrixes of the three closest coordinates of a pre-defined 3D blending control grid with position and transformation of each control point. The results can be found in \cref{fig-neumesh-mic}.
+
+    \item Color tool, which edits color via color space mapping (single color or texture). Here the spatial mapping is identical and we directly map the color output of the network to HSL space, which helps for color consistency. Our method is capable of preserving shading details (\eg shadows) on the modified surface. We achieve this by transferring the luminance (in HSL space) offsets on the original surface color to the target surface color. Implementation details of this shading preservation strategy are presented in the supplementary.
+    % $color(\msymbol{point_color})$ maps the color space. In our case, we map $\msymbol{point_color}$ from RGB to HSV and edit in the HSV space,then map back to RGB space, similar to Kuang \etal \fcite{paletteNeRF}.
+    % \begin{equation}
+    % \begin{aligned}
+    %     \msymbol{point_sigma}, \msymbol{point_color} & =\msymbol{infer_func}(\msymbol{point_pos}, \msymbol{point_dir})\\
+    %     \msymbol{mapper_func} &= (\msymbol{point_pos}, \msymbol{point_dir}) \to (\msymbol{point_sigma}, color(\msymbol{point_color}))
+    % \end{aligned}\notag
+    % \end{equation}
+\end{itemize}
+
+
+% % Figure environment removed
+
+
+% \paragraph{Network Optimization.} 
+% As for the training strategy of distillation, a straightforward solution  is to directly apply photometric loss between pixel values $\hat{C},\hat{D}$ accumulated by \cref{eq-render} of teacher and student inference. 
+
+For the training strategy of distillation, the student model $f^S_\theta$ is optimized with the supervision of pseudo ground truths generated by the aforementioned teacher inference process $F^t$. The editing guidance from the teacher model is distilled into the student model by  directly applying the photometric loss between pixel values $\hat{C},\hat{D}$ accumulated by \cref{eq-render} from the teacher and student inference.
+
+
+% \yq{It is worth mentioning that the rendering results produced by the distilled student model have better quality than the pseudo ground truths which will be illustrated in \cref{sec-ablation}}. \yq{not necessary here and may go to results section. explain why}, .
+
+
+However, we find that the convergence speed of this training process is slow ($\approx$30s or longer), which cannot meet the needs of instant preview.  To tackle this problem, we design a two-stage training strategy: the first stage aims to converge instantly (within 1 second) so that a coarse editing result can be immediately presented to the user as a preview, while the second stage further finetunes the coarse preview to obtain a final refinement.
+
+
+\subsection{Two-stage Student Training for Instant Preview} \label{sec-train}
+
+\paragraph{Local pretraining for instant preview.}
+Usually, the edit space is relatively small compared to the entire scene, so training on the global photometric loss is wasteful and leads to slow convergence. To achieve instant preview of editing, we adopt a local pretraining stage before the global training begins. The local pretraining process consists of: 1) uniformly sample a set $\mathcal{X}\subset\mathcal{T}$ of local points within the target space and a set $\mathcal{D}$ of directions on the unit sphere, and feed them into the teacher inference process $F^t$ to obtain teacher labels $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$, and cache them in advance; 2) \Skip{in each pretraining epoch,} the student network is trained by local pertaining loss $\msymbol{loss_pretrain}$:
+% Given the editing bounding $B$, we sample dense points within $B$ and feed them into the teacher inference process to obtain corresponding color and density values. These values are cached locally 
+% \subsubsection{Real-time Local pretraining} \label{sec-pretraining}
+% \Skip{The most time-consuming operation while training is sampling and $\msymbol{mapper_func}$. The results of these two operations can be cached, for the editing space is relatively small. To bring the generation of editing previews and results to a real-time level, we adopt a local pretraining stage before the global training begins, as Fig. \ref{fig-training} (a) shows. To speed up the pertaining, we 1) uniformly sample local points inside the editing space in advance. 2) compute the ground truth $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$ in advance. In each epoch, we compute the local pertaining loss $\msymbol{loss_pretrain}$ directly for all sampled points:}
+\begingroup
+% \everymath{\scriptstyle}
+% \scriptsize
+\begin{align}
+    &(\msymbol{point_color_mapped},\msymbol{point_sigma_mapped}) = F^t(\mathbf{x},\mathbf{d}), (\msymbol{point_color_student},\msymbol{point_sigma_student}) = f^S_\theta(\mathbf{x},\mathbf{d}), \\
+    &\msymbol{loss_pretrain} = \sum_{\mathbf{x}\in\mathcal{X},\mathbf{d}\in\mathcal{D}}\msymbol{weight_pretrain_color} \|\msymbol{point_color_mapped} - \msymbol{point_color_student}\|_1+ \msymbol{weight_pretrain_sigma} \|\msymbol{point_sigma_mapped} - \msymbol{point_sigma_student}\|_1
+\end{align}
+\endgroup
+% $$\msymbol{loss_pretrain} = \msymbol{weight_pretrain_color} \|\msymbol{point_color_mapped} - \msymbol{point_color_student}\|_1 + \msymbol{weight_pretrain_sigma} \|\msymbol{point_sigma_mapped} - \msymbol{point_sigma_student}\|_1$$
+where $\msymbol{point_color_student},\msymbol{point_sigma_student}$ are the predicted color and density of sampled points $\mathbf{x}\in\mathcal{X}$ by the student network, and $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$ are cached teacher labels. This pretraining stage is very fast: after only about 1 second of optimization, the rendered image of the student network shows plausible color and shape consistent with the editing instructions.
+
+However, training on only the local points in the editing area may lead to degeneration in other global areas unrelated to the editing due to the non-local implicit neural network. We observe the fact that in hybrid implicit representations (such as Instant-NGP~\cite{mueller2022instant}), local information is mainly stored in the positional embedding grids, while the subsequent MLP decodes global information. Therefore, in this stage, all parameters of the MLP decoder are frozen to prevent global degeneration. Experimental illustrations will be presented in \cref{sec-ablation,fig-ab_fix}.
+% Note that all MLPs' parameters are frozen in this stage to prevent the model from being messed up globally.
+
+% \subsubsection{Global Training} \label{sec-training}
+\paragraph{Global Finetuning.}
+After pretraining, we continue to finetune $f^S_\theta$ to refine the coarse preview to a fully converged result. This stage is similar to the standard NeRF training, except that the supervision labels are generated by the teacher inference process instead of image pixels.
+\begingroup
+% \everymath{\scriptstyle}
+% \scriptsize
+\begin{align}
+    \msymbol{loss_train} = \sum_{\mathbf{r}\in\mathcal{R}} &\msymbol{weight_train_color} \|\msymbol{pixel_color_edited} - \msymbol{pixel_color_student}\|_2 + \msymbol{weight_train_depth} \|\msymbol{pixel_depth_edited} - \msymbol{pixel_depth_student}\|_1
+\end{align}
+\endgroup
+where $\mathcal{R}$ denote the set of sampled rays in the minibatch and $(\msymbol{pixel_color_edited},\msymbol{pixel_depth_edited})$,$(\msymbol{pixel_color_student},\msymbol{pixel_depth_student})$ are accumulated along ray $\mathbf{r}$ by \cref{eq-render} according to $(\msymbol{point_color_mapped},\msymbol{point_sigma_mapped})$,$(\msymbol{point_color_student},\msymbol{point_sigma_student})$, respectively.
+
+% % Figure environment removed
+
+It is worth mentioning that the student network is capable of generating results of better quality than the teacher network that it learns from. This is because the mapping operation in the teacher inference process may produce some view-inconsistent artifacts in the pseudo ground truths. However, during the distillation, the student network can automatically eliminate these artifacts due to the multi-view training that enforces view-consistent robustness. See \cref{sec-results,fig-bbox-elf} for details.
+% We provide a comparison example in~\cref{fig:teacher}.
+
+% \subsection{Real-time Editing via Distillation}
+\Skip{
+\color{magenta}
+
+\subsection{Pixel-wise NeRF Editing} \label{sec-freeediting}
+
+\subsubsection{NeRF Preliminaries}
+
+% Neural radiance fields (NeRFs) provide implicit representations for a 3D scene as a 5D function: $f: (x,y,z,\theta,\varphi)\mapsto(c,\sigma)$, where $\mathbf{x}=(x,y,z)$ is a 3D location and $\mathbf{d}=(\theta,\phi)$ is the view direction, while $c$ and $\sigma$ denote color and volume density, respectively. The 5D function is typically parameterized as an MLP $f_\theta$.
+
+% To render an image pixel, a ray $\mathbf{r}$ with direction $\mathbf{d}$ is shot from the camera position $\mathbf{o}$ through the pixel center according to the intrinsics and extrinsics of the camera. $K$ points $\mathbf{x}_i = \mathbf{o} + t_i\mathbf{d}, i=1,2,\ldots,K$ are sampled along the ray, and the network $f_\theta$ is queried for their corresponding color and density:
+% \begin{equation}
+%     (c_i,\sigma_i) = f_\theta(\mathbf{x}_i,\mathbf{d})
+% \end{equation}
+% Subsequently, the predicted pixel color $\hat{C}(\mathbf{r})$ is computed by volume rendering:
+% \begin{align}
+%     \hat{C}(\mathbf{r}) &= \sum_{i=1}^K{T_i\alpha_i\mathbf{c}_i} \\
+%     T_i &= \prod_{j<i}(1-\alpha_j),\quad\alpha_i = 1 - \exp{(\sigma_i\delta_i)}
+% \end{align}
+% where $\alpha_i$ is the alpha value for blending, $T_i$ is the accumulated transmittance, and $\delta_i = t_{i+1} - t_i$ is the distance between adjacent points. NeRF is trained by minimizing the photometric loss between the predicted and ground truth color of pixels.
+
+% NeRF-like methods achieve state-of-the-art quality of scene reconstruction. However, in terms of scene editing, it is difficult to find a mapping between the \textit{explicit} editing instructions (in pixel space, usually) and the \textit{implicit} update of network parameters. Hence, pixel-wise NeRF editing remains a challenging open problem.
+
+% % NeRF-like methods use implicit representation and no explicit mapping between the editing operation on the 2D pixel/3D space and the parameters of the model to be updated can be found, thus pixel-wise NeRF editing is still an open challenge.
+
+% In this paper, we build our real-time interactive NeRF editing system upon Instant-NGP~\cite{mueller2022instant}, which achieves nearly real-time rendering performance for NeRF. Note that our editing framework does not rely on any specific NeRF backbone and can be transplanted to any other frameworks as long as they follows the aforementioned volume rendering pipeline.
+
+\subsubsection{Pixel-wise Editing}
+
+To provide a possible route to solve the problem of scene editing in NeRF, we decompose the pixel-wise editing task into two core steps: 1) Guidance Generation: generating the guidance for scene editing from the user input; 2) Network Optimization: optimizing the original network under the supervision of the training guidance. 
+
+Previous works have observed solutions to this problem. NeRF-Editing~\cite{Yuan22NeRFEditing} and NeuMesh~\cite{neumesh} simplify the guidance generation step into mesh modification. Despite a mature and simple method, the mesh editing pipeline limits the flexibility and scalability, and makes instant update and preview impossible.  \Skip{However, relying on mesh editing makes instant preview and update of the NeRF model relatively difficult and less extensive.} Liu \etal~\cite{liu2021editing} implements the model optimization step by designing additional color and shape losses as supervision. However, the design of editing loss for some editing cases is difficult or even impossible, which limits the applicable scenarios of their method.
+% However, the editing type is limited, as designing loss for different editing types is indirect or even impossible in some cases.
+
+To overcome these deficiencies, we design a full-flow framework which takes into account both steps to achieve scalability and instant preview. Our framework implements an interactive pixel-wise editing system, and can be extended to any editing types easily using similar editing strategies as the traditional explicit 3D representation editing. The pipeline is narrated as follows:
+
+\paragraph{Interactive Instructions.} We read the user editing instructions from the interactive NeRF editor (represented by a 2D mask) and project corresponding pixels to 3D raw points $\msymbol{points_raw} \in \mathbb{R}^3$ via ray casting. More details about the interactive editor are presented in the supplementary.
+% More details about the interactive editor can be found in the appendix.
+
+\paragraph{Guidance Generation.}  A mapper module $\msymbol{mapper_func} = (\msymbol{point_pos}, \msymbol{point_dir}) \to (\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped})$ from $\msymbol{points_raw}$ is generated for the selected editing type. $\msymbol{mapper_func}$ proxies the inferring module $\msymbol{infer_func}$ of the teacher model to generate desired ground truth $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$ for supervision.
+
+% Figure environment removed
+
+As shown in \cref{fig-tools}, we implement 4 editing types as examples. Here $\msymbol{infer_func}$ is the original inferring function.
+
+% Local variables for tools are not defined in lib.tex
+
+\begin{itemize}
+    \item Bounding shape tool, which supports common features in traditional 3D editing software including copy-paste, rotation and resizing. With a bounding shape specified by user, all contents inside it are transformed (\eg rotation, translation, and scaling) according to user instructions in 3D space. Let $B$ denote the bounding shape, and $R, t, s$ be the rotation, translation, and scaling matrix.
+
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_pos}^m & = R \cdot ((\msymbol{point_pos} - \bar{\msymbol{point_pos}}) \cdot s + \bar{\msymbol{point_pos}}) + t\\
+        \msymbol{point_dir}^m & = R \cdot \msymbol{point_dir}\\
+        \msymbol{mapper_func} &= (\msymbol{point_pos}, \msymbol{point_dir}) \to 
+        \left\{
+        \begin{array}{ll}
+            \msymbol{infer_func}(\msymbol{point_pos}^m, \msymbol{point_dir}^m) &, \text{if}\ \msymbol{point_pos}^m\ \text{in}\ B\\
+            \msymbol{infer_func}(\msymbol{point_pos}, \msymbol{point_dir}) &, \text{otherwise}
+        \end{array}
+        \right.
+    \end{aligned}\notag
+    \end{equation}
+
+    \item Brushing tool, similar to sculpt brush in traditional 3D editing that lifts or descends the painted surface. $\Vec{n}$ is brush face normal, $pressure(\msymbol{point_pos}) \in [0, 1]$ computes brush pressure with attenuation to smoothing the brush track.
+
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_pos}^m & =\msymbol{point_pos} + pressure(\msymbol{point_pos}) \cdot \Vec{n}\\
+        \msymbol{mapper_func} &= (\msymbol{point_pos}, \msymbol{point_dir}) \to \msymbol{infer_func}(\msymbol{point_pos}^m, \msymbol{point_dir})
+    \end{aligned}\notag
+    \end{equation}
+
+    \item anchor tool, set a control point and stretch it with its surrounding points. $\Vec{t}$ is anchor point translation, $growth(\msymbol{point_pos}, \Vec{t}) \in \mathbb{R}^3$ computes point growth vector to decide how the current point is affected by anchor point movement.
+
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_pos}^m & =\msymbol{point_pos} + growth(\msymbol{point_pos}, \Vec{t})\\
+        \msymbol{mapper_func} &= (\msymbol{point_pos}, \msymbol{point_dir}) \to \msymbol{infer_func}(\msymbol{point_pos}^m, \msymbol{point_dir})
+    \end{aligned}\notag
+    \end{equation}
+
+    \item color tool, edit color via color space mapping. $color(\msymbol{point_color})$ maps the color space. In our case, we map $\msymbol{point_color}$ from RGB to HSV and edit in the HSV space,then map back to RGB space, similar to Kuang \etal \fcite{paletteNeRF}.
+
+    \begin{equation}
+    \begin{aligned}
+        \msymbol{point_sigma}, \msymbol{point_color} & =\msymbol{infer_func}(\msymbol{point_pos}, \msymbol{point_dir})\\
+        \msymbol{mapper_func} &= (\msymbol{point_pos}, \msymbol{point_dir}) \to (\msymbol{point_sigma}, color(\msymbol{point_color}))
+    \end{aligned}\notag
+    \end{equation}
+\end{itemize}
+
+Thirdly, corresponding to the model optimization (step 2) mentioned above, we introduce a teacher-student distillation structure with a two-stage training strategy. We will discuss this step in the Sec. \ref{sec-distillation} as follows.
+
+\subsection{Teacher-Student Distillation Strategy} \label{sec-distillation}
+
+The teacher-student distillation strategy is first introduced to NeRF training by \ftext[Reiser?] \etal \fcite{kilonerf}. Here we borrow this classical knowledge distillation concept, while not expecting the student model $\msymbol{student_model}$ to learn exactly the same parameters as the teacher model$\msymbol{teacher_model}$, but to learn from the mapped ground truth influenced by $\msymbol{mapper_func}$. Both $\msymbol{teacher_model}$ and $\msymbol{student_model}$ are initialized from the same origin NeRF-like model.
+
+As a NeRF-like model, $\msymbol{teacher_model}$'s original inferring function $\msymbol{infer_func}$ accepts positions $\msymbol{point_pos}$ and directions $\msymbol{point_dir}$ as the input and outputs color $\msymbol{point_color}$ and density $\msymbol{point_sigma}$. We proxy the inputs before they were sent to the original inferring function, much like the man-in-the-middle attack in network security, and the $\msymbol{mapper_func}$ maps them according to the rules designed for the current editing type to generate $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$. $\msymbol{point_color_mapped}, \msymbol{point_sigma_mapped}$ are ground truth in the pretraining stage (Sec. \ref{sec-pretraining}) and their accumulation $\msymbol{pixel_color_edited}, \msymbol{pixel_depth_edited}$ are ground truth in the finetuning training stage (Sec. \ref{sec-training}).
+
+}
+

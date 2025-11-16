@@ -1,0 +1,69 @@
+\documentclass{article}
+\begin{document}	
+    Unlike LinnOS that focuses on a particular use case of ML-based performance prediction, Fu et.al. conducted this field study (referred to as MLSys), attempting to answer a broader question: does ML make prediction simple and general? MLSys develops a methodology for systematically diagnosing whether, when and why ML does (not) work for performance prediction, and identify steps to improve predictability.
+    
+    \subsection{Overview}
+    \label{sec:5.1}
+    \noindent {\textbf{Methodology:} In what follows, we first introduce the metrics and parameters, followed by two tests and two predictors that are used throughout MLSys.
+    
+    \textit{Metrics:} For generality and remaining agnostic to the specifics of a use-case, prediction quality is measured using the root mean square relative error (rMSRE).
+    
+    \textit{Parameters:} MLSys considers the following three classes of parameters that impact an application's performance: application-level input that the application acts on, including both the size of these inputs and (when noted) the actual values of these inputs; application-level configuration that is exposed to users to tune its behavior, e.g., the degree of parallelism; infrastructure that captures the resources on which the application runs, e.g., CPU speed, memory size, etc. These are all static parameters that can be known prior to running the application.
+    
+    \textit{The Best-Case (BC) Test:} The BC test is designed to give the predictor a best chance at making accurate predictions. It makes several strong assumptions. First, the one-feature-at-a-time assumption: in all the data given to the model (training and test), only a single parameter is being varied and that parameter is the only feature on which the model is trained. Second, the seen-configuration assumption: the model's training data always include datapoints from the scenario it is being asked to predict. Third, the no-contention assumption: to avoid variability due to contention, the workloads are run on dedicated EC2 instances. Fourth, the identical-inputs assumption: for a given input dataset size, the application's input data is identical across all experiments.
+    
+    \textit{The Beyond Best-Case (BBC) Test:} The BBC test systematically relax each of the assumptions imposed in the BC test, so as to study more realistic scenarios.
+    
+    \textit{The Best-of-Models Predictor:} In order to obtain a broad picture, a range of ML models are considered. For any given prediction test, MLSys computes the rMSRE for each ML model, and defines the best of models error (BoM-err) as the minimum rMSRE across all models considered.
+    
+    \textit{The Oracle Predictor:} In order to exclude the effect of poor ML model tuning, as well as obtaining a lower bound on the error rate we can expect from any ML model, an oracle predictor is used: it looks at all the data points in the test set that share the same feature values as the prediction task, and returns a prediction that will minimize the rMSRE for all these data points. If there is no variance at all in these data points, the Oracle error (O-err) will achieve zero.
+    } \\
+    
+    \noindent {\textbf{Test Setup:} MLSys runs experiments against 13 real world applications, spanning data analytics, time series database, web services, etc.: Memcached, Nginx, Influxdb, Go-fasthttp, Spark (running Terasort, PageRank, logistic regression, KMeans, Word2Vec, FPGrowth, ALS), and Tensorflow. It aims to predict aggregate performance metric for each application, such as JCT and mean query latency.
+
+    It selects six ML algorithms to train, including kNN, random forest regression, linear regression, linear SVM regression, kernelized SVM regression, and neural networks (MLP). Each ML model is tuned carefully.
+    }
+    
+    \subsubsection{Tackling Irreducible Error}
+    \label{sec:5.1.1}
+    % Figure environment removed  
+    
+    Given this methodology and set up, Figure~\ref{fig:existing} shows the results for existing applications. Since the BC test is extremely easy, we expected a very high accuracy: the O-err should be well under 5\% error. To our surprise, the results are on the contrary: in 5 of 13 applications, O-err is $>15\%$ for at least 20\% of prediction tasks. This high irreducible O-err suggests, the application's performance is so inherently variable that no predictor could predict performance with high accuracy, even on identical runs.
+    
+    To alleviate this problem, MLSys tried the first workaround: tackling irreducible error. It proceeds to find the root of such variability, which can be attributed to two common software design techniques: the use of randomization (e.g., load-balancing in TFS, task scheduling in Spark), and the use of system optimizations where a new mode of behavior is triggered by a threshold parameter (e.g., worker readiness in Spark, adaptive garbage collection in JVM). For the latter, we illustrate a more concrete example: by default, Spark launches an application once at least 80\% of its target worker nodes are ready, and the application partitions the input dataset based on the number of workers ready at this time. This optimization ensures resilience to failure and stragglers, but leads to variable parallelism and hence JCTs. Unfortunately, this variability cannot be captured by the static parameters/features we described above, since the exact degree of parallelism is affected by small differences in worker launch times, which is not known prior to runtime.
+    
+    \subsubsection{Results of Modified Applications}
+    \label{sec:5.1.2}
+    % Figure environment removed  
+    
+    To justify that MLSys has found the root cause, we now present the results after removing these root causes. Moreover, if doing so promotes the prediction accuracy to a decent value, then we can imagine a workflow where the application developer identifies the root causes of irreducible errors and makes them configurable. However, this modification itself already concludes that \textit{ML is not a simple, i.e. easy to use, predictor for applications}.
+    
+    Figure~\ref{fig:modified} shows the results after removing the root causes. For BC test, all applications now have O-err well within 10\% for at least 90\% of their prediction tasks. In other words, 90-th percentile O-err is $<10\%$ for all 13 applications, and in fact, only two applications have O-err $>6\%$. Also, only two applications have 90-th percentile BoM-err $>6\%$. However, for BBC test (not shown here) where the seen-configuration-assumption is relaxed, multiple applications experience severe accuracy degradation: 10 out of the 13 applications have 90-th percentile BoM-err $> 10\%$; the 90-th percentile BoM-err of Memcached exceeds 60\%, while that of KMeans and TFS exceeds 25\%. This results concludes that \textit{ML is not a general predictor, i.e., suitable across a range of different applications, in real world settings}.
+    
+    Diving deeper on BBC prediction errors, MLSys further relaxed the identical-inputs assumption in addition to the seen-configuration-assumption and varied the input scale. It is shown that the applications most notably impacted are KMeans and logistic regression, since their performance is sensitive to the input data. For example, the number of iterations for KMeans depends on the actual values of the input data, resulting in a multi-modal behavior as is shown in Figure~\ref{fig:kmeans}. This entails high prediction errors for both fixed input and varied input.  
+    % Figure environment removed 
+    
+    \subsubsection{Probabilistic Predictions}
+    Inspired by the multimodal performance distribution, MLSys tried the second workaround for performance variability: extending ML models to predict not just one performance value, but a probability distribution from which we derive $k$ possible values, with the goal that the true value is one of the $k$ predictions.
+
+    MLSys extends neural network to Mixture Density Networks. It modifies the neural network to predict parameters for a Gaussian Mixture Model with $k$ components (mean and variance for each component and mixing coefficients). It uses negative log-likelihood of the data under the predicted GMM as the loss function to train the MDN. Similarly, random forest is extended to probabilistic random forests. Unfortunately, although this workaround helps reduce prediction errors, we continue to see scenarios with high error rates in the more realistic BBC tests. Thus, achieving a fully general predictor remains out of reach.
+    
+    \subsection{Evaluation}
+    MLSys is a case study for Task 2. According to the taxonomy presented in Section~\ref{sec:taxonomy}, it adopts blackbox techniques for performance prediction. We summarize strengths and limitations of this field study as follows:\\
+    
+    \noindent \textbf{Strengths:}
+    \begin{itemize}
+        \item It is the first paper that \textit{comprehensively} evaluates whether ML-based prediction can \textit{simultaneously} offer high accuracy, easy-of-use and generality.
+        \item It draws the conclusion that ML fails to serve as a simple and general predictor, while ML can be effective in several scenarios. This points a direction for system researchers: we must apply ML in a more \textit{nuanced} manner, by first identifying whether ML-based prediction is effective.
+
+    \end{itemize}
+    
+    \noindent \textbf{Limitations:}
+    \begin{itemize}
+        \item Although it points out some root-causes, it does not provide a easy or systematic mechanism for operators to identify them. In addition, the elimination of variability hurts other goals such as resilience and efficiency that are crucial for distributed big data frameworks.
+        \item This study does not provide the intuition on which ML model is best matched with which scenario. Instead, it simply brute-searches the models and the hyperparameters for each prediction task, which is cumbersome and not interpretable.
+        \item The probabilistic prediction is only effective when the underlying trend is hard to learn due to the multi-modality. It does not work for other complex trends (e.g., in TFS and go-fasthttp).
+    \end{itemize}
+    
+    \ifcsdef{mainfile}{}{\bibliography{../references/main}}
+\end{document}

@@ -1,0 +1,237 @@
+\noindent \textbf{\Large Appendix}
+\vspace{0.1in}
+
+This appendix is organized as follows:
+\begin{itemize}
+    % \item Section~\ref{supp_sec:face_interp} includes analysis and comparison between \ourmodel and pixel DDPM on face interpolation task.
+    \item Section~\ref{supp_sec:3d} details the implementation and comparison for 3D-full baseline and \ourmodel on Bedroom.
+
+    \item Section~\ref{supp_sec:channel_scale} ablates the model scalings for \ourmodel on FFHQ.
+    
+    \item Section~\ref{supp_sec:more} provides more qualitative and quantitative results at different sampling steps on Bedroom and Church.
+\end{itemize}
+
+
+\section{Comparison with 3D-full baseline}\label{supp_sec:3d}
+We compare \ourmodel with a baseline model which uses 3D convolutions and attention at all spatial and frequency locations, denoted as 3D-full baseline.
+\subsection{Implementations}
+We implement 3D Convolution and 3D All Attention in Pytorch code~\ref{lst:3d} and~\ref{lst:3dattn}. We also provide the code implementations of our spat-freq conv and attention in~\ref{lst:21d} and~\ref{lst:sepattn}, respectively. Note that both methods share the consistent QKV self-attention implementation in code~\ref{lst:qkv}.
+
+\textbf{Convolutions}
+\renewcommand{\lstlistingname}{Code}
+\begin{lstlisting}[language=Python, label={lst:3d}, caption=3D Convolution]
+dims=3 #3D conv
+ops = nn.Sequential(
+        normalization(in_channels),
+        SiLU(), #Nonlinear
+        conv_nd(dims, in_channels, out_channels, stride=(1,1,1), 
+        kernel_size=(3,3,3), padding=(1,1,1))
+        )
+\end{lstlisting}
+
+
+\begin{lstlisting}[language=Python, label={lst:21d}, caption=(2+1)D Spat-Freq Convolution]
+f = 3 #kernel_size for frequency
+k = 3 #kernel_size for spatial
+dims = 3
+
+midplanes = (in_channels * out_channels * f * k * k) //
+            (channels * k * k + f * out_channels)
+ops = nn.Sequential(
+        normalization(in_channels),
+        SiLU(), #Nonlinear
+        conv_nd(dims, in_channels, self.midplanes, stride=(1,1,1), 
+        kernel_size=(1,3,3), padding=(0,1,1)), #2D spatial
+        normalization(midplanes),
+        SiLU(), #Nonlinear
+        conv_nd(dims, midplanes, out_channels, stride=(1,1,1), 
+        kernel_size=(3,1,1), padding=(1,0,0)) #1D frequency
+        )
+\end{lstlisting}
+
+\noindent \textbf{Attentions}
+\begin{lstlisting}[language=Python, label={lst:qkv},caption=QKV Self-Attention (red blcok in Figure 2 of the main paper)]
+import torch
+class QKVAttention(nn.Module):
+    """
+    A module which performs QKV attention.
+    """
+
+    def forward(self, qkv):
+        """
+        Apply QKV attention.
+
+        :param qkv: an [N x (C * 3) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x C x T] tensor after attention.
+        """
+        ch = qkv.shape[1] // 3
+        q, k, v = torch.split(qkv, ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        return torch.einsum("bts,bcs->bct", weight, v)
+\end{lstlisting}
+
+
+\begin{lstlisting}[language=Python, label={lst:3dattn}, caption=All Attention (in 3D-full baseline)]
+class 3DAllAttentionBlock(nn.Module):
+    """
+    An attention block that allows all (spatial and freqency) positions to attend to each other.
+    """
+    
+    def forward(self, x):
+        b, c, *spat_freq = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = QKVAttention(self.norm(x)) #QKV Self-Attention
+        qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spat_freq)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, label={lst:sepattn}, caption=Spatial-Frequency Attention]
+class AttentionBlock(nn.Module):
+    """
+    An attention block that allows spatial-only positions to attend to each other.
+    """
+    
+    def forward(self, x):
+        b, c, f, s1, s2 = x.shape
+        x = x.permute((0,2,1,3,4)).reshape(b*f, c, -1) #permutation
+        qkv = QKVAttention(self.norm(x)) #QKV Self-Attention
+        qkv = qkv.reshape(b * f * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b*f, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, f, c, s1, s2).permute((0,2,1,3,4))
+
+class AttentionBlockFreq(nn.Module):
+    """
+    An attention block that allows frequency-only positions to attend to each other.
+    """
+    
+    def forward(self, x):
+        b, c, f, s1, s2 = x.shape
+        x = x.permute((0,3,4,1,2)).reshape(b*s1*s2, c, -1) #permutation
+        qkv = QKVAttention(self.norm(x)) #QKV Self-Attention
+        qkv = qkv.reshape(b * s1 *s2 * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b*s1*s2, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, s1, s2, c, f).permute((0,3,4,1,2))
+\end{lstlisting}
+
+\textbf{Results}
+As shown in Figure~\ref{append_fig:bedroom:3d}, 3D-full baseline is able to generate realistic images with high-quality details. 
+This is because 3D convolutions and attentions at all locations altogether can also recover all frequency sub-bands with complementary information. 
+Nevertheless, Table~\ref{tab:full3d:result} suggests that the spat-freq design in \ourmodel is more efficient and effective.
+% Figure environment removed
+
+\begin{table}[tbh]
+\begin{center}
+% \vspace{-4mm}
+% \tablestyle{4pt}{1.0} 
+% \vspace{-5mm}
+\caption{Qunatitative comparison between 3D-full and \ourmodel on LSUN-Bedroom.}
+\label{tab:full3d:result}
+\begin{tabular}%{L{0.01cm}C{2.0cm}C{2.0cm}C{2.0cm}C{1.01cm}}
+{lccccccccc}
+\toprule
+&\multicolumn{1}{c}{{Methods}}
+&\multicolumn{1}{c}{{Params (M)}}
+&\multicolumn{1}{c}{{FLOPs (G)}}
+&\multicolumn{1}{c}{{FID}} \\
+% &\multicolumn{1}{c}{FLOPs(\%)}\\
+%&\multicolumn{1}{c}{Pruned(\%)}
+% \midrule
+% &Real Images &- &35.26 &6.09\\
+\midrule
+& 3D-full &364.14 &870.06 &6.73\\
+& \ourmodel &291.31 &669.28 &3.88\\
+\bottomrule
+\end{tabular}
+\end{center}
+% \vspace{-8mm}
+\end{table}
+
+\begin{table}[tbh]
+\begin{center}
+\vspace{-4mm}
+% \tablestyle{4pt}{1.0} 
+% \vspace{-5mm}
+\caption{Scaling effect with model size on FFHQ}
+\label{tab:scale:result}
+\begin{tabular}%{L{0.01cm}C{2.0cm}C{2.0cm}C{2.0cm}C{1.01cm}}
+{lccccccccc}
+\toprule
+&\multicolumn{1}{c}{{Model Scale}}
+&\multicolumn{1}{c}{{Params (M)}}
+&\multicolumn{1}{c}{{FLOPs (G)}}
+&\multicolumn{1}{c}{{FID}} \\
+% &\multicolumn{1}{c}{FLOPs(\%)}\\
+%&\multicolumn{1}{c}{Pruned(\%)}
+% \midrule
+% &Real Images &- &35.26 &6.09\\
+\midrule
+& $c=64$ &73.10 &163.01 &43.12 \\
+& $c=128$ (default) &291.31 &669.28 &12.48 \\
+& $c=192$ &665.35 &1496.23 &10.09\\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-8mm}
+\end{table}
+
+% Figure environment removed
+
+\section{Scaling Model Size}\label{supp_sec:channel_scale}
+To measure how performance scales with model size, we train another two models for 100K iterations on FFHQ, with different base channels $c=64, 192$, respectively. The results in Table~\ref{append_fig:ffhq:size} show that the sample quality improves as model size and computation increases. However, naively scaling the model size may not be the optimal solution to better generation performance. As observed in Table~\ref{append_fig:ffhq:size}, when scaling the model from 291M to more than 600M parameters, the performance improvement becomes more subtle (-2.39 in FID) compared to scaling from 73M to 291M parameters (-30.64 in FID). 
+
+% \newpage
+\section{Generation with Reduced Sampling Steps}\label{supp_sec:more}
+We evaluate the models that were trained with 1000 sampling steps on Bedroom and Church using 50, 100, 150, 200 and 250 sampling steps during inference. As shown in Table~\ref{tab:sampling:result}, sampling with 1000 steps achieves the best FID. We also visualize the generation @50, 100, 250 sampling steps in Figure~\ref{append_fig:church:50}-~\ref{append_fig:bedroom:250} (zoom in for better view, especially for high-frequency sub-bands). We see even at 50 sampling steps, our method is able to recover the details of all frequency sub-bands hence producing realistic images. Sampling with 100 steps yields images with comparable visual quality.
+\begin{table}[tbh]
+\begin{center}
+\vspace{-4mm}
+% \tablestyle{4pt}{1.0} 
+% \vspace{-5mm}
+\caption{FID($\downarrow$) with different sampling steps.}
+\label{tab:sampling:result}
+\begin{tabular}%{L{0.01cm}C{2.0cm}C{2.0cm}C{2.0cm}C{1.01cm}}
+{lccccccccc}
+\toprule
+&\multicolumn{1}{c}{{Dataset}}
+&\multicolumn{1}{c}{{@50}}
+&\multicolumn{1}{c}{{@100}}
+&\multicolumn{1}{c}{{@150}}
+&\multicolumn{1}{c}{{@200}}
+&\multicolumn{1}{c}{{@250}}
+&\multicolumn{1}{c}{{@1000}} \\
+% &\multicolumn{1}{c}{FLOPs(\%)}\\
+%&\multicolumn{1}{c}{Pruned(\%)}
+% \midrule
+% &Real Images &- &35.26 &6.09\\
+\midrule
+&Church &10.65 &8.73 &8.00 &7.65 &7.00 &6.11\\
+&Bedroom &11.23 &9.12 &6.22 &5.34 &4.77 &3.88\\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{-8mm}
+\end{table}
+
+% Figure environment removed
+% Figure environment removed
+
+% Figure environment removed
+
+
+% Figure environment removed
+% Figure environment removed
+
+% Figure environment removed
+
+% \end{document}

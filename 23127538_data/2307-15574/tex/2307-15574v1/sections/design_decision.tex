@@ -1,0 +1,118 @@
+%------------------------------------------------------------------------------
+\section{Design Challenges for \sys}
+\label{sec:streamprocessing}
+%------------------------------------------------------------------------------
+There are intuitive advantages of building an XR system as an SP system.
+An XR system processes inputs as data streams from device sensors such as cameras, inertial measurement units, \etc, and provides output as data streams such as field of view content in VR and graphic overlay in AR.
+The SP design provides benefits of high throughput with pipeline parallelism and distributed computation with its modularity, but the application of SP in XR presents non-trivial issues.
+In this section, we present the design space exploration we conducted to address those issues when building \sys.
+
+\subsection{Issues with Stream Processing for XR}
+\label{sec:spissues}
+We use an example AR pipeline in Figure~\ref{fig:semantics}, to articulate the issues when applying SP to an XR system.
+The application renderer overlays virtual objects on the camera frame based on the result from the object detector.
+The objects can be manipulated using key inputs, and the AR scene with the overlaid objects is displayed to the end user.
+Using this pipeline, we discuss the main issues below.
+
+\noindent\textbf{\bf I1: Communication Cost. }
+As shown in Figure \ref{fig:semantics}, there are a number of components in the pipeline across which data transmissions must occur.
+Those data transfers need to be performed with least latency because high latency lowers the application's responsiveness and causes discrepancies between the real and virtual worlds.
+However, the SP design increases the end-to-end latency as it requires data movement across the ports of the pipelined kernels~\cite{khare2019linearize, basanta2017patterns}.
+Since XR functionalities process and produce large multimedia data, the overhead of the cross-kernel communications is significant and must be addressed in order to meet the latency constraints of XR.
+
+% Figure environment removed
+
+\noindent\textbf{\bf I2: Communication Semantics. }
+In Figure~\ref{fig:semantics}, the downstream kernels, \ie, the renderer, has input dependencies with the upstream kernels.
+Some of those dependencies are hard, \ie, an input must be received for the downstream kernel to execute, as is the case with the camera and renderer.
+Other dependencies are soft, meaning an input is not required from the particular upstream kernel, as is the case with the keyboard or detector and renderer.
+This property has implications on whether the execution of the upstream kernels should be synchronized with the downstream kernels in terms of their invocation frequencies.
+In short, the type of dependency is specific to the functionalities that are connected, and this semantic information must be expressed by the application and adequately handled by the underlying system via  support for appropriate communication semantics.
+
+\noindent\textbf{\bf I3: Data Recency. }
+If the camera frames in Figure~\ref{fig:semantics} are delayed due to queuing delays when the frame data is transmitted, its freshness decreases.
+As a result, the placement of the AR object would be off, thus lowering the quality of the AR experience, which is also established by prior work that stale data deteriorates the quality of XR experiences~\cite{li2020towards}.
+Generally, as data is transmitted across kernels of different frequencies and execution times, it may result in queuing delays if the data is queued at any of the port buffers in a pipeline.
+When the data contains  real-world contexts from sensors, \eg, camera frames, it is critical to ensure that it remains fresh with all pipeline components that process it. Thus, the SP system for XR must provide a way to manage data recency.
+
+
+\subsection{Design Decisions for The Issues}
+\label{sec:designdecisions}
+\sys\ as a specialized DSP system for XR, incorporates solutions to address the issues raised in the previous section.
+
+\noindent\textbf{\bf D1: Efficient Local Communication. }
+The remote communication cost is unavoidable even with data compression, but the local communication should be efficient for low overheads.
+We evaluated the suitability of several existing SP libraries in terms of their communication costs: RaftLib~\cite{beard2017raftlib}, GStreamer~\cite{gstreamer}, Python pipeline libraries~\cite{mpipe, pypeln}, and the robot operating system (ROS)~\cite{quigley2009ros}.
+
+\begin{table}[]
+  \caption{\label{tab:localcommunication} \small The local communication latencies between two kernels in milliseconds.}
+  \resizebox{0.8\linewidth}{!}{
+    \begin{tabular}{|l|c|c|c|c|}
+      \hline
+      \diagbox{Libraries}{Resolution} & 720p & 1080p & 1440p & 2160p \\ \hline
+      ROS Pub/Sub\cite{quigley2009ros}    & 3.4           & 6.9            & 7.1            & 12.5           \\ \hline
+      ROS Shm Pub/Sub \cite{rosshm}       & 2.2           & 4.3            & 5.9            & 10.2           \\ \hline
+      Python Queue \cite{mpipe, pypeln}   & 14.3          & 24.1           & 30.4           & 52.1           \\ \hline
+      Python Pipe \cite{mpipe, pypeln}    & 9.3           & 17.1           & 29.5           & 52.1           \\ \hline
+      Python Shm \cite{pythonshm}         & 3.0           & 8.6            & 14.8           & 32.3           \\ \hline
+      \textbf{GStreamer} \cite{gstreamer}          & 0.1           & 0.1            & 0.1            & 0.1            \\ \hline
+      \textbf{RaftLib} \cite{beard2017raftlib}  & 0.1   & 0.1            & 0.1            & 0.1            \\ \hline
+    \end{tabular}
+  }
+\end{table}
+
+We measure the communication costs with two locally connected kernels and raw RGB frames of different resolutions.
+Table~\ref{tab:localcommunication} shows the transmission latencies of the frames.
+ROS and Python libraries provide process-level SP, where each kernel runs as a separate process and the processes communicate %with others
+via interprocess communication (IPC) channels.
+Based on our results, the local communication in process-level SP is hardly efficient for large multimedia data even with shared memory channels~\cite{pythonshm, rosshm}.
+While the shared memory channel reduces the number of data copies, the data still needs to be copied between the shared memory and process memory regions.
+
+GStreamer and RaftLib provide thread-level SP with zero-copy communication ports.
+As kernel functions are threads in the same address space, local communication can be done without copy.
+\emph{A DSP system for XR should leverage a  thread-level SP for efficient local communication of collocated kernels, and extend its communication with  support for remote communication.}
+
+\noindent\textbf{\bf D2: Blocking and Non-blocking Semantics. }
+%Distributed XR pipelines have kernels with different execution times and dependencies.
+To handle the hard and soft dependencies and synchronize the kernel executions in a pipeline, providing
+the proper communication semantics (blocking and non-blocking) for the local and
+remote communication primitives (send and receive) is  essential~\cite{cypher1994semantics}.
+The design of \sys\ handles this as a first-order concern when executing XR pipelines.
+
+The send semantics of an output port is for synchronizing the kernel execution.
+A blocking send blocks the execution of an upstream kernel function when the downstream kernel's queue is full,
+and this backpressure leads to flow control and implicitly synchronizes the upstream to downstream kernels.
+For non-blocking semantics, the upstream kernel continues when the downstream kernel cannot receive data on its input port. %take the message.
+The output port requires both blocking and non-blocking send semantics in XR pipelines.
+In the example AR pipeline of Figure~\ref{fig:semantics}, if only blocking semantics are supported, the camera kernel is synchronized to the longest path of object detection (blue line).
+Even if the app renderer does not require the results from the object detector for every camera frame, the frame stream (green line) is blocked by the object detector.
+
+The receive semantics of an input port is for kernel dependencies.
+A blocking receive waits for the message from a port, and a non-blocking continues when there is no message. % from the port.
+So, when the kernel is written, the primary inputs on which the kernel %functionality
+depends (\eg, camera frame for a kernel performing frame processing) should be specified with blocking semantics.
+For inputs generated by other sources (\eg, other sensors or user events), which can impact or steer the kernel processing but are only optionally used, the semantics should be with non-blocking to handle them.
+
+When only a blocking receive is available, all input streams of a kernel are forced as mandatory.
+The kernel execution and pipeline throughput are restricted by the lowest frequency input.
+In Figure~\ref{fig:semantics}, the renderer is blocked until the key input arrives from the user (red line).
+Even without the key input, the renderer execution is governed by the object detector, and the pipeline
+throughput is limited by the path with the highest latency (blue line).
+
+\emph{Supporting both blocking and non-blocking primitives for the input and output ports makes it possible
+to correctly describe stream dependencies and synchronize kernel executions in XR pipelines.}
+
+\noindent\textbf{\bf D3: Queuing Management and Network Protocols. }
+Since poor data freshness causes discrepancies between the real and virtual worlds, it is crucial to manage data recency in XR pipelines.
+% Recency management
+This can be achieved by minimizing the queuing delays of a pipeline~\cite{little1961proof}.
+
+For local communication, it is possible to bound the queuing delay by limiting the number of outstanding data entries %\st{messages}
+in the port buffer.
+For remote communication,  recency management becomes challenging because there is no way to control the queuing mechanisms of unknown
+middleboxes across the backend network.
+In this situation, recency management can be enabled by compromising communication reliability.
+Reliable network protocols such as TCP~\cite{stevens1997tcp} guarantee in-order message delivery via retransmission and acknowledgment mechanisms.
+However, in cases where recent data is prioritized (\eg, the object detection result on a live camera frame), the reliable protocols are inappropriate, and should be replaced with protocols favoring data timeliness over reliability even with data loss, \eg, RTP~\cite{schulzrinne2003rfc3550} and RTSP~\cite{schulzrinne1998real} over UDP.
+
+Thus, \emph{the DSP system for XR should provide knobs for  data recency management via queue size management and support for multiple network protocols for local and remote kernel communications.}

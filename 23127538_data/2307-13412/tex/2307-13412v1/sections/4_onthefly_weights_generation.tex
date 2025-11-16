@@ -1,0 +1,178 @@
+
+\section{CNN Engine Design for On-the-Fly Weights}
+\label{sec:arch}
+
+This section starts by reviewing the hardware architecture of a conventional CNN engine, similar to the ones in \cite{shidiannao2915isca,eyeriss2017jssc,cascadecnn2018fpl}. Then, it provides a series of design requirements to enable on-the-fly weights generation for CNNs and presents our techniques for achieving them.
+
+
+\subsection{Conventional CNN Engine Design}
+Fig.~\ref{fig:conventional_cnn_engine} illustrates a typical CNN engine design. The accelerator consists of an array of processing elements (PEs) to perform matrix multiplications and convolutions, one input and one output activations buffer, and a weights buffer. From an operational perspective, the CNN layers are scheduled sequentially, with pipelining applied between I/O communication and computation to hide the off-chip memory transfer latency.
+
+\textbf{Processing Engine:}
+To execute layers of various shapes and types, the core processing engine comprises an array of PEs for the execution of block matrix multiply (GEMM). Each PE contains a scalable dot-product circuit with configurable number of multiply-accumulate (MAC) units.
+By translating convolutions into matrix multiplication, the engine can process both CONV and FC layers. To this end, a CONV layer with $N_{\text{in}}$ $H$$\times$$W$ input activations, $N_{\text{out}}$ output channels, $K$$\times$$K$ filters, $p$ padding and $S$ stride involves the multiplication between an $R$$\times$$P$ activations matrix and a $P$$\times$$C$ weights matrix to produce an $R$$\times$$C$ output matrix, with $R$$=$$\left\lceil \frac{H + 2p - K}{S}+1 \right\rceil \left\lceil \frac{W + 2p - K}{S} + 1  \right\rceil$, $P$$=$$N_{\text{in}} K^2 $ and $C$$=$$N_{\text{out}}$.
+
+\begin{wrapfigure}{R}{0.5\textwidth}
+    % \vspace{-0.45cm} ,
+    \centering
+    % \fbox
+    {
+    % Figure removed
+    \vspace{-0.6cm}
+    }
+    \captionsetup{font=small,labelfont=bf}
+    \caption{A conventional CNN engine.}
+    \label{fig:conventional_cnn_engine}
+     \vspace{-0.2cm}
+\end{wrapfigure}
+
+\textbf{Design-time Parametrisation:}
+The CNN engine can be scaled based on the workload characteristics and the resources of the target FPGA. As such, it is parametrised with respect to the parameter tuple $\left<T_R,T_P,T_C\right>$. Each parameter determines the tile sizes for each matrix dimension $\left<R,P,C\right>$, the number of PEs ($T_C$) and the MAC units within each PE ($T_P$).
+
+\textbf{Operational Flow:}
+To produce a {\small $T_R$$\times$$T_C$} output tile, {\small $\left\lceil \frac{P}{T_P}\right\rceil$} tiles from the activations and weights matrices are processed and accumulated sequentially. 
+A common mapping strategy (Fig.~\ref{fig:conventional_cnn_engine}) ties $T_P$ to the MACs per PE to exploit the parallelism within each $T_P$-wide dot product, and $T_C$ to PEs to parallelise the dot products at each output column. Overall, the rows of the {\small $T_R$$\times$$T_P$} activations tile are processed in a pipelined manner to maximise throughput. This is equivalent to an output stationary dataflow~\cite{shidiannao2915isca,eyeriss2017jssc,cascadecnn2018fpl}, which minimises the memory accesses for the output activations by caching partial sums on-chip. Nonetheless, \tool is adaptable to other dataflows with minimal modifications.
+
+\textbf{The Data Movement Bottleneck:}
+From a data movement perspective, this approach requires the transfer of {\small $\left\lceil \frac{P}{T_P}\right\rceil$} tiles of size {\small $T_R$$\times$$T_P$} for the inputs, {\small $\left\lceil \frac{P}{T_P}\right\rceil$} tiles of size {\small $T_P$$\times$$T_C$} for the weights, and one tile of size {\small $T_R$$\times$$T_C$} for the outputs. To produce all the output tiles, all the data movements are performed {\small $\left\lceil \frac{R}{T_R}\right\rceil \left\lceil \frac{C}{T_C}\right\rceil$} times. 
+In spite of the compute-bound CONV layers, the external memory bandwidth often becomes the bottleneck in CNN inference. This is primarily manifested in cases where: \textit{i)}~a resource-rich FPGA device is targeted. In this case, a large and powerful processing engine is instantiated and the speed of feeding it with new data constrains the performance; \textit{ii)}~the CNN layers have a large amount of weights, either due to large kernel sizes or number of filters. This case often occurs in deeper CNN layers, which are typically of significant width. As such, the weights cannot be stored on-chip and multiple memory transactions have to be issued, putting pressure on the available bandwidth; \textit{iii)}~high-dimensional input and output activations have to be transferred, increasing excessively the bandwidth requirements. This typically occurs in earlier layers of a CNN, where the feature maps dimensions are still large. 
+
+As such, there is an emerging need for relieving the data movement burden and address the impact of hitting the memory wall. In this context, \textit{on-the-fly weights generation} can be an enabling factor in extracting higher performance and making more cost-effective use of hardware CNN engines.
+
+
+% \stelios{TODO: Outline in which cases this becomes the bottleneck to motivate on-the-fly weights. See the following.}
+% \stelios{1) Fast processing engine $\rightarrow$ memory becomes the bottleneck, 2) large amount of weights, 3) large amount of inputs/outputs where freeing bandwidth resources can speed up the execution.}
+% \stelios{These necessitate the need for removing the burden of transferring weights. We propose on-the-fly weights generation. But on-the-fly weights without carefully designed hardware support defeats the purpose.}
+
+
+% Nonetheless, \tool is adaptable to other dataflows.
+
+
+\subsection{Devising a Hardware CNN Weights Generator}
+
+% Figure environment removed
+
+The objective is to minimise the data movement of CNNs by dynamically constructing the model weights using only on-chip resources. %To do so, the underlying hardware engine needs to generate at run time the weights of a given layer in a timely manner. 
+Importantly, on-the-fly weights generation needs to take place at run time, in a timely and per-layer fashion, since each CNN layer is a standalone independent schedulable unit. Moreover, the amount of computational and memory resources assigned to the weights generator ought to be balanced with the rest of the CNN engine to maximise the throughput of the accelerator while sustaining high resource utilisation. To that end, bringing forth on-the-fly weights generation requires devising two major components:
+% Efficiently mapping on-the-fly weights generation algorithms to hardware requires devising two major components: a data blocking methodology, which enables a fixed-size weights generator to sustain high throughput for layers with various shapes; and a microarchitecture that achieves fast weights generation with low resource usage while being compatible with existing CNN engine designs. 
+
+% \begin{wrapfigure}{R}{0.45\textwidth}
+%     \centering
+%     \vspace{-0.6cm}
+%     {
+%     % Figure removed
+%     }
+%     \vspace{-0.4cm}
+%     \captionsetup{font=small,labelfont=bf}
+%     \caption{\footnotesize Example of TiWGen. With a tile size of $M$, each tile is generated in $\lceil T_P T_C/M \rceil \cdot \rho K^2$ cycles.}
+%     \vspace{-0.55cm}
+%     \label{fig:weights_gen_tiling}
+% \end{wrapfigure}
+
+
+\subsubsection{Tiled Weights Generation}
+Our novel insight is that, to be able to generate weights for layers of various dimensions, there is a need for a tiling method on top of the weights generation process. We denote our proposed tiling method by TiWGen. As shown in Fig.~\ref{fig:unzipfpga_cnn_engine}, TiWGen divides each $T_P$$\times$$T_C$ weights tile into subtiles of size $M$, with $M$ being uniform across the CNN's layers. Tiling on top of the weights generation method makes the dataflow of diverse layers identical to each other. With this approach, the value of $M$ becomes independent of the CNN architecture and is solely bound by the resources allocated to the weights generator. As such, $M$ exposes a tunable trade-off between weights generation speed and resource consumption.
+
+\input{algorithms/tiwgen}
+
+Alg.~\ref{alg:tiled_weights_gen} describes the internal workings of TiWGen. Initially, the $P$$\times$$C$ weights matrix is partitioned into {\small $\left\lceil \frac{P}{T_P}\right\rceil$} tiles of size $T_P$$\times$$T_C$, with each tile processed sequentially (line~1). Next, each tile is divided into $\left\lceil \frac{T_P T_C}{M} \right\rceil$ subtiles~(line 2). After all basis vectors of the current subtile have been processed (lines~4-9), the associated part of the output tile is updated (line~10) and the algorithm proceeds to the next subtile. When all subtiles of a tile have been generated, the weights matrix is updated (line~12) and the algorithm continues to the next iteration until all weights tiles have been constructed.  
+
+\rev{\textbf{Applicability to Other Dataflows.}~Although the presented instance of TiWGen focuses on output stationary dataflows, our method can be applied to hardware designs that employ other dataflows. The main modifications comprise \textit{i)}~the order the generated weights and \textit{ii)}~the required generation rate. For instance, considering Google’s TPU~\cite{tpu2017isca} which is the most widely used systolic array for CNN inference, the accelerator adopts a weight-stationary dataflow. In this case, as the tile of the weight matrix is reused for several cycles, the OVSF generator would have to generate weights in longer periods compared to output stationary dataflow and the resource allocation would be automatically adjusted at the DSE stage accordingly.}
+
+
+\subsubsection{Weights Generator Microarchitecture}
+With the design objectives and constraints of Section~\ref{sec:design_flow} in mind, we propose a microarchitectural unit, called \texttt{CNN-WGen}, which is placed within the CNN engine (Fig.~\ref{fig:unzipfpga_cnn_engine}) and is responsible for generating the weights in an orderly manner and feeding them to the processing engine. Fig.~\ref{fig:hw_weights_gen} illustrates the design. As shown, the unit consists of: \textit{i)}~a \textit{vector compute datapath} comprising two vector units (multiplier and adder arrays), \textit{ii)}~the \textit{Alpha buffer} storing the $\alpha$ values, and \textit{iii)}~the \textit{OVSF generator} that is responsible for outputting the $M$-sized basis vector subtiles as dictated by the TiWGen scheme.
+
+\textbf{Mapping Strategy.}
+To efficiently map and perform the TiWGen loops, \texttt{CNN-WGen} employs loop optimisation techniques, annotated in Alg.~\ref{alg:tiled_weights_gen}. Namely, loop pipelining and unrolling are employed to customise the computation patterns and on-chip memory reuse of the weights generator. Pipelining is applied on the three outer loops over tiles (line~1), subtiles (line~2) and basis vectors (line~4), and unrolling on the inner loop that processes the $M$-sized subtile (line~5). To unroll the innermost loop, \texttt{CNN-WGen} employs two $M$-wide vector units that perform $M$-parallel multiplications and additions, respectively. In this manner, tuning $M$ can balance the parallelism-resource usage trade-off of the module.
+
+% Figure environment removed
+
+
+\textbf{Parametrised Vector Compute Datapath.}
+As shown in Fig.~\ref{fig:hw_weights_gen}, the vector arithmetic units must have a fixed size that complies with the resource constraints of the target FPGA and namely the available DSP blocks. The multiplier array is connected to the \textit{OVSF generator} and the \textit{Alpha buffer}. For the i-th subtile (line~3 in Alg.~\ref{alg:tiled_weights_gen}), the former produces $\rho K^2$ basis vectors of size $M$, while the latter outputs the associated $\alpha$ coefficients, both of which are forwarded to the multiplier array in a pipelined manner.
+All $M$ elements are processed in parallel by the $M$-wide vector units, leading to the vectorised unrolling of the inner loop on line~5 of Alg.~\ref{alg:tiled_weights_gen}. The adder array processes the output of the multiplier array by accumulating the $\rho K^2$ partial results. Finally, when TiWGen proceeds to the next subtile (\textit{i.e.}~next iteration of the loop on line~2), the control unit (CU in Fig.~\ref{fig:hw_weights_gen}) resets the accumulators' state.
+Overall, the vector compute datapath is design-time configurable with respect to parameter $M$ which controls the sizing of the vectors units and balances in this way the performance-resource usage trade-off of \texttt{CNN-WGen}. The design space exploration of $M$ is discussed in Section~\ref{sec:dse}.
+
+% the design-time configurable parameter $M$ determines the size of the vector units and controls in this way the performance-resource trade-off of \texttt{CNN-WGen}. The tuning of $M$ is exposed to the DSE to determine how many resources should be allocated to \texttt{CNN-WGen}.
+
+\textbf{Memory Customisation in Alpha Buffer.}
+TiWGen dictates that each subtile contains weights from $N_f$ distinct $K$$\times$$K$ filters. To sustain \texttt{CNN-WGen}'s throughput, an equal number of $\alpha$s have to be fetched in parallel from the \textit{Alpha buffer}. To accomplish this, we design the \textit{Alpha buffer} as a unified buffer with customised memory organisation and addressing.
+Each layer contains $N_{\text{in}} N_{\text{out}} \left\lceil \rho_l K_l^2 \right\rceil$ distinct $\alpha$ values. 
+As such, the \textit{Alpha buffer} is broken down to $N_P^{\text{Alpha}}$$=$$N_f$ independent multi-bank sub-buffers, with a depth of $D^{\text{Alpha}}$ (Eq.~(\ref{eq:alpha_buff_depth})) to accommodate $N_L$ layers.
+% 
+% \vspace{-1mm}
+\begin{equation}
+    \footnotesize
+    % \resizebox{0.725\linewidth}{!}{
+    N_{f} = \left\lceil \frac{\min (T_P,M)}{K_\text{max}^2} \right\rceil \left\lfloor \frac{M}{T_P} \right\rfloor + \text{mod}(M,T_P) \left\lceil \frac{M}{K_\text{max}^2} \right\rceil
+    % }
+    \vspace{-1mm}
+    \label{eq:filters_per_subtile}
+\end{equation}
+\begin{equation}
+    \footnotesize
+    % \resizebox{0.725\linewidth}{!}{
+    D^{\text{Alpha}} = \overbrace{\sum_{l=1}^{N_L}}^{\text{for each layer}} \frac{\overbrace{N_{\text{in}}^l N_{\text{out}}^l \left\lceil \rho_l K_l^2 \right\rceil}^{\text{no. of $\alpha$ values}}}{N_P^{\text{Alpha}}} \quad \text{ ( \textit{Buffer depth} )}
+    % }
+    \label{eq:alpha_buff_depth}
+    \vspace{-0.1cm}
+    % \vspace{-0.2cm}
+\end{equation}
+where $N_L$ is the number of layers, $N_{\{\text{in},\text{out}\}}^l$ the l-th layer's number of input/output channels and $\rho_l$ the compression ratio. Finally, the outputs of the sub-buffers are concatenated and connected to the multiplier array to provide concurrent access to $N_f$ coefficients. Finally, if the number of $\alpha$ coefficients exceeds the available on-chip memory, the remaining coefficients are transferred from the off-chip memory.
+
+\textbf{Rate Matching in OVSF Generator.}
+Following TiWGen, the basis vectors are processed in a blocked manner with a tile size of $M$. This approach leads to two pipelined loops over the $\left\lceil \frac{T_P T_C}{M} \right\rceil$ subtiles (line~2) and the $\rho K^2$ basis vectors (line~4) and the unrolled loop of processing the $M$-element subtile with the vector units (line~5). To produce the i-th subtile, the \textit{OVSF generator} feeds the compute datapath with $\rho K^2$ basis vectors that are tiled as dictated by TiWGen's parameter $M$.
+
+In order not to straggle the operation of \texttt{CNN-WGen}, the \textit{OVSF generator} has to match the rate of the vector units by feeding them with $M$ bits/cycle. A conventional design involves statically laying out the tiled vectors into a single buffer, with $M$ ports and a depth equal to the number of reads per tile (\textit{i.e.}~\#basis vectors$\times$\#subtiles).
+However, such a monolithic design would impose significant overheads as the basis vectors would have to be replicated either in the same address (\textit{e.g.}~when $M$$>$$K^2$) or in multiple addresses (\textit{e.g.}~storing rotated versions as required by different subtiles). This leads to inefficient utilisaiton of the on-chip memory due to excessive replication.
+
+An alternative approach that would avoid the basis vector replication involves the instantiation of a $K^2$-deep OVSF memory with each location storing one $K^2$-bit vector. Such a design requires significantly lower amount of storage and provides an access rate of 1 vector/cycle by reading the appropriate address. Nonetheless, to obtain the $M$-bit subtile from the $K^2$-bit vectoc, complex multiplexer selection circuitry has to be instantiated. This approach can affect the maximum clock rate or add latency cycles to such an extent that any throughput gains would be outweighed.
+
+To alleviate these limitations when mapping TiWGen's tiling scheme, a custom \textit{OVSF generator} was developed. The top-level diagram of the \textit{OVSF generator} is shown in Fig.~\ref{fig:hw_weights_gen}. It is composed of three main components: the \textit{OVSF FIFO}, a \textit{basis vector aligner} and the \textit{output register}. By introducing a FIFO for the OVSF vectors in combination with a \textit{basis vector aligner}, the \textit{OVSF generator} introduces a rate-matching mechanism that sustains the processing rate of the \textit{vector compute datapath} while efficiently utilising the on-chip memory. The generator performs a different operation depending on the values of $M$ and $K^2$ of layer $i$ (Fig.~\ref{fig:hw_weights_gen}).
+
+Initially, the \textit{OVSF FIFO} stores the \mbox{{\small ($K_i^2K_i^2$)}-bit} basis vectors. %\footnote{Based on OVSF theory, an $\mathbb{R}^{K^2}$ base requires $K^2$ components.} 
+The current vector is read from the FIFO into the top register. 
+If {\small $M$$\le$$K_i^2$}, % (top left), 
+the $M$ least significant bits (LSBs) are outputted to the \textit{vector compute datapath}. At the same time, the basis vector is processed by the \textit{basis vector aligner}, which performs an $M$-bit left circular shift and writes the rotated vector to the \textit{OVSF FIFO}.
+If {\small $M$$>$$K_i^2$}, % (top right), 
+the basis vector is self-concatenated {\small $\left\lfloor \frac{M}{K_i^2} \right\rfloor$} times and written to the output's LS part. Simultaneously, the {\small $\text{mod}(M,K_i^2)$} LSBs of the basis vector are written to the output's MSBs and the constructed vector is passed to the compute datapath. Here, the aligner performs a left circ-shift of \mbox{{\small $K_i^2$-$\text{mod}(M,K_i^2)$}} bits and writes the result to the FIFO.
+
+With this approach, when the basis vectors are read again out of the OVSF FIFO after $\rho K_i^2$ cycles (\textit{i.e.}~in the next iteration of the loop on line~2), they are correctly aligned to directly match TiWGen's tiling pattern. For instance, after the generation of the red-striped subtile in Fig.~\ref{fig:unzipfpga_cnn_engine}, the FIFO-read basis vectors will be correctly aligned in order to generate the blue-striped subtile without the need for costly selection logic or redundant storage. 
+For CNNs with multiple filter sizes, the \textit{basis vector aligner} is instantiated with as many circ-shift options. As the distinct filter sizes are known \textit{a priori}, only the required shifting logic is inserted, avoiding expensive generic multiplexers, and the appropriate per-layer bit-shift is selected at run time.
+
+Overall, the proposed design offers two main benefits. First, it alleviates the redundant replicated storage of basis vectors and avoids the hardware cost of partitioning multiplexers that would require excessive LUTs usage. Second, it provides the necessary bandwidth to the \textit{vector compute datapath} while efficiently utilising the on-chip memory through the \textit{OVSF FIFO} and the resource-efficient aligner design.
+As the values of $K_i^2$ for each layer and $M$ are known at design time and after the DSE phase respectively, the \textit{OVSF generator} can be statically instantiated at compile time. % with the appropriate design.
+
+\begin{wrapfigure}{R}{0.45\textwidth}
+    \centering
+    \vspace{-0.6cm}
+    % \fbox
+    {
+    % Figure removed
+    }
+    \vspace{-0.6cm}
+    \captionsetup{font=small,labelfont=bf}
+    \caption{\footnotesize \tool's input selective PE array for CNNs.}
+    \vspace{-0.2cm}
+    \label{fig:new_pe_design}
+\end{wrapfigure}
+
+\vspace{0.4cm}
+\subsection{Input Selective PEs for Counteracting Underutilisation}
+\label{sec:pe_design}
+% \vspace{-0.2em}
+
+One key limitation of existing CNN engines is that, when processing compute-bound layers, the layer dimensions often do not match the fixed processing engine configuration, leading to underutilisation of the computational resources and severe performance penalties~\cite{latency2017fpl,alamo2020tcad,caffeine2019tcad,maestro2020micro}.
+Such a scenario can be observed when mapping a layer with $N_\text{out}$$=$$64$ channels (\textit{i.e.}~$C$$=$$64$) on an engine with 128 PEs (\textit{i.e.}~$T_C$$=$$128$). In this case, the PEs would remain idle 50\% of the time, halving the attainable performance.
+
+To alleviate this, we propose \textit{input selective PEs}, a design that enables existing PEs to perform load-balancing through inter-PE work-stealing in a resource-efficient manner.
+Fig.~\ref{fig:new_pe_design} shows \tool's input selective PEs. The initial PE is augmented with registers and switches. However, not all PEs have the same components; only the PEs that remain \textit{underutilised} even for a single layer are further equipped with a compact switch that selects the inputs to the dot-product circuit. 
+In addition to the normal flow of data, these switches enable each PE to send its weight to its bottom neighbour. As highlighted in dark blue at the bottom PE of Fig.~\ref{fig:new_pe_design}, the switch on the left of the PE selects its input from \rev{two options: \textit{i)}~under normal operation, the PE is fed with the weight written by \texttt{CNN-WGen} in the weights buffer $\bigl(\protect\circled{1}\bigr)$; \textit{ii)}~in the absence of this weight (\textit{e.g.}~due to a mismatch between $C$ and $T_C$), the PE is fed with the weight passed by the adjacent PE $\bigl(\protect\circled{3}\bigr)$.}  
+% either \textit{i)}~the weight written by \texttt{CNN-WGen} in the weights buffer \rev{$\bigl(\protect\circled{1}\bigr)$} or, \textit{ii)}~in the absence of this weight, the weight passed by the adjacent PE \rev{$\bigl(\protect\circled{3}\bigr)$}.
+In the second case, the weights are propagated along the PE array \rev{$\bigl(\protect\circled{3}\bigr)$} so that a different weight is used by each augmented PE in each cycle. Moreover, the Input Buffer (Fig.~\ref{fig:unzipfpga_cnn_engine}) is reorganised accordingly to provide parallel access to multiple rows.
+
+
+
+
+Effectively, this design works as a load-balancing mechanism that partially unrolls the $T_R$ dimension and thus distributes the work more evenly among the PEs. By restricting connectivity to adjacent units and enhancing only the underutilised PEs, the additional circuitry is low-overhead and delivers up to 20\% higher performance on compute-bound layers.

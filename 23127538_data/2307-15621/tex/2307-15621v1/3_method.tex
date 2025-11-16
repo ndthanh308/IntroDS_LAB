@@ -1,0 +1,119 @@
+\section{Method}
+\label{method}
+
+\subsection{Problem setting}
+
+The goal of single-objective NAS is to find a network architecture $\alpha^*$ from a search space $\Omega$ that maximizes an objective function $f$ after training the weights $\theta$:
+\begin{equation}
+\alpha^* = \argmax_{\alpha \in \Omega} f(\alpha; \theta)
+\end{equation}
+% $f$ does not have to be differentiable.
+% : various metrics, such as classificaton accuracy or Inception score, can be maximized.
+$\Omega$ typically includes network architecture properties such as the number of layers, types of each layer, and its hyperparameters (e.g., convolution size). We will describe an architecture $\alpha$ by $M$ categorical variables $\{x_i\}_{i=0..M-1}$, each taking $l_i$ possible values. 
+% Finding an optimal architecture corresponds to finding the optimal values of these variables.
+Note that in the case where more than one architecture is searched for (e.g., generator and discriminator of a GAN), we consider, for simplicity, $\alpha$ to include architecture parameters of all architectures.
+
+\subsection{Algorithm overview} \label{method:naspbt}
+
+In our algorithm, PBT-NAS, we follow the general structure of PBT, where $N$ networks are trained in parallel\footnote{Note that since each network has a different architecture, it has a different training speed, so to avoid biasing the search towards models that require less training time, we use the synchronous variant of PBT.}.
+In each iteration of the algorithm, every network is trained for $e\_step$ epochs. Then, each of the worst $\tau\%$ of the networks is replaced by a mix of two networks from the best $\tau\%$ (according to the objective function $f$). Over time, better architectures are created. Mixing architectures during training is the key component of PBT-NAS. In Section~\ref{method:motivation}, we motivate the choice to do NAS by mixing networks. Further details of how we mix architectures are given in Section~\ref{method:combine}.
+
+A visual representation of one iteration of PBT-NAS is shown in Figure~\ref{fig:algo_step_scheme}, and the pseudocode is listed in Algorithm~\ref{alg:naspbt}.
+
+\begin{algorithm}[tb]
+   \caption{PBT-NAS}
+   \label{alg:naspbt}
+\begin{algorithmic}
+    \fontsize{8.65pt}{10.65pt}\selectfont
+   \STATE {\bfseries Input:} search space $\Omega$, number of variables $M$, population size $N$, number of epochs $e\_{total}$, step size $e\_{step}$, selection parameter $\tau$, probability $p$ of replacing a layer, parameters $\lambda$, $\gamma$ of shrink-perturb
+\end{algorithmic}
+%   \STATE {\bfseries Begin}
+\begin{algorithmic}[1]
+\fontsize{8.65pt}{10.65pt}\selectfont
+
+   \STATE ${pop} \gets $ \{$N$ random architectures from $\Omega$\}
+   
+%   \COMMENT{Main loop}
+   \STATE ${e} \gets 0$
+   \WHILE{${e} < {e\_total}$}
+        \FOR[in parallel]{$i \gets 0$ {\bfseries to} $N-1$}
+            \STATE train ${pop}_i$ for $e\_step$ epochs
+            \STATE ${pop}_i.fitness \gets $  \texttt{evaluate}$({pop}_i)$
+        \ENDFOR
+        \STATE sort ${pop}$ by $fitness$
+        \STATE $best\_nets  \gets $ the best $\tau\%$ nets
+        \STATE $worst\_indices \gets $ indices of the worst $\tau\%$ nets
+        \FOR{$j$ \textbf{in} $worst\_indices$}
+            \STATE $pop_j  \gets $ \texttt{create\_architecture}$(best\_nets, p, M, \lambda, \gamma)$
+            
+            \COMMENT{the result of mixing, see Algorithm~\ref{alg:combine}}
+        \ENDFOR
+        \STATE $e \gets e + e\_step$
+   \ENDWHILE
+%   \STATE {\bfseries End}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Key question when modifying architecture during training: where to get the weights from?} \label{method:motivation}
+% Core difficulty in adapting PBT to NAS: where to get the weights?
+
+PBT relies on random perturbations of hyperparameters for exploring the search space while the network weights are being continuously trained. This works well when searching for hyperparameters that can be replaced independently of the weights: e.g., after changing the learning rate, the training can continue with the same weights.
+
+However, searching for an architecture means introducing changes that impact the weights, e.g., changing the type of a layer from linear to convolutional. After such a change, the training process is disturbed: the weights of one type of layer cannot be used in another one.
+
+To follow the paradigm of PBT and continue training the network after an architectural change, the source of the weights needs to be determined. We consider three potential approaches (Figure~\ref{fig:shrink_perturb_spectrum}).
+
+% Figure environment removed
+
+One approach is initializing the new weights randomly. Intuitively, this could be problematic, as replacing weights of a whole layer with random ones can substantially disrupt the learned connections between neurons across the whole network.
+
+Instead of being initialized randomly, the weights of the modified part can come from another network in the population. If the new value of the type of the layer is not generated randomly but copied from another solution, the corresponding layer weights can be copied from it too. 
+Straightforward weight copying may be better than random initialization but it faces the following issue: even though the layers at the same depth of different networks should perform similar transformations (when trained on the same task), the actual data representations in each network are likely to be different. The copied weights would need to be adapted to a different representation space, but it might be difficult for gradient descent to adapt them quickly.
+
+\begin{algorithm}[tb]
+   \caption{\texttt{create\_architecture}}
+   \label{alg:combine}
+\begin{algorithmic}
+\fontsize{8.65pt}{10.65pt}\selectfont
+   \STATE {\bfseries Input:} set of networks to potentially mix $nets$, probability $p$ of replacing a layer, number of variables $M$, parameters $\lambda$, $\gamma$ of shrink-perturb
+\end{algorithmic}
+%   \STATE {\bfseries Begin}
+\begin{algorithmic}[1]
+\fontsize{8.65pt}{10.65pt}\selectfont
+    % \STATE $net_1, net_2 \gets$ \texttt{sample\_parents}$(nets)$
+    \STATE $net_1, net_2 \gets$ randomly sample from $nets$
+   
+    \IF{$net_1.fitness < net_2.fitness$}
+        \STATE $net_1, net_2 \gets net_2, net_1$ \COMMENT{sort by fitness}
+    \ENDIF
+    
+    \STATE $net_{new} \gets$ \texttt{copy}$(net_1)$
+   
+    \FOR[iterate over architecture variables]{$i=0$ {\bfseries to} $M-1$}
+        \IF{\texttt{random\_uniform}$() < p$}
+            \STATE $net_{new}.\alpha_i \gets net_{2}.\alpha_i$ \COMMENT{copy the value of the variable}
+            \IF{$\exists net_{2}.W^i$}
+                \STATE \COMMENT{if the variable is a layer, copy and modify its weights}
+                \STATE $W_{new} \gets$ \texttt{copy}$(net_{2}.W^i)$
+                \STATE \texttt{shrink\_perturb}$(W_{new}, \lambda, \gamma)$
+                \STATE $net_{new}.W^i \gets W_{new}$
+            \ENDIF
+        \ENDIF
+    \ENDFOR
+    
+    \STATE \textbf{return} $net_{new}$
+    
+\end{algorithmic}
+\end{algorithm}
+
+Shrink-perturb~\cite{ash2020warm} is potentially helpful in this scenario. It was motivated by the observation that in online learning, continuing training from already trained weights when new data comes in can be worse than retraining from scratch using all the available data. Shrink-perturb consists of modifying the weights of a neural network by \emph{shrinking} (multiplying by a constant $\lambda$) and \emph{perturbing} them (adding noise multiplied by a constant $\gamma$; a new initialization of the network architecture is used as the source of noise). 
+
+Applying shrink-perturb to the copied weights is the middle ground between copying the weights as-is, and initializing them randomly. This preserves some useful information in the weights, while also potentially making their adaptation to the new architecture easier. 
+
+\subsection{Mixing networks} \label{method:combine}
+
+Algorithm~\ref{alg:combine} shows our procedure for creating a new network. Firstly, two parent networks are randomly sampled from the top $\tau$ percentile of the population. An offspring solution is created by copying the better parent, and replacing with probability $p$ each layer with the layer from the worse parent (including the weights, which are shrink-perturbed). Our mixing is a version of uniform crossover~\cite{syswerda1989uniform} where only one offspring solution is produced. 
+Note that our mixing requires that layers in the same position can be substituted for each other (i.e., the output can be used as the input of the next layer), with the architecture remaining valid after a layer is replaced. We further discuss this limitation in Section~\ref{discussion}.
+
+Unlike existing approaches to combining neural networks (see Section~\ref{rel:combine}), we do not expect (or need) the new network to perform well right away. Instead, it will be trained for several epochs in the next iteration of PBT-NAS, the same as the other networks in the population. 
+% We empirically observe that this training may be enough for the new architecture to outperform some unmodified networks.

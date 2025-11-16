@@ -1,0 +1,126 @@
+\noindent The proposed method is aimed at estimating an accurate scene temperature from a single-image, while also correcting the space-variant degradation in microbolometer arrays.
+\input{content/main/method/fig_charactrize.tex}
+
+\noindent The proposed method is composed of four steps:
+\begin{enumerate}[label=\Alph*.]
+    \item Characterize the nonuniformity in an uncooled microbolometer thermal camera described by four steps (\cref{sec:method:characterize}).
+          \begin{enumerate}[label=\arabic*)]
+              \item Model the camera response to a set of object temperatures (\cref{sec:method:characterization:temperatureDependency}).
+              \item Use the spatial dependency between pixels as a constraint (\cref{sec:method:characterization:spatialDependency}).
+              \item Exploit symmetry around the middle of the frame (\cref{sec:method:characterization:axisSymmetry}).
+              \item Apply the method to new frames (\cref{sec:method:characterization:applyToNew}).
+          \end{enumerate}
+    \item Acquire a large dataset of accurate temperature maps.
+    \item Create samples using the accurate temperature maps and the synthetic nonuniformity  (\cref{alg:applyNonUniformity}).
+    \item Train a neural network to perform NUC in a supervised manner (\cref{sec:method:net}).
+\end{enumerate}
+
+\subsection{Characterization of the nonuniformity}\label{sec:method:characterize}
+    The goal of the characterization was to create a general model for the camera, that can be used to estimate the nonuniformity for any possible combination ambient temperature and object temperature.
+
+    In this work, we used the low-cost uncooled microbolometer thermal camera FLIR \taucamera, because it allows access to raw measurements of thermal radiation.
+    To estimate the nonuniformity for various ambient temperatures, the camera was placed in an environmental chamber (described in \cref{sec:materials:equipment}), and focused on a \blackbody blackbody, which served as the object of the setup.
+    The \taucamera was set to $60$ frames per second (FPS). The camera output was set to radiation flux, so the raw measurement of each microbolometer is represented as a $14_{bit}$ integer. To acquire the rawest possible radiation flux and without any image processing, all the automatic image enhancements were disabled before each measurement (details are in \cref{tab:cameraParams} in the supplementary materiel).
+    \cref{sec:materials:equipment} elaborates on the equipment used.
+
+    An extensive dataset of camera responses was collected, comprised of the measured radiance in gray-levels at a known object temperature for different ambient temperatures.
+    The radiance was measured for a series of \opPoints denoted as $R(\tamb, \tobj)_i$, where $\tamb$ is the ambient temperature, $\tobj$ is the object temperature and $i\in[1,\hdots,N]$. The measurements were made on a predefined set of temperatures such that $\tamb\in\Tamb$ and $\tobj\in\Tobj$.
+    $N$ images were averaged for each \opPoint to lower the noise per pixel~$\left(\propto N^{-0.5}\right)$.
+    % The averaged images at an \opPoint are denoted as $\Bar{R}(\tamb, \tobj)$.
+
+    We exploited domain knowledge about pixel-dependence in the nonuniformity. Specifically, the radial pixel dependence stemming from the self-heating described in \cref{sec:intro:nonuniformity}.
+    
+    To find the different coefficients for the simulator,
+    first we found pixel-wise coefficients connecting between the radiance and the real temperature of the \blackbody,
+    and then we found approximated pixel-wise coefficients with the radial pixel dependency constraint.
+    The algorithm for finding the coefficients is described in \cref{alg:estimateNonUniformity} in the supplementary material.
+    The algorithm also handles error in the measured data, such as skewing around the middle of the image.
+    
+    \cref{fig:method:simulator} illustrates the process of simulating a gray-level frame with nonuniformity from a temperature map.
+    The process is also detailed in \cref{alg:applyNonUniformity} of the supplementary material.
+
+    The sets of ground-truth temperatures and their corresponding degradation maps enable training different supervised algorithms for the nonuniformity correction. The maps are noise-less and perfectly symmetrical around the middle of the image. Different augmentations can be applied by the user to simulate noises of varying degrees, directional heating on the camera which results in skewing, and FPN on the frames. These augmentations increase generalization, making it possible to perform NUC on different cameras with the same training. Details on the exact augmentations performed in this work are given in \cref{sec:method:preprocessing}.
+
+    The characterization is shown to be general in \cref{sec:experiments:realdata}.
+    We used the characterization process to create synthetic nonuniformity maps and train a neural network (\cref{sec:method:net}), and used the network to estimate temperatures from scenes taken by a \emph{different camera} than the one used for the characterization. These experiments with real-world data are displayed and discussed in \cref{sec:experiments:realdata}.
+
+    Detailed information on the characterization process and various challenges in it are given in \cref{sec:supp:characterization} of the supplementary material.
+    The dataset used for characterization can be found \href{https://drive.google.com/drive/folders/1tu_hMJR1SPunttWM65EyuCs7DJs2K6ah?usp=drive_link}{Here}.
+
+\subsection{Network}\label{sec:method:net}
+    \input{content/main/method/network.tex}
+
+\subsection{Loss functions}
+\noindent The loss function is comprised of a fidelity term, a structural term, and a noise-reduction term. The fidelity term is the mean absolute error (MAE) which is robust to outliers \cite{anwar2020}, applied on the difference between the accurate temperature map $\tobj$ and the output of the network $\tobjapprox$ from \cref{eq:netPysical}:
+\begin{equation}\label{eq:lossFid}
+    \mathcal{L}_{Fid} = \frac{1}{h\cdot w}\sum_{i,j}\left|\tobj\left[i,j\right] - \tobjapprox\left[i,j\right]\right|
+\end{equation}
+where $h,w$ are height and width respectively.
+
+The structural term measures the dissimilarity index, based on the structural similarity metric (SSIM). The SSIM is aimed at providing a good metric for the human visual-perception system. Use of the DSSIM method has been shown to improve network performance in image-restoration tasks \cite{ssimLoss2017}. It is calculated as:
+\begin{equation}\label{eq:lossSSIM}
+    \mathcal{L}_{DSSIM} = \frac{1-\text{SSIM}(\tobj,\tobjapprox)}{2}
+\end{equation}
+
+The noise-reduction term is total variation loss \cite{totalvariation}. The underlying assumption is that the sum of absolute gradients for noisy images is higher than for clean images:
+\begin{subequations}
+    \begin{align*}
+        \mathcal{L}_{TV}(\tobjapprox) = \frac{1}{h\cdot w}\sum_{i,j}&\left|\tobjapprox\left[i,j+1\right]-\tobjapprox\left[i,j\right]\right|+\\+&\left|\tobjapprox\left[i+1,j\right]-\tobjapprox\left[i,j\right]\right|
+    \end{align*}
+\end{subequations}
+where $i,j$ denotes the pixel position.
+
+The overall loss term for the network training is:
+\begin{equation}\label{eq:loss}
+    \mathcal{L} = \mathcal{L}_{Fid} + \beta\cdot\mathcal{L}_{DSSIM} + \gamma\cdot\mathcal{L}_{TV}
+\end{equation}
+where $\beta, \gamma$ are the hyperparameters that balance the loss terms.
+
+
+\subsection{Preprocessing}\label{sec:method:preprocessing}
+\noindent The input to the network is a gray-level map created from an accurate temperature map using the synthetic nonuniformity as described in \cref{alg:applyNonUniformity}. The input to the network can be described as:
+\begin{equation}\label{eq:netInput}
+    I(\tamb) = \Hat{R}(\tamb, \tobj) + \mathcal{N}(0, \sigma^2)
+\end{equation}
+where $\Hat{R}(\tamb, \tobj)$ is the synthetic gray-level map (\cref{alg:applyNonUniformity}), and $\mathcal{N}$ is the additive Gaussian noise.
+
+The input of the network is a frame representing the radiation flux measured by the microbolometer. These are represented by 14-bit gray-levels. To normalize them to the range of [0,1], the maximal and minimal values of gray-levels in the entire training and validation sets were obtained, and all inputs were normalized by:
+\begin{equation}
+    \Bar{I}(\tamb) = \frac{I(\tamb) - I_\text{min}}{I_\text{max}-I_\text{min}}
+\end{equation}
+where $\Bar{I}(\tamb)$ is the normalized input and $I_\text{min},I_\text{max}$ are the minimal and maximal gray-levels over the datasets.
+
+The accurate temperature maps must also be normalized to the range [0,1]. Again, the maximal and minimal temperatures were found over all datasets and both the output of the network and the original accurate temperature maps were normalized:
+\begin{equation}
+    \Bar{T} = \frac{T - T_\text{min}}{T_\text{max}-T_\text{min}}
+\end{equation}
+where $\Bar{T}$ is the normalized accurate temperature map and $T_\text{min},T_\text{max}$ are the minimal and maximal temperatures over all datasets.
+
+Augmentations were applied during training and validation to enrich the dataset further. These included cropping to $256\times256$ pixels, random horizontal and vertical flips, and $90^\circ$ rotations.
+
+Random Gaussian noise with $\sigma^2=5_{GL}$ and FPN were generated for each frame. FPN was generated as:
+\begin{equation}
+    M_{FPN} = \begin{bmatrix}
+        1 \\ \vdots  \\ 1
+    \end{bmatrix}_{h\times1}\cdot
+    \left(\begin{bmatrix}
+        \mathcal{U}[v_{\min}, v_{\max}] \\ \vdots  \\ \mathcal{U}[v_{\min}, v_{\max}]
+    \end{bmatrix}^T\right)_{1\times w}
+\end{equation} where $\mathcal{U}$ is uniform distribution. $v_{\min}, v_{\max}$ were chosen as $v_{\min}=0.9, v_{\max}=1$.
+
+During training, all augmentations were generated and applied randomly, i.e, random cropping and flipping, and randomly generated noise and FPN\@.
+During validation, the cropping was a $256\times 256$ pixels rectangle around the center of the frame, to make the validation process deterministic.
+Moreover, the Gaussian noise and FPN were generated once for each frame and used throughout the entire validation process. This was done to allow a fair comparison between experiments.
+
+To construct the input of the network, first cropping and flipping augmentations were applied to a temperature map $T$. Second, a random $\tamb$ was generated and used with the augmented temperature map in \cref{eq:estimationOfMeas:fpa} to obtain a simulated camera response $\simulatedCameraResponse{\tamb}{T}$. Then, normalization was applied to this simulated response to get $\Bar{I}(\tamb)$. The last step was to apply the Gaussian noise $\left(\mathcal{N}(1, \sigma^2)\right)$ and FPN $\left(M_{FPN}\right)$ to the normalized simulated camera response:
+\begin{equation}
+    I^{in}_{\tamb} = \mathcal{N}(1, \sigma^2) \otimes M_{FPN} \otimes \Bar{I}(\tamb)
+\end{equation} where $I^{in}_{\tamb}$ is the normalized gray-level input to the network and $\otimes$ is the element-wise multiplication.
+
+\subsection{Training details}\label{sec:experiments:training}
+\noindent The network was trained using the ADAM optimizer \cite{adamOpt2015} with a learning rate of $10^{-4}$. The learning rate was halved on a validation loss plateau of more than 3 epochs. The network was run for a 100 epochs, but early stopping was applied for a validation loss plateau of 8 epochs.
+The weights were initialized using the orthogonal scheme \cite{orthoInit2014} with a scaling of $50^{-2}$.
+The training was run on a single Nvidia 2080Ti. The network was written in Python3.8 using Pytorch 1.10.  The hyperparameters of the network are given in \cref{tab:hyperparams} at the supplementary material.
+The optimal hyper-parameters by optimizing on the average MAE (\cref{eq:lossFid}) of the validation sets.
+
+The convergence results for the validation MAE of the E2E and GxPD network is found in \cref{fig:results:convergence} at the supplementary materiel.

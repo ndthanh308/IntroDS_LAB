@@ -1,0 +1,283 @@
+\section{The proposed model}
+In this section, the proposed model will be discussed in detail by describing its ability to address the previously mentioned challenges and their solutions. Specifically, the model is designed to satisfy the following goals: 1) Sharing knowledge among different users to improve performance on cold-start users, 2) Capturing short-range and long-range dynamics in users' preferences, 3) Optimizing the model to perform accurately on cold-start users, and 4) Avoiding local minima in shared parameters and considering major and minor preferences, simultaneously.
+
+\subsection{Problem Setup}
+We assume there exists a set of users $U$ divided between training and testing ($U_{train} \cap U_{test} = \emptyset$), and items $I$. The model's goal is to predict the next-item preference score of all items and recommend top-N items by inputting a short chronological order sequence of a user's preference $Seq_u = (i_{u,1},i_{u,2},...,i_{u,k-1})$. Note that the items and the users have no auxiliary information, and embedding is calculated only by their ID. 
+%\rafiei{ as a result is not necessary} as a result.
+
+To mimic the cold-start scenario, the users with a limited number of transactions $(K)$ will exist in the $U_{test}$. Based on the proposed optimization strategy and architecture, the model's parameters will adapt quickly to the user's short available transactions. The model's performance for predicting the next item of test users will be reported.  
+
+\subsection{Proposed Architecture}
+The following sections provide detailed information about each module's components and its significance. We will first discuss the meta-learning approach to overcoming the few-shot problem in section \ref{subsection:few-shot}. In section \ref{subsection:model_overview}, we will provide an overview of the proposed architecture. The details of the sub-modules will be described in sections \ref{subsection:dynamic_transition} and \ref{subsection:clustering_module}. Finally, we describe how to optimize the model's parameters in the meta-learning setting in section \ref{subsection:optimization}.
+
+\subsubsection{Few-shot Recommendation}
+\label{subsection:few-shot}
+Meta-learning could transfer knowledge from data-rich users to cold users. By considering each user as a separate task, meta-learning extracts common knowledge among users. Therefore, a cold-start user needs much less data to converge to its optimal parameters, and user preferences could be detected with a few-shot approach. When using meta-learning, you must define support and query sets. 
+
+The support set of a user is used to adapt shared knowledge (parameters) to the user. Thus, the user's personalized parameter will be adapted to the support set. Afterward, the user's query set is used to evaluate the adaptation. We assume users with a constant (K) sequence length as:  
+
+\[
+I_{1}
+\to
+I_{2}
+\to
+...
+\to
+I_{k-1}
+\to
+I_{k}
+\]
+
+We define each user $u$ as a task $\tau_{u}$, and its sequence is divided into support and query sets. First, $k-1$ items in a sequence are considered support-set, and the last item of the sequence is in query-set. Meta-learning tries to predict the query set by adapting to the previous items in the support set. 
+
+The approach to sampling training data also needs to be designed. Users usually have a wide range of history lengths that should be used efficiently to extract sequential patterns. Users' history of transactions should also be appropriately utilized, even in a short user sequence, to improve performance for cold-start users. Sampling the training data should mimic cold-start users. Therefore, it only samples a short sequence of transactions for each user. First, a user is sampled from $U_{train}$ to construct a meta-training task. All user interactions will then be limited to a sequence of length $K$. In this way, the training is more like a test scenario in which test users will be considered.
+
+\subsubsection{Model Overview}
+\label{subsection:model_overview}
+
+% Figure environment removed
+
+In terms of capturing both short-range and long-range dynamics of users' preferences, and considering all major and minor groups of users, we designed a dynamic transition modeling and clustering module. This will be explained in the following sections \ref{subsection:dynamic_transition} and \ref{subsection:clustering_module} respectively.
+
+Figure \ref{fig:overallarchitecture} shows the overall view of our proposed model. First, the Dynamic Transition model converts item transitions to user embeddings. Then, using a clustering module, we calculate two soft clustering assignments. These assignments are used to calculate loss values and condition user embeddings for the next item prediction. Finally, we score positive and negative item predictions and propagate it backwards on the marginal ranking loss.
+
+
+\subsubsection{Dynamic Transition Modeling}
+%\rafiei{I will add comments after completion}
+\label{subsection:dynamic_transition}
+Considering sequential patterns and extracting dynamic patterns needs a particular architecture in few-shot settings. Also, the model needs to detect temporal and long-term user preference changes. As shown in Figure \ref{fig:modelarchitecture}, attention-based recurrent neural network architecture is proposed to satisfy these goals.
+
+% Figure environment removed
+
+This architecture consists of an encoder and a decoder incorporating an attention mechanism. In the first stage of the process, the user transition sequence $u_i$ is fed to the encoder, which is essentially a Gated Recurrent Unit (GRU) gate \cite{chung2014empirical}:
+\begin{equation}
+\begin{aligned}
+    \label{eq:dyn_trans_enc}
+    o_{i, enc}^{(k)} &= f_{enc}(u_i^{(k-1)}, h_{i, enc}^{(k-1)}) \\
+    h_{i, enc}^{(k)} &= h_{enc}(u_i^{(k-1)}, h_{i, enc}^{(k-1)})
+\end{aligned}
+\end{equation}
+$f_{enc}$ and $h_{enc}$ are GRU functions to generate its output and hidden vector, respectively. We consider $O_{i, enc}\in \mathbb{R}^{K\times D} = \{o_{i, enc}^{(k)}\}$ the primary context vector of this sequence. $h_{i, enc}^{(0)}$ is initialized by a zero vector. \\
+As for the decoder, each sequence item passes through the network in different iterations. We use the decoder output vector $o_{i, dec}^{(k-1)}$ and hidden value $h_{i, dec}^{(k-1)}$ of the previous iteration to apply attention to the context vector for the current one:
+\begin{equation}
+\begin{aligned}
+    \label{eq:dyn_trans_dec_attn}
+    attn\_{w_i}^{(k)} &= softmax(fc_1(o_{i, dec}^{(k-1)};h_{i, dec}^{(k-1)})) \\
+    attn_i^{(k)} &= attn_{w_i}^{(k)} \cdot O_{i, enc}
+\end{aligned}
+\end{equation}
+
+Here, the semicolon sign $;$ shows the concatenation of vectors, $fc_1 \colon \mathbb{R}^{2D} \mapsto \mathbb{R}^{K}$ is a one-layer fully connected network and $attn\_w_i^{(k)} \in \mathbb{R}^{K}$ indicates attentional weights to be applied to the context vector concerning the previous $k-1$ items. The following will calculate the decoder's output and hidden vectors:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:dyn_trans_dec_gru}
+    X_i^{k} &= relu(fc_2(o_{i, dec}^{(k-1)};attn_i^{(k)})) \\ 
+    o_{i, dec}^{(k)} &= softmax(fc_3(f_{dec}(X_i^{k}, h_{i, dec}^{(k-1)}))) \\
+    h_{i, dec}^{(k)} &= h_{dec}(h_{i, dec}^{(k-1)})
+\end{aligned}
+\end{equation}
+
+We consider the last encoder hidden vector $h_{i, enc}^{(K)}$ as $h_{i, dec}^{(0)}$ and a zero vector as $o_{i, dec}^{(0)}$. Also, $fc_2 \colon \mathbb{R}^{2D} \mapsto \mathbb{R}^{D}$ and $fc_3 \colon \mathbb{R}^{D} \mapsto \mathbb{R}^{D}$ are one-layer fully connected networks and $f_{dec}$ and $h_{dec}$ are the output and hidden functions of the GRU gate.
+% \textcolor{red}{It seems better to explain that the final output vector and hidden vector will produce user embedding, which will be used later in the clustering module,...}
+
+%\noindent\textbf{\textcolor{red}{@reze: Please add figure of the model here}}\\
+
+%\noindent\textbf{\textcolor{red}{@reze: Please write about the architecture of the model (NLP or Transformer) - formulation}}\\
+
+\subsubsection{Clustering Module}
+\label{subsection:clustering_module}
+%\rafiei{I will add comments after completion}
+Our goal should be to consider both major and minor preferences sufficiently, and avoid major users distorting the model parameters as shown in Figure \ref{fig:cluster_fig}. In order to accomplish this, a clustering model is developed. Based on the fact that only implicit interactions between users are available, the clustering must be based solely on these interactions. Clustering, however, would be beneficial only if the major cluster did not disrupt clustering by attracting all the points to its center.
+
+% Figure environment removed
+
+To address the problem of collapsing by major users, the proposed module is inspired by \cite{opochinsky2020k}. More specifically, it consists of a Graph Convolutional Network (GCN) to capture topological information from users' interaction data, combined with a K Auto Encoder (KAE) clustering module. The GCN network determines the topological clusters, and the auto-encoder chooses the encoding cluster based on the auto-encoded number. In order to accomplish this, we must first reconstruct user embeddings using $M$ randomly initialized autoencoders. Each autoencoder reconstructs the user embedding with the corresponding reconstruction loss. Therefore, each user's encoding cluster assignment is based on its reconstruction loss. The encoding clustering assignments are calculated according to equation \ref{eq:kae_cluster_assignment}.
+% \textcolor{red}{\st{reze: This most definitely will change in the future}}\\
+% \textcolor{red}{\st{mohammad: number of autoencoders that corresponds to the assignment is forgotten}}\\
+% \textcolor{red}{\st{mohammad: d must be defined}}\\
+\begin{equation}  
+    \label{eq:kae_cluster_assignment}
+    % c_u = arg\,min_{i=1}^M d(e_u,\hat{e}_u (i))
+    c_{enc}^{u} = softmax([-d(e_u,\hat{e}_u (i))])
+\end{equation}
+$c_u$ is the assignment of user $u$. In addition, $e_u$ and $ \hat{e}_u (i)$ are embeddings of the user and their reconstructions by the $i$th autoencoder, respectively, and $d$ is the $L2$ distance norm. The reconstruction loss of the autoencoders should also be calculated. The loss is calculated based on \ref{eq:kae_loss}:
+
+\begin{equation}
+    \label{eq:kae_loss}
+    \mathcal{L}_{rec} = L(\theta_1, ... , \theta_M) = min_i d(e_u,\hat{e}_u (i))
+\end{equation}
+Where $\theta_j$ is the parameters of the $j$th autoencoder.
+
+Then, we construct a users' relation graph $G$ using user embedding cosine similarity:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:user_relation_graph}
+    \forall{u_i \in{U_{train}}}, \forall{(u_i, u_j)\in{G}}; \\ \{u_j\} = argmax_{A'\subset{U_{train}-{u_i}}, |A'|=n_{adj}} \\ {\frac{u_i.u_j}{|u_i||u_j|} + \sigma \sum_{i_1, i_2 \in shared(u_i,u_j)}}{\frac{i_1.i_2}{|i_1||i_2|})}
+\end{aligned}
+\end{equation}
+
+% \textcolor{red}{\st{New way of reconstruction of the graph should be explained here}}
+
+Here, for each user embedding $u_i$ we select $n_{adj}$ other user embeddings with the maximum user and item similarity values with $u_i$ to construct a graph $G$. As for the user similarity value, we compute the cosine similarity between user embeddings. As for item similarities, we calculate the sum of the cosine similarity values of all shared items between $u_i$ and $u_j$ ($shared(u_i,u_j)$). Here, $\sigma$ is a user-item balancing hyperparameter.
+
+We assume the autoencoder with minimum reconstruction loss for user $u$ has $L = L_{enc} + L_{dec}$ layers and $H_u^{(l)}$ is the representation learned by layer $l$ of this autoencoder.
+Here, $H_u^{(0)}$ is the user dynamic transition embedding. 
+Corresponding to each encoder layer, there is a GCN layer ($L_{enc}$ layers in total) which we show by $Z^{(l)}$ and is calculated sequentially for user $u$ as follows:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:gcn_update}
+    Z_u'(l) &= (1-\epsilon)Z_u^{(l-1)} + \epsilon H_u^{(l-1)} \\
+    Z_u^{(l)} &= \phi{(AZ_u'^{(l)}W_l)}
+\end{aligned}
+\end{equation}
+Taking $B$ as the batch size, $D_{l, in}$ and $D_{l, out}$ as the in and out dimensions of $l$th layer of autoencoders,
+ $A \in \mathbb{R}^{B\times B}$ is the normalized adjacency matrix of graph $G$ and $W_l \in \mathbb{R}^{D_{l, in}\times D_{l, out}}$ 
+ is the weight matrix of $l$th layer. Using the GCN output, we calculate the topological clustering assignment of $u$:
+
+ \begin{equation}
+\begin{aligned}
+    \label{eq:top_clustering}
+    c_{top}^u = softmax(Z_u^{(L_{enc})}) \\
+\end{aligned}
+\end{equation} 
+
+%As suggested in (Kim et. al. 2020) \noindent\textbf{\textcolor{red}{(fix it)}}, 
+We optimize clustering assignment $c_{enc}^u = [c_{i,j}]$ by closing representations to cluster centers and making harder assignments using KL divergence loss: 
+% \textcolor{red}{\st{mohammad:closing representation to cluster centers? or making the cluster assignment harder?}}\\
+% \textcolor{red}{\st{mohammad:Loss mode seems wrong} -> Re: In reality, we calc log of $c^u_top_mod$ to calc KL value, but for the sake of simplicity, I didn't include it.}
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:top_clustering_modified}
+    c_{enc\_mod}^u = [c'_{i,j}]; c'_{i,j} = \frac{c_{i,j}^2 / f_{i,j}}{\sum_{j'}{c_{i,j'}/f_{i,j'}}} \\
+    \mathcal{L}_{mod} = KL(c_{top}^u || c_{top_{mod}}^u)
+\end{aligned}
+\end{equation} 
+where $f_{i,j} = \sum_{i}{c_{i,j}}$. This clustering assignment is used to supervise $c_{enc}^u$ using KL divergence loss:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:kld_top_enc_clustering}
+    \mathcal{L}_{combo} = KL(c_{enc\_mod}^u || c_{top}^u)
+\end{aligned}
+\end{equation} 
+
+The overall clustering loss is calculated as the sum of all previously mentioned losses:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:clustering_loss}
+    %\mathcal{L}_{clustering\_module} =
+    \mathcal{L}_{CM} =
+    \mathcal{L}_{rec} + \mathcal{L}_{mod} + \mathcal{L}_{combo}
+\end{aligned}
+\end{equation} 
+
+The user embedding $u$ is then conditioned on the encoding clustering assignment $c_{enc}^u$ as shown in 
+\ref{eq:clustering_conditioning}:
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:clustering_conditioning}
+    u' = f_{gamma}(c_{enc_{mod}}^u).u + f_{beta}(c_{enc_{mod}}^u)
+\end{aligned}
+\end{equation} 
+where $f_{gamma}$ and $f_{beta}$ are one-layer fully connected networks and $.$ is element-wise multiplication.
+% \textcolor{red}{Mohammad: final prediction of the model (sum of the modified user embed and last item) should be considered. In this section or a new section.}
+
+%\noindent\textbf{\textcolor{red}{@reze and @mohammad: Please write a paragraph about the architecture of the clustering module - why we use GNN for clustering - Emphasis on implicit transition and no side information to use in the clustering process - formulation. }}\\
+
+%\noindent\textbf{\textcolor{red}{@reze : Please add figure of the clustering module}}\\
+
+
+\subsubsection{Optimization and Fast Adaptation}
+\label{subsection:optimization}
+The proposed model needs proper optimization to transfer extracted knowledge to new users and adapt personalized parameters based on their few transactions. Specifically, some initialized parameters will be adjusted to support a user's set, to produce personalized parameters. In contrast, other parameters are not personalized for each user and shared. We denote the parameters that will not adapt to support set and are shared among tasks (users) with $\omega$. Other parameters are denoted by $\Phi$.   
+%\rafiei{how do you choose whether parameters are shared or meta?}
+It would be better to share the clustering module parameters among all tasks since this module detects similar tasks, as shown in Figure \ref{fig:overallarchitecture}.
+%\rafiei{why?} 
+ In contrast, the user's preference extractor will be adapted by each user, so its parameters are in the personalized parameter set $\Phi$. In addition, all model parameters are denoted by $\theta$ $(\theta = \omega \cup \Phi)$. Therefore, user-specific parameters could be adapted to the support set by equation \ref{eq:user_specific_update}:
+
+\begin{equation}
+    \label{eq:user_specific_update}
+    \omega'_{n} = \omega - \alpha \nabla_{\omega} \mathcal{L}_{S_n}
+\end{equation}
+
+\noindent In which $\alpha$ is the task learning rate (local learning rate) and $\mathcal{L}_{S_n}$ are the losses calculated on the support set data and $\nabla_{\omega} \mathcal{L}_{S_n}$ is its corresponding gradient. More specifically, the support loss is based on ranking margin loss. This is the difference between the score of the positive and negative items' scores. The positive sample is the item in the actual sequence of a user, and the negative samples are items that are not a member of the user's actual sequence and are sampled randomly. The support loss $\mathcal{L}_{S_n}$ is calculated based on the equation \ref{eq:support_loss}:
+%\rafiei{define $\nabla_{\omega} \mathcal{L}_{S_n}$ } \\
+
+\begin{equation}
+\begin{aligned}
+    \label{eq:support_loss}
+    \mathcal{L}_{S_n} = \sum_{i=3}^{K-1} max(0,\lambda + s(I_{i-1} \xrightarrow[]{} I_i) - s(I_{i-1} \xrightarrow[]{} I_i'))\\
+    s(I_{i-1} \xrightarrow[]{} I_i) = \lVert 
+    f( \{I_0,...,I_{i-1} \} , \theta)  - I_i
+    \rVert _{2}
+\end{aligned}
+\end{equation}
+
+$\lambda$ represents the margin value, and $I_k'$ represents the negative sample, an item that has never interacted with the user $u_n$. Also, $s(.)$ is the function that calculates the score of the predicted item compared with the ground truth ($I_i$) on the given parameters of the neural network $\theta$. The function $f(.)$ symbolizes the model's output based on the user's history sequence.
+%\rafiei{explain more about the formula.}\\
+
+The query loss will be calculated based on the $\omega'_{n}$ on the query set $Q_n$. Specifically, the query loss is calculated by \ref{eq:query_loss}:
+
+\begin{equation}
+    \label{eq:query_loss}
+    \mathcal{L}_{Q_n} = 
+    %\sum_{(I_{k-1} \xrightarrow[]{} I_k) %\in Q_n} 
+    max(0,\lambda + s(I_{K-1} \xrightarrow[]{} I_K) - s(I_{K-1} \xrightarrow[]{} I_K'))
+\end{equation}
+
+Based on the meta-learning goals, the learning process tries to find the initial parameters for $\theta$, which reduces the overall loss of the query sets of all tasks. More specifically, the overall loss is calculated by \ref{eq:overal_loss}:
+
+%\noindent\textbf{\textcolor{red}{reze : We'd better include SDCN loss here}}\\
+
+\begin{equation}
+    \label{eq:overal_loss}
+    \theta = \min_{\theta} \sum_{\tau_n \in p(\tau)}\mathcal{L}_{Q_n}(\omega'_n,\phi) + 
+    \mathcal{L}_{CM_n}
+\end{equation}
+
+$\mathcal{L}_{CM_n}$ is the loss corresponding to the clustering module for $u_n$, which was defined in \ref{eq:clustering_loss}.
+As the equation defines, meta-training tasks come from a distribution, and we only have a random sample set in the training phase. So by minimizing their query loss on the adopted parameters, the algorithm will converge to a proper initialization parameter for the tasks. The query loss is calculated based on the parameters adopted on each user's training support set. To solve the equation, the Stochastic Gradient Descent (SGD) is used in \ref{eq:sgd}:
+
+
+\begin{equation}
+    \label{eq:sgd}
+    \theta \xleftarrow{} \theta - \beta \nabla_{\theta}  \sum_{\tau_n \in p(\tau)} \mathcal{L}_{Q_n}(\omega'_n,\phi)
+\end{equation}
+
+\noindent in which $\beta$ is the meta-learning rate.
+
+The test phase is almost similar to the training phase. For each cold-user not seen in training, the task-specific parameters are adapted to its support set as in \ref{eq:user_specific_update}. Secondly, the score of the target item in the query set will be compared with 100 random negative samples to calculate the evaluation metrics.
+
+
+
+% Place all illustrations (figures, drawings, tables, and photographs)
+% throughout the paper at the places where they are first discussed,
+% rather than at the end of the paper.
+
+% They should be floated to the top (preferred) or bottom of the page,
+% unless they are an integral part
+% of your narrative flow. When placed at the bottom or top of
+% a page, illustrations may run across both columns, but not when they
+% appear inline.
+
+% Illustrations must be rendered electronically or scanned and placed
+% directly in your document. They should be cropped outside \LaTeX{},
+% otherwise portions of the image could reappear during the post-processing of your paper.
+% When possible, generate your illustrations in a vector format.
+% When using bitmaps, please use 300dpi resolution at least.
+% All illustrations should be understandable when printed in black and
+% white, albeit you can use colors to enhance them. Line weights should
+% be 1/2-point or thicker. Avoid screens and superimposing type on
+% patterns, as these effects may not reproduce well.
+
+% Number illustrations sequentially. Use references of the following
+% form: Figure 1, Table 2, etc. Place illustration numbers and captions
+% under illustrations. Leave a margin of 1/4-inch around the area
+% covered by the illustration and caption.  Use 9-point type for
+% captions, labels, and other text in illustrations. Captions should always appear below the illustration.

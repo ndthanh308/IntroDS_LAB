@@ -1,0 +1,466 @@
+
+
+\section{\sysname{} Design}\label{sec: method}
+This section introduces the technical details of \sysname{}. 
+First, we introduce the problem formulation in Section~\ref{subsec: prob}. 
+Then, we discuss 
+order-flow embedding in Section~\ref{subsec: extractor}, 
+surrogate-trading loss function in Section~\ref{subsec: loss}, 
+and context-aware variable estimator in Section~\ref{subsec: adapter}. 
+
+\subsection{Problem Formulation}\label{subsec: prob}
+
+% Table
+\begin{table}
+    \centering
+        \caption{Notation summary.}
+    \begin{tabular}{c|c}
+        \hline
+            Notation & Description \\
+            \hline
+            $P_t$ & Mid-price on the order book at time instant $t$ \\
+            $\hat{P}_t^{(w)}$ & Expected mid-price of a pure fundamentalist at time instant $t$ \\
+            $\hat{P}_t^{(c)}$ & Expected mid-price of a pure chartist at time instant $t$ \\
+            $\hat{P}_t^{(n)}$ & Expected mid-price of a pure noise trader at time instant $t$ \\
+            $\hat{P}_t^{(i)}$ & Expected mid-price of the $i$th agent at time instant $t$ \\
+            $p_t$ & Price of an order at time instant $t$ \\ 
+            $Q_t$ & Shape of the order book at time instant $t$ \\
+            $v_t$ & Size of an order at time instant $t$ \\
+            $x_t$ & State of the order book at time instant $t$ ($x_t=(P_t, Q_t)$)  \\
+            $x$ & Order flow of a trading day ($x=\{x_t\}$) \\
+            $\hat{x}$ & Simulated order flow \\
+            $\beta_i$ & Degree of risk aversion of the $i$th agent \\
+            $\tau_i$ & Horizon of the $i$th agent \\
+            $a$ & Agent variable of a trading day  \\
+            $w$ & Fundamental value of an asset  \\
+            $s$ & Index of market condition  \\
+        \hline
+    \end{tabular}
+    \label{tb: Notation}
+\end{table}
+
+In the problem, 
+denoting $s$ as the index of market condition and $x=\{x_t\}$ as the order flow of one trading day, 
+we aim to capture the distribution of agent variable of the target day, which is given as 
+\begin{equation}
+    Pr(a|x,s), 
+    \label{eq: objective}
+\end{equation}
+such that the multi-agent market model can generate an order flow similar to $x$. 
+
+In the meantime, to correlate agent variable with market condition, 
+we maximize their correlation, denoted as $Corr(\cdot, \cdot)$, while maintaining desirable simulation accuracy, which is summarized as 
+\begin{equation}
+    \begin{aligned}
+        &\max\ \operatorname{Corr}(a, s) \\
+        \text{s.t.}\ & \left\lVert \mathbb{E}_{Pr(x|a, w)}(x)-x\right\rVert_n <\epsilon,  
+    \end{aligned}
+\end{equation}
+where $\epsilon$ controls the degree of simulation accuracy. 
+The optimization is possible because the multi-agent market model is a probabilistic model, 
+where multiple candidate agent variables can possibly lead to a similar order flow. 
+
+To derive the distribution, 
+we consider the relationship among the elements for calibrating the multi-agent model as shown in Figure~\ref{fig: sim_graph}. 
+As mentioned, the simulation of the market model jointly depends on the fundamental value of the asset and the agent variable. 
+Meanwhile, we want to simulate the reality that market condition affects the behaviors of traders, such that the 
+market condition (reflected by some indexes) directly affects the agent variable. 
+Given the graph, we next disassemble the objective in Equation~(\ref{eq: objective}).  
+
+Recalling in Section~\ref{subsec: ham_sys} that the fundamental value~$w$ can be derived from the order flow,   
+we rewrite our objective in Equation~(\ref{eq: objective}) as
+\begin{equation}
+    Pr(a|x,s)=Pr(a|x,s,w). 
+    \label{eq: fundamental}
+\end{equation}
+Since Equation~(\ref{eq: fundamental}) is intractable to estimate,
+we tackle this by applying the Bayesian rule, which is given as 
+\begin{equation}
+    Pr(a|x,s,w)=\frac{Pr(x|a,s,w)Pr(a|s,w)}{Pr(x|s,w)}.
+    \label{eq: bayesian}
+\end{equation}
+
+Equation~(\ref{eq: bayesian}) suggests estimating agent variables using previous calibration experiences on the multi-agent market model.  
+First, when agent variables are given, 
+market condition does not affect order flow because it influences order flow mediated by agent variables (as illustrated in Figure~\ref{fig: sim_graph}), and thus we have 
+\begin{equation}
+    Pr(x|a, s, w)=Pr(x|a,w). 
+\end{equation}
+Second, the agent variable is independent of the fundamental value when order flow is unknown based on the D-separation~\cite{pearl2009causal}, and thus we get
+\begin{equation}
+    Pr(a|s,w)=Pr(a|s). 
+\end{equation}
+
+In a nutshell, the calibration of agent variable in Equation~(\ref{eq: objective}) can be estimated by the joint probability from two conditional distributions, which is given as 
+\begin{equation}
+    Pr(a|x,s)\propto Pr(x|a,w)Pr(a|s). 
+    \label{eq: goal}
+\end{equation}
+On the right-hand side, the first term indicates that the agent variables should be able to simulate the order flow by the multi-agent model, 
+and the second term suggests that market conditions are the prior knowledge for estimating the agent variables. 
+In the following, we discuss how to estimate the two probabilities independently. 
+
+
+\subsection{Order-flow Embedding}\label{subsec: extractor}
+
+% Figure environment removed 
+
+We first introduce how to calibrate the agent variable using deep learning model to achieve simulation accuracy. 
+As the first step, we discuss embedding order flow as deep feature in this section. 
+
+To calibrate the agent variable using deep learning models, 
+we embed the order book information into deep feature space using 
+an order-flow embedding module. 
+As shown in Figure~\ref{fig: extractor}, 
+the module decomposes the information of order book into mid-price and order-book shape based on Equation~(\ref{eq: order_book})
+and uses two LSTM models, separately denoted as $k_{\theta_P}(\cdot)$ and $k_{\theta_Q}(\cdot)$, to capture their temporal features individually, which is shown as 
+\begin{equation}
+    k_{\theta_P}(P_0, P_2, ..., P_{T-1})=h_P,
+\end{equation}
+and 
+\begin{equation}
+    k_{\theta_Q}(Q_0, Q_2, ..., Q_{T-1})=h_Q,
+\end{equation}
+where $T$ is the step number in a simulated trading day. 
+Then, the price feature $h_P$ and shape feature $h_Q$ are concatenated to form a {\em flow feature} as
+\begin{equation}
+    h_x=[h_P, h_Q].  
+\end{equation}
+
+\subsection{Surrogate-trading Loss Function}\label{subsec: loss}
+
+% Overview
+The agent variable, with the market model, should be able to reproduce the target order flow, as suggested in Equation~(\ref{eq: goal}). 
+Considering the irrationality of the market model, 
+we build a mapping from the target order flow to the distribution of the agent variable. 
+As shown in Figure~\ref{fig: loss_function}, 
+we employ a variational auto-encoder (VAE) to learn the mapping (the VAE decoder is used for generating the agent variable). 
+The VAE model, denoted as $p_{\omega_1}(\cdot)$, maps the flow feature into a Gaussian distribution in latent feature space
+\begin{equation}
+    p_{\omega_1}(h_x)=[z_0, \sigma_0],  
+\end{equation}
+where the feature mean and standard deviation are presented as $z_0$ and $\sigma_0$ respectively. 
+Then, we use a decoder to convert the feature distribution to the agent variable by a sampling, which is given as 
+\begin{equation}
+    q_{\omega_2}(z_0+\epsilon\sigma_0)=a, 
+\end{equation}
+where $\epsilon\sim \mathcal{N}({\bf 0}, \sigma_0^2)$ implements the reparameterization trick of VAE. 
+
+% Problem
+Different from most deep-learning tasks, 
+the multi-agent market model is not differentiable. 
+As a result, we cannot learn the VAE by evaluating the quality of the simulated order flows. 
+One intuitive idea is to pseudo-label the order flows with the agent variable searched by the traditional approaches, 
+and the model training would be given as 
+\begin{equation}
+    \min_{(\omega, \theta_P, \theta_Q)} \sum_{x\in \mathcal{D}} \left\lVert a-a_x \right\rVert_n,
+    \label{eq: comp_goal}
+\end{equation}
+where $a_x$ is the pseudo label of the order flow, and $\mathcal{D}$ is the training dataset.  
+However, this could be very costly because acquiring each pseudo label requires conducting multiple simulations. 
+% and the search randomness may cause unstable training. 
+
+To tackle this non-differentiable issue, 
+we reparameterize the multi-agent market model by a deep learning surrogate.  
+Specifically, we learn a surrogate model to mimic the behaviors of the multi-agent model, 
+and let the surrogate provide gradients for model training. 
+We argue that the surrogate model is sufficient to provide the gradients to supervise the calibration learning, 
+as it directly reflects the behavior of the multi-agent market model. 
+Another advantage of learning the surrogate model is training data-efficiency. 
+In other words, 
+we merely need to randomly create sets of agent variables to probe the multi-agent model's behavior, serving as the training data. 
+This is much more data-efficient than searching the pseudo-labels. 
+% Also, as the surrogate learns to predict the expectation of the model output, it is more stable for learning the calibration. 
+
+% Figure environment removed 
+
+However, it is nontrivial to reparameterize the multi-agent market model due to the system complexity. 
+To tackle this, we characterize order flows by a group of representative features and 
+train the surrogate model to predict these features based on the agent variable. 
+For example, agents tend to make larger orders when they hold a lower risk aversion. Another example is that
+the mid-price tends to fluctuate more significantly with more chartists in the market. 
+In the field of market simulation, these features are called stylized facts, which are believed to capture the main components of the market, 
+serving as good representations of order flow. 
+In this paper, we consider the following stylized facts (details can be found in~\cite{vyetrenko2020get}):
+\begin{itemize}[leftmargin=*]
+    \item \emph{Thickness of return tail } reflects the heaviness of the tail of the return distribution, which is captured by the kurtosis of return distribution; 
+    \item \emph{Volatility clustering } reflects the fluctuation of the stock price, which is captured by the parameter of the auto-regression model; 
+    \item \emph{Order book volume } refers to the distribution of order volume at the best bid and ask, which is often described by Gamma distribution. In this paper, we measure it by its distribution parameter; 
+    \item \emph{Order-size distribution } describes the pattern of order size from various traders, which is often modeled as power-law distribution. In this paper, we measure it by the distribution parameter. 
+\end{itemize}
+
+Based on these stylized facts, 
+we reparameterize the multi-agent model by learning a surrogate model, denoted as $u_\gamma(\cdot)$, which is given as
+\begin{equation}
+    \min_{\gamma} \sum_{a\in \mathcal{A}} \left\lVert u_{\gamma}(a)-r(\hat{x}) \right\rVert_2^2,
+\end{equation}
+where $r(\cdot)$ calculates the stylized facts from the simulated order flow $\hat{x}$. 
+Overall, the calibration modules of \sysname{} learns from a surrogate-trading loss function based on the surrogate model, which is shown as 
+\begin{equation}
+    \mathcal{L}_{sur}(x)= \left\lVert p\circ q\circ u(h_x)-r(x)  \right\rVert_2^2, 
+    \label{eq: sur_loss}
+\end{equation}
+recalling that $q$ is the VAE decoder, $p$ is the surrogate model, $h_x$ is the flow embedding, and 
+$x$ is the target order flow. 
+
+
+
+\subsection{Condition-aware Variable Estimator}\label{subsec: adapter}
+
+% Figure environment removed 
+
+Besides simulation accuracy, 
+we want to correlate the agent variable with the indexes of market conditions. 
+On one hand, this makes the calibration, as well as the market simulation, more interpretable~\cite{iori2012agent}. 
+On the other hand, if we can use the market condition to fine-tune the agent variable, 
+we can hypothesize and create more market scenarios through calibration, 
+which is important for many Fintech studies. 
+
+As discussed, the order-flow embedding module maps each order flow to a distribution in deep feature space. 
+Suppose we know the distribution of the feature under each market condition, 
+we can calculate the joint distribution to fine-tune the order flow feature. 
+This is similar to the style transfer in image generation. 
+
+As shown in Figure~\ref{fig: adapter}, 
+we build a condition-aware variable estimator to calculate such joint distribution. 
+Specifically, we learn a condition adapter to map each market condition to a feature distribution in latent space, which is shown as 
+\begin{equation}
+    f_\eta(s)=[z_s, \sigma_s].  
+\end{equation}
+Similarly, the condition adapter is an additional encoder of the VAE, and it outputs the parameters of the Gaussian distribution. 
+From another point of view as in Equation~(\ref{eq: goal}), the output of the conditional adapter is the prior knowledge of the flow feature. 
+
+To avoid the market condition degrading the simulation accuracy, 
+we transform it as a uniform distribution and constrain it by a range parameter $k$. 
+Therefore, the joint distribution is calculated as
+\begin{equation}
+    z\sim \mathcal{U}[z_s-k\sigma_s, z_s+k\sigma_s]*\mathcal{N}(z_0, \sigma_0^2), 
+    \label{eq: convolution}
+\end{equation}
+where we consider the latent feature within $k$ standard deviation from $z_s$ as the candidate set, and 
+$*$ is the operator of convolution. 
+After getting the joint distribution, 
+we calculate the the expectation as the flow feature, which would be decoded to estimate the agent variable.   
+
+% 
+However, the order flow distribution under the market condition is non-trivial to learn, as we do not have the ground truth. 
+To tackle this, our observation is that the real trader tends to behave similarly under similar market conditions. 
+Therefore, we cluster the deep feature of order flow by their market condition to learn the condition adapter. 
+In other words, it is more likely for the agent variables of two trading days to be similar if their market conditions are more similar.   
+As such, for each pair of order flow of different trading days, 
+we enforce a constraint of consistency based on their market conditions.  
+The constraint is stronger if their market conditions are more similar. 
+With real trading data denoted as $\mathcal{D}$, 
+we learn the condition adapter using a market-condition loss function, which is shown as
+\begin{equation}
+    \mathcal{L}_{con}(s)= \sum_{i=1}^{|\mathcal{D}|}\sum_{j=1}^{|\mathcal{D}|} \frac{\left\lVert a_i-a_j \right\rVert_n}{\left\lVert s_i-s_j\right\rVert_n+1}. 
+\end{equation}
+In the loss function, the weight of the constraint is inversely proportional to the distance of market conditions between the pair, 
+as the constraint should be stronger if two pairs have more similar market conditions. 
+
+The estimator can be regarded as a fine-tuning step, which is built upon the learned encoder and decoder. 
+Therefore, it converges very fast without requiring massive real trading data. 
+In the training of the estimator, 
+we additionally use the surrogate-trading loss function to ensure the simulation accuracy, and the overall loss function is shown as
+\begin{equation}
+    \mathcal{L}_{ada}=\mathcal{L}_{sur}(x)+\alpha\mathcal{L}_{con}(s). 
+    \label{eq: all_loss}
+\end{equation}
+
+
+
+
+
+
+
+\iffalse
+
+\begin{equation}
+    \begin{aligned}
+            z&\sim \mathcal{N}(z|z_0, \sigma_0^2)\times \mathcal{N}(z|z_s, \sigma_s^2) \\
+            &=\mathcal{N}\left(z\bigg|\frac{z_0\sigma_s^2+z_s\sigma_0^2}{\sigma_0^2+\sigma_s^2}, \frac{\sigma_0^2\sigma_s^2}{\sigma_0^2+\sigma_s^2}\right). 
+    \end{aligned}
+\end{equation}
+
+In reality, market condition characterizes traders' behaviors. 
+For example, traders tend to be more optimistic and aggressive under an environment of low interest and inflation, 
+while they would become more cautious in an opposite scenario. 
+On the other hand, market conditions partially explain traders' behaviors due to the extreme sophistication of stock markets. 
+Therefore, 
+we use the analogy of images with different styles to describe traders' behaviors in various market conditions.
+
+
+In a standard pipeline of deep learning, 
+we can estimate the agent variables based on the flow feature:
+\begin{equation}
+    g_\omega(h_x)=a,
+\end{equation}
+where we name $g_\omega(\cdot)$ as the variable estimator. 
+
+% Figure environment removed 
+
+
+
+\section{\sysname{} Design}\label{sec: method}
+% \chang{overview}
+We overview the design of \sysname{} in Figure~\ref{fig: overview}.
+To simulate a target trading period, 
+a state-aware calibration module generates behavior variables based on the order flow of the period.  
+The behavior variables can be promptly used to configure the multi-agent system for further financial analysis. 
+Considering that investors may perform differently under various market states,
+a meta-calibration module is designed to fine-tune the calibration module using the market state of the target period.
+In the training phase, 
+\sysname{} involves a surrogate trading system 
+and two consistency constraints, 
+with the goal of achieving order-flow reconstruction while maintaining interpretable behavior variables. 
+
+\subsection{Meta-design for State-aware Calibration}\label{sec: meta}
+
+\vspace{3pt}
+\noindent
+\textbf{Meta-calibration Module} 
+% We treat macroscopic data as representations of market states, denoted as $s$. 
+To capture the influence of these market states while maintaining reasonable variations among different states, 
+we conceptualize the market state as a domain index, as discussed in prior work~\cite{wang2020continuously}. 
+This domain index informs the model parameters of a state-specific calibration module, represented as:
+\begin{equation}
+\theta = g_\omega(s).
+\label{eq: adapt}
+\end{equation}
+Here, $g_\omega(\cdot)$ refers to the meta-calibration module, parameterized by $\omega$.
+
+Essentially, 
+this module characterizes the different calibration strategies, parameterized as~$\theta$, under various market states~$s$, for which we name it as a meta-module. 
+This differentiates directly using market state to calibrate behavior variables in that market states, which are microscopic data, are usually not considered to have a direct impact on investor behavior. 
+In other words, market state may not be useful in reconstructing the order flow of the target trading period, though, it helps to determine a set of behavior variables when multiple candidate variables, caused by the calibration-redundancy issue, are to be chosen. 
+
+% Introduce adaptor
+\vspace{3pt}
+\noindent
+\textbf{State-specific Calibration Module} 
+Given the parameters of the state-specific calibration module $\theta$, we define the calibration model $K_\theta(\cdot)$. The behavior indicator is calculated as follows:
+\begin{equation}
+b = K_{\theta}(y),
+\label{eq:adaptor}
+\end{equation}
+Here, $y$ represents the extracted features of the order stream~$x$, specifically denoted as $y = f(x)$, where $f(\cdot)$ functions as the feature extractor. 
+Generally, the features can be extracted by deep models~\cite{coletta2022learning} or manually designed (the so-called stylized facts)~\cite{vyetrenko2020get}. 
+The features used in our experiments will be introduced in Section~\ref{sec: exp_set}.
+
+Based on such a model structure, 
+\sysname{} effectively integrates the macroscopic~(market state) and microscopic~(order flow) data to calibrate multi-agent system, achieving order-flow reconstruction while maintaining interpretable behavior variables. 
+Note that, the model structure provides the possibility to accommodate both kinds of data for calibration. The training objectives will be discussed in the following. 
+
+\subsection{Consistency Constraints} 
+% Motivation
+To make the simulation results easy to interpret, besides order-flow reconstruction,
+calibration should also consider the temporal correlation of the behavior variables. 
+In this paper, 
+we consider market-state consistency and temporal consistency, both serving as the training objectives of the calibration modules. 
+
+\noindent
+{\bf Market-state Consistency}
+Generally,
+the investor behaviors perform similarly under similar market states. 
+To reflect this, 
+we target the consistency of behavior variables,
+building up a relationship between behavior variables with market states. 
+Intuitively, in a bull market, 
+investors are generally optimistic about making profits and thus can be bold in making moves. 
+While, in a bear market, they tend to be risk-averse and act holding back. 
+We characterize this feature as market-state consistency, 
+where the behavior variables, in similar markets, should resemble each other. 
+This serves as an objective to explore the relationship between behavior variables and market states from historical data
+and makes it possible to apply such a relationship back to the calibration of multi-agent systems. 
+
+In detail, the market-state consistency is enforced by a sampled-based approach. 
+We sample from some trading days and design a loss function based on the contrastive method. 
+For the sampled trading days~$i$, $j$, and $k$,
+whose market states conform to
+\begin{equation}
+\left\lVert s_j-s_i\right\rVert_n< \left\lVert s_k-s_i\right\rVert_n,
+\label{eq: state_sim}
+\end{equation}
+we apply a triplet loss to permutate their behavior variables according to their market states:
+\begin{equation}
+\mathcal{L}_{stat} =  \max
+\left\{
+\left\lVert b_i-b_j \right\rVert_n - \left\lVert b_i-b_k \right\rVert_n + \sigma 
+, 0\right\},
+\label{eq: contrast_loss}
+\end{equation}
+where $\sigma$ denotes a pre-defined contrastive gap. 
+With multiple such kinds of sampling,
+the calibration modules will learn to assign each market state with a domain of behavior variable. 
+Thus, in the calibration of each period,
+the generated behavior variables will conform to the domain of their market states, 
+making the simulation results easier to interpret. 
+
+\noindent
+{\bf Temporal Consistency}
+Without a striking intervention, 
+the overall behaviors of the market usually vary smoothly and continuously.
+Thus,  
+we further consider a temporal consistency to constrain the behavior variables: 
+\begin{equation}
+\mathcal{L}_{temp}= \mathbbm{1}(\left\lVert s_t-s_{t+1}\right\rVert_n<\tau) \left\lVert b_t-b_{t+1} \right\rVert_n,
+\label{eq: temp_loss}
+\end{equation}
+where $\mathbbm{1}(\cdot)$ denotes the indicator function and~the threshold $\tau$ indicates an exogeneous intervention. 
+
+In a simulation system, 
+the exogenous intervention is usually referred to as a drastic change in market states. 
+This makes the selection of market-state indicators a crucial assumption of a Fintech market simulation system. 
+From a user perspective,
+the selected market-state indicator should be the key factor that dominates the simulated market. 
+Luckily, 
+\sysname{} can capture the correlation between the market states and behavior variables, which provides a way for users to examine if the selected market-state indicators are desirable. 
+This will be shown in the case study of our experiment. 
+
+Overall, the proposed two constraints are integrated into one loss function
+\begin{equation}
+\mathcal{L}_{cons}=\mathcal{L}_{stat}+\mathcal{L}_{temp},
+\label{eq: state_loss_func}
+\end{equation}
+which is used to supervise the training process of the calibration modules in Section~\ref{sec: meta}. 
+ 
+\subsection{Surrogate Trading System}
+The proposed calibration model requires end-to-end training to achieve order-flow reconstruction,
+while the multi-agent simulation is not differentiable because its order-generation process is based on sampling. 
+Specifically,
+to model the irrationality of investors, 
+the order-making decision of an agent usually involves randomness. 
+Therefore,
+it is hard to numerically determine the behavior variables for a specific day via end-to-end training. 
+
+To tackle this,
+our basic idea is to learn a differentiable evaluation metric to measure the discrepancy between a set of behavior variables and an order flow
+\begin{equation}
+    \mathcal{L}_{rec}=\left\lVert y-\hat{y_1} \right\rVert_n,
+\label{eq: sur1}
+\end{equation}
+where~$\hat{y_1}$ is generated by an actual multi-agent system. 
+Since getting~$\hat{y_1}$ necessitates involving the tedious and inefficient simulation in the training process that is not differentiable, 
+we replace it by 
+\begin{equation}
+    \hat{y_2}=G_\gamma(b),
+\label{eq: sur2}
+\end{equation}
+where~$G$ is a surrogate trading system parameterized by~$\gamma$. 
+The surrogate trading system can be learned from past calibration experiences
+\begin{equation}
+\min_{\gamma \in Y}\ \left\lVert G_{\gamma}(b)-\hat{y}_1\right\rVert_n.
+\label{eq: learn_obj}
+\end{equation}
+As the simulation model is dominated by behavior variables, it is also possible to learn to estimate order-flow features from a set of behavior variables. 
+Further, the past calibration experiences not only involve those successful calibrations in terms of order-flow reconstruction, but all others are useful in learning a surrogate trading system. 
+
+Overall, the loss function for training the calibration model is
+\begin{equation}
+\mathcal{L}=\mathcal{L}_{rec}+\eta\mathcal{L}_{cons},
+\label{eq: all_loss}
+\end{equation}
+where $\eta$ is a balance weight.
+The weight is suggested to be smaller than 1 so that the two constraints do not influence the order-flow recontruction. 
+
+\fi

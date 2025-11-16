@@ -1,0 +1,514 @@
+% !TEX root = paper.tex
+
+\section{Asynchronous Effects, by Example}
+\label{sec:overview}
+
+We begin with a high-level overview of how we model asynchrony within algebraic effects.
+
+\subsection{Conventional Algebraic Effects Are Synchronous by Nature}
+\label{sec:conventional-algebraic-effects}
+
+We first recall the basic ideas of programming with algebraic effects, 
+illustrating that their traditional treatment is synchronous by nature.
+For an in-depth overview, we refer the reader to a tutorial on effect handlers~\cite{Pretnar:Tutorial}, and to the 
+seminal papers of the field \cite{Plotkin:NotionsOfComputation,Plotkin:HandlingEffects}.
+
+In this algebraic treatment, sources of computational effects are modelled using signatures 
+of \emph{operation symbols} $\op : A_\op \to B_\op$. For instance, one models 
+$S$-valued state using operations $\sigget : \tyunit \to S$ and $\sigset : S \to \tyunit$, 
+and $E$-valued exceptions using a single operation $\opsym{raise} : E \to \tyempty$.
+
+Programmers can then invoke the effect that an operation 
+$\op : A_\op \to B_\op$ models by placing an \emph{operation call} $\tmop {op} V y M$ in their code. Here, 
+the parameter value $V$ has type $A_\op$, and the variable $y$, which is bound in the continuation $M$, 
+has type $B_\op$. For instance, for the $\sigset$ operation, the parameter value $V$ would be 
+the new value of the store, and for the $\sigget$ operation, the variable $y$ 
+would be bound to the current value of the store.
+
+A program written in terms of operation calls is by itself just an inert piece of code. To 
+execute it, programmers have to provide \emph{implementations} for the operation 
+calls appearing in it. The idea is that an implementation of $\tmop {op} V y M$ takes $V$ as its input, 
+and its output gets bound to $y$.
+For instance, this could take the form of defining a suitable effect handler 
+\cite{Plotkin:HandlingEffects}, but could also be given by calls  
+to runners of algebraic effects \cite{Ahman:Runners}, or simply by invoking some  
+(default) top-level (native) implementation.
+What is important is that some pre-defined piece of code $M_\op[V/x]$
+gets executed in place of every operation call $\tmop {op} V y M$.
+
+Now, what makes the conventional treatment of algebraic effects \emph{synchronous} is 
+that the execution of an operation call $\tmop {op} V y M$ \emph{blocks} until some implementation 
+of $\op$ returns a value $W$ to be bound to $y$, so that 
+the execution of the continuation $M[W/y]$ could proceed \cite{Kammar:Handlers,Bauer:EffectSystem}. 
+%
+Conceptually, this kind of blocking behaviour can be illustrated as
+\begin{equation}
+\begin{gathered}
+\label{eq:syncopcall}
+\xymatrix@C=1.25em@R=0.8em@M=0.5em{
+& M_\op[V/x] \ar@{}[r]|{\mbox{\Large{$\leadsto^{\!*}$}}} & \tmreturn W \ar[d]
+\\
+\cdots \ar@{}[r]|>>>{\mbox{\Large{$\leadsto$}}} & \tmop {op} V y M \ar[u] & M[W/y] \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & \cdots
+}
+\end{gathered}
+\end{equation}
+where $\tmreturn W$ is a computation that causes no effects and simply returns the value $W$.
+
+While blocking the execution of the rest of the computation is needed in the presence of 
+general effect handlers that can execute their continuation  any number 
+of times, e.g., when simulating nondeterminism~\cite{Plotkin:HandlingEffects}, 
+it forces all uses of algebraic effects to be synchronous, even 
+when this is not necessary, e.g., when the effect in question involves 
+executing a remote query to which a response is not needed immediately, 
+or sometimes never at all.
+
+In the rest of this section, we describe how we decouple the invocation of 
+an operation call from the act of receiving its result, and how we give 
+programmers a means to block execution only when it is necessary. 
+While we end up surrendering some of effect handlers' generality, 
+such as having access to the continuation that captures the rest of the 
+computation to be handled, then in return we get a natural and robust formalism for 
+asynchronous programming.
+
+\subsection{Outgoing Signals and Incoming Interrupts}
+\label{sec:overview:signals}
+
+We begin by observing that the execution of an operation call $\tmop {op} V y M$, 
+as depicted in (\ref{eq:syncopcall}), consists of \emph{three distinct phases}: (i) signalling that an 
+implementation of $\op$ needs to be executed with parameter $V$ (the up-arrow), (ii) executing 
+this implementation (the horizontal arrow), and (iii) interrupting the blocked computation $M$ with a value $W$ 
+(the down-arrow). In order to overcome the unwanted side-effects of blocking execution at every operation call, 
+we decouple these phases into separate programming concepts, allowing  
+$M$ to proceed executing even if (ii) has not yet completed and (iii) taken place. In particular, we 
+decouple an operation call into issuing an \emph{outgoing signal}, 
+written $\tmopout{\op}{V}{M}$, and receiving an \emph{incoming interrupt}, written $\tmopin{\op}{W}{M}$.
+
+It is important to note that while we have used the execution of operation calls  
+to motivate the introduction of signals and interrupts as programming concepts, \emph{not all issued signals need to have a corresponding 
+interrupt response}, and \emph{not all interrupts need to be responses to issued signals}, 
+allowing us to also model spontaneous behaviour, such as a user clicking a button or the environment pre-empting a thread.
+
+When \emph{issuing a signal} $\tmopout{\op}{V}{M}$, the value $V$ is called a \emph{payload}, such as a location to be looked up or a 
+message to be displayed, aimed at whoever is listening for the given signal. We use the $\tmkw{\uparrow}$-notation to indicate that signals issued in sub-computations propagate outwards---in this sense signals behave just like conventional algebraic 
+operation calls.
+
+Since no additional variables are bound in the continuation $M$, it is naturally possible to
+continue executing $M$ straight after the signal has been issued, as depicted below:
+\vspace{-2ex}
+\[
+\xymatrix@C=1.25em@R=1.25em@M=0.5em{
+& &
+\\
+\cdots \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & \tmopout {op} V M \ar[u]^{\op\, V} \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & M \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & \cdots
+}
+\]
+This crucially differs from the usual treatment of algebraic effects, which though being able to simulate our approach~\cite{Poulson:AsyncEffectHandling}, find asynchronous
+evaluation of continuations undesirable. For example, even if in the (conventional) operation call
+$\tmop {op} V y M$ the continuation $M$ does not depend on $y$, $M$ can cause further
+effects, leading to unexpected behaviour if $M$ performs those effects before or after the handler
+for $\op$ is evaluated.
+
+\newcommand{\client}{M_{\text{feedClient}}}
+
+As a \emph{running example}, let us consider a computation $\client$, which lets a user scroll 
+through a seemingly infinite feed of data, e.g., by repeatedly clicking a ``next page'' button.
+For efficiency, $\client$ does not initially cache all the data available on a server, but instead requests a 
+new batch of data each time scrolling through the data is nearing the end of the cache. To communicate with 
+the outside world, $\client$ can issue a signal
+\[
+  \tmopout{\opsym{request}}{\mathit{offset}}{\client}
+\]
+to request a new batch of data starting from the given offset, or a different signal
+\[
+  \tmopout{\opsym{display}}{\mathit{message}}{\client}
+\]
+to display a string $\mathit{message}$ to the user. In both cases, the continuation \emph{does not wait} 
+for an acknowledgement that the signal was received, 
+but instead continues to provide a seamless experience to the user.
+%
+It is however worth noting that these signals differ in what $\client$ expects of them: 
+to the $\opsym{request}$ signal, it expects a response at some future point in 
+its execution, while it does not expect any response to the $\opsym{display}$ signal, 
+illustrating that not every issued signal needs an immediate response, and that 
+some do not need one at all.
+
+When the outside world wants to get the attention of a computation, be it in response to 
+a signal or spontaneously, 
+it happens by \emph{propagating an interrupt}~$\tmopin{\op}{W}{M}$ to the computation. 
+Here, the value $W$ is again called a \emph{payload}, while $M$ is the computation receiving the interrupt.
+%
+It is important to note that unlike signals, interrupts are not triggered by the computation itself, 
+but are instead issued by the \emph{outside world},
+and can thus interrupt any sequence of evaluation steps,
+e.g., as depicted in
+\vspace{-2ex}
+\[
+\xymatrix@C=1.25em@R=1.25em@M=0.5em{
+&  \ar[d]^-{\op\, W}  &
+\\
+\cdots \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & M \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & \tmopin {op} W M \ar@{}[r]|<<<{\mbox{\Large{$\leadsto$}}} & \cdots
+}
+\]
+
+In our running example, there are two interrupts of interest that $\client$ might receive:
+\[
+\tmopin{\opsym{response}}{\mathit{newBatch}}{M}
+\]
+which delivers a batch of new data to replenish $\client$'s cache, and 
+\[
+\tmopin{\opsym{nextItem}}{\tmunit}{M}
+\]
+with which the user requests to see the next data item. In both cases, the continuation 
+$M$ represents the state of $\client$ at the time of receiving the interrupt.
+
+We use 
+the $\tmkw{\downarrow}$-notation to indicate that interrupts propagate inwards into sub-computations, 
+trying to reach anyone listening for them, and only get discarded when they reach a $\tmkw{return}$. 
+%
+Programmers are not expected to write interrupts explicitly in their programs---instead, 
+interrupts are usually induced by signals issued by other parallel processes, as explained next. 
+
+\subsection{A Signal for the Sender Is an Interrupt to the Receiver}
+\label{sec:overview:processes}
+
+As noted above, the computations we consider do not evolve in isolation, instead they also communicate with 
+the outside world, by issuing outgoing signals and receiving incoming interrupts.
+
+We model the outside world by composing individual computations into \emph{parallel processes} $P, Q, \ldots$.
+To keep the presentation clean and focussed on the asynchrony of algebraic effects, we consider a very 
+simple model of parallelism: a process is either one of the computations being run
+in parallel, written $\tmrun M$, or the parallel composition of two processes, 
+written $\tmpar P Q$. Later, in \autoref{sec:extensions:dynamic-process-creation}, we 
+show how to also accommodate dynamic process creation.
+
+\newcommand{\server}{M_{\text{feedServer}}}
+
+To capture the signals and interrupts based interaction of processes,  
+our operational semantics includes rules for \emph{propagating outgoing signals} from individual 
+computations to processes, 
+\emph{turning processes' outgoing signals into incoming interrupts} for their surrounding world, and
+\emph{propagating incoming interrupts} from processes to individual computations.
+%
+For instance, in our running example, 
+$\client$'s request for new data is executed as follows:
+\[
+\begin{array}{r l}
+  & \tmpar{\highlightgray{\tmrun (\tmopout{request}{V}{\highlightwhite{\client}})}}{\tmrun \server} 
+  \\[0.5ex]
+  \reduces & \highlightgray{\tmpar{(\tmopout{request}{V}{\highlightwhite{\tmrun \client}})}{\highlightwhite{\tmrun \server}}}
+  \\[0.5ex]
+  \reduces & \tmopoutbig{request}{V}{\tmpar{\tmrun \client}{\highlightgray{\tmopin{request}{V}{\tmrun {\highlightwhite{\server}}}}}}
+  \\[0.5ex]
+  \reduces & \tmopoutbig{request}{V}{\tmpar{\tmrun \client}{\tmrun (\tmopin{request}{V}{\server})}}
+\end{array}
+\]
+
+Here, the first and the last reduction step respectively propagate signals outwards and 
+interrupts inwards. The middle reduction step corresponds to what we call a \emph{broadcast rule}---it 
+turns an outward moving signal in one of the processes into an inward moving interrupt for the process 
+parallel to it, while continuing to propagate the signal outwards to any further parallel processes.  
+The active redexes in these rules are highlighted in grey.
+
+
+\subsection{Promising To Handle Interrupts}
+\label{sect:overview:promising}
+
+So far, we have shown that our computations can issue outgoing signals and receive incoming interrupts, and how 
+these evolve and get communicated when executing parallel processes, but we have not yet said 
+anything about how computations can actually \emph{react} to incoming interrupts of interest. 
+
+In order to react to interrupts, our computations can install \emph{interrupt handlers}, written
+\[
+  \tmwith{op}{x}{M}{p}{N}
+\]
+that should be read as: ``we promise to handle a future incoming interrupt named $\op$ using the computation  
+$M$ in the continuation $N$, with $x$ bound to the payload of the interrupt''. Fulfilling this promise consists of 
+executing $M$ and binding its result to the promise variable $p$ in $N$ when a corresponding interrupt arrives, as 
+captured by the following reduction rule:
+\[
+  \tmopin{op}{V}{\tmwith{op}{x}{M}{p}{N}} \reduces \tmlet{p}{M[V/x]}{\tmopin{op}{V}{N}}
+\]
+%
+Interrupts that do not match a given interrupt handler ($\op \neq \op'$) simply move past it:
+\[
+  \tmopin{op'}{V}{\tmwith{op}{x}{M}{p}{N}} \reduces \tmwith{op}{x}{M}{p}{\tmopin{op'}{V}{N}}
+\]
+
+It is worth noting that the interrupt itself \emph{keeps propagating inwards} into the sub-computation 
+$N$, where it can trigger further interrupt handlers installed for the given interrupt.
+%
+Allowing the interrupts to always keep propagating inwards is a natural design choice, as it connects
+the behaviour of our interrupts with the behaviour of deep effect handling~\cite{Plotkin:HandlingEffects} (see 
+\autoref{sec:basic-calculus:semantics:computations}), and it is crucial for certain examples (see
+\autoref{sec:applications:chaining}).
+
+In order to skip certain interrupt handlers for some $\opsym{op}$, one can carry additional data 
+in $\opsym{op}$'s payload (e.g., a thread ID) and then condition the (non-)triggering of those interrupt 
+handlers on this data, e.g., as we demonstrate in \autoref{sec:applications:guarded-handlers}.
+This is analogous to how one controls which particular operation calls are handled with 
+ordinary effect handlers~\cite{Kammar:Handlers}.
+
+Interrupt handlers differ from conventional algebraic operation calls 
+(see \autoref{sec:conventional-algebraic-effects}) in two important aspects.
+First, they enable \emph{user-side post-processing} of received data, using $M$, 
+while in operation calls the result is immediately bound in the continuation. Second, and more 
+importantly, their semantics is \emph{non-blocking}. In particular, we have a congruence rule
+\[
+N \reduces N' \qquad \text{implies} \qquad \tmwith{op}{x}{M}{p}{N} \reduces \tmwith{op}{x}{M}{p}{N'}
+\]
+meaning that the continuation $N$, and thus the whole computation, can make progress 
+even though no interrupt $\opsym{op}$ has been propagated to the computation 
+from the outside world.
+
+As the observant reader might have noticed, the non-blocking behaviour of interrupt handling 
+means that our operational semantics has to work on \emph{open terms} because the variable 
+$p$ can appear free in both $N$ and $N'$ in the congruence rule given above. However, it is important 
+to note that $p$ is not an arbitrarily typed variable, 
+but in fact gets assigned a distinguished \emph{promise type} $\typromise X$ for some value type 
+$X$---we shall crucially make use of this typing of $p$ in the proof of type safety for our \lambdaAEff-calculus 
+(see \autoref{thm:progress} and \ref{thm:progress:extended}).
+Furthermore, since it is the computation $M$ that fulfils the promise (either by supplying a value or returning
+another promise), it also needs to have the same return type $\typromise X$.
+
+
+\subsection{Blocking on Interrupts Only When Necessary}
+\label{sec:overview:await}
+
+As noted earlier, installing an interrupt handler means making a promise to handle a given 
+interrupt in the future. To check that an interrupt has been received and handled, 
+we provide programmers a means to selectively \emph{block execution}
+and \emph{await} a specific promise to be fulfilled, written 
+$\tmawait{V}{x}{M}$, where if $V$ has a promise type $\typromise X$, the variable $x$ bound in $M$ has type $X$.
+Importantly, the continuation $M$ is executed only 
+when the $\tmkw{await}$ is handed a \emph{fulfilled promise} $\tmpromise V$, as
+\[
+\tmawait{\tmpromise V}{x}{M} \reduces M[V/x]
+\]
+
+In our example of scrolling through a seemingly infinite feed,
+$\client$ could use $\tmkw{await}$ to block until it has received an initial configuration, 
+such as the batch size used by $\server$.
+
+As the terminology suggests, this part of \lambdaAEff~is strongly influenced by existing work on 
+\emph{futures and promises} \cite{Schwinghammer:Thesis} for structuring concurrent programs, and their use in modern languages, 
+such as in \pl{Scala} \cite{Haller:Futures}. While prior work often models promises as writeable, single-assignment 
+references, we instead use the substitution of values for ordinary immutable variables (of distinguished promise type) 
+to model that a promise gets fulfilled exactly once. 
+%
+This way we achieve the standard reading of promises without needing
+a stateful operational semantics and a non-trivial type system to
+enforce the single-assignment behaviour~\cite{Ahman:RecallingWitness}.
+
+\subsection{Reinstalling Interrupt Handlers}
+\label{sec:overview:reinstallable-interrupt-handlers}
+
+As seen in the reduction rule
+\[
+  \tmopin{op}{V}{\tmwith{op}{x}{M}{p}{N}} \reduces \tmlet{p}{M[V/x]}{\tmopin{op}{V}{N}}
+\]
+%
+the interrupt handler is \emph{not reinstalled by default}. The programmers can selectively reinstall
+interrupt handlers using general recursion~\cite{Ahman:POPL}, or use the extension of \lambdaAEff~with
+\emph{reinstallable interrupt handlers} we propose in this paper (see 
+\autoref{sec:extensions:reinstallable-interrupt-handlers} for details), which have the form
+\[
+  \tmwithre{op}{x}{r}{M}{p}{N}
+\]
+These behave similarly to ordinary interrupt handlers, except that the handling computation $M$
+has access to an additional variable $r$ bound to a function that reinstalls the handler when called.
+Specifically, triggering a reinstallable interrupt handler has the following form:
+\begin{multline*}
+  \tmopin{op}{V}{\tmwithre{op}{x}{r}{M}{p}{N}} \\
+  \reduces \tmlet{p}{M\big[V/x, \big(\tmfunano{\_}{\tmwithre{op}{x}{r}{M}{p}{\tmreturn{p}}}\big)/r\big]}{\tmopin{op}{V}{N}}
+\end{multline*}
+
+Further, in examples we often find it useful to also pass data between 
+subsequent reinstalls of an interrupt handler. Programmers can achieve this by working 
+with an additionally assumed primitive notion of memory references~\cite{Ahman:POPL}, 
+or by using a \emph{stateful variant of reinstallable interrupt handlers} that we propose in 
+this paper. The latter have the form
+\[
+  \tmwithrest[S]{op}{x}{r}{s}{M}{W}{p}{N}
+\]
+where $S$ is the type of state associated with a particular interrupt handler, 
+$W$ is the interrupt handler's state at the time of its next triggering, 
+the variable $s$ gives the interrupt handler code $M$ access to the state, 
+and the state can be updated by reinstalling the handler with an updated value
+using $r$. Specifically, the interrupt handler triggering rule now has the form
+\[
+\tmopin{op}{V}{\tmwithrest[S]{op}{x}{r}{s}{M}{W}{p}{N}} \reduces \tmlet{p}{M\big[V/x , R/r , W/s\big]}{\tmopin{op}{V}{N}}
+\]
+where $R$ denotes a function that reinstalls the interrupt handler
+with an updated state value:
+\[
+R ~\defeq~ \tmfun{s' \of S}{\tmwithrest[S]{op}{x}{r}{s}{M}{s'}{p}{\tmreturn p}}
+\]
+When it is clear from the context, for brevity we often omit the $S$-annotation in examples.
+
+\subsection{Putting It All Together}
+\label{sec:overview:runningexample}
+
+We conclude this overview by showing how to implement the example of a user scrolling through a seemingly 
+infinite feed of data in our \lambdaAEff-calculus.
+
+For a simpler exposition, we allow ourselves access to mutable references, with which 
+we communicate data between different interrupt handlers, though the same can be  
+achieved by rolling one's own state. For passing data between subsequent reinstalls of the same 
+interrupt handler, we use the state-passing features of interrupt handlers 
+introduced above.
+
+While having explicit continuations in operation calls, signals, interrupt handlers, and when awaiting promises
+to be fulfilled makes the meta-theory of the underlying calculus cleaner (see Section~\ref{sec:basic-calculus:semantics:computations}), in programming we prefer to use 
+\emph{generic} versions of them, i.e., ones with trivial continuations~\cite{Plotkin:GenericEffects}.
+In particular, we define and use the syntactic sugar:
+\begin{align*}
+  \tmopoutgen {op} V &~\defeq~ \tmopout {op} V {\tmreturn \tmunit} \\
+  \tmwithregen {op}{x}{r}{M} &~\defeq~ \tmwithre{op}{x}{r}{M}{p}{\tmreturn{p}} \\
+  \tmwithregenst{op}{x}{r}{s}{M}{V} &~\defeq~ \tmwithrest{op}{x}{r}{s}{M}{V}{p}{\tmreturn p} \\
+  \tmawaitgen{V} &~\defeq~ \tmawait{V}{x}{\tmreturn x}
+\end{align*}
+
+\subsubsection{Client}
+\label{sec:overview:runningexample:client}
+
+We implement the client computation $\client$ as the function \ls$feedClient$ defined below. 
+For presentation purposes, we split its definition between multiple code blocks.
+
+First, the client initialises some auxiliary references, 
+issues a signal to the server to ask for the data batch size that it uses, and then installs a corresponding
+interrupt handler:
+\begin{lstlisting}
+let feedClient () =
+    let cachedData = ref [] in
+    let requestInProgress = ref false in
+    send batchSizeRequest ();
+    let batchSizePromise = promise (batchSizeResponse batchSize |-> return <<batchSize>>) in
+    ...
+\end{lstlisting}
+
+While the server is asynchronously responding to the batch size request, the client
+sets up an auxiliary function \ls$requestNewData$, with which it can request new data from the server:
+\begin{lstlisting}
+    ...
+    let requestNewData offset =
+        requestInProgress := true;
+        send request offset;
+        promise (response newBatch |->
+            cachedData := !cachedData @ newBatch;
+            requestInProgress := false;
+            return <<()>>
+        )
+    in
+    ...
+\end{lstlisting}
+Here, we first set a flag indicating that a new data request is in process, 
+then issue a \ls$request$ signal to the server, and finally install an 
+interrupt handler that updates the cache 
+once a corresponding \ls$response$ interrupt arrives.
+We note that the client computation does not block while awaiting new data
+from the server---instead, it continues executing, notifying the user to wait and try again once 
+the cache temporarily becomes empty (see below).
+
+As a last step of setting itself up, the client blocks until the server has responded 
+with the batch size it uses by awaiting \ls$batchSizePromise$ to be fulfilled, 
+after which the client starts its main loop, which we implement as a simple reinstallable 
+interrupt handler:
+%
+\begin{lstlisting}
+    ...
+    let batchSize = await batchSizePromise in
+    promise (nextItem _ r currentItem |->
+        let cachedSize = length !cachedData in
+        (if (currentItem > cachedSize - batchSize / 2) && (not !requestInProgress) then
+             requestNewData (cachedSize + 1)
+         else
+             return ());
+        if currentItem < cachedSize then
+            send display (toString (nth !cachedData currentItem));
+            r (currentItem + 1)
+        else  
+            send display "please wait a bit and try again";
+            r currentItem
+    ) @ 0
+\end{lstlisting}
+In it, the client listens for \ls$nextItem$ interrupts from the user to display more data.
+Once the interrupt arrives, the client checks if its cache is becoming empty, i.e., if
+the index of the currently viewed item is less than half of the batch size away from the
+last cached item and if no request for new data has been issued yet. If that happens, 
+the client uses the \ls$requestNewData$ function to request more data from the server,
+starting with offset \ls$cachedSize + 1$, which is the index of the first item that is
+outside of the data cached by the client.
+
+Next, if there is still some data in the cache, the client issues a \ls$display$ signal to show
+the next data item to the user. If however the cache is empty, the client issues a \ls$display$ signal 
+to show a message to the user asking them to wait and try again. The client then simply reinvokes itself
+by reinstalling the interrupt handler for \ls$nextItem$ interrupts (by calling \ls$r$). 
+
+Observe that the 
+\ls$currentItem$ counter is initially set to $0$ and then passed between subsequent 
+interrupt handler reinstalls using the state-passing features introduced earlier.
+
+\subsubsection{Server}
+\label{sec:overview:runningexample:server}
+
+We implement the server computation $\server$ as the following function:
+\begin{lstlisting}
+let feedServer batchSize =
+    promise (batchSizeRequest () r |->
+        send batchSizeResponse batchSize;
+        r ()
+    );
+    promise (request offset r |->
+        let payload = map (fun x |-> 10 * x) (range offset (offset + batchSize - 1)) in
+        send response payload;
+        r ()
+    )
+\end{lstlisting}
+where the computation \lstinline{range i j} returns a list of integers ranging from \lstinline{i} to \lstinline{j} (both inclusive).
+
+The server simply installs two reinstallable interrupt handlers: the first 
+one listens for and responds to client's requests about the batch size it uses; 
+and the second one responds to client's requests for new data. Both interrupt 
+handlers then simply reinstall themselves.
+
+The two interrupt handlers share a common pattern of handling the interrupt by
+issuing a signal and then reinstalling the handler, and it is tempting to avoid the
+repetition. A dual shared pattern can be found in
+\autoref{sec:overview:runningexample:client}, where a request signal is
+followed by an interrupt handler for its response. However, proper user-defined
+abstractions capturing these patterns would require operation names to be first-class values, which is not only orthogonal to the issue of asynchrony we are focussing on, but leads to a dependently typed calculus in combination with an effect system.
+
+\subsubsection{User}
+\label{sec:overview:runningexample:user}
+
+We can also simulate the user as a computation. For the sake of simplicity,
+we allow ourselves general recursion to implement the user behaviour as an infinite loop
+that every now and then issues a request to the client to display the next data item.
+%
+\begin{lstlisting}
+let rec user () =
+    let rec wait n = 
+        if n = 0 then return () else wait (n - 1)
+    in
+    send nextItem (); wait 10; user ()
+\end{lstlisting}
+%
+Alternatively, without assuming general recursion, we could have implemented the user 
+instead as two parallel processes that indefinitely ping-pong each other, and occasionally 
+issue \ls$nextItem$ signals to the client (see~\autoref{sec:conclusion} for an 
+example of such non-terminating behaviour).
+%
+It is also straightforward to extend the user program with a reinstallable handler for 
+\ls$display$ interrupts that simulates displaying the data items received from the 
+client (omitted here).
+
+
+\subsubsection{Running the Server, Client, and User in Parallel}
+\label{sec:overview:runningexample:parallel}
+
+Finally, we can simulate our running example in full by running all 
+three computations as parallel processes, as follows: 
+\begin{lstlisting}
+run (feedServer 42) || run (feedClient ()) || run (user ())
+\end{lstlisting}
+

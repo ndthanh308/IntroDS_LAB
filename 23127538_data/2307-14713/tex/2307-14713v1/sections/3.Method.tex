@@ -1,0 +1,64 @@
+The use of a VQ-VAE \cite{van2017neural} for learning a latent walking representation for skeletons is motivated by the discrete nature of the latent embeddings, which simplifies the constraint optimization for morphing between walking variations. While the VQ-VAE is widely used in generative modelling \cite{zhang2023t2m,xie2022vector,liu2022learning}, other algorithms such as diffusion models \cite{zhang2022motiondiffuse} might offer higher quality reconstructions. However, our aim is not to generate walking sequences, but to manipulate the latent space to change existing walks into desired variations.
+
+In this section, we describe the main components of GaitMorph: we describe the pretraining dataset used for training the VQ-VAE, the architecture and training procedure for the VQ-VAE, and the morphing algorithm based on optimal transport between the latent codes. 
+
+\subsection{Pretraining Dataset}
+
+\input{sections/3.0.Dataset}
+
+% Figure environment removed
+
+\subsection{Learning the Walking Codebook}
+
+In order to learn an informative and context-rich walking codebook, we leverage the expressive power of a Vector Quantized Variational AutoEncoder model (VQ-VAE) \cite{van2017neural}. The VQ-VAE model has been shown to be effective for a range of tasks, including image compression and generation \cite{esser2020taming,razavi2019generating}, and speech recognition \cite{van2017neural}. It is particularly useful in situations where the input data has a high degree of variability, and where traditional continuous latent space models may struggle to capture the underlying structure of the data. Furthermore, a discrete latent space enables a high degree of data compression, and allows the input data to be further processed as a sequence of discrete tokens. 
+
+To properly encode skeleton sequences, we construct a skeleton autoencoder based on the MS-G3D \cite{liu2020disentangling} model. Figure \ref{fig:architecture} showcases the overall architecture of our method. MS-G3D is a powerful graph convolutional model that has state-of-the-art results in skeleton action recognition, surpassing other graph-based methods \cite{yan2018spatial,shi2019two} by a large margin. Graph convolutional models are well established in the field of skeleton sequence processing \cite{gupta2021quo} and were developed to properly handle spatial and temporal variation of the skeleton graph.
+
+\subsubsection{MS-G3D Encoder-Decoder}
+
+The encoder and decoder models for the skeleton autoencoder are both based on the MS-G3D architecture \cite{liu2020disentangling}. For simplicity, we did not perform any graph subsampling \cite{yan2019convolutional}, and only used temporal pooling to compress the skeleton sequence. We follow the official model implementation \cite{liu2020disentangling}, and adapt it for gait processing. Specifically, we changed all activations to GeLU \cite{hendrycks2016gaussian}, we removed the initial data batch-normalization since the skeletons were already normalized. Initial experiments showed that the default model was not large enough to reconstruct sequences other than the mean skeleton. Consequently, we doubled each convolution - batch normalization - activation block to increase model capacity. A MS-G3D model is composed of multiple Spatial-Temporal Graph Convolution (ST-GC) blocks. Each block consists of a Multi-scale Graph Convolution block (MS-GCN) and two Multi-Scale Temporal Convolutional blocks \cite{liu2020disentangling}. We used the default 6 G3D scales and 13 GCN scales for both the encoder and decoder models.
+
+For the MS-G3D encoder $E(\cdot)$, we used 20 ST-GC encoder blocks. We used a feature map size of 64 for the first 5 blocks, 128 for the next 5 and 256 for the final 10. Temporal pooling is performed every 5 blocks. Therefore, for an initial skeleton sequence $x \in \mathbb{R}^{T \times J \times 2}$ consisting of $T = 64$ skeletons (i.e. frames) with $J = 18$ joints, the sequence is temporally downsampled to $\hat{z} \in \mathbb{R}^{\frac{T}{4} \times J \times n_{\hat{z}}}$, where, in our case, $n_{\hat{z}} = 256$ the encoder embedding size. 
+
+For the MS-G3D decoder $G(\cdot)$, we opted for a slightly smaller model, since we experimentally observed that the encoder size is more negatively correlated to the final reconstruction error than the decoder size. Moreover, having a smaller decoder is more computationally efficient, and enables faster reconstruction of latent codes. The overall constituent decoder blocks are identical to the encoder blocks, but we replaced the strided convolution with a strided deconvolutional block for the temporal upsampling. We used 16 ST-GC blocks, with feature maps of size 32 for the first 4 blocks, 16 for the next 4 and 8 for the final 8. Temporal upsampling was performed every 4 blocks. 
+
+\subsubsection{Skeleton Vector Quantization}
+
+Instead of utilizing a continuous latent space to encode the skeleton sequences, we quantize each latent embedding into a fixed-length learnable codebook $\mathcal{Z} = \{z_k\}^K_{k=1} \subset \mathbb{R}^{n_z}$. Any skeleton sequence $x \in \mathbb{R}^{T \times J \times 2}$ is encoded using the MS-G3D encoder described above into a temporally-compressed representation $\hat{z} \in \mathbb{R}^{\frac{T}{4} \times J \times n_{\hat{z}}}$, which is then quantized into $z_{\textbf{q}} \in \mathbb{R}^{\frac{T}{4} \times J \times n_{z}}$, where $n_{\textbf{z}}$ is the codebook dimensionality, not necessarily equal to the encoder embedding size. Each $\hat{z}$ is encoded using a nearest neighbor search in the codebook (see Eq. \ref{eq:quantization-nn}).
+
+\begin{equation}
+    z_{\mathbf{q}} = \mathbf{q}(\hat{z}) \coloneqq \argmin_{z_k \in \mathcal{Z}} \lVert \hat{z}_{ij} - z_k \rVert \in \mathbb{R}^{T \times J \times n_z}
+    \label{eq:quantization-nn}
+\end{equation}
+
+After quantization, skeletons are reconstructed using the MS-G3D decoder: $\hat{x} = G(z_{\textbf{q}}) = G(\textbf{q}(E(x)))$. The model is trained end-to-end using a stop-gradient operation (see Eq. \ref{eq:vq-loss}) since the dictionary look-up is not differentiable. For more details regarding training, readers are referred to the work of Van Den Oord et al. \cite{van2017neural}.
+
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{VQ} (E, G, \mathcal{Z}) = \lVert x - \hat{x} \rVert &+ \lVert \text{sg}[E(x)] - z_{\mathbf{q}} \rVert_2^2 \\
+    & + \lVert \text{sg}[z_{\mathbf{q}}] - E(x) \rVert_2^2
+\end{split}
+\label{eq:vq-loss}
+\end{equation}
+
+In practice, instead of the $l_2$ loss for the reconstruction error, we employed a Smooth $l_1$ with $\beta = 0.25$ \cite{girshick2015fast} to further penalize small reconstruction errors. VQ-VAE models are notoriously hard to train \cite{lancucki2020robust}, primarily due to the dictionary collapse problem, in which most of the codebook entries are not utilized in reconstruction, yielding poor performance. To deal with this problem, we employed a standard array of "bag-of-tricks" to increase codebook usage. We used K-means initialization of the codebook \cite{zeghidour2021soundstream}, we used a lower codebook dimensionality of $n_z = 16$ by linearly projecting down the encoder embedding, we used cosine similarity for codebook search \cite{yu2021vector}, expiring stale codes \cite{zeghidour2021soundstream} and orthogonal regularization \cite{shin2021translation} of the codebook vectors to encourage linear independence. The codebook is learned using an exponential moving average approach with a decay rate of $\gamma = 0.9$. Autoencoder warm-up \cite{fu-etal-2019-cyclical} was not necessary. We experimented with using a separate codebook for each limb, similar to Xie et al. \cite{xie2022vector}, but did not observe a substantial improvement.
+
+Training was performed on a single NVIDIA RTX 3060, using mixed-precision training, with a batch size of 48. The network was updated for 50k steps, using AdamW \cite{kingma2014adam} optimizer using a cyclical learning rate schedule \cite{cyclical-lr} which varies the learning rate between 0.0025 and 0.0075. The model has 4.8M non-embedding parameters. The training duration for the VQVAE is approximately 15 hours.
+
+\subsection{Learning Optimal Transport Mappings}
+
+In order to exploit the expressive power of the learned gait tokens, we posit that only specific tokens from a tokenized gait sequence are responsible for encoding the gait viewpoint and variation. Therefore, for a set of walks from a particular variation $\mathcal{T}$, we can learn a set of transport maps $\Gamma = \{\gamma_j^{\textbf{*}} | j \in 1 \dots (\frac{T}{4} \times J)\}$, for each encoded position $j$, that transform the target quantized gait representation into a quantized representation of a baseline walk $\mathcal{B}$. The transformed walk $\mathcal{T}$ is then decoded by the generator: $\mathcal{T}^* = G(\Gamma(\textbf{q}(E(\mathcal{T}))))$. The walks $\mathcal{B}$ and $\mathcal{T}^*$ should be from the same walking variation.  We propose to learn the transport maps $\Gamma$ by utilizing optimal transport theory \cite{villani2009optimal}. We learn a transport map $\gamma^*_j$ by minimizing the Earth Mover's Distance (EMD) between the histograms of two quantized gaits. EMD assumes there is a cost for moving one quantity to another, which is encoded into a cost matrix $C$. In general, EMD is defined as:
+
+\begin{equation}
+\begin{split}
+    \gamma^* = \argmin_{\gamma \in \mathbb{R}_{+}^{m \times n}} \sum_{i,j} \gamma_{i,j} C_{i,j} \\
+    \text{s.t.} \gamma 1 = a; \gamma^T 1 = b; \gamma \geq 0
+\end{split}
+\label{eq:ot}
+\end{equation}
+
+In our case, $a$ and $b$ are histograms of the token occurrences in each gait sequence, and the cost matrix $C$ is given by the pairwise distances between the token embeddings. To account for multiple occurrence of the same token in a quantized gait sequence, we scale the corresponding vector embedding by the number of occurrences. We describe our method in Algorithm \ref{alg:gait-morphing}. The algorithm is an instance of an assignment problem for each token position, and is similar to finding the minimum flow between the two token distributions. In practice, we use the algorithm proposed by Bonneel et al. \cite{bonneel2011displacement} implemented in the PyOT \cite{flamary2021pot} library.
+
+\input{algorithms/gait-morphing}
+
+In practical scenarios where the gait variation is not known beforehand, domain-expert models such as pedestrian attribute identification models \cite{wang2022pedestrian} can be used to estimate particular walking attributes, similar to the approach of Cosma and Radoi \cite{cosma22gaitformer}, to inform the morphing target. This method can also be used as data augmentation to generate multiple views for the same walking sequence, for use in contrastive self-supervised training \cite{jaiswal2020survey,cosma22gaitformer}.

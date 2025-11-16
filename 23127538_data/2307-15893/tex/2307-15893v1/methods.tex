@@ -1,0 +1,147 @@
+\section{Methods}
+
+\subsection{Background}
+
+We aim to build Online Matching by learning users' feedback to items in a closed loop, see Fig. \ref{fig:illustration-om} for an illustration. One naive approach is to apply multi-armed bandits for each user. That is for each user, we maintain a set of bandit parameters for all the explored items.
+This approach is not scalable because when there is a large number of explored items, many trials are needed for each user, making it hard for bandit parameters to converge, especially in the case new items are continuously added. Therefore, we need to consider contextual bandits where user context is modeled to allow using context features and across-user learning. Formally, let $t$ denote the current time step, $a_t \in \mathcal{A}$ denote the action selected at time $t$ from the entire action space $\mathcal{A}$, and $r_t(a_t)$ denote the reward obtained by selecting action $a_t$ at time $t$. The goal is to learn a policy $\pi_t(\rvx_t)$ that maps the observed user feature $\rvx_t \in \mathbb{R}^d$ to an action $a_t$, such that the expected cumulative reward is maximized over a sequence of $T$ time steps:
+
+\begin{equation}
+\max_{\pi_t} \mathbb{E}\left[\sum_{t=1}^T r_t(a_t)\right]
+\end{equation}
+
+In contextual linear bandits, the reward function is assumed to be linear in the feature vector $\rvx_t$, i.e.,
+\begin{equation} \label{bandit_reward}
+\mathbb{E}\left[r_t(a)\right] = \rvx_t^\top \vtheta_a^*,
+\end{equation}
+for all $t$, where $\vtheta_a^*$ is an \textsl{unknown} weight vector associated with action $a$. The goal is to estimate the weight vectors $\vtheta_a^*$ ($a \in \mathcal{A}$) and use them to select actions that maximize the expected reward. A more generic formulation \cite{pmlr-v15-chu11a} is assuming there is a single unknown weight vector $\vtheta^*$, and the expectation reward is $\rvx_{t,a}^\top \vtheta^*$, where $\rvx_{t,a}$ represents both user and item features. We choose not to model item features in this work because we find item id is a very important feature to reflect the finest difference among various items, and adding this feature to $\rvx_{t,a}$ can make this vector to be very high-dimensional. The setup in \eqref{bandit_reward} is also called disjoint linear models as studied in a few papers \cite{Li_2010, deshpande2012, wang2017}.
+
+The LinUCB algorithm \cite{Li_2010} maintains an estimate of the unknown parameter vector $\vtheta_{a, t}$ for each action $a$ at each time step $t$. Let $\rmA_{a,t}$ and $\rvb_{a,t}$ be the $d$-by-$d$ positive definite matrix and $d$-dimensional vector that represent the covariance matrix and mean vector of the context features up to time $t$, respectively. Then the estimate of $\vtheta_{a, t}$ is given by:
+\begin{equation}\label{eq:linucb_update_theta}
+\vtheta_{a,t} = \rmA_{a,t}^{-1} \rvb_{a,t}.
+\end{equation}
+LinUCB selects the arm with the highest upper confidence bound, namely:
+\begin{equation}\label{eq:linucb_ucb}
+UCB_a(t) = \rvx_t^T \vtheta_{a, t} + \alpha \sqrt{\rvx_{t}^T \rmA_{a,t}^{-1} \rvx_t},
+\end{equation}
+where $\alpha$ is a hyperparameter that controls the exploration-exploitation tradeoff. If action $a$ is chosen, $\rmA_{a,t}$ and $\rvb_{a,t}$ are then updated using the observed reward $r_{a,t}$ and context vector $\rvx_t$ through:
+\begin{equation} \label{eq:linucb_update}
+\rmA_{a,t} \leftarrow \rmA_{a, t-1} + \rvx_t \rvx_t^T,~ \rvb_{a, t} \leftarrow \rvb_{a, t-1} + \rvx_t r_{a,t},
+\end{equation}
+For any action $a$ not chosen, we have $\rmA_{a,t} \leftarrow \rmA_{a, t-1}, \rvb_{a, t} \leftarrow \rvb_{a, t-1}$. See Algorithm \ref{alg:linucb} for a detailed description.
+
+
+\begin{algorithm}[H]
+\caption{LinUCB Algorithm \cite{Li_2010}}
+\label{alg:linucb}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: context vector $\rvx_t$ for each time step $t$, number of arms $N$, hyperparameter $\alpha$,
+\STATE Initialize $\rmA_{a,0} = \rmI_d, \rvb_{a,0} = \mathbf{0}_d$ for all arms $a \in [N]$.
+\FOR{t = 1 to T}
+\STATE Observe context vector $\rvx_t$.
+\FOR{j = 1 to N}
+\STATE Compute $UCB_j(t)$ using current estimate of $\vtheta_j$ (Eq. \eqref{eq:linucb_ucb} ).
+\ENDFOR
+\STATE Select arm $a_t$ with the highest $UCB_a(t)$.
+\STATE Observe reward $r_{a_t,t}$.
+\STATE Update $\rmA_{a_t,t}$ and $\rvb_{a_t,t}$ using Eq. \eqref{eq:linucb_update}.
+\STATE Update $\vtheta_{a_t,t}$ using Eq. \eqref{eq:linucb_update_theta}.
+\STATE For $a \neq a_t$, $\rmA_{a,t} \leftarrow \rmA_{a, t-1}, \rvb_{a, t} \leftarrow \rvb_{a, t-1}$.
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Scaling problems of LinUCB}. There are several practical issues that prevent us from directly using LinUCB for serving online traffic and getting real-time updates:
+\begin{itemize}
+\item \textbf{Large Action Space}. The computation of $UCB_j(t)$ is over all actions or items. In our application, even after narrowing the corpus down to fresh items, there are still millions of items worth exploring.
+\item \textbf{Covariance Inversion}. Computing $UCB_j(t)$ and updating $\theta_{a,t}$ depend on calculating the inverse of the covariance matrix $\rmA_{a,t}$ that has a size of $d$-by-$d$. Note that the covariance matrix cannot be precomputed or cached due to the streaming updates. The online computational cost could be prohibitively high when facing a large user traffic.
+\item \textbf{Synchronous Updates.} When one item is exposed to users, there could be many feedback received from various users. The streaming updates of $\rmA_{a,t}$ and $\rvb_{a,t}$ require an item-level synchronization, which poses a challenge on maintaining a high throughput to handle large traffic. As LinUCB converges to exploiting fewer top items, synchronization cost could be a real bottleneck.
+\end{itemize}
+\subsection{Sparse bipartite graph} \label{sec:sparse_bipartite_graph}
+To overcome the aforementioned challenges, we propose a novel variant of LinUCB. Before diving into that, we take a step back to build some intuitions for our solution. Let's look at the problem of user-item matching from a graph perspective. As shown in Fig. \eqref{fig:ui-dense}, suppose there is a dense bipartite graph between users and items, the main goal of recommendation is to find good edges in the graph to make the connections between users and items. Naively, we could explore all items for each user disjointly, but apparently this would not be efficient. Our idea is to group users by clusters, and then reduce the exploration space in each cluster. As illustrated in Fig. \eqref{fig:ui-sparse}, we build user clusters where each cluster can be considered as a user cohort. For each cluster representing users with certain type of interest, we only consider a small subset of items to explore since it is not worth exploring many unrelated items in the corpus. For each user, we assign them to multiple top clusters and use the cluster weights when deciding how to connect user to the items in their corresponding clusters. The edges in the sparsified graph can be further converted to bandit parameters learnt online. Besides the intuitions, we provide a principled bandit framing in Section \ref{sec:diag-linucb}.
+
+% Figure environment removed
+
+\textbf{Embedding-based graph construction.} With the graph view, now we describe how the graph is constructed offline. The idea is to leverage neural modeling. We first train a two-tower model to co-embed users and items, similar to the way many batch retrieval models \cite{yi2019samplingbias} are built nowadays.
+Specifically, we train two neural networks, denoted by $f$ and $g$, to encode user and item features $\rvx, \rvy$ to embeddings $f(\rvx)$ and $g(\rvy)$ respectively. Given a batch of positive user-item pairs $\{\rvx_i, \rvy_i\}_{i=1}^B$, we use the batch softmax loss to train the two-tower model:
+\begin{equation} \label{eq:two-tower}
+\mathcal{L}(f, g) = -\sum_{i \in [B]}\log \frac{\exp{(\langle f(\rvx_i), g(\rvy_i)\rangle/\tau)}} {\sum_{j \in [B]}\exp{(\langle f(\rvx_i), g(\rvy_j)\rangle/\tau)}},
+\end{equation}
+where $\tau$ is a hyperparameter representing softmax temperature. 
+In practice, using normalized embeddings, i.e., $\|f(\rvx_i)\|_2 = \|g(\rvy_i)\|_2 = 1$, can greatly improve trainability. As a result, we need to scale the logits to obtain meaningful softmax probabilities using $\tau$, as the logits are limited to the range of -1 to 1. 
+We omit further details here and refer interested readers to \cite{yi2019samplingbias}, as the offline modeling is not the main focus of this paper.
+
+Next, we apply off-the-shelf clustering algorithms to discretize the embedding space into a set of user clusters, based on a large sample of user embeddings.
+For each user cluster, we choose the set of items with the highest embedding similarity measured by dot product between cluster centroid embeddings and item embeddings. This step largely narrows down the exploration space, allowing the online learning algorithm to focus on the items that have a higher probability of success.
+More details can be found in Algorithm \ref{alg:graph-construction}. Note that it is possible to apply various clustering algorithms in our proposed framework, though we adopt kMeans in our system for simplicity. 
+
+\begin{algorithm}[H]
+\caption{Sparse Graph Construction }
+\label{alg:graph-construction}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: A sample of user embeddings $\{\rvu_i\}_{i=1}^M$, item embeddings $\{\rvv_j\}_{j=1}^N$ as the target corpus. Here $\rvu_i$ and $\rvv_j$ are provided by a two-tower model trained according to Eq. \eqref{eq:two-tower}. Target number of items per cluster $W$.
+\STATE Run a clustering algorithm (e.g., kMeans) on $\{\rvu_i\}_{i=1}^M$ to obtain C centroid embeddings $\{\rvc_c\}_{c=1}^C$. 
+\STATE $\mathcal{I}_c \leftarrow \emptyset$ for all $c \in [C]$. $\mathcal{I}_c$ denotes the item set per cluster.
+\FOR{c = 1 to C}
+\STATE $\mathcal{I}_c \leftarrow $ \text{top-W items with largest values in set} $\{\langle \rvc_c, \rvv_j \rangle\}_{j \in [N]}$.
+\ENDFOR
+\STATE \textbf{Output}: $\{\mathcal{I}_c\}_{c=1}^C$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Sparse Linear Bandits and Diagonal LinUCB} \label{sec:diag-linucb}
+Now that we have explained the graph sparsification, we can proceed to introduce our bandit learning algorithm. We should note that if we assign each user to only one cluster during online learning, we can view the items ($\mathcal{I}_c$) in each cluster as distinct arms in a multi-armed bandit problem and utilize the UCB algorithm. Nonetheless, limiting each user to a single cluster could lead to a considerable loss of information from user embeddings. To tackle this issue, we instead assign each user to the closest $K$ (e.g., 10) clusters and also incorporate the cluster weights as part of the context representation. The question now becomes how to design an effective exploration-exploitation strategy to handle the many-to-many mapping from both users to clusters and items to clusters.
+We propose a principled framing called \textsl{sparse linear bandits}, where the cluster weights can be effectively treated as a sparse context representation of a user in the high-dimensional space $\mathbb{R}^C$.
+
+\textbf{Sparse linear bandits.} 
+Given $C$ clusters, let $\rvw_u \in \mathbb{R}^C$ represent the weights of the top-$K$ clusters for the query from user $u$. Note that $\rvw_u$ is very sparse because $C$ is large and $\|\rvw_u\|_0 = K << C$. 
+On the other hand, suppose for each item $j$, we have the ``ground-truth'' parameter $\vtheta_j^* \in \mathbb{R}^C$, where the $c$-th coordinate $\theta_{j,c}^*$ represents the quality or value of item $j$ for the cluster $c$. 
+Based on the sparse graph in Fig. \eqref{fig:ui-sparse}, we can assume that $\theta_{j,c}^* = 0$ if there is no edge between item $j$ and cluster $c$. Accordingly, $\vtheta_{j}^*$ is also sparse, and we have $\|\vtheta_{j}^*\|_0 << C$ for most items. It is possible that some items (e.g., the popular ones with large audience) can belong to many clusters, but we could always control the sparsity of $\vtheta_{j}^*$ by setting a maximum degree per item. Similar to linear bandits, the reward $r_{u,j}$ is assumed to satisfy $\mathbb{E}( r_{u,j} | \rvw_u) = <\rvw_u, \vtheta_j^*>$. Based on our sparsity assumption, we can see that $\mathbb{E}(r_{u,j})$ is 0 for most $(u, j)$ pairs, and such pairs won't be explored in our algorithm. In other words, the \textsl{Large Action Space} problem of LinUCB is largely mitigated by our graph sparsification. Now we introduce a novel approximation, Diagonal LinUCB, to avoid computing the expensive $\textsl{Covariance Inversions}$ and to address the \textsl{Synchronous Updates} problem in the meantime. 
+
+\textbf{Diagonal LinUCB.} The key idea is to only maintain and utilize the diagonal terms of covariance matrix $\rmA_{j,t}$ for item $j$ at step $t$. This is inspired by the momentum-based gradient descent methods (e.g., Adagrad and Adam) where only diagonal terms of Hessian matrix are used. Actually, covariance matrix $\rmA_{j,t}$ is essentially the Hessian matrix for solving linear regression. 
+% From now on, we drop the subscript $t$ to ease the notations. 
+From this point forward, we will omit the subscript $t$ to simplify the notation.
+Let vector $\rvd_{j}$ denote the diagonal terms of $\rmA_{j}$ at some step. Let $d_{j,c}$ be the $c$-th coordinate of $\rvd_{j}$, and let $w_{u,c}$ be the $c$-th coordinate of $\rvw_u$. For a vector $\rvx$, let $\|\rvx\|_{supp}$ denote its support, i.e., the set of indices with non-zero entries. Then the update rules of $\rvd_j$ and $\rvb_j$ become:
+\begin{align} \label{eq:diag_linucb_update}
+d_{j,c} & \leftarrow d_{j,c} + w_{u,c}^2, \notag \\
+% b_{j,c} & \leftarrow b_{j,c} + w_{u,c} \cdot r_{u,j},~ \text{for any}~ c~ \text{if}~ j \in \mathcal{I}_c,
+b_{j,c} & \leftarrow b_{j,c} + w_{u,c} \cdot r_{u,j},~ \text{if}~ j \in \mathcal{I}_c (\forall{c} \in [C]),
+\end{align}
+where $\mathcal{I}_c$ is from Algorithm \ref{alg:graph-construction}. Furthermore, $UCB_j$ becomes
+\begin{equation} \label{eq:ucbj}
+UCB_j =  \sum_{c \in \|\rvw_{u}\|_{supp}} w_{u,c} b_{j, c} / d_{j, c} + \alpha \cdot \sqrt{\sum_{c \in \|\rvw_{u}\|_{supp}} w_{u,c}^2 / d_{j,c}},
+\end{equation}
+In exploitation mode, we drop the confidence bound term, and the estimated reward becomes
+\begin{equation} \label{eq:diag-exploit}
+    \hat{r}_{u,j} = \sum_{c \in \|\rvw_{u}\|_{supp}} w_{u,c} b_{j, c} / d_{j, c}.
+\end{equation}
+In the experiment section below, we will discuss how the exploitation mode is used in the use case of fresh content discovery. Putting things together, our detailed algorithm is shown in Algorithm \ref{alg:diag-linucb}.
+\begin{algorithm}[H]
+\caption{Diag-LinUCB Algorithm}
+\label{alg:diag-linucb}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Sparse graph $\{\mathcal{I}_c\}_{c=1}^C$ created by Algorithm \ref{alg:graph-construction}, context vector $\rvw_{u} \in \mathbb{R}^C$ at certain step from user $u$ by cluster assignment, number of clusters per user query $K$, number of items $N$,  hyperparameter $\alpha$,
+\STATE Initialize $\rvd_{j} = \mathbf{I}, \rvb_j = \mathbf{0}$ for all $j \in [N]$.
+\FOR{t = 1 to T}
+\STATE Observe context vector $\rvw_u \in \mathbb{R}^C$.
+% \STATE Set of triggered items $\hat{\mathcal{C}} \leftarrow \bigcup_{c \in \|\rvw_u\|_{supp}}\mathcal{I}_c$.
+\STATE Identify the set of triggered items $\hat{\mathcal{C}} \leftarrow \bigcup_{c \in \|\rvw_u\|_{supp}}\mathcal{I}_c$.
+\FOR{$j \in \hat{\mathcal{C}}$}
+\STATE Compute $UCB_j$ according to Eq. \eqref{eq:ucbj}.
+\ENDFOR
+\STATE Select item $a = \arg\max_{j \in \hat{\mathcal{C}}} UCB_j$. 
+\STATE Observe reward $r_{u,a}$.
+\STATE Update $\rvd_a$ and $\rvb_a$ using Eq. \eqref{eq:diag_linucb_update}.
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Discussion on Eq. \eqref{eq:diag_linucb_update}}. Now we take a closer look at the parameter updates in Eq. \eqref{eq:diag_linucb_update}. Given a reward $r_{u,j}$, the update of $b_{j,c}$ gives higher weights to clusters closer to the user embedding. In other words, for user that is more familiar with an explored item, their feedback on the item will be trusted more. It is worth noting that when $w_{u,c} = 1$, Eq. $\eqref{eq:diag_linucb_update}$ is reduced to multiple $UCB$ that run separately for each cluster. As shown in experiments, we find that incorporating cluster weights can outperform treating all clusters equally. Compared to LinUCB, the updates in Diag-LinUCB are much more light-weighted, and more importantly, do not require the item-level synchronization since the updates are fully distributed over the edges in the sparse graph. This property eases the design of online learning infrastructure and significantly improves the system throughput.  
+
+\textbf{Context vector}. There could be a few options for computing the context vector $\rvw_u$ from user embedding $\rvu$. The naive way is to let $w_{u,c} = \langle \rvu, \rvc_c\rangle$ where $\rvc_c$ is the embedding of each centroid. 
+As mentioned in Section \ref{sec:sparse_bipartite_graph}, we apply embedding normalization and softmax temperature when learning the two-tower model, which usually leads to top clusters having similar weights, with small numerical differences.
+This is expected because small difference in logits is amplified by the temperature $\tau << 1$ and the softmax function during training. Directly using the logits as context vector does not reflect the true user preferences over various clusters.
+To address this issue, one option is to use a softmax transform similar to the one used in the training stage, namely
+\begin{equation} \label{eq:context-vector}
+w_{u,c} = \frac{\exp(\langle \rvu, \rvc_c\rangle/\tau')}{\sum_{c' \in [C]} \exp(\langle\rvu, \rvc_{c'}\rangle/\tau')},
+\end{equation}
+where $\tau'$ is another hyperparameter. One limitation of this approach is that we need to empirically tune $\tau'$. Another option is to train a multi-class classification model to directly predict the distribution over user clusters. However, this requires a much more intricate pipeline that involves training both the two-tower model and the user clusters. In this paper, we choose the simple approach in Eq. \eqref{eq:context-vector} and leave the second option to future work.

@@ -1,0 +1,89 @@
+\subsubsection{Breadcrumbs}
+
+When the vehicle turns around and begins retracing the flight path, the ETS algorithm will select online breadcrumbs for correlation. When the vehicle flies out of range of the current online breadcrumb and finds the next online breadcrumb in the database, the filter must update the state and covariance for the current online breadcrumb position being tracked in the filter. Multiple approximations were explored for this step and the current implementation is discussed below.  First, the position estimate for the breadcrumb is set to the saved position in the database.  The update of the covariance presents a larger challenge to prevent collapse of the vehicle position covariance.  If the new breadcrumb position covariance is merely set to the saved position covariance in the database, and all cross covariance terms are zeroed, the filter will treat each new breadcrumb as an independent measurement.  This causes the vehicle position covariance to rapidly collapse over several breadcrumbs because it doesn't account for the high correlation between the position errors of sequential breadcrumbs.  A covariance update approach was developed to preserve as much cross correlation information between the breadcrumb and vehicle positions as possible.  This algorithm is applied separately along the north, east and down position components since a closed form solution was calculated for a single axis at a time.  
+
+The covariance update is based on the following simplified problem.  Consider an initial covariance matrix for two variables:
+
+\begin{equation}
+    \text{P}^- = \left[ {\begin{array}{cc}
+    a & 0 \\
+    0 & b \\
+  \end{array} } \right]
+  \label{eq:blackmagic1}
+\end{equation}
+
+\noindent The goal is to define a linear measurement of the form:
+\begin{align}
+    y &= \left[ h_{1}\text{ }h_{2} \right] \textbf{x} + \eta \\
+    \eta &\sim \mathcal{N}(0, R_{eff})
+    \label{eq:blackmagic2}
+\end{align}
+\noindent such that after applying this measurement model to the standard Kalman filter covariance update equation, the updated covariance becomes:
+
+\begin{equation}
+    \text{P}^+ = \left[ {\begin{array}{cc}
+    a_f & \frac{a_f + b_f - c }{2} \\
+    \frac{a_f + b_f - c }{2} & b_f \\
+  \end{array} } \right]
+  \label{eq:blackmagic3}
+\end{equation}
+
+\noindent Applying the Kalman Filter update equation to Eqs. \ref{eq:blackmagic1} and \ref{eq:blackmagic2} yields:
+
+\begin{equation}
+    \text{P}^+ = \left[ {\begin{array}{cc}
+    a\left(1 - \frac{ah_1^2}{z}\right) & \frac{-abh_1h_2}{z} \\
+    \frac{-abh_1h_2}{z} & b\left(1 - \frac{bh_2^2}{z}\right)
+  \end{array} } \right]
+  \label{eq:blackmagic4}
+\end{equation}
+
+\begin{equation}
+    S = ah_1^2 + bh_2^2 + R_{eff}
+  \label{eq:blackmagic5}
+\end{equation}
+
+\noindent It is assumed that $a$, $b_f$ and $c$ are known.  These correspond to the vehicle position covariance for the given axis, the new breadcrumb covariance along that axis, and the cross-correlations between the breadcrumb and vehicle positions along the axis.  The problem is to solve for $b$, $h_{1}$, $h_{2}$ and $R_{eff}$.  In this formulation, $a_f$ is set to a value slightly less than $a$.  The values cannot be equal because of mathematical constraints, but setting them close accounts for the fact that switching to a new breadcrumb before receiving the measurement to it does not change the knowledge of the current vehicle position.  Under this formulation, $z$ can also be chosen arbitrarily and is set to a large parameterized number.  Setting Eqs. \ref{eq:blackmagic3} and \ref{eq:blackmagic4} equal allows the desired values to be solved:
+
+\begin{align}
+    b &= b_f + \frac{(a_f + b_f - c)^2}{4(a - a_f)} & 
+    h_1 &= \sqrt{\frac{(a-a_f)z}{a^2}} \\
+    h_2 &= \sqrt{\frac{(b-b_f)z}{b^2}} &
+    R_{eff} &= z - ah_1^2 - bh_2^2
+    \label{eq:blackmagic6}
+\end{align}
+
+\noindent This process is applied three times to the filter, once for each position direction, to update the covariance of the newly loaded online or historic breadcrumb.  When applying the measurement model for the covariance update for each axis in the actual filter, the $H$ matrix is 1x$N_{states}$ and the calculated $h_1$ and $h_2$ values are put into the indices corresponding the vehicle position and the breadcrumb position for that axis.  Although this approach is an approximate heuristic, it has shown good performance in preventing covariance collapse and maintaining the relative position errors between the vehicle position and breadcrumb positions.
+
+After the pseudo measurement is run, the breadcrumb measurement is processed using a similar model as Eqs.~\ref{eq:ets_fifo}-\ref{eq:ets_fifo_meas}. For breadcrumbs the $\bm{b}_{ETS}$ term is not included as the bias corresponds to terrain induced errors in the images used for velocimetry, which won't necessarily align with the image geometry used for the breadcrumb correlation. Further, for historic breadcrumbs, the term representing errors between the two TOFs is expanded:
+
+\begin{equation}
+\bm{R}_{tof2}^{tof1}\left(\gamma_{1}, \gamma_{2}\right) = \bm{R}_{ned}^{tof1}\left(\gamma_{1}\right)\bm{R}_{tof2}^{ned}\left(\gamma_{2}\right) =  \bm{R}_{3}\left(\gamma_{1}\right)\bm{R}_{3}\left(-\gamma_{2}\right)
+\end{equation}
+
+\noindent where $\bm{R}_{3}$ is a rotation about the z axis. This term, and the associated sensitivities in the measurement model, is the mechanism to improve absolute heading knowledge by processing historic breadcrumb measurements.  
+
+\subsection{Mapping Breadcrumbs Between Flights}
+
+Since all online breadcrumb positions are defined relative to the takeoff location, breadcrumbs from previous flights that are promoted to historic breadcrumbs must be updated relative to the new takeoff location. This is done by saving the estimated landing position and covariance at the end of the flight. The curvature of Titan will also lead to slight variations in the true NED frame at each new takeoff location ($\sim$5 km resulting in changes of $\sim$0.1$^\circ$).  The rotation matrix between the true NED directions at takeoff and landing can be calculated and used to apply an additional correction.
+
+The position of the $i^{th}$ breadcrumb in the TOF of the next flight, $\bm{r}_{bc_i}^{tof2}$ is updated by subtracting off the landing location in the original TOF, $\bm{r}^{tof1}(t_f)$ from each breadcrumb location in the original frame, $\bm{r}_{bc_i}^{tof1}$ and then rotating the point into the new NED frame at the landing site:
+
+\begin{equation}
+    \bm{r}_{bc_i}^{tof2} = \bm{R}_{tof1}^{tof2} \left( \bm{r}_{bc_i}^{tof1} - \bm{r}^{tof1}(t_f) \right)
+\end{equation}
+
+Updating the covariance of each breadcrumb requires an approximation because the cross covariance of all of the breadcrumbs to the landing position is not saved in the filter.  This approximation starts by calculating the covariance of the final online breadcrumb from the previous flight relative to vehicle position at landing and adding the approximate covariance between the final breadcrumb position and the the breadcrumb being updated, $\Delta \text{P}$.  This total covariance is then rotated into a frame corresponding to NED at the new location.  
+\begin{equation}
+    \text{P}_{bc}^{n_2} = \bm{R}_{n_1}^{n_2}\left(\bm{H}_{rel} \text{P}^{n_1}(t_f) \bm{H}_{rel}^T + \Delta \text{P}\right) \bm{R}_{n_1}^{n_2 T}
+\end{equation}
+\noindent where $\bm{P}^{n_1}(t_f)$ is the full covariance matrix at the landing time, $\bm{H}_{rel}$ is a matrix of size 3 x $\text{N}_{states},$ with the identity matrix in the indices corresponding to the current online breadcrumb position in the filter, a negative identify matrix in the vehicle position vector indices, and zeros elsewhere.  This corresponds to calculating the position of the final breadcrumb relative to the landing site.  The relative covariance between the $i^{th}$ and $j^{th}$ breadcrumb and breadcrumb saved in the filter is approximated as:
+\begin{equation}
+    \Delta \text{P} = \left[ {\begin{array}{ccc}
+   |\text{P}_{bc_i}[1,1] - \text{P}_{bc_j}[1,1]| & 0 & 0 \\
+   0 & |\text{P}_{bc_i}[2,2] - \text{P}_{bc_j}[2,2]| & 0 \\
+   0 & 0 & |\text{P}_{bc_i}[3,3] - \text{P}_{bc_j}[3,3]|\\
+  \end{array} } \right]
+  \label{eq:DeltaP}
+\end{equation}
+\noindent where $\text{P}_{bc_i}[k,k]$ is element [k,k] in the 3x3 position covariance of the $i^{th}$ breadcrumb saved in the database and $bc_f$ corresponds to breadcrumb loaded into the filter at landing. This approximation produces reasonable results because the breadcrumbs are dropped in sequential fashion and the positions defined in a frame unaffected by heading uncertainties as previously described. Only breadcrumbs along the flight path of the next flight are converted into historic breadcrumbs. The heading of the online breadcrumbs is also used to down select the number of breadcrumbs. When there are both inbound and outbound breadcrumbs available, images with the same orientation that they will be viewed on the next flight are chosen.  This is done to improve image processing performance.

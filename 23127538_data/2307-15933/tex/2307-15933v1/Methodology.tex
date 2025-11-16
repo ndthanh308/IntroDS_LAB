@@ -1,0 +1,98 @@
+\section{Methodology}\label{sec:method}
+\genemask{} aims to mask the k (=6)-mers that co-occur much more than expected compared to their components (i.e., k-mers of shorter length, such as 4-mers or 5-mers). These spans then replace the (uniform) random masking strategy used by SOTA models. Removing highly correlated local contexts make the masked token prediction task more difficult, which may improve the pretraining efficiency~\cite{pmi-masking}. 
+However, \genemask{} significantly differs from the \textit{PMI-masking} strategy~\cite{pmi-masking} used in NLP, which first uses the (unnormalized) PMI score to formulate an absolute importance notion and subsequently creates a fixed masking vocabulary. To the best of our knowledge, this is the first work to develop a principled (statistical) approach to identify a highly correlated span of tokens in gene sequences based on normalized PMI score (Section~\ref{sec:pmiscoring}) and then develop a novel masking algorithm (\genemask) for efficient MLM training of gene-based (pretrained) SOTA models like DNABert and LOGO (Section~\ref{sec:entitydnabert}); Figure~\ref{fig:method-overview} provides the methodology overview.
+
+\subsection{PMI-based Metric to Identify Correlated Spans in Gene Sequences}\label{sec:pmiscoring}
+
+This work considers a single nucleotide equivalent to a single token in NLP. Thus an n-gram from the NLP domain is equivalent to a k-mer from the gene sequence modeling literature.
+We propose a novel strategy to adapt PMI-based scoring to our genomic setting, which can help us identify high PMI tokens to mask. \textit{Pointwise Mutual Information} (PMI) quantifies how often two tokens occur compared to what is expected if they are independent. The PMI formula (proposed by Levine et al.~\cite{pmi-masking}) when extended to k-mers (where k $>$ 2) is:
+\begin{equation}\label{eq:pmi}
+	\textrm{PMI}_k(w_1\ldots w_k)=\min_{\sigma\in\textrm{seg}(w_1\ldots w_k)}\log\frac{p(w_1\ldots w_k)}{\prod_{s\in\sigma}p(s)}
+	\end{equation}
+\raggedbottom
+Here, $\textrm{seg}(w_1\ldots w_k)$ is the set of all contiguous segmentations of the $k$-mer ``$w_1\ldots w_k$" (excluding the identity segmentation). In a valid segmentation ($\sigma$), the original sequence ``$w_1\ldots w_k$" can be divided into any number of partitions of positive ($>0$) size. For example, say for $k=6$, some of the possible valid segmentations are: ``($w_1\ldots w_3$), ($w_4\ldots w_6$)" or ``($w_1,w_2$) ($w_3$), ($w_4\ldots w_6$)".
+
+\textbf{The PMI\textsubscript{k} formulation many times favors tokens with lower frequency}, that is, the number of times the k-mer gene sequence appears in the \textit{Human Reference Genome}. We thus impose a \textbf{discounting factor} that penalizes rare tokens~\cite{pantel2002} because such PMI tokens will be more frequently selected as masked tokens during the MLM training stage. This may lead the model to over-emphasize corner cases and thus wrongfully mask `not-so-easy' cases. We refer to it as the \textit{Normalized PMI\textsubscript{k}} (NPMI\textsubscript{k}) formula, which we finally use for scoring all the individual n-gram sequences. 
+
+{\small{
+\begin{equation}\label{eq:norm-pmi}
+	\textrm{NPMI}_k(w_1\ldots w_k)= \newline PMI\textsubscript{k} * \frac{\log f(w_1\ldots w_k)}{\log (c)+ \log f(w_1\ldots w_k)} 
+	\end{equation}
+}}
+\raggedbottom
+Here, $f(w_1\ldots w_k)$ refers to the frequency of occurrence of the k-mer sequence of $w_1\ldots w_k$. $c$ refers to the minimum frequency of occurrence (a constant value used as a threshold to remove rare tokens). In this paper, we focus only on computing NPMI\textsubscript{k} for all k-mer sequences where $k = 6$, and develop {\bf a ranked list (\textit{GRANK}) of all 6-mers} ($4096$ in total) based on the decreasing order of NPMI\textsubscript{k}. Next, we discuss how we use the NPMI\textsubscript{k} scores as a  measure to choose tokens to be masked during MLM training.
+
+\subsection{Masking Algorithm for Efficient Pretraining over Gene Sequences} \label{sec:entitydnabert}
+ \genemask{} aims to mask all the nucleotides simultaneously in the most correlated spans. Masking correlated spans minimizes information leakage and helps the system to learn deeper patterns. Side by side, we would like to preserve the benefit drawn out of the traditional random masking strategy. Therefore, we propose a novel linear-time masking algorithm, \genemask, for MLM training of gene sequences, where we randomly identify positions in a gene sequence as mask centers and locally select the span around the mask center with the highest NPMI\textsubscript{k} to mask. We present the details of our proposed \genemask{} strategy in Algorithm~\ref{algo:genemask}. 
+
+ \newcommand\mycommfont[1]{\footnotesize\ttfamily\textcolor{blue}{#1}}
+\SetCommentSty{mycommfont}
+\SetKwInput{KwInput}{Input}      % Set the Input
+\SetKwInput{KwOutput}{Output}    % set the Output
+\SetKwInput{KwData}{Initialization}
+
+\LinesNumberedHidden
+
+\begin{algorithm}[ht]
+\footnotesize
+\caption{\genemask{} Algorithm}\label{algo:genemask}
+
+\DontPrintSemicolon \;
+    \KwInput{DNA string made of 6-mer tokens with a maximum length of 510, Dictionary containing NPMI\textsubscript{k} values for all 6-mers }
+    \KwOutput{$MaskTokenSet$: List of tokens to mask in the DNA string}
+    \KwData{
+    \tcp{T[i] denotes a 6-mer token at $i$-th position in the DNA segment, DNA[i] denotes the $i$-th nucleotide}
+
+    $MaskTokenSet \gets \emptyset$ 
+    
+    T[$i$] $\gets$ \{DNA[$i$-2]~$\cdots$~DNA[$i$+3]\}
+    }
+	\SetKwFunction{FMain}{MapNucleotideToKmerTokens}
+	\SetKwProg{Fn}{Function}{:}{}
+	
+	\Fn{\FMain{nucleotide position id $i$}}{
+
+            $MappedTokens$ $\gets$ T[$j$],  $\forall(j)_{j=i - 2}^{i + 3}$ \;
+			
+			\KwRet\  $MappedTokens$ \; 
+    }
+
+    \textbf{Step 1:} Randomly select $m$ nucleotides as mask centers (MC) spread uniformly over the DNA string.
+            
+            \tcp{In this step corresponding to each mask center, the neighboring nucleotide  which locally has the highest NPMI\textsubscript{k} is chosen}
+    \textbf{Step 2:}
+    \For{each nucleotide in $m$ mask centers}
+	{
+            $PositionId$ := Token index of nucleotide on the DNA segment given as input
+
+            $KmerTokens$ := $MapNucleotideToKmerTokens$ ($PositionId$)
+
+            \tcp{Select kmer with the highest $NPMI_k$ score, T[$\tau$] }
+            
+            $T[\tau]$ $\gets \arg$ $\max_{kmer \in KmerTokens}$ $NPMI_k$( kmer )
+
+            \tcp{Store the Locally Maximum NPMI score as MPMI\textsubscript{$\tau$}}
+            \textit{MPMI\textsubscript{$\tau$}} $\gets$  NPMI\textsubscript{k} $(T[\tau])$
+            
+	} 
+
+     \textbf{Step 3:} Divide the $m$ nucleotides into two sets based upon their \textit{MPMI} scores, where the high set is the $m/2$ nucleotides with the highest \textit{MPMI} scores. 
+
+     \textbf{Step 4:} 
+     
+    \For{each nucleotide in high set}	{
+        \tcp{Mask all the nucleotides in T[$\tau$] (this ensures the masking of correlated spans together, 11 tokens in length)}
+        $MaskTokenSet$ $\gets$ $MaskTokenSet$ $~\cup$ $\forall(j)_{j=\tau - 2}^{\tau + 3}$ $MapNucleotideToKmerTokens$( j )
+     }
+
+     \For{each nucleotide in low set}{
+            \tcp{Mask only the corresponding nucleotide DNA[$i$] (this mimics a random masking strategy)}
+        $MaskTokenSet \gets MaskTokenSet \cup MapNucleotideToKmerTokens( i )$
+     }
+
+     \KwRet\  $MaskTokenSet$ \;
+\end{algorithm}
+
+\noindent {\bf Determining the value of \textit{m}:} To mask six base pairs-long gene sequence that is all the nucleotides in a particular token T[$i$], we need to mask a span of contiguous $11$ tokens (6 mask centers, two tokens to the left and three tokens right) while as mentioned a single nucleotide induce masking of $6$ tokens. Thus, the expected mask span length per mask center is computed as $0.5 * 6 + 0.5 * 11 = 8.5$. Subsequently, the \textit{mlm probability} is updated from $2.5\%$ to $1.765\%$ (= $15\% / 8.5$). Hence when the DNA length is $512$, $m$ $\approx$ 9. 
+
+\noindent \textbf{Efficiency of \genemask{} algorithm.} \genemask{} first samples $m$ random nucleotides as mask centers and locally chooses the one with the highest NPMI\textsubscript{k} score within the span (fixed number of adjacent tokens) of the mask center. Thus the time complexity of \genemask{} becomes $O(m)$. Since $m = c*n$, where $n$ is the input sequence length and $c$ is a constant value (equal to $1.765\%$ in our case), the time complexity of \genemask{} is: $O(m)$ = $O (c*n)$ = $O(n)$. 

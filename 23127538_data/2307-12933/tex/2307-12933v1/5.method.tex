@@ -1,0 +1,107 @@
+\section{Implementation}
+According to the above theory, the proposed extended policy improvement via planning over multiple time steps can also guarantee value improvement and convergence to the optimal policy. And the increase of planning horizon has the potential to get a better new policy. In this section, we discuss some essential design choices for distilling the model-based planning into SAC \cite{sac}. We further propose a practical algorithm, \textit{\textbf{M}odel-based \textbf{P}lanning \textbf{D}istilled to \textbf{P}olicy (MPDP)}, under the model-based paradigm.
+There are two essential issues in the design of MPDP, \textbf{(1)} how to solve the objective in \cref{eq:objective}, and \textbf{(2)} how to reduce the bias introduced by the generalization error of the environment model.
+
+\subsection{Solver} 
+Solving the proposed objective defined by \cref{eq:objective} is a model-based planning problem, which has been widely discussed in many prior works \cite{latco,pets,poplin}. We roughly divide the current solvers into two categories, sample-based methods and gradient-based methods.
+
+
+Sample-based methods typically include random shooting and cross-entropy method (CEM) \cite{cem}. However, sample-based methods are usually inefficient in complex high-dimensional tasks.
+Gradient-based methods include gradient optimization and collocation method \cite{latco}, which optimize with reward to the action sequence and backpropagate the gradient to all actions in the sequence.
+Both gradient optimization and collocation methods suit our formulation due to their accessibility of the gradient. We can develop a practical algorithm based on both of them. We observe that they perform comparably on the MuJoCo benchmark in our early-stage experiments. 
+
+
+With the above discussion, we choose gradient optimization as our solver, because it naturally suits the framework of SAC and achieves comparable performance without introducing extra hyperparameters and computational cost compared to the collocation method.
+
+
+\begin{algorithm}[ht]
+%   \vspace{-1.0em}
+   \caption{Farsighted Policy Improvement}
+   \label{alg:improvement}
+\begin{algorithmic}[1] %[1] enables line numbers
+   \Require state batch $B$, policy networks $\pi_{0:H_{max}-1}$, dynamic models $p_{1:K}$, threshold $u_T$, coefficient $\alpha$ and $\beta$
+   \For{$\boldsymbol{s}$ {\bfseries in} $B$}
+   \State $\boldsymbol{s}_0 = \boldsymbol{s}$, $J=0$
+   \For{$t=0:H_{max}-1$}
+        \State Sample $\boldsymbol{a}_t \sim \pi_{t}$
+        \State Predict $\boldsymbol{s}_{t+1} \sim p_{1:K}(\boldsymbol{s}_{t+1},\boldsymbol{a}_{t})$
+   \If{$u(\boldsymbol{s}_t,\boldsymbol{a}_t) \geq u_T$ or $\boldsymbol{s}_{t+1}$ is a terminal state}
+   \State $J=J+\gamma^{t+1} \cdot V(\boldsymbol{s}_{t+1})$
+   \State break
+   \EndIf
+  \State \begin{small}$
+  J \!=\! J \!+\! \gamma^{t} \cdot [ r(\boldsymbol{s}_{t},\boldsymbol{a}_{t})
+    \!-\! \alpha \cdot log\pi(\boldsymbol{a}_{t}|\boldsymbol{s}_{t})
+    \!-\! \beta \cdot u(\boldsymbol{s}_{t},\boldsymbol{a}_{t}) ]
+          $\end{small}
+  % \State $
+  % J += \gamma^{t} \cdot[ r(\boldsymbol{s}_{t},\boldsymbol{a}_{t})
+  %   \!-\! \alpha \cdot log\pi(\boldsymbol{a}_{t}|\boldsymbol{s}_{t})
+  %   \!-\! \beta \cdot u(\boldsymbol{s}_{t},\boldsymbol{a}_{t})] $
+   \EndFor
+   \EndFor
+   \State Update $\pi_{0:H_{max}-1}$ with the mean of $\nabla_{\boldsymbol{a}_{0:H_{max}-1}}J$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Model Regularization} 
+The bias resulting from the environment model's generalization error raises two issues for consideration. 
+First, although increasing the planning horizon has the potential of resulting in a higher value theoretically, we must consider the trade-off between the bias of $Q^{\pi_{old}}$ and the environment model. A larger $H$ introduces more model bias but reduces the bias of $Q^{\pi_{old}}$. 
+Second, we need to avoid the update of the policy towards the area where the model has high generalization error, because this will result in a sub-optimal solution and the gradients of the environment model at those unseen state-action pairs $(s, a)$ are unsupervised and not numerically stable, i.e., applying the environment model iteratively for many time steps may lead to gradient explosion \cite{latco}.
+
+Both the two issues need the estimation of the model error, which has been well discussed in prior works. In this paper, we use One-vs-Rest (OvR) \cite{m2ac}, a simple method to estimate model errors. OvR learns multiple dynamic models and uses the KL divergence between models as an estimator of model error, which is formalized as:
+\begin{equation}
+\setlength{\abovedisplayskip}{5pt}
+\setlength{\belowdisplayskip}{5pt}
+    u(\boldsymbol{s},\boldsymbol{a}) = \sum_{i=1}^{K}D_{KL}[p_{i}(\cdot|\boldsymbol{s},\boldsymbol{a}) \Vert p_{-i}(\cdot|\boldsymbol{s},\boldsymbol{a})].
+\end{equation}
+Here $p_{i}(\cdot|s,a)$ is the predicted distribution of the one model and $p_{-i}(\cdot|s,a)$ is the mean of the rest models' prediction. 
+
+Based on OvR, we develop two methods separately for the above two issues. First, we use adaptive horizons for trajectories starting from different states. The planning stops when a trajectory generates a state-action pair which has a model error larger than a pre-defined threshold. Secondly, we develop an additional regularization of model error, which adds the model error estimated by OvR on our objective \cref{eq:objective}. This regularization directs the final solution to the area where the environment model is more believable and reduces both the numerical instability and the model error. Specifically, we add the estimation $u(\boldsymbol{s},\boldsymbol{a})$ on the original reward $r^{\pi}(s,a)$ as a regularization, and re-formalize \cref{eq:objective} as:
+\begin{equation}
+    J_{\boldsymbol{s}_t}^{H,u}(\pi) 
+    = 
+    \mathbb{E}_{\boldsymbol{a} \sim \pi}
+    \left[
+        \sum_{i=0}^{H-1}
+            \gamma^i 
+            \cdot r^{\pi,u}(\boldsymbol{s}_{t+i},\boldsymbol{a}_{t+i})
+            + V^{\pi_{old}}(\boldsymbol{s}_{t+H})
+    \right], \label{eq:objective_reg}
+\end{equation}
+\begin{gather}
+\begin{aligned}
+    r^{\pi,u}(\boldsymbol{s}_{t+i},\boldsymbol{a}_{t+i}) 
+    =
+    &r(\boldsymbol{s}_{t+i},\boldsymbol{a}_{t+i}) 
+    - log\pi(\boldsymbol{a}_{t+i}|\boldsymbol{s}_{t+i})
+    \\
+    &- \beta \cdot u(\boldsymbol{s}_{t+i},\boldsymbol{a}_{t+i}).
+    \label{eq:beta_obj}
+\end{aligned}
+\end{gather}
+
+
+
+\begin{algorithm}[ht]
+   \caption{Model-based Planning Distilled to Policy}
+   \label{alg:MPDP}
+\begin{algorithmic}[1]
+%   \Require data buffer $D=\emptyset$, policy nets $\pi_{0:H_{max}-1}$, dynamic models $p_{1:K}$, threshold $u_T$, coefficient $\alpha$ and $\beta$.
+   \State Initialize data buffer $D=\emptyset$, dynamic models $p_{1:K}$, policy networks $\pi_{0:H_{max}-1}$, value networks $Q$ and $V$
+   \Repeat
+   \State Collect data from real environment with policy $\pi_0$: $D \leftarrow D\cup {(s,a,r,s')}$
+   \State Train ensemble models $p_{1:K}$ on $D$
+   \State Sample a batch $B$ from $D$
+   \State Update $Q$ and $V$ with $B$ as in SAC
+   \State Update $\pi_{0:H_{max}-1}$ by \cref{alg:improvement}.
+   \Until{Convergence}
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsection{Model-based Planning Distilled to Policy}
+
+% Figure environment removed
+
+We conclude our extended policy improvement in \cref{alg:improvement}. The algorithm processes a batch of states at each iteration and the model rollouts states until the task terminates, that is to say, the pair of $(\boldsymbol{s}_t, \boldsymbol{a}_t)$ has a larger model error than the threshold $u_T$, or the rollout reaches the max horizon $H_{max}$. And we maintain the policy networks $\pi_{0:H_{max}-1}$ at $H$ time steps. The policy networks generate the actions for each step and are updated jointly in our extended improvement step. After the model rollouts, the policy networks $\pi_{0:H_{max}-1}$ are updated with the gradients to the action sequence. The complete algorithm is described in \cref{alg:MPDP}. The method alternates among using the policy $\pi_{0}$ on the first step to interact with the environment, training an ensemble of models, and updating the policy with policy evaluation and our extended policy improvement.

@@ -1,0 +1,100 @@
+% for figure1 in page 1
+
+\section{Proposed Method}
+\label{sec:method}
+
+% \subsection{Incremental Object Detection}
+\subsection{Problem Formulation and Overview}
+Object detection is primarily concerned with accurately identifying and localizing objects of interest within an image. 
+Given a set of data $D=\{(I_n, Y_n)\}_{n=1}^{N}$, an ideal object detector $f_{\theta}(I_n)$ can predict a series of boxes $\hat{Y}_n$ corresponding to the groundtruth $Y_n$, where $Y_n = \{y_g=(u_g, v_g, w_g, h_g, c_g)\}_{g=1}^{G_n}$, with $(u_g, v_g)$ denoting the top-left corner coordinates of the bounding box and $(w_g, h_g)$ the width and height of the bounding box, and $c_i$ denotes the class for each of the $G_n$ bounding boxes. Therefore, $D$ has $K$=$\sum_{n=1}^{N} G_n$ groundtruth boxes totally.
+This work focuses on two-stage detectors from the R-CNN family~\cite{ren2015faster,girshick2015fast,he2017mask} that typically consist of a CNN-based feature extractor, a Region Proposal Network (RPN), and a class-level classification and bounding box regression network (RCN). 
+
+Incremental object detection aims to learn to detect objects in a sequence of $T$ tasks, where each task $D^t=\{(I^t_n, Y^t_n)\}_{n=1}^{N^t}$ corresponds to a new set of classes $\mathcal{C}^t$. The model should be able to detect objects in the new classes $\mathcal{C}^t$ while retaining the ability to detect objects in the previously seen classes $\mathcal{C}^{1:t-1}$ without catastrophic forgetting. However, unlike in the classification tasks where each input has a single label, $I^t_{n}$ may contain objects from both $\mathcal{C}^t$ and $\mathcal{C}^{1:t-1}$, and the annotations $Y^t_n$ only include the bounding boxes and class labels for $\mathcal{C}^t$. Therefore, $G^t_n\leq$ the number of the real annotations in IOD. 
+The presence of unlabeled previous objects can lead to \textbf{\textit{Background Shift}} during training, where attention of the detector is biased towards the $\mathcal{C}^t$ and it fails to differentiate between the objects from $\mathcal{C}^t$ and $\mathcal{C}^{1:t-1}$. Moreover, misassociations can propagate over time, exacerbating catastrophic forgetting of previous classes. 
+
+A straightforward way to a solution is using the original images from $D^{1:t-1}$, as shown in~\cref{fig:introduction}, which provides certain information for $\mathcal{C}^{1:t-1}$. However, the image replay method involves replaying original images from the previous training set during the current one, which can cause \textit{\textbf{Foreground Shift}} due to replay of unlabeled objects from $\mathcal{C}^t$. Thus, the new classes or the foreground in the current images are considered as the background in the replayed images which results in the model failing to generalize to new contexts. Additionally, storing the original images can result in significant memory overhead, since they include a lot of redundant information.
+
+\subsection{Augmented Box Replay}
+
+To mitigate the foreground shift problem, we propose an Augmented Box Replay (ABR) strategy that selects a subset of informative and representative box images from the previous task, along with a new set of boxes for the current task $t$. This method avoids replaying redundant information and optimally employs its storage for the relevant object regions. Specifically, ABR can replay these boxes in an augmented way, which helps the model retain its ability to detect previous objects in new contexts while improving its detection performance on the current task. \cref{fig:ABR} illustrates the pipeline of Augmented Box Replay strategy.
+
+At the beginning, we involve a prototype box selection to choose the most representative boxes whose feature maps are close to the mean feature map after training of task $t-1$. The memory buffer is denoted as $B^{t-1}$, where the memory size $M^{t-1}$ of $B^{t-1}$ is limited. Therefore, the selection is an important factor that affects the performance. The final $B^{t-1}$ can focus on the most relevant information and avoid redundant or irrelevant information. Since box images are smaller than images, the storage cost is reduced, making it scalable to large datasets and complex models. See supplementary material for more details.
+
+To leverage prototype boxes $B^{t-1}$ accumulated from the previous tasks in the current task $t$, we have designed two types of replay strategies: mixup box replay and mosaic box replay, inspired by~\cite{zhangmixup,bochkovskiy2020yolov4}. These strategies allow us to effectively transfer knowledge from past tasks to the current one and enhance the performance of the model.
+
+\noindent  \textbf{MixUp box replay.} This method replays the box images of the previous class in the current data, placed in such a way that the previous box objects blend into the image more naturally, while ensuring that they have minimal overlap with the groundtruth bounding boxes of the new class. It involves assigning a random location in the current image $I_n^t$ to each box image $b \in B^{t-1}$ with size $(w_b, h_b)$, and then mixing it with $I_n^t$ to create a new image $\hat{I}_n^t$. More specifically, $\hat{I}_n^t$ is obtained by overlaying  $b$ onto $I_n^t$ at a location with a mixing coefficient $\lambda$. For each pixel location in $\hat{I}_n^t$, if $(u,v)$ is not inside the box, then the original pixel value of $I_n^t$ is retained. If $(u,v)$ is inside the box, the mixed pixel value is computed by:
+\begin{equation}
+\begin{aligned}
+\hat{I}_n^t(u,v) = \begin{cases}
+\lambda I_n^t(u,v)\quad &\multirow{2}*{$\text{if } \max\limits_{g\in G^n_t} y_g \cup b \leq th$}\\
++ (1-\lambda) b({\hat{u},\hat{v}}), \\
+I_n^t(u,v) & \text{otherwise}
+\end{cases},
+\end{aligned}
+\end{equation}
+where $\lambda$ is values with the [0, 1] range and is sampled from the Beta distribution~\cite{zhangmixup}, $b(\hat{u},\hat{v})$ is the pixel value of the box image $b$ at location $(\hat{u}=u-w_b,\hat{v}=v-h_b)$, $y_g \cup b$ is the intersection over union (IOU) between each groundtruth annotation $y_g, \forall {g}\in G_n^t$ and the box image $b$, and $th$ is a threshold value. If the maximum IOU over union between the groundtruth annotations and the box image $b \leq th$, then the pixel value at $(u,v)$ in the new image $\hat{I}_n^t$ is a mixture of the original pixel value $I_n^t(u,v)$ and the corresponding pixel value in the box image $b$. Otherwise, the original pixel value $I_n^t(u,v)$ is retained. Note that at most two boxes are mixed up in a single image $I_n^t$ since the boxes are selected randomly and the overlap condition limits the number of boxes that can be mixed up in a single image.
+
+\noindent  \textbf{Mosaic box replay.} This method involves dividing $I_n^t$ into a grid and randomly selecting a subset of cells. Each cell is then replaced with a box image $b$ from $B^{t-1}$, and the resulting image $\hat{I}_n^t$ is used for rehearsal. In the mosaic box replay strategy, a composite image is formed by combining four box images into a single mosaic image. To create the composite image, a random location is first selected as the center point of the mosaic image. Then, each of the four boxes is resized to a new size that is proportional to the size of the mosaic image, with the scaling factor $\mu$ randomly sampled from the range of [0.4, 0.6]. The resized boxes are arranged in the four quadrants of the mosaic image, and the remaining areas are filled with a fixed color value. 
+
+In summary, the Augmented Box Replay offers several advantages for incremental learning in object detection: 1) \textbf{Information Richness:} ABR selects the most informative and representative boxes for rehearsal, which preserves the accuracy and diversity of learned model. 2) \textbf{Enhanced generalization:} ABR serves as an augmentation method which gives a different background context to both previous and new classes and thus improves the generalization of the model. 3) \textbf{Memory efficiency:} ABR replays only a small set of representative box images instead of the entire images, which significantly reduces the memory requirement. 4) \textbf{Adaptability:} ABR can easily be integrated with different object detection models to improve their performance.
+
+
+\subsection{Attentive RoI Distillation}
+
+\input{tables/table_inf_rpn}
+Distillation-based methods~\cite{shmelkov2017incremental,peng2020faster,cermelli2022modeling} are commonly used in IOD, aiming to transfer the knowledge of a model trained on a previous task (teacher) to a current model (student) while simultaneously learning the new task.
+To further explore the impact of the distillation operation on the forgetting of each detector component, an ablation study is evaluated on the Faster-ILOD model~\cite{peng2020faster} as shown in~\cref{tab:infrpn}.
+We can find that the feature extractor has a minimal effect on forgetting when either freezing the backbone or applying the feature distillation operation, and the presence or absence of the RPN component only has a 0.1\% effect on forgetting. However, removing the distillation operation of the prediction head (RCN) results in a 26.2\% drop in performance. 
+Our obtained analysis and~\cite{verwimp2022re} together suggest that forgetting mainly occurs at the classification head. However, a limitation of RPN distillation lies in its focus solely on extracting RPN modules, which provide region proposals without considering features within each proposal. Consequently, the distilled model may overlook informative features within the proposals, leading to suboptimal performance.
+%%%%%%%% old version %%%%%%%%%%%%%
+% However, our analysis~\footnote{More details are shown in supplementary material} and~\cite{verwimp2022re} suggest that forgetting occurs mainly at the classification head. While, for RPN distillation, one limitation is that it mainly focuses on extracting Region Proposal Network (RPN) modules, which only provide region proposals for object detection without considering features within each proposal. As a result, the distilled model may miss some informative features inside the proposals, leading to suboptimal performance.
+%%%%%%%% old version %%%%%%%%%%%%%
+To address this, we propose the Attentive RoI Distillation (ARD) loss, which allows the student model to selectively focus on the most important features from the teacher model by aligning the spatial attention maps and masked features of each proposal. Moreover, ARD supports more inclusive RoI features for the final prediction and helps to overcome the forgetting problem in the classification head. 
+
+To enable the model to focus on the most informative parts of an image, we calculate a spatial attention map $A^t_i$ for each $F^t_i$, $\forall i \in P^t_n$, where $P^t_n$ is the number of proposals. The spatial attention map is obtained by raising the absolute value of each feature plane $F^t_{i,d}$ to a power $p$ (in the experiments, $p=2$) based on~\cite{zagoruyko2016paying} and summing them up:
+\begin{equation}
+A^t_i=\sum^{C}_{d=1}\left|F^t_{i,d}\right|^{p}, \quad p>0,
+\end{equation}
+Our method employs spatial attention maps from previous and current models to emphasize the most informative features and suppress the less informative ones. More superficially, the pooled attention distillation (PAD) loss is:
+\begin{equation}
+    \mathcal{L}_{PAD}=\left\|A_{i}^{t-1}-A_{i}^{t}\right\|,
+\end{equation}
+where $A_{i}^{t-1}$ and $A_{i}^{t}$ are the spatial attention maps for the $i^{th}$ proposal in the previous and current models, respectively. PAD can transfer knowledge from a previously trained model to a new one in a progressive learning setting.
+The key difference with existing distillation methods in IOD is that here we explicitly distill the knowledge on the location of the relevant features (this is encoded in the attention map). 
+Furthermore, ours applies the attentive distillation into the aligned bounding boxes, which contain the very relevant both location and feature information. Specifically, the Attentive RoI Feature Distillation (AFD) loss is employed:
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{AFD}= &\dfrac{1}{P_n}\sum^{P_n}_{i=1}\left(F_{i}^{t-1}-F_{i}^{t}\right)^{2}A_{i}^{t-1},
+\end{aligned}
+\end{equation}
+where $P_n^t$ is the number of proposals for $I_n^t$, $F_i^{t-1}$ and $F_i^{t}$ are the features extracted from the previous and new models, respectively. The squared difference $(F_{i}^{t-1}-F_{i}^{t})^2$ penalizes larger deviations between the previous and new features, which further encourages the new model to reproduce informative features from the previous model. By using the attention maps to weight the MSE term, AFD ensures new model to focus on reproducing the most important features from the previous model, while allowing for some flexibility in reproducing the less informative features. The overall ARD loss function is defined as: 
+\begin{equation}
+    \mathcal{L}_{ARD}=\mathcal{L}_{AFD}+\gamma \mathcal{L}_{PAD}
+    \label{eq:ard}
+\end{equation}
+where $\gamma$ is a hyperparameter that controls the strength of the regularization. 
+
+ARD loss not only aligns the features of each proposal but also has an effect on the position deviation of each anchor point. This spatial attention feature alignment reduces the impact of background shift caused by the imbalance between new and previous classes and promotes knowledge transfer from the previous model to the new model.
+
+
+\subsection{Inclusive Loss with Background Constraint}
+To avoid forgetting in classification head, we followed the unbiased classification and distillation losses proposed by~\cite{cermelli2020modeling,cermelli2022modeling}. However, due to our Augmented Box Replay strategy, the input image $\hat{I}_n^t$ contains many annotations about previous objects. This means that using unbiased losses directly in this situation is not feasible, as it would ignore the positive influence of the $B^{t-1}$ on the previous categories during the training phase. Therefore, we involve Inclusive Loss with Background Constraint to adapt the ABR based on the unbiased classification and distillation losses. In detail, the Inclusive Classification Loss is defined as follows:
+\begin{equation}
+\mathcal{L}_{IC}=\frac{1}{P_n^t} \sum_{i=1}^{P_n^t} c_{i}
+\begin{cases}\log (p_{i}^b + \sum\limits_{c=1}^{\mathcal{C}^{1:t-1} } p_{i}^c), 
+&  c_i = \mathcal{C}^b \\ 
+\sum\limits_{c=1}^{\mathcal{C}^{1:t} } c_i \log p_{i}^c,  
+&  c_i\in \mathcal{C}^{1:t}\end{cases}
+\end{equation}
+where $c_{i}$ is the label of proposal $i$, $p_{i}^b$ is the probability as $\mathcal{C}^{b}$, $p_{i}^c$ is the probability as $\mathcal{C}^{t}$. For positive RoI of $\mathcal{C}^{1:t}$ in ABR, the standard RCN loss based on cross-entropy is maintained. However, for negative RoI, the sum of the probabilities of $\mathcal{C}^{1:t-1}$ is treated as $\mathcal{C}^{b}$, ensuring that the model does not learn to predict $\mathcal{C}^{1:t-1}$ for unlabeled objects.
+
+ 
+Moreover, the inclusive distillation (ID) loss maintains the performance of task $t-1$ by aligning the probabilities of the previous model for the background class with the probabilities of the new model for both $\mathcal{C}^{b}$ and $\mathcal{C}^{t}$. The training data for ABR includes grountruth annotations from box rehearsal, and the teacher model can detect previous objects. Therefore, we only need to focus on each proposal of $\mathcal{C}^{t}$:
+\begin{equation}
+\mathcal{L}_{ID} =  \frac{1}{\Omega}
+\begin{cases}p_{i}^{b, t-1} \log ( p_{i}^{b,t} + \sum\limits_{c=1}^{\mathcal{C}^t } p_{i}^{c,t}), 
+&  c_i = \mathcal{C}^b \\ 
+\sum\limits_{c=1}^{\mathcal{C}^{t-1} } p_{i}^{c, t-1} \log (p_{i}^{c,t}),  
+&  c_i\in \mathcal{C}^{1:t}\end{cases}
+\end{equation}
+where $\Omega = |\mathcal{C}^{1:t-1}|+1$ is the number of previous and background classes, $p_{i}^{b, t-1}$ and $p_{i}^{c, t-1}$ are the classification probabilities of the background class and previous classes in task $t-1$, respectively, $p_{i}^{b,t}$ and $p_{i}^{c,t}$ are the classification probabilities of the background class and new classes in task $t$, respectively, for the proposal $i$, $p_{i}^{c,t}$ is the classification probability of previous classes and new classes for the proposal $i$ in the current task $t$. 

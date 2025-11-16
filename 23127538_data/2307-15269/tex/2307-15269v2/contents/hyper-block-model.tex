@@ -1,0 +1,111 @@
+Our second proposal is a Hyper-Block Model that allows for generating proofs for transaction results. Our solution adheres to the architecture demonstrated in Figure~\ref{fig_NT} and integrates the fast-commit rules from Definition~\ref{def_fast_commit}. Previous DAG-based consensus protocols focus on creating consensus by ordering transactions such that proof of whether transactions were included in the DAG and which conflicting transactions succeed or fail is available only after a DAG is formed. The purpose of the Hyper-Block model is to create such proof for the status of a transaction in parallel to form the DAG, thus reducing the latency between the commitment and the inclusion of a transaction in the consensus. Note that our approach does not produce any communication overhead such that its impact on the performance of DAG creation is minimal.
+
+At a high level, a hyper-block consists of three parts: 1) proof of leadership, 2) a commitment to batches in the sub-DAG, and 3) a commitment to the failed transaction set. The consortium will sign all contents to enable any client to use the hyper-block and verify whether its transaction is correct. The commitment of the set can be any proper cryptographic aggregator that satisfies the requirements. Specifically, each proof of transaction result contains three parts. 
+\begin{itemize} 
+    \item \textbf{Block membership}: Proof that the transaction is in a batch contained by a hyper-block; 
+    
+    \item \textbf{Result Proof}: A demonstration of whether the transaction is a member or non-member of the corresponding failed transaction set in the hyper-block; 
+    
+    \item \textbf{Leadership Proof}: Proof of leadership for the protocol. %{\color{red}\textit{Leadership Proof} might be briefer.}
+\end{itemize}
+
+The primary technical challenge arises from preparing the hyper-block without disrupting the consensus protocol, which only decides the leader proposal index. To overcome this problem, we need to accomplish two tasks: Firstly, we need to obtain the transaction results to commit the failed transactions. Secondly, we must ensure that byzantine nodes cannot forge a hyper-block that validates a failed transaction.
+
+We propose two strategies to achieve this: 1) A blocking strategy that synchronizes the DAG and consensus layers to execute a process similar to a view-change in other BFT protocols, and 2) a non-blocking strategy that commits all possible and valid output paths through the consensus algorithm.
+
+Here we list some sub-functions we use in our blocking and non-blocking algorithms, along with implementation remarks: 
+\begin{itemize}
+    \item MakeProposal: Take a round $r$ as inputs and return a proposal $p$ that patches at least $2f+1$ proposals from the previous round and a bundle of batches received from its workers; 
+    
+    \item TakeLeader: Take a round $r$ as inputs, await the consensus layer output the leader of round $r$. If the leader is not in the DAG, recursively outputs the latest leader in the DAG;
+    
+    \item SimulateCommit: Take a proposal and the previous leader as input. It outputs a list of committed batches and a set of failed transaction IDs. The flow is almost the same as Algorithm~\ref{Alg_TX_Result} without side effects, thus should be implemented as a function of Board;
+    
+    \item CommitList: Take a list as input and return one value as output commitment. It can be implemented as a cryptographic accumulator that supports both membership and non-membership proof;
+
+    \item AttachWitness: Including some witnesses to a proposal $p$ for acquiring signatures.
+\end{itemize}
+
+Now, we thoroughly detail both strategies.
+
+\subsection{The Blocking Strategy}
+The blocking strategy modifies the clerk consensus algorithm and proposes rules. For the consensus algorithm, if the first proposal of an odd round of $r\geq 5$ is added to the DAG, the consensus layer will automatically trigger the protocol to select the leader for the round $r-1$. %{\color{red}Specify which consensus algorithm is modified.}
+
+Secondly, when the proposer initiates a proposal for any even round of $r+1 > 4$, it will first collect batches and wrap them properly. Next, the proposer will block the proposal and await the selection of a leader from round $r-1$. After the proposer becomes aware of the selection of the round leader, it will simulate the transaction results of its proposal as if this proposal is committed to the future leader. This simulation will compute the corresponding failed transaction commitment and batch set commitment. Subsequently, the two commitments are wrapped together with the proposal and dispatched to the broadcast phase. The flow for the proposing process is presented in Algorithm~\ref{Alg_Proposing}. 
+
+
+
+ \begin{algorithm}[htbp]
+ 	\caption{Blocking algorithm for proposing}
+ 	\label{Alg_Proposing}
+ 	\begin{algorithmic}[1]
+ 		\Require Round $r$
+ 		\Ensure Proposal $p$ for round $r$
+ 		
+            \Function{Proposer.Proposing}{$r$}
+ 		\State MakeProposal($r$) $\longrightarrow p$
+            \State TakeLeader($r-2$).await() $\longrightarrow L$
+            \State Board.SimulateCommit($p, L$) $\longrightarrow (B,F)$
+ 		\State CommitList($F$) $\longrightarrow wf$
+            \State CommitList($B$) $\longrightarrow wb$
+ 		\State AttachWitness($p$,$wb,wf$)
+ 		\State Return $p$
+            \EndFunction
+ 	\end{algorithmic}
+ \end{algorithm}
+
+Upon receiving the proposal from the other nodes, the initial action is to verify the DAG history and confirm the correct calculation of the failed transaction commitment. Confirmation is done by signing the proposal ID, the commitment of failed transactions, and the commitment of batch set. The signed information is used to generate the certificate of the proposal in the DAG. Once the proposal is successfully committed to a leader, each node independently assembles the hyperblock by fetching this signature and the output of the consensus layer.
+
+Our blocking strategy does not affect the security claims of the Tusk algorithm, as the election process is independent.  
+
+\begin{remark}
+The counting process can be accelerated for efficiency by utilizing dynamic programming methods to cache the votes for conflicted transactions (M in line 13 of Algorithm~\ref{Alg_TX_Result}). The cached outcome can later be removed after the commitment of corresponding leaders.
+\end{remark}
+
+\subsection{The Non-Blocking Strategy}
+
+In an asynchronous network setting, waiting for the consensus layer results in the blocking strategy may not be tolerable. Therefore, we propose a non-blocking strategy to minimize the potential delays due to the network.
+
+We use a commit and prove flow technique to create the hyperblock in the non-blocking strategy. The proposer maintains a leader DAG by the present DAG. The difference is that the leader DAG comprises proposals only for even rounds (\ie, rounds for selecting leaders). Every two proposals are connected only if they are connected in the DAG. Moreover, whenever a leader is chosen for a round $r$, the proposals other than the selected one are removed from the leader DAG instantaneously. The leader DAG can be seen as comprising all the probable leader proposals of the current DAG.
+
+In the leader DAG, we store batch and failed transaction commitments. Each proposal has a vector for these two commitments; every position in the vector reflects a path in the leader DAG from the current proposal to the previously committed leader (if the leader is not in the DAG), given that the corresponding proposals on the path are chosen as the leaders for the corresponding rounds. 
+
+Figure~\ref{fig_leader_dag} shows an instance of a leader DAG and its verification path based on the consensus layer results. When proposing for round 10, we assume the leaders of round 4,6 are known(checked), and the leader of round 8 is unknown (question marked). The new proposal at round 10 has four possible cases for the round leader at round 8. It will create corresponding commits and form them as a vector for proposing. For proposals at round 8, which already know the leader of round 6 (checked), Node 2 will contain a commitment for it and be used by the proposer in round 10. On the other hand, Node 3 has not yet seen proposals 2-6, so its commitment to the older leader 1-4 (checked) will be used for proposing. If the 2-8 is the eventual new leader, the black line represents the commitments that all users eventually use.
+
+% Figure environment removed
+
+We require that a leader DAG supports the following functions: First, Candidates($r$) returns a list of candidates leaders for round $r$. If the leader is not selected, it should be all proposals in round $r$ plus Candidate($r-2$) in a recursive way. Second, Add($p, V$) adds the proposal $p$ to the leader DAG with a vector $V$ of commitment of batches and transactions. In addition, the leader DAG should also support some clean-up functions to remove non-leader or committed proposals accordingly.
+
+The proposal contains the vector created according to the paths of the leader DAG. After receiving a proposal, a node verifies the vector and then commits it as a Merkle tree, sending the root's signature as evidence back to the proposer. This evidence, along with the consensus layer output, will eventually be used to verify the correctness of the batch commitment and the failed transactions commitment made by the node if this proposal is the leading one in the future. Algorithm~\ref{Alg_Proposing_NB} outlines the proposal procedure in the non-blocking strategy.
+
+ \begin{algorithm}[htb]
+ 	\caption{Non-Blocking algorithm for proposing}
+ 	\label{Alg_Proposing_NB}
+ 	\begin{algorithmic}[1]
+ 		\Require Round $r$, Leader DAG $LD$
+ 		\Ensure Proposal $p$ for round $r$
+ 		\Function{Proposer.Proposing}{$r,LD$}
+ 		\State MakeProposal($r$) $\longrightarrow p$
+            \State Initiate a vector $V$
+            \For{ $L$ in $LD$.candidates($r-2$)}
+                \State Board.SimulateCommit($p,L$) $\longrightarrow (B,F)$
+     		\State CommitList($F$) $\longrightarrow wf$
+                \State CommitList($B$) $\longrightarrow wb$
+                \State $V$.Push($wf,wb$)
+            \EndFor
+            \State $LD$.Add($p,V$)
+ 		\State AttachWitness($p$,$V$) 
+ 		\State Return $p$
+        \EndFunction
+ 	\end{algorithmic}
+ \end{algorithm}
+
+\subsection{Theoretical Analysis}
+
+Both strategies only add one commitment for successful and failed transactions to the proposal. Narwhal will collect sufficient signatures for the proposal, including this commitment, so nodes can prove the result of arbitrary transactions through this commitment(\eg, proving a transaction has a valid open to the successful or failed set). In the non-blocking strategy, the prover must provide additional proof of the previous leader since it commits all possible results for different leaders. 
+
+Since both strategies are deterministic processes, each proposal's communication overhead is just $O(1)$. Algorithm~\ref{Alg_TX_Result} dominates the computational complexity of both the blocking and non-blocking strategies. For the blocking strategy, it should be noted that this process triggers at least $2f+1$ simulations during the RBCs phases of each round. However, the result can be cached for the formal commit process. Unlike the blocking strategy, the non-blocking strategy involves a polynomial scale of possible paths to commit. However, in practice, if the leader of round $r-4$ is evident by round $r$, the proposer needs to calculate at most $2f+2$ possibilities for its vector, given that each proposal's commitment at round $r-2$ is already confirmed. Thus, the total computation cost for each leader round is at most $O(n^2)$ in this case. 
+
+\begin{remark}
+    Practically, we can hybrid non-blocking and blocking strategies. We can safely choose the non-blocking strategy when there are no or limited conflict transactions. Once the conflicted transaction increases, a blocking strategy can cool down the proposing phase and reduce the computation overhead.
+\end{remark}

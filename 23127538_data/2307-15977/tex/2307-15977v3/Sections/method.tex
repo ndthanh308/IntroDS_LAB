@@ -1,0 +1,171 @@
+
+\section{Method}
+
+In this work, our primary goal is to design a fingerprint extractor that could generalize to unseen models in the open world. To accomplish this goal, we propose a new approach by utilizing synthetic models, to mimic the fingerprint patterns of real-world generative models. By this approach, we significantly broaden the scope of the training data of fingerprint extractor, and consequently diminish the generalization gap. In the following, we begin with an analysis of the factors influencing the fingerprint patterns of generative models, detailed in Section~\ref{subsec:warm_up}. Based the analysis, we then design our model synthesis strategy in Section~\ref{subsec:model_synthesis}. Finally, in Section~\ref{subsec:fingerprint_extractor}, we use the synthetic models to train the fingerprint extractor to perform the model attribution task.
+
+\subsection{Preliminary Analysis of Model Fingerprint}
+\label{subsec:warm_up}
+\inputfigure{spectrums}
+
+Our study draws inspiration from recent research~\cite{marra2019gans, yu2019attributing, corvi2023intriguing}, which demonstrates that generative models, differing in architecture or parameters, leave unique patterns, termed \emph{model fingerprints}, on their generated images. Despite these fingerprints are typically imperceptible in the spatial domain, they are more evident in the frequency domain. As shown in Figure~\ref{fig:spectrums}, each generative model is characterized by a distinct pattern in the averaged Fourier spectrum. To gain insights for replicating these patterns, we first explore why generative models display unique spectrum patterns. 
+
+The common architecture of an image generative model typically includes several key components designed to generate high-quality images from a latent representation or input data. Some of the most widely used architectures in image generative models include Generative Adversarial Networks (GANs), Variational Autoencoders (VAEs), Diffusion Models, etc. Image generative models, regardless of their specific type, typically consist of a series of generative blocks. Each block is designed to progressively transform the noise/latent vector into an image through several operations. To provide a cohesive mathematical foundation, consider a common generative block architecture consisting of upsampling, convolution, activation, and normalization layers applied to a Gaussian noise input \( \mathbf{z}\). The block's output \( \mathbf{y} \) can be expressed as:
+
+\begin{align}
+\mathbf{y} = \mathcal{N}\left( \phi\left( F\left( U\mathbf{z} \right)\right) \right),
+\end{align}
+
+where:
+\begin{itemize}
+    \item \( U \): Upsampling operator.
+    \item \( F \): Convolution operator with kernel \( \mathbf{W}_{conv} \) and bias \( \mathbf{b} \).
+    \item \( \phi \): Nonlinear activation function.
+    \item \( \mathcal{N} \): Normalization function.
+\end{itemize}
+
+In the following, we aim to discuss the impact of these basic components and different generative blocks on output's spectrum patterns. To validate the theoretical insights, we also conducted experiments using ProGAN, SNGAN, and StyleGAN2 models with varying network components in Appendix~\ref{sec:appendix_analysis}, analyzing their spectrum influence on output images.
+
+\subsubsection{\textbf{Upsampling Effects}} In the spatial domain, the upsampling operation \( U\textbf{z} \) is equivalant to zero-interleaving the input signal \textbf{z} and then applying a standard convolutional operation, which can be expressed as:
+\begin{align}
+U \textbf{z} = \text{ZeroInter}(\textbf{z}) \otimes \textbf{K}_{\text{up}},
+\end{align}
+where \( \text{ZeroInter}(\textbf{z}) \) represents \textit{zero-interleaving} of the input signal \( \textbf{z} \), which inserts zeros between spatial samples. \( \otimes \) denotes the convolution operation in the spatial domain. \( \textbf{K}_{\text{up}} \) represents the upsampling kernel. 
+
+Using the Convolution Theorem, the upsampling operation in the frequency domain becomes:
+\begin{align}
+\mathcal{F}\{U \textbf{z}\}(\omega) =\text{Repeat}_{2,2}(\mathcal{F}\{\textbf{z}\})(\omega) \cdot \mathcal{F}\{\textbf{K}_{\text{up}}\}(\omega),
+\end{align}
+where \( \text{Repeat}_{2,2} \) represents the replication of the input spectrum \( \mathcal{F}\{\textbf{z}\} \) along two frequency dimensions by a factor of 2. \( \mathcal{F}\{\textbf{K}_{\text{up}}\} \) represents the Fourier Transform of the upsampling kernel \( \textbf{K}_{\text{up}} \). \( \cdot \) denotes pointwise multiplication in the frequency domain.
+
+\textit{Fingerprint:} The upsampling kernel $\textbf{K}_{\text{up}}$ determines how the replicated spectra are weighted. Its magnitude $|\mathcal{F}\{\textbf{K}_{\text{up}}\}(\omega)|$ directly shapes the output signal. Different types of upsampling are discussed in existing works to leave different spectral properties~\cite{zhang2019detecting, schwarz2021frequency}. Basic kernels like nearest-neighbor or bilinear correspond to low-pass frequency responses, attenuating high-frequency content. In contrast, learned transposed convolution kernels can either preserve, boost, or selectively filter out certain frequency bands. Thus, they tends to preserve more high-frequency components~\cite{zhang2019detecting}. Thus, the upsampling "fingerprint" represents a characteristic spectral pattern formed through frequency shaping by the upsampling kernel.
+
+\subsubsection{\textbf{Convolution Effects}} Applying the Convolution Theorem, convolution \( F \) in the spatial domain translates to multiplication in the frequency domain:
+\begin{align}
+\mathcal{F}\{ F\mathbf{x} \}(\omega) = \mathcal{F}\{ \mathbf{W}_{conv} \}(\omega) \cdot \mathcal{F}\{ \mathbf{x} \}(\omega) + \mathbf{b} \cdot \delta(\omega),
+\end{align}
+where $\mathbf{x}$ is the input signal, $\mathbf{W}_{conv}$ and $\mathbf{b}$ are the kernel and bias of the Convolution operator.
+
+\textit{Fingerprint:} The output spectrum is shaped by \( |\mathcal{F}\{ \mathbf{W}_{conv} \}(\omega)|\). Each learned convolution kernel acts as a frequency-selective filter, enhancing certain frequency bands and suppressing others. This creates a spectral “fingerprint” dictated by the learned convolution kernel’s frequency response. 
+
+\subsubsection{\textbf{Nonlinear Activation Effects}} In the spatial domain, applying $\phi(\mathbf{x})$ is elementwise. While in frequency domain, elementwise nonlinearities do not translate to simple pointwise operations. Instead, nonlinearities correspond to convolution-like mixing of frequencies. To simplify the analysis, the nonlinearity can be approximated by a Taylor series expansion. For small values of $\mathbf{x}$, common nonlinear activation functions like ReLU, Sigmoid and Tanh can be approximated using their Taylor series expansions: 
+% \approx \text{softplus}_{10}(x)
+\begin{itemize}
+    \item ReLU:  
+    The expansion is\footnote{Since ReLU is non-differentiable at $\mathbf{x}=0$, we approximate it using $\text{softplus}_{10}(x)$, and use the Taylor series expansions of $\text{softplus}_{10}(x)$ for ReLU.}:  
+    \begin{align}
+    ReLU(\mathbf{x}) \approx \frac{\log(2)}{10} + \frac{1}{2}\mathbf{x} - \frac{5}{4}\mathbf{x}^2 + \frac{5}{48}\mathbf{x}^3 + \mathcal{O}(\mathbf{x}^4).
+    \end{align}
+    \item \text{Tanh}:  
+    The expansion is:  
+    \begin{align}
+    \tanh(\mathbf{x}) \approx \mathbf{x} - \frac{\mathbf{x}^3}{3} + \mathcal{O}(\mathbf{x}^5).
+    \end{align}
+
+    \item \text{Sigmoid}:  
+    The expansion is:  
+    \begin{align}
+    \text{sigmoid}(\mathbf{x}) \approx \frac{1}{2} + \frac{\mathbf{x}}{4} - \frac{\mathbf{x}^3}{48} + \mathcal{O}(\mathbf{x}^5).
+    \end{align}
+\end{itemize}
+
+In the frequency domain, higher-order terms (e.g., $\mathbf{x}^2$) result in repeated convolutions of the input signal's Fourier Transform $H(\omega)$ with itself:
+\begin{align}
+\mathcal{F}\{\mathbf{x}^n\}(\omega) = \underbrace{H(\omega) * H(\omega) * \cdots * H(\omega)}_{n \text{ times}},
+\end{align}
+where $H(\omega) = \mathcal{F}\{\mathbf{x}\}(\omega)$. This convolution operation generates harmonics at integer multiples of the input frequency $\omega$. For example, $H(\omega) * H(\omega)$ introduces even-order harmonics, such as $2\omega$, and a DC component ($\omega$=0).
+
+\textit{Fingerprint:} The frequency-domain  “fingerprint” of the nonlinear activation is the introduction of harmonics and frequency mixing patterns, transforming a input into a broader spectral distribution. For instance, ReLU introduces strong even harmonics due to the quadratic term ($\frac{5}{4}\mathbf{x}^2$). Tanh and Sigmoid add weak odd harmonics ($\frac{\mathbf{x}^3}{3}$ and $\frac{\mathbf{x}^3}{48}$).
+
+\subsubsection{\textbf{Normalization Effects}}
+
+Normalization techniques adjust data by normalizing its mean and variance. In the frequency domain, different types of normalization have the same formula as below:
+\begin{align}
+\mathcal{F}\{\hat{\mathbf{x}}\}(\omega) = \frac{\gamma}{\sigma} \mathcal{F}\{\mathbf{x} - \mu\}(\omega) + \mathcal{F}\{\beta\}(\omega),
+\end{align}
+where \(\mu\) and \(\sigma\) are the mean and standard deviation. \(\gamma\) and \(\beta\) are learnable scale and shift parameters. \(\mu\) and \(\sigma\) are computed differently depending on the method, such as across the entire batch for Batch Normalization~\cite{ioffe2015batch} or for each individual sample in the case of Instance Normalization~\cite{ulyanov2016instance}. 
+
+\textit{Fingerprint:} Despite having the same frequency formulation, due to the variations in the optimization landscapes they create, different types of normalization can lead to distinctive distributions of parameters~\cite{ulyanov2016instance}, and consequently different spectrum patterns.\footnote{For instance, Figure~\ref{fig:norm_dft} in Appendix~\ref{sec:appendix_analysis} shows that models trained with different seeds but the same normalization type generally exhibit more consistent spectral patterns than those trained with a different normalization method.}
+
+\input{Figures/compose}
+\subsubsection{\textbf{Effects of Different Generative Blocks}} The discussion above focuses on the influence of basic components. Moving forward, it is important to consider how different generative blocks throughout the entire generation process contribute to the final spectral pattern on the generate image. Generative models typically consist of multiple generative blocks, with upsampling layers playing a crucial role as connectors between these blocks, doubling the resolution of the input feature maps. As mentioned above, commonly used upsampling layers, such as bilinear and nearest-neighbor interpolation, inherently possess a low-pass filtering effect. This property leads them to attenuate high-frequency components from prior layers. Given that existing research~\cite{yu2019attributing} suggesting that model fingerprints predominantly reside in the high-frequency components, it becomes apparent that the \textit{later blocks in a model's architecture could more significantly influence the model fingerprints on the output image as the high-frequency patterns from earlier layers could be filtered out.} To empirically test this hypothesis, we designed an experiment depicted in Figure~\ref{fig:compose}, consisting of three key steps:
+    \begin{itemize}
+    \item \textbf{Training:} Train a classifier on the Fourier spectrum of images generated by two distinct generative models with the same architecture (Model 1 and Model 2). 
+    \item \textbf{Testing I:} Measure the classification results using a test set of images generated by Model 1 and Model 2.
+    \item \textbf{Testing II:} Starting from the i-th block, sequentially exchange the succeeding blocks from Model 1 to Model 2 and vice versa. After each exchange, generate a new set of images with the composed models and assess the classifier's classification results on this new dataset. Figure~\ref{fig:compose}(c) visualize the operation by exchanging the last block.
+    \end{itemize}   
+Figure~\ref{fig:compose}(d,e) shows the confusion matrices under Testing I and Testing II of two experiments. We use two ProGAN models for Model 1 and Model 2. In (d), we constructed these models using nearest-neighbor upsampling layers. In (e), the models utilize bilinear upsampling layers. As shown in the Figure, under Testing I, the classifier achieves high accuracy, indicated by the high diagonal values in the confusion matrix. However, after swapping the last few blocks in Testing II, the confusion matrix reveals a notable reversal in model attribution results. Specifically, when swapping the last two blocks, the reversal accuracy reaches 0.9. These shifted results suggest that the most distinguishable spectral patterns for differentiating models are primarily generated by the last two blocks of the models. In contrast, the patterns left by earlier blocks appear to become less distinct as they progress through the generative process.
+
+
+
+\subsection{Model Synthesis Strategy}
+\inputfigure{generative_blocks}
+\label{subsec:model_synthesis}
+
+In this section, we introduce the model synthesis strategy that we use to create models for training the fingerprint feature extractor. Intuitively, a good synthesis strategy should generate models whose fingerprint patterns closely resemble those of real generative models, allowing these synthetic models to effectively simulate new models in an open environment. According to the discussion in Section~\ref{subsec:warm_up}, there are important factors to consider. First, the last few blocks tend to have a more profound influence on the distinguishable spectrum patterns of the output images. Thus, employing a synthesis architecture with a small number of generative blocks could ensure fidelity in mimicking fingerprints. Second, it is crucial to increase diversity by varying the types of upsampling layers, activation functions, normalization layers, and parameters. We explicitly incorporate these considerations into our method. Moreover, to further enhance diversity, we also consider variations in the number and sequence of layers.  
+
+Overall, our model synthesis strategy is illustrated in Figure~\ref{fig:generative_blocks}, the structure of the synthetic model could be viewed as a shallow auto-encoder, composed of $K$ downsampling blocks and $K$ upsampling blocks. Based on the above discussion, $K$ can selected as a small value, such as one or two. Each downsampling block use a fixed architecture, with a pooling layer to downscale the input resolution by half, and two convolutional layers to increase the feature dimension. The feature output from the downsampling blocks is then sent into the upsampling blocks, which share common components with the generative blocks in standard generative models but offer various architectural options. 
+
+In summary, the architecture of synthetic models is defined by the options $\{K, L, U, A, N, S\}$. 
+\begin{itemize}
+    \item $K$ refers to the number of downsampling/upsampling blocks within the synthetic model, which can be one or two.
+    \item $L$ represents the number of convolution layers per block, which can be one or two.
+    \item $U$ is the upsampling operation that can be nearest neighbor upsampling, bilinear upsampling, or a stride 2 transposed convolution layer.
+    \item $A$ is the activation function that can be ReLU, Sigmoid, Tanh, or no activation. 
+    \item $N$ is the normalization type that can be batch normalization, instance normalization, or no normalization. 
+    \item $S$ refers to the order of activation and normalization relative to the convolution layer. 
+\end{itemize}
+By varying these configurations, we can get $2 \times 2 \times 3 \times 4 \times 3 \times 2 = 288$ different architectures within the construction space. For each architecture, we train $M$ models with different training seeds, creating $M$ distinct models with different parameters per architecture. $M$ is set to 20 in our experiments.
+
+We recognize that speed is a key factor in model synthesis. In our approach, we simplify the objective to focus on reconstruction, where the generative neural network is specifically tasked with minimizing the reconstruction loss of input images. This method is not only straightforward to implement but also allows for rapid training. We leave the exploration of other training approaches to future work. We set a constraint on the minimum reconstruction residual to $\eta = 0.005$ to limit the amount of artifacts in the output images. Ultimately, the total number of synthetic models generated is 5760, allowing for a wide simulation of a wide range of potential generative models with diverse architectures and parameters.
+
+
+\subsection{Effectiveness of Model Synthesis}
+\label{sec:sec43}
+
+We evaluate the effectiveness of our model synthesis strategy in terms of \textit{Fidelity} and \textit{Efficiency}. Fidelity assesses how well the synthetic models replicate the spectrum/fingerprint patterns of real-world generative models. Efficiency examines the speed of training on a large number of synthetic models.
+
+\inputfigure{ffd}
+
+\textbf{Fidelity.} Currently, there is no off-the-shelf tool to quantitatively measure the gap between synthetic and real models in fingerprint distributions. To address this gap, we introduce a new metric called Frechet Frequency Distance (FFD), inspired by the Frechet Inception Distance (FID)~\cite{heusel2017gans}. The choice of Frechet Distance is made due to its practical utility and widespread acceptance for comparing distributions, especially in contexts where these the mean and covariance effectively captures differences in the average content and the variation of the data. Different from FID that is used to assess the fidelity of generated images by comparing the distribution distance of inception features, FFD assess the fidelity of the fingerprints of synthetic models by comparing the distribution distance of spectrum features. The FFD is calculated through two primary steps:
+\inputtable{fid_compare}
+% in \cref{eq:1d_spectrum}
+\begin{itemize}
+    \item \textbf{(Step I) Spectrum Pattern Representation:} We extract the spectrum pattern of generated images to represent the fingerprint pattern of each synthesized and real models. As depicted in Figure~\ref{fig:ffd}(a), for each model, we initially generate $N$ (e.g., 100) images\footnote{We provide ablation study on the value of $N$ in Appendix~\ref{sec:appendix_ablation}.}, and then, following~\cite{corvi2023intriguing}, we enhance the spectrum patterns by applying a noise extractor~\cite{zhang2017beyond} to remove semantic contents from these images. The resultant noise images are then used to compute a reduced 1D power spectrum~\cite{durall2020watch} by Azimuthal Integration (AI) over radial frequencies on the 2D Fourier spectrum. We calculate the averaged spectrum from these $N$ images to serve as the spectrum pattern representation for each model.
+
+    \item \textbf{(Step II) Frechet Distance Calculation:} As illustrated in Figure~\ref{fig:ffd}(b), we first compute the mean and covariance of the spectrum representations for all real-world models in Table~\ref{tab:dataset}, which covers the mainstream generative models ranging from GAN, VAE, Flow and Diffusion. Then in the same way, we calculate the mean and covariance of the spectrum representations for synthetic models in Section~\ref{subsec:model_synthesis}. The Fréchet distance is then calculated between these distributions. Specifically, for the mean $\mu_r$ and covariance $\Sigma_r$ of real distribution, and the mean $\mu_s$ and covariance $\Sigma_s$ of synthetic distribution, their distance is given by:
+    \begin{align}
+    \text{FFD} = \left\|\mu_r-\mu_s\right\|^2 + \operatorname{Tr}\left(\Sigma_r + \Sigma_s - 2\left(\Sigma_r \Sigma_s\right)^{1/2}\right),
+    \end{align}
+    where $\operatorname{Tr}$ represents the trace of a matrix. A low FFD score indicates that the synthetic models closely mimic the real models in terms of spectrum patterns.
+\end{itemize}
+In Table~\ref{tab:fid_compare}, we evaluate the Frechet Frequency Distance of synthetic models against real models, varying synthesis choices. The variations in the architecture include: ``w/o K" and ``w/o L," indicating the construction with a single down/up block and a single layer, respectively; ``w/o S," using only one type of sequence — normalization and activation after convolution; ``w/o U," utilizing only bilinear interpolation for upsampling; and ``w/o A" and ``w/o N," which denote the absence of activation and normalization layers, respectively. We also consider not using diverse seeds for each architecture, denoted as ``w/o seed". The results displayed in the table indicate that reducing most synthesis options tends to increase the Frechet Frequency Distance (FFD), pointing to a poorer alignment between the distributions. Notably, eliminating the diversity in activation functions and upsampling methods results in the most significant increases in FFD. This may be because these factors, when varied, mostly increase the diversity of synthetic models. 
+
+\textbf{Efficiency.} We measured the time required to train these models. For models with single generative block ($K=1$), the averaged required training time per model is 53 seconds, while those with $K=2$ required 113 seconds each. In total, training all the synthetic models takes 133 hours on a single 3090 GPU. This is considerably more efficient than the time investment needed for training state-of-the-art generative models. For example, it takes 14 days 22 hours on single V100 GPUs to train a StyleGAN~\cite{karras2019style} model that generate with a 256$\times$256 resolution\footnote{https://github.com/NVlabs/stylegan}.
+
+
+\subsection{Training the Fingerprint Extractor}
+\label{subsec:fingerprint_extractor}
+\inputfigure{method}
+
+After obtaining the synthetic models, these models are utilized to train the fingerprint extractor. The goal of this extractor is to identify unique fingerprints embedded within images generated by different models, thereby enabling differentiation among them. As illustrated in Figure~\ref{fig:method}, the training procedure involves the synthetic model pool that we construct in the above section, and a real image dataset pool.
+
+In the training phase, a batch of real images is randomly sampled from the real image dataset pool. Simultaneously, an equivalent number of synthetic models are selected from the synthetic model pool. Each real image $I_\text{real}$ from the batch is processed through a synthetic model $M_k$, producing a generated image $I_k$ that contains distinct fingerprints characteristic of the specific synthetic model used. 
+\begin{align}
+    I_k = M_k (I_\text{real})
+\end{align}
+To reveal the underlying fingerprint patterns inherent in the images, we follow a common preprocessing technique~\cite{kirchner2009resampling, guo2023exposing} to strip away low-frequency semantic content through a denoiser by~\cite{zhang2017beyond}. The extracted noises are then transformed using a Discrete Fourier Transform to facilitate the extraction of their spectrum properties. The spectrum obtained from this transformation are fed into the fingerprint extractor, which is built upon the ResNet50 architecture. 
+\begin{align}
+    h_k &= f_{\operatorname{fp\_extractor}} \lp \gF (I_k^{\prime}) \rp \\
+ \text{ with }   I_k^{\prime} &= I_k - f_{\operatorname{denoise}}(I_k)
+\end{align}
+where $f_{\operatorname{denoise}}$ and $f_{\operatorname{fp\_extractor}}$ denote the denoiser and fingerprint extractor, $\gF$ denotes the Discrete Fourier Transform, $h_k$ is the extracted fingerprint embedding.
+
+To enhance the model's performance, we combine classification and metric loss to enhance the discrimination of learned fingerprint embedding. The classification head employs a multi-class cross-entropy (CE) loss function, which enable the fingerprint extractor to accurately classify the originating synthetic model of each input image. The projection head is followed by a triplet loss introduced in~\cite{weinberger2009distance}, which encourages generated images from the same generator to be as similar as possible in the feature space while promoting a larger dissimilarity between images from different generators. 
+\begin{align}
+\mathcal{L} = \mathcal{L}_{\text{CE}}(h_k, y_k) + \mathcal{L}_{\text{Triplet}}(h_a, h_p, h_n)
+\end{align}
+where $y_k$ is the true label for $k$-th synthetic model. $h_a$, $h_p$, and $h_n$ are the anchor, positive, and negative fingerprint embedding from a triplet set. Positive and negative mean the embedding is from the same model with the anchor embedding or not. 
+
+
+
+

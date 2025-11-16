@@ -1,0 +1,534 @@
+
+\section{\at: Learn-to-synthesize}
+
+We now describe our proposed \at system, which learns to synthesize transformations. We will start with an architecture overview before we delve into individual components.
+
+\subsection{Architecture overview}
+
+
+% Figure environment removed
+
+We represent our overall  architecture in
+Figure~\ref{fig:architecture}. The system operates in two modes, with  the upper-half of the figure showing the offline training-time pipeline, and the lower-half showing the online inference-time steps.
+
+At offline training time, \at uses three main components: (1) A ``training data generation'' component that consumes large collections of relational tables $R$, to produce (example, label) pairs; (2) An ``input-only synthesis'' module that learns-to-synthesize using the training data, and (3) An ``input-output re-ranking'' module that holistically considers both the input table and the output table (produced from the synthesized program), to find the most likely program. 
+
+The online inference-time part closely follows the offline steps, where we directly invoke the two models trained offline (the last two blue boxes shown in the figure). When given an input table from users, we pass the table through our input-only synthesis model, to identify top-$k$ candidate programs, which are then re-ranked by the input-output model for final predictions.
+
+We now describe these three modules in turn below.
+
+
+\subsection{Self-supervised training data generation}
+\label{sec:training_data_generation}
+
+
+As discussed earlier, the examples in Figure~\ref{fig:combined-ex} demonstrate that there are clear patterns in the input tables that we can exploit (e.g., repeating column-groups and row-groups) to predict required transformations for a given table. Note that these patterns are ``visual'' in nature, which can likely be captured by computer-vision-like algorithms.\footnote{Like computer vision problems such as object detection where hand-crafted heuristics are hard to write, the row/column-level patterns existing in our tables are also hard to write with heuristics, which makes a learning-based method necessary.}
+
+The challenge however, is that unlike computer vision tasks that typically have large amounts of training data (e.g., ImageNet~\cite{imagenet}) in the form of (image, label) pairs, in our synthesis task, there is no existing labeled data that we can leverage. Labeling  tables manually from scratch are likely too expensive to scale.
+
+\underline{Leverage inverse operators.} To overcome the lack of data, we propose a novel self-supervision framework leveraging the inverse functional-relationships between operators, to automatically generate large amounts of training data without using humans labels.
+
+
+
+Figure~\ref{fig:inverse-function} shows the overall idea of this approach. For each operator $O$ in our DSL that we want to learn-to-synthesize, we can find its inverse operator (or construct a sequence of steps that are functionally equivalent to its inverse), denoted by $O^{-1}$. For example, in the figure we can see that the inverse of ``\code{transpose}'' is ``\code{transpose}'', the inverse of ``\code{stack}'' is ``\code{unstack}'', while the inverse of ``\code{wide-to-long}'' can be constructed as a sequence of 3 steps (``\code{stack}'' followed by ``\code{split}'' followed by ``\code{pivot}'').
+
+The significance of the inverse operators, is that it allows us to automatically generate training examples. 
+Specifically, to build a training example for operator $O$ (e.g., ``\code{stack}''), we can sample any relational table $R$, and  apply the inverse of $O$, or $O^{-1}$ (e.g., ``\code{unstack}''), to generate a non-relational table $T = O^{-1}(R)$. For our task, given $T$ as input, we know $O$ must be its ground-truth transformation, since by definition $O(T) = O(O^{-1}(R))=R$, and $R$ is known to be relational. 
+This thus allows us to generate $(T, O)$ as an (example, label) pair, which can be used for training. %, with $T$ as the input table and $O$ the ground-truth transformation.
+
+Furthermore, we can easily produce such training examples at scale, by sampling: (1) different relational tables $R$; (2) different operators $O$; and (3) different parameters associated with each $O$, therefore addressing our lack of data problem in \at. 
+
+
+The overall steps of the data generation process are shown in Algorithm~\ref{alg:data-gen}, where Line~\ref{line:sample_op}, Line~\ref{line:sample_table}, Line~\ref{line:sample_parameter} correspond to the sampling of operators ($O$), tables ($R$), and parameters ($p$), respectively, that together creates diverse training examples.  We note that in Line~\ref{line:augment_table}, we perform an additional ``data augmentation'' step to create even more diversity in training, which we explain below.
+%\kr{So the data generation only considers one step of the transformation?}
+
+
+
+% Figure environment removed
+
+
+\underline{Data Augmentation.} Data augmentation~\cite{shorten2019survey} is a popular technique in computer vision and related fields, to enhance training data and improve model robustness. 
+%used for image data or text data to enlarge the size of training examples and improve the robustness of deep learning models. 
+For example, in computer vision tasks, it is observed that training using additional data generated from randomly flipped/rotated/cropped images, can lead to improved model performance (because an image that contains an object, say dog, should still contain the same object after it is flipped/rotated, etc.)~\cite{shorten2019survey}.
+
+
+In the same spirit, we
+augment each of our relational table $R$ by (1) Cropping, or randomly sampling contiguous blocks of rows and columns in $R$ to produce a new table $R'$;  and (2) Shuffling, or randomly reordering the rows/columns in $R$ to create a new $R'$. In \at, we start from over 15K relational tables crawled from public sources (Section~\ref{sec:exp}), and create around 20 augmented tables for each relational table $R$. This further improves the diversity of our training data and end-to-end model performance, as we will show in the experiments. %(Section~\ref{subsec:ablation}). 
+
+%\yeye{see if we need to add an example to show how parameters are selected. maybe not, discussing how to select parameters will necessitate the explanation of heuristics.}
+
+%First, since any subset of a relational table is still relational, we can randomly sample contiguous blocks of rows and columns from the original table to generate new relational tables. Second, since the order of rows or columns in a relational table is insignificant, we can randomly changing the order of columns and rows to get new tables. Third, for operators with parameters, we can generate multiple training examples from one relation table by picking different parameters for the inverse operator. For example, for unstack, its parameter specifies the column that will be expanded. By choosing different columns, we can generate different training tables. As we will show in our experiments, we generate 10$\sim$20 tables from each relational table for each operator and the data augmentation significantly improves the model performance.
+
+
+ 
+\begin{small}
+\begin{algorithm}[t]
+\SetKw{kwReturn}{return}
+ \Input{DSL operators $\mathbf{O}$, large collections of relational tables $\mathbf{R}$}
+ \Output{Training table-label pairs: $(T, O_p)$}
+ 
+ %$V \leftarrow \{v_T | T \in \mathbf{T} \}$, with $v_T$ representing each $T \in \mathbf{T}$ %\tcp{Algorithm~\ref{algo:constraints}} 
+
+ $E \leftarrow \{\}$
+ 
+  \ForEach{$O$ in $\mathbf{O}$ \label{line:sample_op}} 
+    {
+      \ForEach{$R$ in $\mathbf{R}$ \label{line:sample_table}} 
+        {
+            \ForEach{$R'$ in \text{Augment}($R$) \label{line:augment_table} \tcp{Crop rows and columns} } 
+            {
+               $p \leftarrow $ sample valid parameter from space $P(O)$ \label{line:sample_parameter} 
+               
+               $O^{-1}_{p'} \leftarrow $ construct the inverse of $O_p$ \label{line:construct_inverse}
+               
+               $T \leftarrow O^{-1}_{p'}(R')$ 
+               
+               
+               $E \leftarrow E \cup \{(T, O_p)\}$
+           }
+       }
+    %\tcp{set edge-weight}
+    }
+
+\kwReturn all training examples $E$
+\caption{Auto-gen training examples}
+\label{alg:data-gen}
+\end{algorithm}
+\end{small}
+
+
+% Figure environment removed
+
+\vspace{-2mm}
+\subsection{Input-only Synthesis}
+\label{subsec:input-model}
+%\yeye{may need to see how to add some intro of cnn}
+
+After obtaining large amounts of training data in the form of $(T, O_p)$ using self-supervision, we now describe our ``input-only'' model that takes $T$ as input, to predict a suitable transformation $O_p$. 
+
+
+\subsubsection{\textbf{Model architecture}} \hfill\\ 
+We develop a computer-vision inspired model specifically designed for our task, which scans through rows and columns to extract salient tabular features, reminiscent of how computer-vision models extract features from image pixels for object detection.
+
+Our model architecture in Figure~\ref{fig:input_model_arch} consists of four sets of layers: (1) table embedding, (2) dimension reduction, (3) feature extraction, and (4) output layers. We will describe each in turn below.
+
+\underline{Table embedding layers.} Given an input table $T$, the embedding layer encodes each cell in $T$ into a vector, to obtain an initial representation of $T$ for training. At a high level, for each cell we want to capture both (1) the ``\textit{semantic features}'' (e.g., people-names vs. company-names), and (2) the ``\textit{syntactic feature}'' (e.g., data-type, string-length, punctuation, etc.), because both semantic and syntactic features provide valuable signals in our task, e.g., in determining whether rows/columns are homogeneous or similar. 
+
+For semantic features, we use the pre-trained Sentence-BERT~\cite{reimers-2019-sentence-bert} (a state-of-the-art embedding in NLP), which maps each cell into a 384-dimension vector that encodes its semantic meaning. For syntactic features, we encode each cell using 39 pre-defined syntactic attributes (data types, string lengths, punctuation, etc.). Concatenating the syntactic and semantic features produces a 423-dimension vector for each cell. For an input table $T$ with $n$ rows and $m$ columns, this produces a $n \times m \times 423$ tensor as its initial representation.\footnote{Like in computer vision problems that use a fixed ``window'', we take the first 100 data-rows (plus a header) and 50 columns at the top-left of each input $T$ (producing a $101 \times 50 \times 423$ tensor), which is sufficient to identify table patterns and predict transformations, like the examples in Figure~\ref{fig:combined-ex} would show.} % (For smaller tables, we pad empty cells with all-0 vectors.)} 
+
+The left half of Figure~\ref{fig:example_feature_extraction} shows a simple sketch of this embedding step, which we will explain in more detail later.
+
+
+\underline{Dimension reduction layers.} Since the initial representation from the pre-trained Sentence-BERT has a large number of dimensions (with information likely not needed for our task, which can slow down training and increase the risk of over-fitting), 
+we add dimension-reduction layers  using two convolution layers with $1\times 1$ kernels, to reduce the dimensionality from  423 to 64 and then to 32, to produce $n \times m \times 32$ tensors. Note that we explicitly use $1\times 1$ kernels so that the trained weights are shared across all table-cells, to produce consistent representations after dimension reduction.
+
+%the initial representation, while preserving salient information for our task.  For this purpose, we use two sequential 1D convolution layers with kernal size $1\times 1$, to reduce the dimension of each embedding vector from 423 to 64 and then to 32. The output of this layer will be a $m\times n \times 32$ tensor.
+
+\underline{Feature extraction layers.} We next have feature extraction layers that are reminiscent of CNN~\cite{li2021survey} but specifically design for our table task. Recall from Figure~\ref{fig:combined-ex} that the key signals for our task are: 
+\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]
+%\setlength{\itemindent}{-5mm}
+\item (1) identify whether values in row or column-directions are ``similar'' enough to be ``homogeneous'' (e.g., Figure~\ref{fig:combined-ex}(b) vs. Figure~\ref{fig:combined-ex}(c)); 
+\item (2) identify whether entire rows or columns are ``similar'' enough to show repeating patterns (e.g., Figure~\ref{fig:combined-ex}(b) vs. Figure~\ref{fig:combined-ex}(d)).
+\end{itemize}
+
+Intuitively, if we were to hand-write heuristics, then signal (1) above can be extracted by comparing the representations of adjacent cells in row- and column-directions. 
+On the other hand, signal (2)  can be extracted by computing the  average representations of each row and column, which can then be used to find repeating patterns. 
+
+%he feature extraction layer aims to extract useful and informative features from table embeddings. Our intuition is that the table relationlization task highly relies on the structural information within and across column/rows. For example, if there are a great number of delimiters (e.g., commas) within a column, it is a strong signal to perform an explode operator; if a column contains diverse values while the rows contains homogeneous values, it is a strong signal to perform a transpose operator; if values across multiple columns are homogeneous , it is a strong signal to perform a stack operator. 
+
+Based on this intuition, and given the strong parallel between the row/columns in tables and pixels in images, we design feature-extraction layers inspired by \textit{convolution filters}~\cite{li2021survey} that are popular in CNN architectures to extract visual features from images~\cite{vgg, alexnet}. 
+Specifically, as shown in Figure~\ref{fig:input_model_arch}, we use 1x2 and 1x1 convolution filters followed by average-pooling, in both row- and column-directions, to represent rows/columns/header. Unlike general $n$x$m$ filter used for image tasks (e.g., 3x3 and 5x5 filters in VGG~\cite{vgg} and ResNet~\cite{resnet}), our design of filters are tailored to our table task, because:
+\begin{itemize}[leftmargin=*,noitemsep,topsep=0pt]
+%\setlength{\itemindent}{-5mm}
+\item (a) 1x2 filters can easily learn-to-compute signal (1) above (e.g., 1x2 filters with +1/-1 weights can identify the representation differences between  neighboring cells, which when averaged, can identify homogeneity in row/column directions).  
+\item (b) 1x1 filters can easily learn-to-compute signal (2) above (e.g., 1x1 filters with +1 weights followed by average-pooling, correspond to representations for entire rows/columns, which can be used to find repeating patterns in subsequent layers).
+\end{itemize}
+
+%As shown in Figure~\ref{fig:input_model_arch},  using the 1x1 and 1x2 filters, we represent columns, rows and the headers separately, through two layers of 64 and 8 filters with trainable filter weights, where different filters can learn and balance the relative importance of different cell-level features.
+
+%In the end, we produce 50x8 representation for 50 input columns (encoding column homogeneity and column content), and similarly 100x8 representation for 100 input rows (for row homogeneity and row content), which are fed into the final output layers of our model.
+
+
+We use an example below to demonstrate why these 1x1 and 1x2 filters are effective for extracting tabular features.
+\vspace{-1mm}
+\begin{example}
+\label{ex:filters}
+%We demonstrate the use of these filters for extracting features in tables, using an example shown in Figure~\ref{fig:example_feature_extraction}. %, based on the input table shown in Figure~\ref{fig:combined-ex}(a). 
+%Recall that our CNN-inspired architecture uses convolution filters to scan line-by-line, in both row and column directions. %(illustrated in the lower-half of the feature-extraction layers in Figure~\ref{fig:input_model_arch}).
+Figure~\ref{fig:example_feature_extraction}(a) shows a simplified example, when using Column-B of Figure~\ref{fig:combined-ex}(a) as input, which has a list of values ``\code{Sports}'', ``\code{Electronics}'', etc. These raw cell values first pass through the embedding step, which produces a row of features for each value, with both \textit{syntactic features} (under the headers ``\code{is-string}'', ``\code{str-length}'', etc.), and \textit{semantic features} (under the header ``\code{s-BERT}'' for sentence-BERT). This results in an embedding table, where each row corresponds to an input cell.
+
+Next, we pass this embedding table  through 1x1 and 1x2 convolution filters, which performs element-wise dot-product~\cite{li2021survey}. Assuming we have a simple 1x1 filter shown at the top of the figure, with weights $[1, 0, \ldots]$.  Because only the first bit of this simple filter is $1$ and the rest is $0$, performing a dot-product on the embedding table essentially only extracts the ``\code{is-string}'' type information of each cell, which in this case is all $1$, leading to a matrix of $[1, 1, 1, 1]$ (since all cells are of type string). After average pooling, this results in a single feature-value $1$ to represent a specific aspect of this entire column (in this case, type information).
+
+We should note that this is just one example 1x1 filter -- there exists many such 1x1 filters (shown as stacked in the figure), all of which have learned weights that extract different aspects of syntactic/semantic information from input cells (string-length, semantic-meaning, etc.), thus forming a holistic representation of values in the column, to facilitate downstream comparison of ``similar'' columns (e.g., to identify repeating rows/columns), as mentioned above as signal (2) for our task.
+
+The 1x2 filters, on the other hand, work to ``compare'' adjacent values in the same column, which intuitively test for homogeneity. For instance, assuming there is a simple 1x2 filter with only +1 and -1 weights in the first column, as shown in the figure. Performing a dot-product in this case ``compares'' the ``\code{is-string}'' type info for neighboring cells, using a sliding window for rows from the top to bottom, which results in $[0, 0, 0]$ (because the convolution computes $1*1 + 1*(-1) = 0$). This is again averaged to produce a feature-value $0$, indicating no type difference, and thus good homogeneity, in the list of given values in the column-direction.
+
+This is again only one example 1x2 filter -- there are many other 1x2 filters with different learned-weights (stacked in the figure) that use different syntactic/semantic features to test for homogeneity between neighboring cells, which corresponds to the signal (1) we want to extract as mentioned earlier.
+
+Recall that our CNN-inspired architecture uses convolution filters to scan line-by-line, in both row and column directions. So in the row-direction our filters work in a similar manner.
+
+The same operations in row-direction is shown in Figure~\ref{fig:example_feature_extraction}(b), which uses Row-2 of the table in Figure~\ref{fig:combined-ex}(a) as example. In this case we have a list of heterogeneous cell values ``\code{Huffy 18 in.}'', ``\code{Sports}'', ``\code{s\_sk\_101}'', ``\code{5}'', etc. In this case, performing a dot-product using the same 1x2 filter produces a feature-vector of $[0, 0, 1]$ (note that the last entry is $1$ because the   ``\code{is-string}'' value for the last two input cells are 1 and 0, leading to a convolution of $1*1 + (-1)*0 = 1$). Average-pooling would then produce 0.33 here, indicating inconsistent types for the list of values in the row-direction (0 would indicates homogeneity, with +1/-1 filter-weights). Other 1x2 filters would work in similar manners, to identify more signals of heterogeneity in the row-direction, all of which are important ingredients to identify latent patterns in the table and corresponding transformations. 
+
+These first-level of features-values from row/column-directions will then go through a second-level of 1x1 and 1x2 convolution filters, to compare and identify similar rows/columns (based on row/column representation from 1x1 filters), to ultimately reveal repeating rows and columns like the color-coded patterns show in Figure~\ref{fig:combined-ex}. These tabular features will pass down to the next output layers, for final classifications.  
+\end{example}
+
+% \begin{example}
+% \label{ex:filters}
+% After the embedding layer and the dimension reduction layer, every cell is converted into a compact embedding vector that contains both semantic and syntactic features of the cell. For example, as shown in Figure~\ref{fig:example_feature_extraction}(a), we can imagine that each embedding vector consists of features such as whether the cell is a company or a person, the text length, etc. Our goal is to extract features for a column by aggregating the features of all cells in the column. The 1x1 filters will scan over cells in a column and perform a dot produce with each cell embedding, and then the average pool will aggregate the results by average, which depicts the general semantic/syntactic meaning of the column. For example, in Figure~\ref{fig:example_feature_extraction}(a), we consider a 1x1 filter that has 1 on the position corresponding to the cell feature ``is company" and 0s elsewhere. Then the feature extracted will be the proportion of companies in the column. Since the feature value is 1, we know the column is all about column names. 
+
+% Another informative feature specifically for table transformation tasks is the homogeneity of the column, e.g., whether the cells in the column are similar or diverse to each other. We use 1x2 filters to extract features about homogeneity.  As shown in ~\ref{fig:example_feature_extraction}(a), the 1x2 filter will scan over every two cells in a column and compare the two cell embeddings using convolution. After average pooling, it reflects the average similarity/difference between cells in a column. For example, in Figure~\ref{fig:example_feature_extraction}(b), we consider a 1x2 filter with 1/-1 on the position corresponding to text length and 0s elsewhere. This filter will compute the difference of text length between cells in a column. Since the cells in the left column all contain two characters, the extracted feature value is 0. In comparison, the cells in the right column has diverse length, thus its result is far from 0. From these extracted features, we know that the left column is more homogeneous than the right one on text length. 
+
+% We use another layer of 1x1 and 1x2 filters to extract higher level features for each column/row from the extracted features. For example, in Figure~\ref{fig:example_feature_extraction}(c), assume that the first layer of 1x1 filters have extracted features such as the proportion of companies in a column. Using the 1x2 filters on top of the extracted features, we can compare the features across different columns. For example, from the result of  1x2 filters, we can see that column 2 to column 5 are homogeneous, which indicates that they should  probably be stacked into one column and thus we need to perform a stack operator on these columns. Although the weights of 1x1 and 1x2 filters in these examples are manually designed by ourselves, in reality, they are learnable parameters that can be automatically learned during training process.
+
+
+% % Specifically, we care about the semantic meaning and syntactic structure about the column, and we also care about the homogeneity of column.
+
+
+% % \yeye{give an example here, similar to the one used in slides, to explain 1x1 / 1x2 filters}
+% \end{example}
+
+% Figure environment removed
+
+
+
+
+
+%a feature extraction layer as shown in Figure~\ref{fig:architecture}. We first arrange the table embeddings into three parts: header vectors that contain cell embeddings for headers, column tensors that contain cell embeddings column by column and row tensors that contain cell embeddings row by row. For column/row tensors, we first extract features using two types of 1D convolution filters of size 1x1 and 1x2 followed by an average pooling. The 1x1 filters  will scan over a column/row cell by cell and then compute the weighted average over all cell embeddings within a column/row. It is assumed to extract some features within a column/row (e.g., the average number of commas in the column). The 1x2 filters will scan over every two cells in a column/row and is assumed to compare the difference between cell embeddings in a column/row, which reflects the homogeneity property of a column/row. Each column/row will be turned into a 64-dimension feature vector. Then, we use another layer of 1x1 and 1x2 filters on headers, rows and columns to extract higher-level features within and across columns and rows. At the end of this layer, we extract a 8-dimension feature vector from each header, each column and each row, which will be concatenated into a feature vector that contains all the informative features about the input table.
+
+
+
+%  we care about the homogeneity within and across rows/columns/headers.
+
+% We first decompose the table into header vectors, row vectors and column vectors.
+
+% we use 1x1 filters and average pool, which amount to computing a weighted average over all cells in a column/row. 
+
+% we use 1x2 filters and average pool, which is expected to compare every two cells in a column/row and return a weighted average on the difference of every two cells in a column/row. 
+
+% For column header, we use one layer of 1x1 and 1x2 filters.
+
+% At the end of this layer, we extract a 8-dimension feature vector for each column, each row and each column header.
+% We concatenate all the feature vectors into a 1600-dimension vector.
+
+\underline{Output layers.} Our output layers use two fully connected layers followed by softmax classification, as shown in Figure~\ref{fig:input_model_arch}, which produces an output vector that encodes both the predicted operator-type, and its parameters.  For example, since we consider 8 possible operator types in our DSL, we encode this as a 8-dimension one-hot vector. 
+Similarly, we represent parameters of each operator as additional bits in the same output vector, resulting in an output vector of 270 dimensions, which in effect makes multiple predictions (operator-type and parameters) simultaneously, for a given $T$.
+
+%, e.g., the parameter ``\code{stack\_start\_idx} (ssi)'' takes the possible range of [1, 50] (since we use 50 left-most input columns to predict transformations) and thus can be encoded as a 50-dimension one-hot vector. 
+
+%Concatenating these possible choices of operator types and parameters together yields an output vector of 270 dimensions, where different segments of the vector encode different operator and parameter predictions, like shown in  Table~\ref{tab:label_vector_encode}. Note that while in our problem we use a 270-dimension 0/1 vector to represent our space of possible choices in synthesizing transformations, the same scheme is general and can easily extend to other synthesis problems that has a different set of operators. 
+
+We apply standard softmax functions~\cite{murphy2012machine} on each prediction vector, %that corresponds to a different prediction (operator-type or parameters),
+so that the output of each prediction is normalized into a probability distribution.
+
+
+% \begin{table}[t]
+% \scalebox{0.7}{
+% \begin{tabular}{cc|cc}
+% \toprule
+% \textbf{Prediction} & \textbf{Vector Position} & \textbf{Prediction} & \textbf{Vector Position} \\
+% \midrule
+% operator type ($O$) & 1:8 & wtl end idx (wei) & 159:208 \\
+% stack start idx (ssi) & 9:58 & explode column idx (eci) & 209:258 \\
+% stack end idx (sei) & 59:108 & pivot row freq (prf) & 259:268 \\
+% wtl start idx (wsi) & 109:158 & ffill end idx (fei)& 269:270 \\
+% \bottomrule
+% \end{tabular}
+% }
+% \caption{Encoding of operator types and parameters, using different parts of one output vector}
+% \vspace{-6mm}
+% \label{tab:label_vector_encode}
+% \end{table}
+
+%\stitle{Training and inference.}
+
+\subsubsection{\textbf{Training and inference}} \hfill \\ 
+We now describe how we train this model shown in Figure~\ref{fig:input_model_arch}, and at inference time, use it to synthesize transformations. 
+
+\stitle{Training time: Loss Function.} Given a training input table $T$, its ground truth operator $O$ and corresponding parameters $P=(p_1, p_2, ...)$, let $\hat{O}$ and $\hat{P} = (\hat{p}_1, \hat{p}_2, ...)$  be the model predicted probability distributions of $O$ and $P$ respectively. 
+The training loss on $T$ can be computed as the sum of loss on all predictions (both the operator-type, and parameters relevant to this operator):
+\begin{small}
+\begin{align}
+    Loss(T) = L(O, \hat{O}) + \sum_{p_i \in P, \hat{p}_i \in \hat{P}}L(p_i, \hat{p_i})
+    \label{eqn:loss_one_example}
+\end{align}
+\end{small}
+Here $L(y, \hat{y})$ denotes the cross-entropy loss~\cite{murphy2012machine} commonly used in classification -- let $y$ be a $n$-dimensional ground truth one-hot vector, and $\hat{y}$ a model predicted vector, $L(y, \hat{y})$ is defined as:
+\begin{small}
+\begin{align}
+    L(y, \hat{y}) = -\sum_{i=1}^n y_i log(\hat{y}_i)
+    \label{eqn:cross_entropy}
+\end{align}
+\end{small}
+Given large amounts of training data $\mathbf{T}$ (generated from our self-supervision  in Section~\ref{sec:training_data_generation}), we train our \at model by minimizing the overall training loss $\sum_{T \in \mathbf{T}}{Loss(T)}$ using gradient descent until convergence. We will refer to this trained model as $H$.
+
+
+
+% Note that our model will also make predictions for parameters of other operators (e.g., our model will always output predictions for stack\_start\_idx no matter the input table needs t). hese predictions are simply ignored for loss.
+
+
+% We compute the loss 
+% for the prediction 
+
+
+
+% for each training example as the sum of the cross entropy loss for operator type and parameters.
+
+
+
+% Given a training input table $T$ generated by Algorithm~\ref{alg:data-gen}, by construction, the ground truth will be a single-step pipeline denoted by $M = {(O(p))}$
+
+% let $O$ denote the ground truth operator type and $P_{O} = \{P_{O1}, P_{O2} ...\}$ denote the ground truth parameters.
+
+
+
+
+
+% We consider the prediction for the operator type and parameters as individual classification tasks. For each classification task, the loss between the prediction and the ground truth can be computed using cross entropy loss. Given a predicted probability distribution $\bm{p}$ and 
+
+
+
+
+% \begin{align}
+% \begin{split}
+% Loss = & L(y_{op}, p_{op}) \\ 
+% &+ [L(y_{ssi}, p_{ssi}) + L(y_{sei}, p_{sei})] \cdot \mathbb{1} (y_{op} = stack) \\
+% &+ [L(y_{wsi}, p_{wsi}) + L(y_{wei}, p_{wei})] \cdot \mathbb{1} (y_{op} = wtl) \\
+% &+ L(y_{ei}, p_{ei}) \cdot \mathbb{1} (y_{op} = explode) \\
+% &+ L(y_{prf}, p_{prf}) \cdot \mathbb{1} (y_{op} = pivot) \\
+% &+ L(y_{fei}, p_{fei}) \cdot \mathbb{1} (y_{op} = ffill) \\
+% \end{split}
+% \end{align}
+
+
+\stitle{Inference time: Synthesizing transformations.} 
+At inference time, given an input $T$, our model $H$ produces a probability for any candidate step $O_P$ that is instantiated with operator $O$ and parameters $P = (p_1, p_2, \ldots)$,
+%for each operator $O$, and probability $Pr(p)$ for each parameter $p$. Then for a predicted step $O(P)$ with operator $O$ and parameters $P = (p_1, p_2, \ldots)$, we can compute the probability of this step $O(P)$ given $T$, 
+denoted by $Pr(O_P | T)$, as: 
+%\begin{small}
+\begin{align}
+    Pr(O_P | T) = Pr(O) \cdot \prod_{p_i \in P} Pr(p_i)
+\label{eqn:prob_operator}
+\end{align}
+%\end{small}
+
+
+Using the predicted probabilities, finding the most likely transformation step $O_P^*$ given $T$ is then simply:
+\begin{align}
+O_P^* = \argmax_{O, P}{Pr(O_P|T)}
+\label{eqn:argmax_one_step}
+\end{align}
+
+%Enumerating different combinations of operator $O$ and parameter $P$ then allows us to different steps with probabilities  $Pr(O(P) | T)$, from which we produce the top-$K$ most likely ones as our predicted transformations.
+
+This gives us the most likely one-step transformation given $T$. As we showed in Figure~\ref{fig:multi-step-ex}, certain tables may require multiple transformation steps for our task.
+
+%Recall that from the output vector of our model, we can compute probability of each operator $Pr(O)$, and its parameter $Pr(p)$, such that for each possible step $O_P$ instantiated by operator $O$ and parameters $P$, we can compute its likelihood $Pr(O_P)$ as: 
+%\begin{align}
+%    Pr(O_P) = Pr(O) \cdot \prod_{p \in P} Pr(p)
+%\label{eqn:prob_operator}
+%\end{align}
+%where $Pr(O)$ is the probability of the operator type $O$, and $Pr(p)$ is the probability of a parameter $p \in P$.
+
+
+
+To synthesize multi-step transformations, intuitively we can invoke our predictions step-by-step  until no suitable transformation can be found. Specifically, given an input table $T$, at step (1) we can find the most likely transformation $O_P^1$ for $T$ using Equation~\eqref{eqn:argmax_one_step}, such that we can apply $O_P^1$ on $T$  to produce an output table $O_P^1(T)$. We then iterate, and at step (2) we feed $O_P^1(T)$ as the new input table into our model, to predict the most likely $O_P^2(T)$, and produce an output table $O_P^2(O_P^1(T))$. This iterates until at the $k$-th step, a ``\code{none}'' transformation is predicted  (recall that ``\code{none}'' is a no-op operator in our DSL in Table~\ref{tab:dsl}, to indicate that the input table is already relational and requires no transformations). The resulting $M = (O_P^1, O_P^2, \ldots)$ then becomes the multi-step transformations we synthesize for the original $T$.
+
+The procedure above is an intuitive sketch of multi-step synthesis, though it considers only the top-1 choice at each step. In general we need to consider top-k choices at each step, to find the most likely multi-step transformations overall. We perform the general search procedure of the most likely top-$k$ steps using beam search~\cite{murphy2012machine}, as outlined in Algorithm~\ref{alg:multistep_pipeline}.
+
+%we can intuitively choose the top-$k$  candidate operators with the highest probability scores for the current input table. Using each of the candidate operator, we can perform a single-step transformation to obtain a candidate transformed table. However, real-world tables sometimes contain multiple issues and the table after a single-step transformation may still be non-relational. Therefore, we need to run our model again on each candidate transformed table to generate $k$ candidate operators for the second-step transformation. We can repeat this process until the table is relationalized. Since our model will predict a ``none" operator when the table is relationalized, we can use it as the stopping criteria to automate the process. That is to say, if the candidate operator is  a ``none" operator, we stop further transformations on the table. 
+
+We start in Algorithm~\ref{alg:multistep_pipeline} with an empty pipeline $M$ and the original input table $T$.  At each iteration, we invoke model $H$ on top-$k$ output tables from the last iteration, to obtain the top $k$ candidate operators for each (Line 6). We perform the predicted transformations and expand each $M$ with one additional predicted step to get $M_{next}$ (Line 8), whose probability can be computed as the product of the probability of its operators (Line 9).
+ If a predicted operator is ``\code{none}", we reach a terminal state and save it as a candidate pipeline (Line 10-11). Otherwise, we keep the current pipeline in the beam for further search (Line 13).
+At the end of each iteration, we rank all partial pipelines by probabilities, and keep only the top $k$ pipelines with the highest probability (Line 14).  We terminate the search after a total of $L$ steps (Line 3), and return the top-$k$  with the highest probabilities as output (Line 15-16).
+%In our experiments, we observe that most tables can be relationalized with only one or two steps. As a result, we set the length limit to be $L=3$ in our experiments.  
+%Finally, we return the top k candidate pipelines with the highest probability scores (Line 17-18). 
+
+We demonstrate  Algorithm~\ref{alg:multistep_pipeline} using the following example.
+
+
+\begin{example}
+\label{ex:algo}
+We revisit Example~\ref{ex:multi-step}.  Given the input table $T$ shown on the left of Figure~\ref{fig:multi-step-ex}, we invoke our trained model $H$ to predict likely transformations, where the top-2 is: (1) $O_1$: ``\code{transpose}'' with probability 0.5, which leads to an output table $O_1(T)$ (shown in the middle of Figure~\ref{fig:multi-step-ex}), (2) $O_2$: ``\code{stack}'' (with parameters: start-idx = Col-B, end-idx=Col-E) which also has a probability 0.5, that will lead to an output table $O_2(T)$. We keep both 1-step candidates $\{O_1, O_2\}$, and continue our search of possible second steps. 
+
+For the second step, if we follow the path of $O_1$ we will operate on $O_1(T)$ as the new input table, for which the top-2 predicted steps is: (1) $O_3$ ``\code{stack}'' (start-idx = Col-C, end-idx=Col-E), with probability 0.8, and (2) $O_4$ ``\code{none}'' with probability 0.1. Alternatively, if we follow the path of $O_2$ we would have $O_2(T)$ as the new input, for which we also generate its top-2. This leads to a total of $2 \times 2=4$ possible 2-step transformations, from which we pick the top-2 with the highest probabilities, to continue our search with 3-steps, etc.
+
+We rank all resulting multi-step transformations by probabilities. This returns $\{O_1, O_3\}$ as the most likely (with probability 0.5*0.8 = 0.4), which is indeed the desired transformation as discussed in Example~\ref{ex:multi-step}.
+\end{example}
+\vspace{-2mm}
+
+% \yeye{Peng, can you please change our narrative in Algo 2 and the following paragraph as Beam search? It generalizes better than BFS, and would appeal to reviewers better I think. (Our current 2-step exhaustive BFS  is equivalent to using beam search while keeping a large number of intermediate steps from step-1, so our numbers in experiments can be used directly).}
+
+% This procedure can be written using a breadth-first search as Algorithm~\ref{alg:multistep_pipeline}. We intialize the queue with the input table $T$ and an empty pipeline (Line 4). At each iteration, we take one input table from the queue (Line 6) and run our model on it to obtain top $k$ candidate operators. We transform the table with each candidate operator (Line 9) and add the operator to the current pipeline (Line 10). The probability of the pipeline can be computed as the multiplication of the probability of each operator in the pipeline (Line 11). If the operator is ``none", we stop further transformation on this table (Line 12) and obtain one candidate pipeline (Line 13). Otherwise, we push the transformed table into the queue for further transformation (Line 15). Finally, we return the top k candidate pipelines with the highest probability scores (Line 16).  To avoid an infinite loop (e.g., infinite repeat of transpose), we can limit on the length of the pipeline and stop the synthesize when the length of the pipeline reaches the limit (Line 12).  In our experiments, we observe that most tables can be relationalized with only one or two steps. As a result, we set the length limit to be 2 in our experiments.
+
+% describes breadth-first search to synthsize $k$ multi-step pipelines. 
+
+% Thanks to the introduction of the ``none" operator, our model can determine whether the input table is relationalized or not by itself. If the predicted operator type is ``none", it means the input table is already relationalized. As a result, this process can  be automated without any human intervention. 
+
+% Since our model can determine whether a table is relationalized
+
+% We take the following steps to generate $k$ (e.g., $k=3$) candidate transformation pipelines ranked by probability scores
+
+% Given an input table $T$,  we take the following steps to generate $k$ (e.g., $k=3$) candidate transformation pipelines ranked by probability scores. 
+
+% Given an input table $T$, we take the following steps to synthesize a transformation pipeline that can relationalize $T$ using our model.
+
+% \begin{enumerate}[leftmargin=*]
+%     \item We feed $T$ into our model and it will 
+% output a predicted probability distribution for the operator type and each parameter.
+%     \item We compute the probability of an operator $O_P$ as the multiplication of the probability of the operator type and each of the parameter as: 
+%     $$Pr(O_P) = Pr(O) \cdot \prod_{p \in P} Pr(p)$$
+
+%     We use the top k operators with the highest probability as the predictions. To find the top k operators, we first choose the best parameters for each operator type, which will yield 8 operators. Then we sort them by probability scores and take the top k operators.
+    
+    % We use the best operator with the highest probability as the prediction. To find the best operator, we first choose the best parameters for each operator type, which will yield 8 operators. Then we can take the best one with the highest probability among them.
+
+%     \item  If the predicted operator type is ``none", it means $T$ is already relationalized and we then stop synthesize. Otherwise, we use the predicted top k operators to transform $T$. We then feed the transformed tables into the model and repeat the above process.
+% \end{enumerate}
+
+
+
+
+
+% In real use cases, instead of generating only one pipeline with the highest probability, we can show users $k$ (e.g., $k=3$) synthesized pipelines ranked by probability scores and let users decide which one to use.  
+
+% We take the top $k$ (e.g., top 3) predictions for operator type. For each operator, we consider the 
+% top 1 prediction for its parameters.
+
+% Otherwise,We feed the transformed table into our model and make the predictions for the second-step transformation. This process will be repeated until the predicted operator is ``none".  To avoid an infinite loop (e.g., infinite repeat of transpose), we can stop the synthesize when the length of the pipeline is large enough.
+% Instead of generating a single pipeline, we can generate $k$ pipelines ranked by probability scores. 
+
+% $$Pr(M) = \prod_{O, P \in M} Pr(O) \cdot Pr(P)$$
+
+
+\begin{small}
+\begin{algorithm}[t]
+\SetKw{kwReturn}{return}
+ \Input{\at model $H$, input table $T$} %, number of synthesized pipelines $k$}
+ \Output{Top-$k$ predicted pipelines by probabilities: $M_1$, $M_2$ ... $M_k$}
+ $Cands = []$, 
+ $M \leftarrow []$, 
+ $M.prob = 1$ \tcp{initialize} 
+ $B_{cur} \leftarrow [(T, M)]$ \\
+
+ \For{i = 1, 2, ... L}{
+    $B_{next} \leftarrow []$ \\
+    \ForEach{$(T, M)$ in $B_{cur}$}{
+       $\hat{O_{p1}}, \hat{O_{p2}} .,. \hat{O_{pk}}  \leftarrow H(T)$ 
+       \tcp{top k predictions}
+       \For{j = 1, 2, ...k}{
+            $T_{next} \leftarrow \hat{O_{pj}} (T)$, $M_{next} \leftarrow M.append(\hat{O_{pj}})$\\
+            $M_{next}.prob \leftarrow M.prob \times \hat{O_{pj}}.prob$ \\
+            \If{$\hat{O_{pj}} = none$}{
+                $Cands.append(M_{next})$
+            }
+            \Else{
+                $B_{next}.append((T_{next}, M_{next}))$
+            }
+       }
+    }
+    sort $B_{next}$ by $M.prob$, $B_{cur} \leftarrow B_{next}[:k]$\\
+    
+ }
+
+ Sort $Cands$ by $M.prob$ \\
+\kwReturn $Cands[:k]$
+\caption{Multi-step pipeline synthesis by top-k search}
+\label{alg:multistep_pipeline}
+\end{algorithm}
+\end{small}
+
+
+
+
+
+% \begin{small}
+% \begin{algorithm}[t]
+% \SetKw{kwReturn}{return}
+%  \Input{\at model $h$, input table $T$} %, number of synthesized pipelines $k$}
+%  \Output{Top-$k$ predicted pipelines by probabilities: $M_1$, $M_2$ ... $M_k$}
+%  $Cands = []$, 
+%  $M \leftarrow []$, 
+%  $M.prob = 1$ \tcp{initialize} 
+%  $Q \leftarrow [(T, M)]$ \tcp{FIFO queue}
+%  \While{ Q.length > 0} {
+%    $curT, curM = Q.pop()$ \\
+%    $\hat{O_{p1}}, \hat{O_{p2}} .,. \hat{O_{pk}}  = h(curT)$ \tcp{top k predictions}
+%    \For{i = 1, 2, ...k}{
+%         $nextT \leftarrow \hat{O_{pi}} (curT)$ \\
+%         $nextM \leftarrow curM.append(\hat{O_{pi}})$ \\
+%         $nextM.prob \leftarrow curM.prob \cdot \hat{O_{pi}}.prob$ \\
+%         \If{$\hat{O_p}[i] = none $ \textbf{or} $nextM.length \geq MAX$}{
+%             $Cands.append(nextM)$
+%         }
+%         \Else{
+%             $Q.push((nextT, nextM, nextS))$
+%         }
+%    }
+% }
+% \kwReturn Top $k$ synthesized pipelines in $Cands$ with the highest probability
+% \caption{Multi-step pipeline synthesize}
+% \label{alg:multistep_pipeline}
+% \end{algorithm}
+% \end{small}
+
+
+\subsection{Input/output Re-ranking}
+\label{subsec:rerank}
+
+So far, our synthesis model is ``input-only'', as it only uses the characteristics of the input table $T$ to predict transformations $M$. However, sometimes this is not enough, as the characteristics of the output table, $M(T)$ would also provide useful signals. We illustrate this using the following example.
+
+
+\begin{example}
+\label{ex:rerank}
+In Example~\ref{ex:algo}, based only on the input $T$ in Figure~\ref{fig:multi-step-ex}, our model predicts both $O_1$  ``\code{transpose}'' and $O_2$  ``\code{stack}'' as possible choices (both with probability=0.5).  ``\code{Stack}'' was incorrectly ranked high, because from $T$ alone ``\code{stack}'' looks plausible, as $T$ has a large number of homogeneous columns (Col-B to E), which fits the typical pattern for ``\code{stack}'' as shown in Figure~\ref{fig:combined-ex}(a).
+
+We can better predict whether $O_1$ or $O_2$ is more suitable, if we apply both programs on $T$ and inspect the resulting output $O_1(T)$ and $O_2(T)$. It can be verified that for $O_1(T)$ values in the same columns are homogeneous, whereas $O_2(T)$ (using ``\code{stack}'') leads to a table where values such as ``\code{ES}'', ``\code{MS}'' (from ``\code{GroupID}'')  become intermixed with integers in the same columns, which is not homogeneous and not ideal, and is something that our tabular model can detect and penalize. Inspecting the output $O_1(T)$ and $O_2(T)$ thus allows us to correctly re-rank $O_1$ as a more likely transformation than $O_2$, which is difficult when a model looks at $T$ alone.
+
+%into our re-ranking model, whose embedding/feature-extraction layers recognize that the output $O_2(T)$ does not look ideal, because after ''\code{stack}'', $O_2(T)$ would have ``\code{GroupID}'' values (``\code{ES}'', ``\code{MS}'', etc.) intermix with integer numbers in the same column, which is not a desirable relational form and thus penalized by re-ranking that has access to both input and output tables. After re-ranking, we get $P(O_1) = 0.8$  and $P(O_2) = 0.2$, making it easier to identify the correct transformation.
+
+%Given the input $T$ in Figure~\ref{fig:multi-step-ex}, in Example~\ref{ex:algo} our model predicts both $O_1$: ``\code{transpose}'' and $O_2$: ``\code{stack}'' to be likely with probability=0.5, because $T$ has a large number of homogeneous columns, making ``\code{stack}'' a plausible choice based on $T$ alone. 
+
+%Using input/output re-ranking, we feed the output from both candidates $O_1(T)$ and $O_2(T)$ into our re-ranking model, whose embedding/feature-extraction layers recognize that the output $O_2(T)$ does not look ideal, because after ''\code{stack}'', $O_2(T)$ would have ``\code{GroupID}'' values (``\code{ES}'', ``\code{MS}'', etc.) intermix with integer numbers in the same column, which is not a desirable relational form and thus penalized by re-ranking that has access to both input and output tables. After re-ranking, we get $P(O_1) = 0.8$  and $P(O_2) = 0.2$, making it easier to identify the correct transformation.
+\end{example}
+% \vspace{-2mm}
+
+
+
+%However, we observe that in some cases, it may be hard to determine whether an operator is suitable based on  the input table, but it is much easier to determine whether the transformed table induced by the operator is relational or not. \peng{examples: xxx}. Also, as we will show in the experiments, sometimes our model can include the ground truth operator in the top $k$ predictions, but its ranking is not high. Therefore, to improve the performance of our model, our idea is to rerank the predicted operators based on the  output transformed tables. 
+
+
+% Figure environment removed
+
+
+This motivates us to develop an ``input/output-based'' re-ranking model as shown in Figure~\ref{fig:reranking_model_arch}. After the input-only synthesis model (Section~\ref{subsec:input-model}) produces top-$k$ likely operators $\{O_{pi}, i \in [k]\}$ (e.g., we consider top-8 operators for re-ranking in our experiments), the re-ranking model will look at all output transformed tables $\{O_{pi}(T), i \in [k]\}$ and aims to generate a re-ranking score for each of them indicating which operator is more suitable based on the output transformed tables. To do so, similar to the input-only model, we need to first convert each transformed table into a feature vector using table embedding, dimension reduction and feature extraction layers. Since the input-only model has been trained well at this time, we directly reuse the architecture and weights of these layer from the pre-trained input-model~\footnote{We remove the fully-connected output layers from the input model, which are specific to predicting synthesis outcomes and not relating to extracting table features.}. We then concatenate the feature vectors of all transformed tables and use fully connected layers followed by a softmax function to produce a $k$-dimension vector as re-ranking scores. For training, we consider the re-ranking as a classification task to predict which of the $k$ transformed tables is the ground truth. Thus, the training loss can be computed using cross-entropy loss. We train the re-ranking model using the same training data generated from self-supervision in Section~\ref{sec:training_data_generation}
+
+
+
+
+% We show the re-ranking model in Figure~\ref{fig:reranking_model_arch}. Since this time we want to extract features from output tables $M_i(T)$ (e.g., row/column homogeneity and similarity), we reuse the the feature extraction part of the input-only model  (Figure~\ref{fig:input_model_arch}) and the same pre-trained model weights from the input-only model.\footnote{We remove the fully-connected output layers from the input model, which are specific to predicting synthesis outcomes and not relating to extracting table features.} This part is shown as the ``feature extraction layers'' in Figure~\ref{fig:reranking_model_arch}. We concatenate the extracted features of all transformed tables and then we add new fully-connected layers at the end of this model. We consider re-ranking as a classification task to predict which of the $k$ transformed tables is the ground truth. We train the re-ranking model using the same training data generated from self-supervision in Section~\ref{sec:training_data_generation}.
+
+% suitable transformations $M$
+% This motivates us to develop an ``input/output-based'' re-ranking model. After the input-only synthesis model (Section~\ref{subsec:input-model}) produces top-$k$ likely programs $M_i, i \in [k]$, this re-ranking model uses both $T$ and $M_i(T)$ to better identify suitable transformations $M$.
+
+%This observation calls us to  leverage the output table $M(T)$ after applying a predicted $M$, to better differentiate between possible choices that are only apparently when we inspect the input table $T$ and the output $M(T)$ jointly.
+
+% We show the re-ranking model in Figure~\ref{fig:reranking_model_arch}. Since this time we want to extract features from output tables $M_i(T)$ (e.g., row/column homogeneity and similarity), we reuse the the feature extraction part of the input-only model  (Figure~\ref{fig:input_model_arch}) and the same pre-trained model weights from the input-only model.\footnote{We remove the fully-connected output layers from the input model, which are specific to predicting synthesis outcomes and not relating to extracting table features.} This part is shown as the ``feature extraction layers'' in Figure~\ref{fig:reranking_model_arch}. We then add new fully-connected layers at the end of this model, to train re-ranking as a classification task. We train the re-ranking model using the same training data generated from self-supervision in Section~\ref{sec:training_data_generation}.
+
+% \yeye{Peng: please feel free to  add more details for reranking if you would like to, just wrap  them inside the ``fullversion'' knob, so that we can turn on/off.}
+
+
+
+%we obtain the output transformed tables. Then we use pretrained input-only model as a feature extractor to extract features for each output table. The extracted features for 8 output tables will be concatenated as the input features for the fully connect layer. The fully connect layer will finally output a 9-dimension vector, where the first 8 dimensions representing the probability that one operator is correct, which can be used to re-rank the operators. 
+
+%The last dimension is used for the case when none of the prediction is correct. We use the original training data to train the re-ranking model.
+% Our idea is to rerank the model predictions based on the transformed tables.
+
+
+
+% For each input table, the pretrained \at model can 
+
+
+
+
+
+

@@ -1,0 +1,52 @@
+\section{Long-Term Tracking with PIPs++}
+\vspace{-0.25em}
+
+In this section, we propose a method that takes advantage of PointOdyssey's realistic long-range motion annotations, both to establish a reasonable benchmark on the dataset's ``test'' split, as well as to improve state-of-the-art on real-world performance.
+We base our approach on ``Persistent Independent Particles'' (PIPs)~\cite{harley2022particle}, a state-of-the-art method for fine-grained tracking. 
+Its main advantage over prior work is that it inspects $8$ frames at a time, whereas prior work typically used just $2$.
+This gives the model some robustness to occlusions, since it can use frames before and after occlusions to estimate the missing parts of the trajectory. We highlight two key limitations, which we aim to address in the following subsections: (1) the temporal field of view is \textit{only} $8$ frames, meaning that the method cannot survive occlusions which are longer than this timespan, and (2) the model relies entirely on the first-frame appearance of the target, making correspondence difficult across appearance changes.
+We begin by describing the PIPs architecture in detail, and then describe how we resolve these limitations. 
+
+\subsection{Preliminaries (PIPs)}
+\vspace{-0.25em}
+
+PIPs takes an $8$-frame RGB video as input, along with a coordinate $p_1=(x_1, y_1)$ indicating a target to track. It produces a $8 \times 2$ matrix as output, representing the trajectory of the target across the given frames. This process can be repeated across $8$-frame segments, to produce long-range tracks. An arbitrary number of targets can be tracked in parallel, but there is no message-passing between the trajectories (hence persistent \textit{independent} particles). Inference has two main stages: initialization, and an iterative loop. 
+
+\vspace{0.5em}\noindent\textbf{Initialization.} 
+Before tracking begins, we compute a feature map $\mathcal{F}_t$ for each frame, with a 2D residual convnet~\cite{he2016deep}. We obtain a vector representing the appearance of the target, by bilinear sampling at the target's position on the first frame's feature map: $f_{p_1}=\texttt{sample}(\mathcal{F}_t, p_1)$. Using this first coordinate and feature vector, we initialize a list of positions and features, $\{(p_t, f_{t})\} = \{(p_1, f_{1})\}$ for all $t\in\{1, 2, \cdots, T\}$. 
+
+\input{figs/figs_network}
+\vspace{0.5em}\noindent\textbf{Iterative Updates.} 
+The main inference stage is an iterative update process, which primarily aims to improve the positions $p_t$, so that they track the target more closely. Denoting the current iteration's workspace on iteration $k$ as $\{(p_t^k, f_{t}^k)\}$, we begin an iteration by measuring the similarity between the per-timestep feature vectors and the per-timestep feature maps, within local windows centered at the current estimates: 
+\begin{equation}
+    C^k_{p_t}=f_{t}^k\otimes \texttt{multicrop}(\mathcal{F}_{t}, p_t^k)/\sigma\,
+    \label{eq:corr}
+\end{equation}
+where $\otimes$ denotes a dot product, $\texttt{multicrop}(\mathcal{F}_{t}, p_t^k)$ produces multi-scale crops from $\mathcal{F}_{t}$ centered at $p_t^k$, and $\sigma$ is a temperature parameter. A 12-block MLP-Mixer~\cite{tolstikhin2021mlp} takes these correlations as input, along with the apparent point motions $p_t^k-p_1^k$, and the features $f_{t}$, and produces updates to the full sequence of positions and features: $\{\Delta p_t^k, \Delta f_t^k\}$. 
+These updates are then applied additively, which leads to sampling new local correlations in the next iteration. The feature vectors are eventually fed to a linear layer, which produces per-timestep visibility estimates. 
+
+\vspace{0.5em}\noindent\textbf{Limitations.} PIPs is locked to the temporal field of view that it is trained with, due to the use of the MLP-Mixer in the iterative stage. While the tracker can be chained across time to produce long tracks, these are sensitive to drift, especially when the target becomes occluded beyond the range of the temporal window. We also note that the \textit{visibility-aware} chaining proposed in PIPs cannot be easily parallelized, and so long-range multi-particle tracking is computationally very expensive.  Additionally, we point out that the feature-update operator \textit{cannot} perform a task resembling a template-update, because it does not have access to the input frames. The residual updates to the feature list likely only serve visibility estimation. 
+
+\subsection{Expanding the temporal field of view (PIPs+)}\label{sec:1dres}
+\vspace{-0.25em}
+
+Our first proposed modification to PIPs aims to widen its temporal field of view, and enable longer-range tracking. The key component here is the MLP-Mixer, which (by design) has a fixed-width temporal field of view, set to $8$ in PIPs. We propose to replace the MLP-Mixer with an 8-block 1D Resnet~\cite{he2016deep}, doing convolutions across time.\footnote{In the PIPs paper, Harley et al.~\cite{harley2022particle} briefly mention an unsuccessful attempt at using temporal convolutions instead of the MLP-Mixer. It may be that their effort failed due to lack of long-sequence training data.} This means learning kernels that slide across the time axis. Each residual block consists of two convolution layers with kernel size 3, with instance normalization~\cite{ulyanov2016instance} and ReLU~\cite{agarap2018deep}. At the final block, the receptive field is 35 timesteps. Note however that since this module is \textit{iterated} during inference, the effective receptive field is much larger.  
+
+We find that this convolutional variant of PIPs, which we name PIPs+, improves long-range tracking accuracy, and also speeds inference in long videos (from $4$ FPS on average, to $55$ FPS on average, at $720 \times 1080$ on an Nvidia V100 GPU). The convolutional  design enables us to train and test with videos of different lengths, similar to how fully convolutional 2D networks can train and test with different image sizes, but in practice we find it is still important to train and test with roughly similar sequence lengths. 
+
+
+%\vspace{-0.5em}
+\subsection{Extending to multiple templates (PIPs++)}
+\label{sec:multi_app}
+\vspace{-0.25em}
+
+Tracked targets are likely to undergo appearance changes across time, and it is important to keep up with these changes. In the original PIPs architecture, the first-frame feature $f_{1}$  (ignoring the negligible feature-update step already discussed) is used for cross-correlation on every frame in the temporal span. This is liable to produce weak matches after appearance changes, and erroneous matches during occlusions. Our second proposed modification to PIPs aims to tackle this ``template update'' problem~\cite{matthews2004template}. 
+
+
+Our main idea is simply to accommodate appearance changes by collecting ``recent appearance'' templates along the estimated trajectory, to complement the ``initial appearance'' template from the first frame. 
+Specifically, when computing local correlations for frame $t$, we use the estimated trajectory to extract new features at fixed temporal offsets from this timestep, such as $\{t-2, t-4\}$. This means using $p_{t-k}$ to extract a temporary feature vector $f_{t-k} = \texttt{sample}(\mathcal{F}_{t-k}, p_{t-k})$. We use these features to compute additional correlations in the current frame's feature map $\mathcal{F}_t$, as done in Eq.~\ref{eq:corr}. This process is illustrated in~\cref{fig:network}. The key idea is that if tracking was successful on one of these offset frames, then the extracted feature will reflect the updated appearance of the target, and will yield a more-useful correlation map than the one from $f_1$. These multiple correlation maps are simply concatenated, increasing the channels input to our 1D Resnet. Note that similar to current methods in object tracking~\cite{yan2021learning}, we always retain the initial template $f_1$, to help prevent ``forgetting''. 
+
+
+An alternative strategy here would be to generate templates exclusively from timesteps with high visibility confidence, as commonly done in object tracking~\cite{yan2021learning}. While this is intuitively appealing, we note that our simpler strategy instead allows the model to (temporarily) capture the appearance of an \textit{occluder}, which can sometimes be the appropriate entity to track (\eg, during object self-occlusions). 
+
+Our multi-template strategy, combined with temporally-flexible computation, obviates the residual feature updates, so we simply omit this component. We also omit visibility estimation for simplicity. We name our full model PIPs++.

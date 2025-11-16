@@ -1,0 +1,125 @@
+\vspacebeforesection
+\section{Mitigation with Region-Based Queries}
+\label{sec:mitigation}
+
+%
+Countering Sybil attacks in an open, decentralized system is challenging.
+Traditionally, this problem is solved by binding identities to valuable resources (\eg using Proof of Work~\cite{dwork92proofofwork,baumgart2007s}), certificate authorities~\cite{castro_dht}, reputation systems~\cite{sybillimit, sybilguard, danezis2005sybil, whanau}, or diversifying the IP addresses of the peers of each node~\cite{total_eclipse}.
+Proof of Work and IP address restrictions are not sufficient as our attack only requires a few Sybil peers ($e \approx 45$): these measures would only slightly increase the cost of the attack. On the other hand, certificate authorities and reputation systems hamper the decentralization and open participation model of IPFS.
+%
+Simply increasing the value of the number of closest peers contacted in a DHT query (currently $k=20$) also does not solve the problem as the attacker only needs to generate more Sybil peers to match the new number.
+Another naive idea is that the providers modify the content by one bit to modify its CID. However, the new CID must be then advertised to potential downloaders to make the content publicly accessible. The attacker can then simply “follow” the new CIDs and continuously censor the content.
+%
+Further, modifying the content is unsuitable for immutable Web3.0 content (e.g., NFTs and DIDs) whose hash is already published on a blockchain.
+
+The fundamental problem in countering the content censorship attack lies in the inability to classify \resolvers as honest or malicious. When a \downloader receives no \provider record or an inactive provider record from a \resolver (\ie, it is unable to find the referenced provider or the provider does not hold the content), this can be due to several reasons. For instance, the \resolver was offline, the record used to be correct but the \provider had since left, or there was a network failure.
+%
+%
+As a result, the \downloader cannot draw any conclusions on the \resolver's correctness based on the received results, eliminating any attempts to gradually filter out malicious nodes by local scoring systems.
+%
+
+
+\input{img/mitigation-illustration.tex}
+
+\para{Main idea}
+The core observation behind our approach is that, while an attacker can spawn additional Sybil identities, it has no way of removing the honest ones from the network. As long as the \provider can send its provider record to the initial honest \resolvers, and the \downloader can communicate with these \resolvers, the censorship attack will be mitigated. To maintain communication with the initial honest \resolvers even during an attack, we propose \emph{region-based} DHT queries. Rather than communicating with the $k=20$ closest peers to a CID, that an attacker can easily control, we communicate with all the nodes in the hash space region that $k=20$ uniformly distributed peer IDs should cover (\Cref{fig:mitigation}).
+The size of this region is calculated using the network size estimate and using the assumption that honest peer IDs are distributed uniformly over the key space.
+%
+Such an approach ensures that regardless of the number of Sybil nodes placed by an attacker, the \provider can store provider records on $\approx 20$ honest \resolvers, and the \downloader also communicates with $\approx 20$ honest \resolvers to reliably retrieve the correct provider records.
+%
+To prevent additional overhead when there is no attack, we run the region-based queries only when an attack is detected using the detection mechanism that we detailed in \Cref{sec:detection}.
+
+%
+%
+%
+
+
+\begin{algorithm}[t]
+    \caption{Function to find all peers with a Common Prefix Length (CPL) $\geq \algvar{minCPL}$ with $\algvar{key}$} 
+    \label{alg:region_queries}
+    \begin{algorithmic}[1]
+    \Procedure{FindByCPL}{$\algvar{key}, \algvar{minCPL}$}
+        \State $\algvar{set} \gets \Call{GetClosestPeers}{\algvar{key}}$
+        \State $\algvar{CPL} \gets \operatorname{minCommonPrefixLength}(\algvar{set}, \algvar{key})$
+        \While{$\algvar{CPL} \geq \algvar{minCPL}$}
+            \State $\algvar{qkey} \gets \algvar{key}[\mathbin{:} \algvar{CPL}] \mathbin\Vert \overline{\algvar{key}[\algvar{CPL}]} \mathbin\Vert \algvar{key}[\algvar{CPL}+1 \mathbin{:}]$
+            %
+            %
+            \State $\algvar{set} \gets \algvar{set} \cup \Call{FindByCPL}{\algvar{qkey}, \algvar{CPL}+1}$
+            \State $\algvar{CPL} \gets \algvar{CPL} - 1$
+        \EndWhile
+        \State $\operatorname{removeItemsWithPrefixLessThan}(\algvar{set}, \algvar{minCPL})$
+        \State \Return $\algvar{set}$
+        \EndProcedure
+        \end{algorithmic} 
+\end{algorithm}
+
+\para{Algorithm}
+The region-based query algorithm is described in \Cref{alg:region_queries}, with a sample execution in~\Cref{fig:region-based-illustration}.
+The goal of this algorithm is to find all peer IDs that share a common prefix of at least $\algvar{minCPL}$ bits with $\key$.
+Note that any two keys $\algvar{k}_1, \algvar{k}_2$ have a common prefix length (CPL) of at least $l$ iff the XOR distance between $\algvar{k}_1$ and $\algvar{k}_2$ is less than $2^{256-l}$.
+Therefore, the common prefix requirement specifies a region of the key space with a distance $2^{256-\algvar{minCPL}}$ from $\key$.
+%
+To keep our mitigation compatible with the current version of \texttt{libp2p} DHT nodes, we use the same RPCs that the DHT nodes currently use.
+Therefore, we build the algorithm using only calls to $\Call{GetClosestPeers}{\key}$ which obtains the 20 peer IDs that are the closest to $\key$, which is already available in \texttt{go-libp2p-kad-dht}~\cite{libp2p_github_get_closest_peers}.  We start with this primitive and then compute the common prefix length shared by $\key$ and all of its 20 closest peer IDs, which we note as $\CPL$.
+
+Since we have found at least one peer ID with a common prefix length $\CPL$, we must have found all peer IDs with common prefix length $\geq \CPL+1$, as the latter are closer (in XOR distance) to $\key$ than the former (see step 0 in \Cref{fig:region-based-illustration}).
+In the next step, we would like to find all peer IDs with common prefix $\geq \CPL$ with $\key$. 
+Since we have already found all peer IDs with the prefix $\key[\mathbin{:} \CPL+1]$ (\ie, the first $\CPL+1$ bits match $\key$),
+we only need to find all peers IDs with the prefix $\key[\mathbin{:} \CPL] \mathbin\Vert \overline{\key[\CPL]}$ (\ie the first $\CPL$ bits match $\key$ and the $(\CPL+1)$-th bit is different).
+This is done recursively using our algorithm.
+%
+This step is repeated until all peer IDs with common prefix length $\geq \algvar{minCPL}$ with $\key$ have been found.
+
+\input{img/region-based-illustration.tex}
+
+While using this region-based query algorithm, we choose the value of $\algvar{minCPL}$ such that a region of the key space with common prefix length at least $\algvar{minCPL}$ with $\key=\cid$ contains at least $k=20$ honest peer IDs with high probability.
+Suppose that there are a total of $N$ peer IDs in the DHT, distributed uniformly across the hash space. A common prefix length of at least $\algvar{minCPL}$ corresponds to a XOR distance $<2^{256 - \algvar{minCPL}}$. Then, the expected number of peer IDs in this region is $2^{\algvar{minCPL}} \times N$.
+By setting $\algvar{minCPL} = \lceil \log_2\left(\frac{N}{k}\right) \rceil$, we have a region that contains $k$ honest peer IDs on average.
+Given an estimate $\hat{N}$ of the network size (as described in \cref{sec:netsize}), we substitute $\hat{N}$ for $N$ to calculate the region size.
+By a simple probabilistic bound, we can also extend this region to contain $k$ honest peer IDs with high probability.
+
+\para{Cost Analysis}
+By default, both \providers and \downloaders do one DHT lookup (using $\Call{GetClosestPeers}{\key}$) to obtain the list of $k=20$ closest peer IDs to $\key$. 
+%
+%
+%
+%
+%
+%
+%
+When a \provider or \downloader uses a region-based query, it does multiple lookups using $\Call{GetClosestPeers}{\cdot}$. 
+The number of lookups required increases sub-linearly in the number of Sybil identities placed by an attacker (shown experimentally in \Cref{fig:mit-lookups-sybils}).
+%
+Importantly, operating a Sybil identity requires participating in the DHT routing and responding to keep-alive messages.
+%
+As a result, the cost for the attacker increases linearly with the number of Sybil identities.
+%
+When the target CID is not under attack, using the region-based query would still use more than one $\Call{GetClosestPeers}{\cdot}$ lookups, because honest peer IDs are distributed randomly, and therefore the chosen region might contain more than $20$ peer IDs.
+To avoid this overhead when there is no attack, we run the region-based lookup only when the detection mechanism (\Cref{sec:detection}) detects an attack, and use the default lookup otherwise.
+We evaluate the \provider's and \downloader's cost of the region-based queries (number of lookups and latency) and the attacker's cost in \Cref{sec:evaluation}.
+
+\para{Correctness Analysis}
+We prove that \Cref{alg:region_queries} indeed finds all peer IDs with a common prefix length of at least $\algvar{minCPL}$ with $\key$.
+\begin{theorem}
+    \label{thm:region-based-routing-proof}
+    Assuming that $\Call{GetClosestPeers}{\key}$ returns the $20$ closest peer IDs to $\key$, $\Call{FindByCPL}{\algvar{key}, \algvar{minCPL}}$ returns all peer IDs with a common prefix of at least $\algvar{minCPL}$ bits with $\key$.
+\end{theorem}
+\begin{proof}
+    We prove this claim through induction.
+    For the base case, if there are $< 20$ peer IDs with a common prefix length of at least $\algvar{minCPL}$ with $\key$, then $\Call{GetClosestPeers}{\key}$ must return at least one peer with a common prefix length $ < \algvar{minCPL}$ with $\key$. Therefore, $\CPL < \algvar{minCPL}$, hence the function returns all peer IDs that have a common prefix length of at least $\algvar{minCPL}$.
+
+    Otherwise, $\CPL \geq \algvar{minCPL}$. Since we have found at least one peer with a common prefix length $\CPL$, we have found all peers with a common prefix length $\geq \CPL + 1$, that is all peers with the prefix $\key[:\CPL+1]$. Thus, we create a new key $\algvar{qkey}$ which has the prefix $\key[:\CPL] \mathbin\Vert \overline{\key[\CPL]}$. By induction, we assume that $\Call{findByCPL}{\algvar{qkey}, \CPL+1}$ returns all peers with prefix $\key[\mathbin{:} \CPL] \mathbin\Vert \overline{\key[\CPL]}$. Together, we now have all peers with the prefix $\key[\mathbin{:} \CPL]$. After subtracting $1$ from $\CPL$, we maintain the invariant that we have found all peers with prefix $\key[\mathbin{:}\CPL+1]$. If the loop doesn’t quit, then we continue to find peers with one more bit in the common prefix in every iteration. If the loop quits, this means that $\CPL + 1 \leq \algvar{minCPL}$, therefore we have found all peers with common prefix length of at least $\algvar{minCPL}$ as promised. 
+\end{proof}
+
+Even if $\Call{GetClosestPeers}{\key}$ does not return \textit{all} of the 20 closest peer IDs to $\key$, the algorithm will still terminate (because $\CPL$ decreases at every iteration) but may not find all the peers with a common prefix length of at least $\algvar{minCPL}$.
+Since we restrict ourselves to build the region-based lookup using $\Call{GetClosestPeers}{\key}$, our method is accurate only in the cases when $\Call{GetClosestPeers}{\key}$ is accurate.
+
+%
+%
+
+%
+    
+%
+
+%

@@ -1,0 +1,182 @@
+\section{Experiment setup}
+\label{exp}
+
+\subsection{General}
+
+We evaluate PBT-NAS on two tasks known to require careful tuning of network architecture and hyperparameters: GAN training and RL for visual control. In these settings, architecture can strongly influence performance~\cite{gui2021review, sinha2020d2rl}. We consider non-trivial architecture search spaces, see Sections~\ref{exp:setup:gan} and~\ref{exp:setup:rl}. We would like to emphasize that achieving a state-of-the-art result on the chosen tasks is not our goal, instead we aim to demonstrate the feasibility of architecture search via simultaneous training and architecture mixing on tasks where performance strongly depends on architecture.
+
+Hyperparameters of PBT-NAS are population size $N$, step size $e\_step$, selection parameter $\tau$ (we use the default value from PBT, $25\%$, in all experiments), probability $p$ of replacing a layer (which is also set to $25\%$). We aim to avoid unnecessary hyperparameter tuning to see if our approach is robust enough to perform well without it and to save computational resources.
+
+The experiments were run in a distributed way, the details on used hardware and on GPU-hour costs of experiments are given in Appendix~\ref{app:impl}. The algorithms used the amount of compute equivalent to training $N$ networks. Every experiment was run three times, we report the mean and standard deviation of the performance of the best solution from each run. 
+% We use the Wilcoxon signed-rank test~\cite{wilcoxon1992individual} with Bonferroni correction~\cite{dunn1961multiple} % saveref
+We use the Wilcoxon signed-rank test with Bonferroni correction for statistical testing (target $p$-value 0.05, 4 tests, corrected $p$ 0.0125, mentions of statistical significance in the text imply smaller $p$, all $p$-values are reported in Appendix~\ref{app:stats}). Our code is available at \url{https://github.com/AwesomeLemon/PBT-NAS}, it includes configuration files for all experiments.
+
+\subsection{GANs} \label{exp:setup:gan}
+
+In AdversarialNAS~\cite{gao2020adversarialnas}, the authors describe searching for a GAN architecture (for unconditional generation) in a search space where random search achieved poor results~---~this motivated us to adopt this search space, which we refer to as \texttt{Gan}. In AdversarialNAS, both generator and discriminator architectures are searched for but we noticed that in the official implementation, the searched discriminator is discarded, and an architecture from the literature~\cite{gong2019autogan} is used instead. This prompted us to create an extended version of the search space (which we call \texttt{GanHard}) that includes discriminator architectures resembling the one manually selected by the AdversarialNAS authors.
+AdversarialNAS cannot be used to search in \texttt{GanHard} because some of the options cannot be searched for via continuous relaxation (one example is searching whether a layer should downsample: since output tensors with and without downsampling have different dimensions, a weighted combination cannot be created). 
+
+Specifics of search spaces are not critical for our research, so we give condensed descriptions here, see Appendix~\ref{app:gan_ss} and our code for more details. 
+
+In \texttt{Gan}, operations for three DARTS-like~\cite{liu2018darts} cells are searched (each cell is a Directed Acyclic Graph (DAG) with operations on the edges; in contrast to DARTS, each cell may have a different architecture). Additionally, inspecting the code of AdversarialNAS showed that the output of some cells is pointwise summed with a projection of a part of a latent vector. Each such projection is a single linear layer mapping a part of a latent vector to a tensor of the same dimensionality as the cell output: $(\#channels, width, height)$. These projections contain many parameters and are therefore an important part of the architecture. In the code of AdversarialNAS, these projections are adjusted for each dataset. As to the discriminator, the architecture from~\cite{gong2019autogan} is used.
+
+Next, we describe \texttt{GanHard}. In \texttt{GanHard}, the parameters of the projections in the generator can be searched for. We additionally treat the layer mapping latent vector to the input of the generator as a projection, since it is conceptually similar. The projections (one per cell) can be enabled or disabled, except for the first one (connected to generator input) which is always enabled. A projection can take as input either the whole latent vector or the corresponding one-third of it (the first third of the vector for the first projection, etc.). 
+There are three options for the spatial dimensions of the output of a projection: \emph{target} (equal to the output dimensions of the corresponding cell), \emph{smallest} (equal to the input dimensions of the first cell), and \emph{previous} (equal to the output dimensions of the previous cell).
+Since the projection output is summed with the cell output pointwise, the dimensions need to match, which is not the case for the last two options. To upsample the tensor to the target dimensions, either $bilinear$ or $nearest\_neighbour$ interpolation is used, which is also a part of the search space. Finally, given that a projection is a large linear layer with potentially millions of parameters (which makes overfitting plausible), we introduce an option for a dropout layer in the projection, with possible parameters $0.0, 0.1, 0.2$.
+
+The discriminator search space in \texttt{GanHard} is based on the one in AdversarialNAS, the discriminator has 4 cells (each being a DAG with two branches), each cell has a downsampling operation in the end. However, we noticed that the fixed architecture from~\cite{gong2019autogan} that is used for final training of AdversarialNAS downsamples only in the first two cells. Additionally, in the first cell, the input is downsampled rather than the output. We amend the discriminator search space to contain a similar architecture. Firstly, we search whether each cell should downsample or not. Secondly, we add options for downsampling operations that are performed at the start of each branch rather than at the end of them. To enrich the search space further, we add two more nodes to each cell. 
+% Because filling them with an identity operation would recover the previous number of nodes, this extension strictly increases the size of the search space.
+
+The number of variables in \texttt{Gan} is 21 and the size of the search space is $\approx 3.4 \cdot 10^{19}$. In \texttt{GanHard}, there are 72 variables (32 for the generator, 40 for the discriminator), and the size of the search space is $\approx 2.9 \cdot 10^{53}$.
+
+Following AdversarialNAS, we run the experiments on CIFAR-10~\cite{krizhevsky2009learning} and STL-10~\cite{coates2011analysis}, using both \texttt{Gan} and \texttt{GanHard}. In AdversarialNAS, the networks were trained for 600 epochs. We reduce that number to 300 epochs to save computation time (preliminary experiments showed diminishing returns to longer training), for the other hyperparameters, the same values as in AdversarialNAS are used.
+
+The Frechet Inception Distance (FID)~\cite{heusel2017gans} is a commonly used metric for measuring GAN quality. We use its negation as the objective function, computing it on 5,000 images during the search. For reporting the final result, the FID for the best network is computed on 50,000 images. We additionally report the Inception Score (IS)~\cite{salimans2016improved}, another common metric of GAN quality. The idea behind both FID and IS is to compare representations of real and generated images.
+
+Based on preliminary experiments, the population size $N$ is set to 24, and $e\_step$ is set to 10.
+
+\subsection{RL} \label{exp:setup:rl}
+
+We build upon DrQ-v2~\cite{yarats2022mastering}, a model-free RL algorithm for visual continuous control. DrQ-v2 achieves great results on the Deep Mind Control benchmark~\cite{tassa2018deepmind}, solving many tasks. Searching for architectures for solved tasks is not necessary, therefore for our experiments we chose tasks where DrQ-v2 did not achieve the maximum possible performance: Quadruped Run, Walker Run, Humanoid Run. 
+
+DrQ-v2 is an actor-critic algorithm with three components: \emph{1)} an encoder that creates a representation of the pixel-based environment observation, \emph{2)} an actor that, given the representation, outputs probabilities of actions, and \emph{3)} a critic that, given the representation, estimates the Q-value of the state-action pair (the critic contains two networks because double Q-learning is used). % ~\cite{hasselt2010double} saveref
+
+We design the search space to include the architectures of all the components of DrQ-v2. Each network has three searchable layers. For the encoder, the options are Identity, Convolution \{3x3, 5x5, 7x7\}, ResNet~\cite{he2016deep} block \{3x3, 5x5, 7x7\}, Separable convolution \{3x3, 5x5, 7x7\}. For the actor and both networks of the critic, the available layers are Identity, Linear, and Residual~\cite{bjorck2021towards} with multiplier $0.5$ or $2.0$. Additionally, we search whether to use Spectral Normalization~\cite{miyato2018spectral} (for each network separately) and which activation function to use in each layer (options: Identity, Tanh, ReLU, Swish). We also search the dimensionality of representation: in DrQ-v2 it was set to either 50 or 100 depending on the task, we have $25, 50, 100,$ and $150$ as options.
+
+There are 36 variables in total, the search space size is $\approx 4.6 \cdot 10^{21}$.
+
+The hyperparameters of DrQ-v2 are used without additional tuning. For the Walker and Humanoid tasks, DrQ-v2 uses a replay buffer of size $10^6$. Our servers do not have enough RAM to allow for such a buffer size when many agents are training in parallel, therefore for these tasks, we use a shared replay buffer (proposed in~\cite{franke2020sample}): different agents can learn from the experiences of each other. To run in a distributed scenario with no shared storage, the buffers are only shared by the networks on the same machine. For fairness, all the baselines also use a shared buffer per machine.
+
+Based on preliminary experiments, the population size $N$ is set to 12. For the Quadruped and the Walker tasks, the DrQ-v2 agent used $3\cdot10^6$ frames. We use the same number of frames per agent, which means that $N$ times more total frames are used. For the Humanoid task, $3\cdot10^7$ frames were used in DrQ-v2, we use only $1.5\cdot10^7$ per agent to save computation time. For uniformness of notation with GANs, we also use "epoch" in the context of RL, one epoch is defined as $10^4$ frames. This means that 300 epochs are used for the Quadruped and Walker tasks, the same as for GANs, and $e\_step$ is also set to 10. Similar to BG-PBT~\cite{wan2022bayesian}, our preliminary experiments showed that having longer periods without selection at the start of the training is beneficial, therefore during the first half of the training, $e\_step$ is doubled from 10 to 20 epochs for the Quadruped and Walker tasks. Since for Humanoid only half the training is performed (in terms of frames per agent), the step size is fixed at 100 epochs (scaled up from 10 proportionally to the increase in the number of frames).
+
+\subsection{Baselines}
+We consider two general baselines that parallelize well and that can search in the proposed challenging search spaces.
+\begin{enumerate}
+\item \textbf{Random search.} $N$ architectures are randomly sampled and trained.
+
+\item \textbf{SEARL-like mutation}. In order to fairly evaluate the performance of a mutation-based architecture search approach like SEARL~\cite{franke2020sample}, we replace the mixing operator of PBT-NAS with the mutation operator from SEARL, adapting it to be applicable to both GAN and RL settings: with equal probability, either \textit{(a)} one variable in the architecture encoding is resampled, \textit{(b)} weights are mutated using the procedure from SEARL, or \textit{(c)} no change is performed.
+\end{enumerate}
+
+AdversarialNAS is a specialized baseline only capable of searching in \texttt{Gan}. In~\cite{gao2020adversarialnas}, the performance for only one seed was reported. We run the official implementation with 5 seeds and report the mean and standard deviation of performance.
+
+\section{Results}
+
+\subsection{PBT-NAS vs. the baselines} \label{exp:betterthanbase}
+
+As can be seen in Table~\ref{tab:perf_c10}, PBT-NAS achieves the best performance among all tested approaches in all GAN settings\footnote{When searching in \texttt{Gan} for STL-10, we faced reproducibility issues (despite using the official implementation), see Appendix~\ref{app:stl10} for results and discussion.}. The improvements in FID over both random search and SEARL-based mutation are statistically significant. Despite the claim of~\cite{gao2020adversarialnas} that random search performs poorly in \texttt{Gan}, we find that the gap between it and AdversarialNAS~\cite{gao2020adversarialnas} on CIFAR-10 is small, and the difference between all algorithms is overall not large. The decreased performance of random search in \texttt{GanHard} shows that \texttt{GanHard} is indeed a more challenging search space. The results of searching in this space for CIFAR-10 and STL-10 show a clear improvement of PBT-NAS over the baselines in terms of FID. IS is better in the majority of settings. 
+
+PBT-NAS is also the best among alternatives on RL tasks, achieving better anytime performance, as shown in Figure~\ref{fig:perf_rl} (the improvements in score over both random search and SEARL-based mutation are statistically significant). For Walker Run, there is no meaningful difference between algorithms, as the task is solved by all tested approaches, demonstrating that for differences between performance of the algorithms to be clear, both the RL task and the search space need to be of significant complexity.
+
+% Figure environment removed
+
+
+\begin{table*}[tp]
+    \centering
+    \caption{Results for GAN training (mean $\pm$ st. dev.). The best value in each column is in bold.}
+    % \vspace{-5pt} % 17pt
+    \begin{NiceTabular}{@{}lcccc|cc@{}} \toprule
+    \Block{3-1}{Algorithm} & \Block{1-4}{CIFAR-10} & & & & \Block{1-2}{STL-10}\\
+    \cmidrule{2-7}& \Block{1-2}{\texttt{Gan}} & & \Block{1-2}{\texttt{GanHard}} & & \Block{1-2}{\texttt{GanHard}} \\
+    \cmidrule{2-3} \cmidrule{4-5} \cmidrule{6-7}  
+    & FID $\downarrow$ & IS $\uparrow$ & FID $\downarrow$ & IS $\uparrow$ & FID $\downarrow$ & IS $\uparrow$ \\
+    \midrule
+    % \Block{1-5}{CIFAR-10} \\ \midrule
+    AdversarialNAS~\cite{gao2020adversarialnas} & $12.29_{\pm 0.80}$ & $8.47_{\pm 0.14}$ & --- & --- &  --- & --- \\
+    Random search & $13.39_{\pm 0.28}$ & $8.22_{\pm 0.15}$ & $16.79_{\pm 0.97}$ & $7.80_{\pm 0.14}$ & $28.58_{\pm 1.77}$ & $9.33_{\pm 0.18}$\\
+    SEARL-like mutation~\cite{franke2020sample} & $13.78_{\pm 1.02}$ & $8.38_{\pm 0.05}$ & $15.72_{\pm 2.22}$ & $\mathbf{8.26}_{\pm 0.21}$ & $26.94_{\pm 0.93}$ & $9.66_{\pm 0.27}$\\
+    PBT-NAS & $\mathbf{12.21}_{\pm 0.16}$ & $\mathbf{8.63}_{\pm 0.17}$  & $\mathbf{13.25}_{\pm 1.64}$ & $8.25_{\pm 0.27}$ & $\mathbf{25.11}_{\pm 0.94}$ & $\mathbf{9.71}_{\pm 0.09}$\\
+    \bottomrule
+    \end{NiceTabular}
+    \label{tab:perf_c10}
+\end{table*}
+
+\vspace{-10pt}
+\subsection{Mixing networks is better than cloning good networks}
+
+In order to show that creating new architectures makes a difference, we run a "No mixing" ablation: every component of PBT-NAS is kept the same, except that a new model is created by mixing a well-performing model with itself (rather than with another well-performing model). This way, no new architecture is produced, but the other benefits of PBT-NAS remain (e.g., replacing poorly-performing networks with well-performing ones). As seen in Table~\ref{tab:ablation}, this degrades the performance, clearly showing the impact that creating a better architecture can have.
+
+\begin{table}
+    \centering
+    \caption{Results of ablation studies (mean $\pm$ st. dev.). The best value in each column is in bold.}
+    \begin{NiceTabular}{@{}lcc@{}} \toprule
+    \Block{3-1}{Algorithm} & FID $\downarrow$ & Score $\uparrow$ \\
+    
+    & (CIFAR-10, & (Quadruped Run) \\
+    & \texttt{GanHard}) & \\
+    \midrule
+    PBT-NAS (default) & $\mathbf{13.25}_{\pm 1.64}$ & $\mathbf{801}_{\pm 70}$ \\
+    No mixing & $14.90_{\pm 1.29}$ & $672_{\pm 53}$\\
+    Shrink-perturb coefficients: & &\\
+    \hspace{0.5cm} [1, 0] --- copy exactly & $14.94_{\pm 0.56}$ & $699_{\pm 4}$\\
+    \hspace{0.5cm} [0, 1] --- reinitialize randomly & $15.06_{\pm 2.59}$ & $532_{\pm 62}$\\
+    \bottomrule
+    \end{NiceTabular}
+    \label{tab:ablation}
+\end{table}
+
+\vspace{-10pt}
+\subsection{Shrink-perturb is the superior way of weight inheritance} \label{abl:shpe_crucial}
+
+Table~\ref{tab:ablation} shows that copying weights from the donor without change (shrink-perturb parameters $[1, 0]$), or replacing them with random weights (shrink perturb $[0, 1]$) leads to worse results in comparison to the usage of shrink-perturb. Thus, in our settings, using shrink-perturb is the best method to inherit the weights. The default parameters  of shrink-perturb from~\cite{Zaidi_Berariu_Kim_Bornschein_Clopath_Teh_Pascanu_2022} ($[0.4, 0.1]$) worked well in PBT-NAS without any tuning.
+
+In~\cite{Zaidi_Berariu_Kim_Bornschein_Clopath_Teh_Pascanu_2022}, shrink-perturb was found to benefit performance, thus raising the question if using it gives PBT-NAS an unfair advantage that is not related to NAS. In order to test this, we added shrink-perturb to random search. As shown in Table~\ref{tab:shpe_random_search}, performance deteriorates, indicating that using shrink-perturb with default parameters in our setting is not helpful outside the context of NAS.
+
+\begin{table}
+    \centering
+    \caption{The effect of using shrink-perturb in random search}
+    \begin{NiceTabular}{@{}lcc@{}} \toprule
+    Use shrink-perturb & FID $\downarrow$ & Score $\uparrow$ \\
+    in random search & (CIFAR-10, \texttt{GanHard}) & (Quadruped Run) \\
+    \midrule
+    No (default) & $16.79_{\pm 0.97}$ & $616_{\pm53}$ \\
+    Yes & $22.39_{\pm 2.64}$ & $498_{\pm30}$ \\
+    
+    \bottomrule
+    \end{NiceTabular}
+    \label{tab:shpe_random_search}
+\end{table}
+
+\vspace{-10pt}
+\subsection{Increasing population size improves performance} \label{abl:scaling}
+
+We design our algorithm to be highly parallel and scalable. Figure~\ref{fig:scaling} demonstrates that as the population size increases, the performance strictly improves (although diminishing returns can be observed). Given enough GPUs, the increased population size will not meaningfully increase wall-clock time, since every population member can be evaluated in parallel.
+
+% Figure environment removed
+
+\subsection{Model soups}
+
+As mentioned in Section~\ref{rel:combine}, the idea of a model soup~\cite{wortsman2022model} is to improve performance by averaging weights of closely-related neural networks. As such, it seems like an especially good fit for the PBT setting: although the networks in the population start from different weights (and different architectures in the case of PBT-NAS), as worse networks are replaced by offspring of better networks, the population gradually converges. Since creating a model soup is done after training and requires a negligible amount of computation (evaluating at most $N$ models), its inclusion into PBT-like algorithms could give an almost free performance improvement. Therefore, we create model soups following the greedy algorithm from~\cite{wortsman2022model}.
+
+Table~\ref{tab:soup_gan} shows that soups improve GAN FID by approximately 0.4 points. For RL, however, there is no improvement when both the encoder and the actor are averaged (Table~\ref{tab:soup_rl}). We hypothesize that different actors may have dissimilar internal representations implementing different behaviour logic, unlike the encoders that only convert pixel inputs into representations. Therefore, we tried to separately average encoders, or actors. The results with averaged encoders are the best overall but they still do not lead to improved performance. For Walker Run, the task where performance is saturated, there is no difference between settings.
+
+\begin{table}
+    \centering
+    \caption{The difference in metrics between a model soup and the best individual model (GAN), mean $\pm$ st. dev.}
+    \begin{NiceTabular}{@{}lcc@{}} \toprule
+    \Block{2-1}{Dataset} & \Block{1-2}{\texttt{GanHard}}\\
+    \cmidrule{2-3} & $\Delta$ FID $\downarrow$ &  $\Delta$ IS $\uparrow$\\
+    \midrule
+    CIFAR-10 & $-0.48_{\pm 0.34}$ & $0.07_{\pm 0.05}$\\
+    % CIFAR-10 ($N=36$) & & \\
+    STL-10 &  $-0.35_{\pm 0.26}$ & $0.04_{\pm 0.25}$ \\
+    \bottomrule
+    \end{NiceTabular}
+    \label{tab:soup_gan}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{The difference in score between a model soup and the best individual model (RL), mean $\pm$ st. dev.}
+    \begin{NiceTabular}{@{}lccc@{}} \toprule
+    \Block{2-1}{What to average} & \Block{1-3}{$\Delta$ Score $\uparrow$}\\
+    \cmidrule{2-4} & Quadruped & Walker & Humanoid \\
+    \midrule
+    Encoder & $-6_{\pm 10}$ & $-1_{\pm 4}$& $-23_{\pm 19}$\\
+    Actor & $-196_{\pm 275}$ & $-4_{\pm 7}$ & $-244_{\pm 32}$\\
+    Both & $-142_{\pm 193}$ & $0_{\pm 6}$& $-223_{\pm 20}$ \\
+    \bottomrule
+    \end{NiceTabular}
+    \label{tab:soup_rl}
+\end{table}
+
+Previously, soups were only demonstrated for classification tasks, so it is interesting to see that they could also be beneficial in GANs. While no improvement was seen for RL, the fact that only the vision-related network, the encoder, could be averaged without large performance degradation hints at the limitations of the technique.

@@ -1,0 +1,93 @@
+\section{VPP}\label{sec:method}
+Our goal is to design a 3D generation method by sharing the merits of both geometric representations, which is capable of addressing the three major issues encountered in previous generation methods.
+In this work, we propose VPP, a Voxel-Point Progressive Representation method for two-stage 3D generation.
+To tackle the problem of \textit{limited generation categories}, VPP employs explicit voxels and discrete VQGAN for semantics representation in the first stage.
+To address the issue of \textit{low inference efficiency}, VPP employs efficient point clouds as representations in the second stage and leverages the parallel generation capability of the mask Transformer.
+Given the wide range of applications of generative modeling, VPP resolves the problem of \textit{restricted downstream tasks}.
+The training overview of VPP is shown in ~\cref{fig:training}.
+\input{fig/smoother}
+
+\subsection{How Does 2D VQGAN Adapt to 3D Voxels?}\label{sec:vqgan}
+
+Due to the formal similarity between voxels and pixels, we can readily draw upon various image generation methods. VQGAN~\citep{vqgan21} is capable of generating realistic images through discrete semantic codebooks and seamlessly integrating with mask generative Transformers~\citep{MaskGiT22, muse23}.
+We utilize 3D volumetric SE-ResNet~\citep{seresnet} as the backbone of VQGAN encoder $\encoder$, decoder $\decoder$ and discriminator $\discriminator$. 
+
+Given one voxel observation $\mathbf{v}\in\mathbb{R}^3$ whose occupancy is defined as function $o: \mathbb{R}^3 \rightarrow [0, 1]$. The original VQGAN is trained by optimizing a vectorized quantized codebook with the loss $\mathcal{L}_{\text{VQ}}$ during autoencoding while training a discriminator between real and reconstructed voxels with loss $\mathcal{L}_{\text{GAN}}$.
+Denoting the reconstructed voxel result as $\hat{\mathbf{v}}$, the overall loss of vanilla VQGAN can be written as:
+\begin{align}
+    \underbrace{\|\mathbf{v}-\hat{\mathbf{v}}\|^2 + \Vert \text{sg}[\encoder(\mathbf{v})] - \quantizedcode \Vert_2^2 \nonumber + \Vert \text{sg}[\quantizedcode] - \encoder(\mathbf{v}) \Vert_2^2}_{\mathcal{L}_{\text{VQ}}(\encoder, \decoder, \codebook)} + 
+    \underbrace{\big[\log D(\mathbf{v})+\log(1-D(\hat{\mathbf{v}}))\big]}_{\mathcal{L}_{\text{GAN}}(\{\encoder, \decoder, \codebook \}, \discriminator)}.
+\end{align}
+
+However, unlike 2D images, 3D voxels only have non-zero values in the region that encompasses the object in grid centroids. 
+This may lead to a short-cut solution that degrades by outputting voxels with values as close to zero as possible, \ie, all empty occupancy.
+To address this issue, we propose to minimize the occupancy disparity between the reconstructed and ground truth voxels. 
+Formally, let $\zeta \circ o(\mathbf{v})$ be the averaged occupancy in SE(3) space, the overall loss $\mathcal{L}_{\text{3D-VQGAN}}$ is:
+\begin{equation}
+    \mathcal{L}_{\text{3D-VQGAN}} =  \mathcal{L}_{\text{VQ}} + \mathcal{L}_{\text{GAN}} + \underbrace{\|\zeta \circ o(\mathbf{v}) - \zeta \circ o(\hat{\mathbf{v}})\|^2_2}_{\mathcal{L}_{\text{OCC}}},
+\end{equation}
+where $\mathcal{L}_{\text{OCC}}$ is proposed to minimize the occupancy rate for better geometry preservation.
+
+% \input{fig/smoother}
+\subsection{How to Bridge the Representation Gap Between Voxels and Points?}\label{sec:smoother}
+We aim to utilize the voxel representation as the intermediate coarse generation before fine-grained point cloud results.
+However, voxels are uniform and discrete grid data, while point clouds are unstructured with unlimited resolutions, which allows for higher density in complex structures. 
+Besides, point clouds typically model the surfaces, while voxel representation is solid in nature.
+This inevitably leads to a \textit{representation gap} issue, and a smooth transformation that bridges the representation gap is needed.
+We employ the Lewiner algorithm~\citep{Lewiner03} to extract the surface of the object based on voxel boundary values and utilize a lightweight sequence-invariant Transformer~\citep{AttentionIsAllYouNeed} network $\mathcal{T}_{\eta}$ parametrized with $\eta$ as \textit{Grid Smoother} to address the issue of grid discontinuity.
+Specifically, given generated point clouds $\mathcal{P} = \{\mathbf{p}_i\in\mathbb{R}^3\}_{i=1}^{N}$ with $N$ points.
+The model is trained by minimizing the geometry distance between generated and ground truth point clouds $\mathcal{G} = \{\mathbf{g}_i\in\mathbb{R}^3\}_{i=1}^{N}$ that is downsampled to $N$ with farthest point sampling (FPS).
+To make the generated surface points more uniformly distributed, we propose $\mathcal{L}_{\text{uniform}}$ that utilizes the Kullback-Leibler (KL) divergence $D_{\mathrm{KL}}$ between the averaged distance of every centroid $\mathbf{p}_i$ and its K-Nearest Neighborhood (KNN) $\mathcal{N}_i$.
+Then we optimize the parameter $\eta$ of Grid Smoother by minimizing loss $\mathcal{L}_{\text{SMO}}$:
+\begin{align}\label{eq:smoloss}
+\mathcal{L}_{\text{SMO}}=
+\underbrace{\frac{1}{|\mathcal{T}_{\eta}(\mathcal{P})|}\sum_{\mathbf{p}\in \mathcal{T}_{\eta}(\mathcal{P})} \min_{\mathbf{g}\in \mathcal{G}} \|\mathbf{p}-\mathbf{g}\| + \frac{1}{|\mathcal{G}|}\sum_{\mathbf{g}\in \mathcal{G}} \min_{\mathbf{p}\in \mathcal{T}_{\eta}(\mathcal{P})} \|\mathbf{g}-\mathbf{p}\|}_{\mathcal{L}_{\text{CD}}} + \underbrace{D_{\mathrm{KL}}
+    \left[
+    \sum_{j \in \mathcal{N}_i} \|\mathbf{p}_i - \mathbf{p}_j \|_2, ~\mathcal{U}
+    \right]}_{\mathcal{L}_{\text{uniform}}},
+\end{align}
+where $\mathcal{L}_{CD}$ is $\ell_1$ Chamfer Distance~\citep{ChamferDistance17} geometry disparity loss, $\mathcal{U}$ is the uniform distribution.
+
+\input{fig/training}
+\subsection{Voxel-Point Progressive Generation Trough Mask Generative Transformer}\label{sec:architecture}
+We employ mask generative Transformers~\citep{MaskGiT22} for rich semantic learning in both the voxel and point stages. Mask generative Transformer can be seen as a special form of denoising autoencoder~\citep{DAE,denoising20}. It forces the model to reconstruct masked input to learn the statistical correlations between local patches. Furthermore, generating reconstruction targets through a powerful tokenizer can further enhance performance~\citep{BEiT,MVP22,iBoT,ACT23}. From the perspective of discrete variational autoencoder (dVAE)~\citep{PracticalELBO11,VAE14,DALL-E,BEiT}, the overall optimization is to maximize the \textit{evidence lower bound} (ELBO)~\citep{MDL78,ELBO93,DGMS22} of the log-likelihood $\mathrm{P}(x_i|\tilde{x}_i)$. Let $x$ denote the original data, $\tilde{x}$ the masked data, and $z$ the semantic tokens, the generative modeling can be described as:
+\begin{align}\label{eq:dVAE}
+    \!\!\!\sum_{(x_i, \tilde{x}_i)\in\mathcal{D}}\!\log \mathrm{P}(x_i|\tilde{x}_i)\geq\!\!\!
+    \sum_{(x_i, \tilde{x}_i)\in\mathcal{D}}\!\!\!
+    \Big (
+    \mathbb{E}_{z_i\sim \mathrm{Q}_{\phi}(\mathbf{z}|x_i)}
+    \big[\log \mathrm{P}_{\psi}(x_i|z_i) \big]
+    -
+    D_{\mathrm{KL}}
+    \big[
+    \mathrm{Q}_{\phi}(\mathbf{z}|x_i), \mathrm{P}_{\theta} (\mathbf{z}|\tilde{z_i})
+    \big]
+    \Big),
+\end{align}
+where (1) $\mathrm{Q}_{\phi}(z|x)$ denotes the discrete semantic tokenizer; (2) $\mathrm{P}_{\psi}(x|z)$ is the tokenizer decoder to recover origin data; (3) $\tilde{z}=\mathrm{Q}_{\phi}(z|\tilde{x})$ denotes the masked semantic tokens from masked data; (4) $\mathrm{P}_{\theta}(z|\tilde{z})$ reconstructs masked semantic tokens in an autoencoding way. 
+In the following sections, we extend the mask generative Transformer to voxel and point representations, respectively. The semantic tokens of voxel and point are described as $z^v$ and $z^p$ in \cref{fig:training,fig:inference}.
+
+\paragraph{Voxel Semantic Generator}
+We generate semantic voxels with low resolution in the first stage to balance efficiency and fidelity. We utilize \textit{Mask Voxel Transformer} for masked voxel inputs, where the 3D VQGAN proposed in \cref{sec:vqgan} is used as the tokenizer to generate discrete semantic tokens. Following prior arts~\citep{MaskGiT22, muse23}, we adopt Cosine Scheduling to simulate the different stages of generation. The masking ratio is sampled by the truncated arccos distribution with density function $p(r) = \frac{2}{\pi}(1-r^2)^{-\frac{1}{2}}$. 
+The prompt embedding comes from the CLIP~\citep{CLIP} features of cross-modal information. We render multi-view images from the 3D object~\citep{recon23} and utilize BLIP~\citep{blip} to get the text descriptions of the rendered images. 
+Furthermore, in order to mitigate the issue of excessive dependence on prompts caused by the high masking ratio (\eg, the same results will be generated by one prompt), we introduce \textit{Classifier Free Guidance}~\citep{cfg} (CFG) to strike a balance between diversity and quality.
+Following Sanghi~\etal~\citep{clipsculptor23}, the prompt embeddings are added with Gaussian noise to reduce the degree of confidence.
+We use $\epsilon\sim \mathcal{N}(0,1)$ and $\gamma\in(0,1)$ as the level of noise perturbation for the trade-off control, which will later be studied.
+
+\paragraph{Point Upsampler}
+Point clouds are unordered and cannot be divided into regular grids like pixels or voxels. 
+Typically, previous masked generative methods~\citep{PointMAE, ACT23} utilize FPS to determine the center of local patches, followed by KNN to obtain neighboring points as the geometric structure. 
+Finally, a lightweight PointNet~\citep{PointNet,PointNet++} or DGCNN~\citep{DGCNN} is utilized for patch embedding.
+However, these methods rely on pre-generated Positional Encodings (PE), rendering the use of fixed positional cues \textit{infeasible} in conditional 3D generation since only conditions like texts are given.
+To tackle this issue, we adopt the first-stage generated voxels-smoothed point clouds as the PEs.
+A pretrained Point-MAE~\citep{PointMAE} encoder is used as the tokenizer (\ie, teacher~\citep{ACT23}). 
+The Mask Point Transformer learns to reconstruct tokenizer features, which will be used for the pretrained decoder reconstruction.
+
+\input{fig/inference}
+\subsection{Inference Stage}\label{sec:inference}
+\paragraph{Parallel Decoding}
+An essential factor contributing to the efficient generation of VPP is the parallel generation during the inference stage. The model takes fully masked voxel tokens as input and generates semantic voxels conditioned on the CLIP~\citep{CLIP} features of text or image prompts. Following~\cite{MaskGiT22, muse23}, a cosine schedule is employed to select the fixed fraction of the highest confidence masked tokens for prediction at each step. Furthermore, we pass the generated voxels through Grid Smoother to obtain smoothed point clouds, which will serve as the positional encoding for the Point Upsampler in the upsampling process. Note that all the stages are performed in parallel.
+The inference overview of VPP is illustrated in \cref{fig:inference}.
+
+\textbf{Central Radiative Temperature Schedule}~
+Due to the fact that 3D shape voxels only have non-zero values in the region that encompasses the object in the center, we hope to encourage diversity in central voxels while suppressing diversity in edge vacant voxels. Consequently, we propose the \textit{Central Radiative Temperature Schedule} to accommodate the characteristics of 3D generation. As for the voxel with a size of $R \times R \times R$, we calculate the distance $r$ to the voxel center for each predicted grid. Then, we set the temperature for each grid as $T=1-(r/R)^2$, where $T$ represents the temperature. Thus, we can achieve the grid that is closer to the center will have a higher temperature to encourage more diversity and vice versa.

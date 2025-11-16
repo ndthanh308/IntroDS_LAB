@@ -1,0 +1,207 @@
+\section{Bayesian Optimization with Adaptive Level-Set Estimation}\label{sec:method}
+We consider the standard BO setting for sequentially optimizing a function $f: \searchSpace \rightarrow \reals$, where $\searchSpace \subseteq \reals^d$ is the search space. 
+At iteration $t$, we maintain a Gaussian process %$\mathcal{GP}$ 
+as the surrogate model,  picks a point $\instance_t\in\searchSpace$ by maximizing the acquisition function $\alpha: \searchSpace \rightarrow \reals$, 
+and observe the function value perturbed by additive noise: 
+$y_t = f(\instance_t) + \epsilon_t$ with $\epsilon_t \sim \mathcal{N}(0, \sigma^2)$ 
+being i.i.d. Gaussian noise. The goal is to maximize the sum of rewards 
+$\sum^T_{t=1}f(\instance_t)$ over $T$ iterations, or equivalently, 
+to minimize the \emph{cumulative regret} $R_T \triangleq \sum_{t=1}^T r_t$, 
+where $r_t \triangleq \max\limits_{\instance\in \searchSpace}f(\instance) - f(\instance_t)$ 
+denotes the \textit{instantaneous regret}. Another common performance metric in BO is the \textit{simple regret} $r^*_T \triangleq \max\limits_{\instance\in \searchSpace}f(\instance) - \max\limits_{t\leq T}f(\instance_t)$. 
+
+\subsection{The \algname framework}\label{sec:ballet}
+\paragraph{Global modeling and representation} Existing works use heuristics to partition the historical observations $\Selected_t = \{X_t, Y_t\}$ first and then generalize it to the whole search space $\searchSpace$ \citep{wang2020learning, eriksson2019scalable}. Here $Y_t =\{y_1,...,y_t\}$ and $X_t =\{\instance_1,...,\instance_t\}$. %The heuristics could introduce unnecessary complexity and potentially incur the loss on the accuracy of the partitioning. 
+The heuristics could be sensitive to additional hyperparameters of the partitioning model (e.g., number of partitions, etc), which in turn affect the optimization performance.
+
+Instead, we propose to learn a partitioning on $\searchSpace$ with a global estimation of the underlying blackbox function $\globalf \defeq f$, which is modeled by a Gaussian process $\mathcal{GP}_{\globalf}(m_{\globalf}(\instance), k_{\globalf}(\instance, \instance'))$ trained on the historical observations. $\mathcal{GP}_{\globalf}$ is parameterized by $\algParam_{\globalf}$, where $m_{\globalf}(\instance)$ is the mean function and $k_{\globalf}(\instance, \instance')$ is the covariance function. 
+
+
+In this work, we resort to \emph{Deep Kernel Learning} (DKL) \citep{pmlr-v51-wilson16} as a scalable tool to train the GPs\footnote{We propose a kernel-agnostic framework and in implementation, we apply the efficient deep kernel for large-scale optimization. In deep kernel learning, which is shown to bear strong empirical performance in regression and optimization (e.g.\citep{pmlr-v51-wilson16, wistuba2021few}), 
+the learning cost is $\mathcal{O}(n)$ for $n$ training points, and the prediction cost is
+$\mathcal{O}(1)$ per test point and is more efficient than exact GP in terms of computational cost.}.
+
+The algorithm learns a latent space mapping $\featureExtractor: \searchSpace\rightarrow \LatentRepSet$ on a neural network to convert the input space $\searchSpace$ to the latent space $\LatentRepSet$, and constructs an objective mapping $h: \LatentRepSet \rightarrow \reals$ such that $f(\instance)\approx h(\featureExtractor(\instance)),\ {\forall \instance\in \searchSpace}$. 
+The neural network $\featureExtractor$ and the base kernel $k$ together are regarded as a \emph{deep kernel}, 
+denoted by $k_{\globalf}(\instance, \instance') = k\paren{\featureExtractor(\instance), \featureExtractor(\instance')}$ \citep{pmlr-v51-wilson16}. The deep kernel is trained by maximizing the negative log-likelihood (NLL) $-\log(\Pr{\mathbf{y}_t \mid X_t,\algParam_{\globalf,t}}) = -\frac{1}{2}\mathbf{y}_t^\top(\GramMat_{\globalf,t}+\sigma^2I)^{-1}\by_t -\frac{1}{2}\log|(\GramMat_{\globalf,t}+\sigma^2I)| -\frac{t}{2}\log(t)$ which is the learning objective for the kernel \citep{rasmussen:williams:2006}. \rebuttal{Note that DKL relies on KISS-GP \cite{wilson2015kernel} which generalize inducing point methods with kernel interpolation for efficient inference and is related to the sparse GP methods \cite{mcintire2016sparse, moss2023inducing}}. In addition to DKL, we use the unlabeled dataset sampled from $\searchSpace$ to pre-train an Auto-Encoder and use the parameters of its encoder to initialize the neural network $\featureExtractor$ following the protocol described by \citet{ferreira2020using}.
+
+At iteration $t$, given the selected points $\Selected_t$, the posterior over $\globalf$ also takes the form of a GP, with mean $\mu_{\globalf,t}(\instance) = k_{\globalf,t}(\instance)^\top(\GramMat_{\globalf,t}+\sigma^2I)^{-1}\by_t$ and covariance $k_{\globalf,t}(\instance, \instance') = k_{\globalf}(\instance,\instance')-k_{\globalf,t}(\instance)^\top(\GramMat_{\globalf,t}+\sigma^2I)^{-1}k_{\globalf,t}(\instance')$, where $k_{\globalf,t}(\instance) \triangleq \bracket{k_{\globalf}(\instance_1, \instance),\dots, k_{\globalf}(\instance_t, \instance)}^\top$ and $\GramMat_{\globalf,t} \triangleq \bracket{k_{\globalf}(\instance, \instance')}_{\instance,\instance' \in \Selected_t}$ is the positive definite kernel matrix \citep{rasmussen:williams:2006}.
+
+\begin{algorithm*}%[H]
+\caption{\textbf{\underline{B}}ayesian Optimization with \textbf{\underline{A}}daptive \textbf{\underline{L}}eve\textbf{\underline{l}}-Set \textbf{\underline{E}}s\textbf{\underline{t}}imation (\algname)}
+\label{alg:main}
+
+    \begin{algorithmic}[1]
+        \STATE {\bf Input}:Search space $\searchSpace$, initial observation $\Selected_0$, horizon $T$;
+        \FOR{$t = 1\ to\ T$}
+            \STATE Fit the global Gaussian process $\mathcal{GP}_{\globalf,t}$: $\algParam_{\globalf,t} \leftarrow \argmax_{\algParam_{\globalf}}-\log \Pr{Y_t\mid X_{t-1},\algParam_{\globalf}}$ 
+             
+            \STATE %Partition by region of interest filtering: 
+            Identify ROIs via superlevel-set estimation
+            $\roi_t \leftarrow \{\instance\in \searchSpace \mid    \UCBit_{\globalf, t}(\instance) \geq  \LCB_{\globalf, t, \max}\}$ \label{alg:ln:filtering}
+            
+            \STATE Partition the historical observation: $\hat{\Selected}_t \leftarrow \{(\instance,y)\in \Selected_t \mid \instance \in {\roi_t}\}$. 
+             
+            \STATE  Fit the ROI Gaussian process  $\mathcal{GP}_{\roif,t}$: $\algParam_{\roif,t} \leftarrow \argmax_{\algParam_{\roif}}-\log \Pr{Y_t \cap \hat{\Selected_t}|{X_{t} \cap \hat{\Selected}_t},\algParam_{\roif}}$ 
+          
+            \STATE Optimize the {superlevel-set} acquisition function: $\instance_{t+1} \leftarrow \argmax\limits_{\instance\in \roi}{\acq(\instance)}$ (e.g., as defined in \eqref{eq:acqCI},~\ref{eq:acqROI-ts} or \ref{eq:acqROI-ci})
+            
+            \STATE $\Selected_{t+1} \leftarrow \Selected_{t} \cup \{(\instance_{t+1}, y_{t+1})\}$
+        \ENDFOR
+        \STATE {\bf Output}: $\max\limits_{t}{y_t}$
+    \end{algorithmic}
+\end{algorithm*}
+
+\paragraph{Superlevel-set estimation and filtering} The global $\mathcal{GP}_{\globalf}$ induces a filter on $\searchSpace$ to locate the region of interest $\roi$. It is desired for $\roi$ that with high probability, the optimum $\instance^* \in \argmax_{\instance\in\searchSpace} f(\instance)$ is contained in $\roi$, while $\Vert\roi\Vert \ll \Vert\searchSpace\Vert$. 
+
+Specifically, we leverage the confidence interval of the global Gaussian process $\mathcal{GP}_{\globalf}$ to define the upper confidence bound 
+$  \UCBit_{\globalf, t}(\instance) \triangleq \mu_{\globalf,t-1}(\instance) + \beta^{1/2}_{t}\sigma_{\globalf,t-1}(\instance)$ 
+and lower confidence bound $ \LCB_{\globalf, t}(\instance) \triangleq\mu_{\globalf,t-1}(\instance) - \beta^{1/2}_{t}\sigma_{\globalf,t-1}(\instance)$, where $\sigma_{\globalf,t-1}(\instance) = k_{\globalf,t-1}(\instance,\instance)^{1/2}$ and $\beta$ acts as an scaling factor. Then the maximum of the global lower confidence bound $ \LCB_{\globalf, t, \max} \triangleq \max_{\instance\in\searchSpace}  \LCB_{\globalf, t}(\instance)$ can be used as the threshold, and we attain the superlevel-set
+\begin{align}
+    \roi_t \triangleq \curlybracket{ \instance \in \searchSpace \mid \UCBit_{\globalf, t}(\instance) \geq  \LCB_{\globalf, t, \max}} \label{eq:roi}
+\end{align} 
+as the region(s) of interest. The historical observation on this subset is denoted as
+\begin{align}
+    \hat{\Selected}_t \triangleq \curlybracket{(\instance,y)\in \Selected \mid \instance \in \roi_t}. \label{eq:selected}
+\end{align}
+
+
+\begin{rem}
+\algname is not assuming that the resulting $\roi$ is composed of one single cluster. 
+\algname learns a single GP over $\roi_t$ and optimizes on all these localities at the same time. Intuitively it aims at conducting (local) BO on the top tier (which could consist of multiple regions) of the unknown function. This mechanism avoids being overconfident to identify only one region of interest or the need to manually specify the number of clusters beforehand. Here we use the term ``superlevel-set'' 
+to differentiate from the methods conducting local BO.
+\end{rem}
+
+
+\subsection{\interCI}\label{sec:interci}
+
+The goal of the filtering step in \algname is to shrink the search space $\roi_t$ while ensuring that the optimum is contained in the ROIs with high probability.
+By definition of $\roi_{t}$ (\eqref{eq:roi}), we note that at iteration $t$ the size of the search space $\Vert\roi_{t}\Vert$ is directly affected by $\UCBit_{\globalf, t}(\instance)$. \footnote{\rebuttal{Given any finite discretization $\discreteSet$ of $\searchSpace$, we refer the size of the search space as the cardinality  $\vert \discreteSet \vert$.}} We thus consider the width of the range of $\UCBit_{\globalf, t}$ over $\instance \in \roi_{t}$, formally defined as
+
+\rebuttal{
+\begin{align}
+    \roiRangeAt{t}(\instance_t) \triangleq \max_{\instance \in \roi} \UCBit_{\globalf, t}(\instance) - \LCB_{\globalf, t, \max} \label{eq:roirange}
+\end{align}
+}
+as a surrogate objective to minimize. 
+
+\subsubsection{%Confidence-interval-based 
+Acquisition function} 
+Evaluating \eqref{eq:roirange} for a new data point $\instance$ requires 1-step look-ahead (i.e., computing the expected $\roiRangeAt{t+1}$ should $\instance$ be acquired at $t$), which could be expensive. Instead, we consider the \emph{point-wise confidence interval} of the ROI Gaussian process $\mathcal{GP}_{\roif}$ trained on $\hat{\Selected}$, denoted by 
+\begin{align}
+    \CI_t(\instance) \triangleq \bracket{\LCB_{\roif,t}(\instance),\UCBit_{\roif, t}(\instance)}, \label{eq:roiciatt}
+\end{align}
+and simply use the width of $|\CI_t(\instance)|$ as an efficiently proxy for evaluating $\instance$. 
+
+\paragraph{Mitigating the loss of information of $\mathcal{GP}_{\roif}$} At each iteration, 
+\algname conducts superlevel-set estimation %region of interest filtering 
+and then runs BO on $\roi$ using the ROI Gaussian process $\mathcal{GP}_{\roif}$ trained on $\hat{\Selected}$. 
+Note that $\mathcal{GP}_{\roif}$ could better capture the locality at the cost of \emph{losing partial historical observations} due to the filtering as $\hat{\Selected}\subseteq \Selected$. The missing historical observations could result in additional undesired uncertainty in $\mathcal{GP}_{\roif}$ compared to the global GP $\mathcal{GP}_{\globalf}$.
+To avoid such information loss while taking the advantage of the identified ROIs,
+
+we propose to tighten the confidence interval (\eqref{eq:roiciatt}) 
+by taking the intersection of the confidence intervals 
+from all ROI GPs trained from each of the previous iterations $\mathcal{GP}_{\roif, i\leq t}$ and the corresponding global GPs, $\mathcal{GP}_{\globalf, i\leq t}$. In this way, the acting superlevel-set confidence interval would be $\hatCI_{t}(\instance) \triangleq \bracket{\acqLCB_{t}(\instance), \widehat{  \UCBit}_{t}(\instance)}$ , where 
+
+\begin{align}
+\begin{cases}
+    \acqLCB_{t}(\instance) \triangleq \max_{i\leq t, f\in\{\roif, \globalf\}}{ \LCB_{f, i}(\instance)} %\label{eq:acqLCB} 
+    \\
+    \acqUCB_{t}(\instance) \triangleq \min_{i\leq t, f\in\{\roif, \globalf\}}{  \UCBit_{f, i}(\instance)} %\label{eq:acqUCB}
+\end{cases} \label{eq:acqLCB+UCB}
+\end{align}
+It is possible that the intersection in \eqref{eq:acqLCB+UCB} results in an empty CI due to the dynamics brought by the learned kernels. 
+In practice, instead of taking the intersections of all the historical GPs, we could mitigate the problem by only taking the intersection of the CIs at step $t$ to get $\tildeCI_{t}(\instance) = [\acqLCBt_{t}(\instance), \acqUCBt_{t}(\instance)]$. Here 
+
+\begin{align}
+\begin{cases}
+    \acqLCBt_{t}(\instance) \triangleq \max_{f\in\{\roif, \globalf\}}{ \LCB_{f, t}(\instance)} %\label{eq:acqLCBt} 
+    \\
+    \acqUCBt_{t}(\instance) \triangleq \min_{f\in\{\roif, \globalf\}}{  \UCBit_{f, t}(\instance)} %\label{eq:acqUCBt}
+\end{cases} \label{eq:acqLCBt+UCBt}
+\end{align}
+
+Note when $\LCB_{\roif,t} \leq \LCB_{\globalf,t}$ and $\LCB$ is monotonically increasing wrt $t$
+, it holds that $\LCB_{\globalf, t, \max}=\max_{\instance \in \hat{\searchSpace}}\acqLCB_{ t}(\instance)=\max_{\instance \in \hat{\searchSpace}}\acqLCBt_{ t}(\instance)$.
+ 
+\paragraph{The \interCI acquisition function} We propose to apply the \underline{i}ntersection of the \underline{c}onfidence \underline{i}ntervals as an acquisition function for \algname (\interCI), namely 
+\begin{equation}\label{eq:acqCI}
+    \acq(\instance) \triangleq \acqUCBt_{t}(\instance) - \acqLCBt_{t}(\instance)  
+\end{equation}
+
+Our algorithm is presented in \algoref{alg:main}. In the following subsection, we rigorously justify the use of \eqref{eq:acqCI} as our acquisition function, and prove that the cost on the optimization performance using the relaxation from \eqref{eq:acqLCB+UCB} to \eqref{eq:acqLCBt+UCBt} could be bounded under certain conditions.
+
+\subsubsection{Theoretical analysis}
+By abuse of notation, we let the maximum confidence interval on a certain set denoted by 
+
+$$\hatCI_{t,\max}(\funcDot) =  \bracket{\max_{\instance \in \funcDot}\acqLCB_{ t}(\instance), \max_{\instance \in \funcDot}\acqUCB_{ t}(\instance)}$$ 
+
+$$\tildeCI_{t,\max}(\funcDot) = \bracket{\max_{\instance \in \funcDot}\acqLCBt_{t}(\instance),
+\max_{\instance \in \funcDot}\acqUCBt_{t}(\instance)}$$
+
+The following lemma shows that the interval
+$\hatCI_{t,\max}(\hat{\searchSpace})$ is a high confidence interval for $f^* = \max\limits_{\instance\in \searchSpace}f(\instance)$ given a good discretization of the search space. 
+
+
+\begin{lem}\label{lem:CI}
+\todo{avoid validity concern over the assumptions}
+Assume $\forall t < T, \instance\in\searchSpace$, $f(\instance)$ is a sample from global $\mathcal{GP}_{\globalf, t}$. \footnote{\rebuttal{Here rigorously $\forall t < T$, $\mathcal{GP}_{\globalf, t}$ should share the same prior with each other, while we periodically retrain the model similar to the practice of \cite{tripp2020sample} and we reflect it with the subscript $t$. }}
+For any $\delta \in (0,1)$ and any finite discretization $\discreteSet$ of $\searchSpace$ 
+containing the optimum $\instance^* = \argmax_{\instance\in \searchSpace}f(\instance)$
+, with $\beta_t=2\log(2\vert \discreteSet \vert \pi_t/ \delta)$ where $\sum_{t\geq 1}\pi_t^{-1} = 1$, 
+$\Pr{f^* \in \hatCI_{t,\max}(\discreteSet)} \geq 1-\delta$.
+
+\end{lem}
+
+A proper choice of $\pi_t$ satisfying Lemma 1 is $\pi_t = \frac{\pi^2t^2}{6}$. The following corollary shows that with high probability, the global optimum is contained in the interval.
+
+\begin{rem}
+Rigorously, $\forall t < T, \instance\in\hat{\searchSpace}$, the marginalized $\mathcal{GP}_{\roif, t}$ and  $\mathcal{GP}_{\globalf, t}$ shall be the same. Therefore, $\forall t < T, \instance\in\hat{\searchSpace}$, $f(\instance)$ is a sample from $\mathcal{GP}_{\roif, t}$ as well. However, in practice, it is challenging to specify the ideal prior. We introduce $\mathcal{GP}_{\roif, t}$ into the analysis to reflect the benefits of learning the hyperparameters for each GP separately in real-world scenarios. 
+\end{rem}
+
+\begin{cor}\label{cor:CI}
+With the same conditions as in \lemref{lem:CI}, $\Pr{\instance^* \in \roi_t} \geq 1-\delta, \forall t\geq 1$.
+\end{cor}
+For simplification, we use the notation $\discreteROI = \discreteSet \cap \roi$. Taking the union bound over \lemref{lem:CI} and \corref{cor:CI}, we obtain the following result:
+\begin{cor} \label{cor:CI2} 
+With probability at least $1-2\delta$, the global optimum lies in the following interval $\hatCI_{t,\max}(\discreteROI) \subseteq \tildeCI_{t,\max}(\discreteROI)$.
+
+\end{cor}
+\corref{cor:CI2} indicates that by narrowing the interval, we could achieve efficient filtering in BALLET and identify the near-optimal areas. Define the maximum information gain about unknown function $f$ after $T$ rounds  as $\maxInfo_{f, T} = \max_{\actionSet\subset \discreteSet: \vert \actionSet \vert=T}{\mutualinfo{y_\actionSet; f_\actionSet}}$. Also, define 
+$$\widehat{\maxInfo_T} = \min_{f \in \{\globalf, \roif\}}{\maxInfo_{f, T}}.$$
+The following results shows that $%\acq(\instance) 
+|\hatCI_{t}(\instance)| = \acqUCB_{t}(\instance) - \acqLCB_{t}(\instance)$ serves the purpose of efficiently narrowing the interval and the resulting range of it is bounded by $\maxInfoBALLET_{T}$.
+
+\begin{prop}\label{prop:regret}
+Under the same conditions assumed in \lemref{lem:CI} except for $\beta_t=2\log(2\vert \discreteROI \vert \pi_t/ \delta)$, with acquisition function $%\acq(\instance) = 
+|\widehat{ \CI}_{t}(\instance)| = \acqUCB_{t}(\instance) - \acqLCB_{t}(\instance)$, after at most $T \geq \frac{\beta_T \maxInfoBALLET_T C_1}{\epsilon^2}$ iterations, 
+$\Pr{|\hatCI_{T,\max}(\discreteROI)| \leq \epsilon} \geq 1 - 2\delta$. Here  $C_1=8/\log(1+\sigma^{-2})$.
+
+\end{prop}
+
+The proposition reveals two potential improvements over the global GP-UCB \citep{srinivas2009gaussian} %\yuxin{over which bound?} 
+on the regret bound brought by \algname. First, $\beta_T$ takes smaller value due to the filtering compared to $\lemref{lem:CI}$ which is also the term in the regret bounds of \cite{srinivas2009gaussian}. Second, $\widehat{\maxInfo_T}$ could potentially be smaller than the global $\maxInfo_{\globalf, T}$ with proper kernel learning on ROI. The following corollary shows the cost of using $\acqUCBt_{t}(\instance) - \acqLCBt_{t}(\instance)$ as acquisition function is $C_2^2$ compared to $\acqUCB_{t}(\instance) - \acqLCB_{t}(\instance)$.
+
+\begin{cor} \label{cor:relax_regret} 
+Under the same conditions assumed in \lemref{lem:CI} except for $\beta_t=2\log(2\vert \discreteROI \vert \pi_t/ \delta)$, with acquisition function $\acq(\instance) = |\tildeCI_t(x)|= \acqUCBt_{t}(\instance) - \acqLCBt_{t}(\instance)$, after at most $T \geq \frac{ \beta_T \maxInfoBALLET_T C_1 C_2^2}{\epsilon^2}$ iterations, $\Pr{|\tildeCI_{T,\max}(\discreteROI)| \leq \epsilon} \geq 1 - 2\delta$. Here  $C_1=8/\log(1+\sigma^{-2})$, and $C_2 = \frac{\min_{t\leq T}(|\tildeCI_{t,\max}(\discreteROI)|) }{|\tildeCI_{T,\max}(\discreteROI)|}$.
+
+\end{cor}
+
+The proof of \corref{cor:relax_regret} follows the proof of \propref{prop:regret} except leveraging the fact $$\min_{t\leq T}(|\tildeCI_{t,\max}(\discreteROI)|) = C_2|\tildeCI_{T,\max}(\discreteROI)|$$ at its last step.
+
+
+\subsection{Other \algname variants}
+\algname provides a flexible framework for partitioning-based BO. In addition to \interCI, one can run Thompson sampling on ROI as the acquisition function (\roiTS), namely
+\begin{equation}\label{eq:acqROI-ts}
+    \acqTs(\instance) \triangleq \roif_{t}(\instance) 
+\end{equation}
+where $\roif_{t} \sim GP_{\roif, t}$.
+Another \algname variant is to directly run uncertainty sampling with $\mathcal{GP}_{\roif}$ on $\roi$ %take the width of the confidence interval of on ROI as acquisition function 
+(\algname-RCI, where RCI is short for ``ROI-CI''):
+\begin{equation}\label{eq:acqROI-ci}
+    \acqRoici(\instance) \triangleq |\CI_t(\instance)| = \UCBit_{\roif, t}(\instance) -  \LCB_{\roif, t}(\instance) 
+\end{equation}
+
+Compared with \roiTS and \roiCI, the intersection of CIs defined in \eqref{eq:acqCI} in \interCI leverages the posterior information of both $\mathcal{GP}_{\roif}$ and $\mathcal{GP}_{\globalf}$. This allows \interCI to efficiently narrow the confidence interval for $f^*$ by explicitly balancing exploration and exploitation, and achieve a high-probability theoretical guarantee on its optimization performance. We also discuss taking the \UCB of the intersection of CI's as the acquisition function (\interUCB) in the appendix.
+
+

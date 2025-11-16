@@ -1,0 +1,639 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+
+\usepackage{iccv}
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{pifont}
+\usepackage{xcolor, colortbl}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{fdsymbol}
+\usepackage{placeins}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+\definecolor{tabhighlight}{HTML}{ffcccb}  
+\definecolor{tabhighlightg}{HTML}{DAF7A6}
+
+\usepackage[pagebackref=true,breaklinks=true,letterpaper=true,colorlinks,bookmarks=false]{hyperref}
+
+\usepackage[capitalize]{cleveref}
+\crefname{section}{Sec.}{Secs.}
+\Crefname{section}{Section}{Sections}
+\Crefname{table}{Table}{Tables}
+\crefname{table}{Tab.}{Tabs.}
+
+
+\iccvfinalcopy
+\def\httilde{\mbox{\tt\raisebox{-.5ex}{\symbol{126}}}}
+\ificcvfinal\pagestyle{empty}\fi
+
+\begin{document}
+
+\title{SimDETR: Simplifying self-supervised pretraining for DETR}
+
+\author{Ioannis Maniadis Metaxas$^{1}\thanks{Corresponding author; Email: i.maniadismetaxas@qmul.ac.uk; Project done during an internship at Samsung AI Cambridge.}$ \and Adrian Bulat$^{2}$ \and Ioannis Patras$^{1}$ \and Brais Martinez$^{2}$ \and Georgios Tzimiropoulos$^{1,2}$\\
+$^{1}$\textit{Queen Mary University of London}  $^{2}$\textit{Samsung AI Cambridge}\\
+}
+
+\maketitle
+\ificcvfinal\thispagestyle{empty}\fi
+
+\begin{abstract}
+   DETR-based object detectors have achieved remarkable performance but are sample-inefficient and exhibit slow convergence. Unsupervised pretraining has been found to be helpful to alleviate these impediments, allowing training with large amounts of unlabeled data to improve the detector's performance. However, existing methods have their own limitations, like keeping the detector's backbone frozen in order to avoid performance degradation and utilizing pretraining objectives misaligned with the downstream task. To overcome these limitations, we propose a simple pretraining framework for DETR-based detectors that consists of three simple yet key ingredients: (i) richer, semantics-based initial proposals derived from high-level feature maps, (ii) discriminative training using object pseudo-labels produced via clustering, (iii) self-training to take advantage of the improved object proposals learned by the detector. We report two main findings: (1) Our pretraining outperforms prior DETR pretraining works on both the full and low data regimes by significant margins. (2) We show we can pretrain DETR from scratch (including the backbone) directly on complex image datasets like COCO, paving the path for unsupervised representation learning directly using DETR.
+\end{abstract}
+
+\setlength{\floatsep}{10pt plus 2pt minus 2pt}
+\setlength{\textfloatsep}{13pt plus 2pt minus 2pt}
+
+\section{Introduction} 
+\label{sec:intro}
+
+Object detection has been a major challenge in computer vision and the focus of extensive research efforts. A recent breakthrough in object detection is the DEtection TRansformer (DETR)~\cite{detr}, an end-to-end trainable single-stage detection framework that reformulates the task as direct set prediction, bypassing the use of hand-crafted components such as non-maximum suppression or anchor generation. Despite these significant advantages, DETR has two important drawbacks, namely sample inefficiency (i.e. requiring large amounts of extensively annotated data), and slow training convergence. DETR-related follow-up works tackle these issues either through architectural changes \cite{c_detr,def_detr,vidt} or through self-supervised pretraining \cite{dai2021up,bar2022detreg,joindet,huang2023siamese}. In this work, we directly adopt recently proposed advanced DETR variants (ViDT+ \cite{vidt,vidt_ori} and Deformable DETR \cite{def_detr}) and focus on the important complementary aspect of self-supervised pretraining.
+
+There are few works for DETR pretraining~\cite{dai2021up, bar2022detreg, joindet,huang2023siamese}, all of which have some important limitations. Their objectives focus on discriminating between object and non-object regions (i.e., localization task) and ignore class-related information, which is not well aligned with the downstream, class-aware detection task. Instead, they rely on a pretrained backbone to formulate distillation-based auxiliary tasks.
+As a consequence, the backbone needs to remain frozen during pretraining to avoid the degradation of its instance discrimination power.
+Finally, they are trained in a single stage, ignoring potential benefits from iterative self-training which seems a natural fit for detection pretraining.
+
+ % Figure environment removed
+ 
+In this work we propose SimDETR, a simple framework for self-supervised pretraining for DETR, which addresses the aforementioned limitations. The main components of our method, seen in~\cref{fig:main_fig} are: 
+
+\noindent \textbf{(i) Richer semantics-based initial proposals derived from high-level feature maps:} Rather than relying on random~\cite{dai2021up} or hand-crafted object proposal methods~\cite{bar2022detreg}, our proposals are obtained by clustering the feature map produced by a self-supervised pretrained backbone, resulting in segmentation maps. We then identify contiguous regions from where object proposals and their feature representations are extracted.
+
+\noindent \textbf{(ii) Class-aware pretraining via clustering:}
+The high-level feature representations of (i) are clustered across the dataset, with cluster membership being used as a class pseudo-label for standard, class-aware object detection training. Contrary to prior methods that isolate localization and discrimination during pretraining, SimDETR combines them through the class-aware detection objective, better aligning with the downstream task.
+%
+\noindent \textbf{(iii) Iterative self-training:} We find that, after pretraining, the detector can be used to produce proposals better than the ones it was trained on. Therefore, we find it beneficial for detection pretraining to be applied in an iterative fashion, where the model is trained with pseudo-labels (bounding boxes and pseudo-class assignments) produced by the model itself in the previous round of training. Importantly, we show that \textit{all three components are needed} for highly effective pretraining. 
+
+We report two main findings:
+
+\noindent \textbf{(1) Improved detection accuracy:} We show that SimDETR consistently outperforms previous works on DETR pretraining by significant margins in all standard benchmarks, including the full data, semi-supervised and few-shot settings.
+
+\noindent \textbf{(2) Self-supervised representation learning from complex images:} 
+We show that SimDETR can be used to train the whole network from scratch directly on complex images, demonstrating impressive performance for unsupervised representation learning.
+
+\section{Related Works} \label{sec:related_works}
+
+\noindent \textbf{DETR and its variants:}
+Transformer-based object detection architectures, introduced by DETR~\cite{detr}, deviate from previous architectures~\cite{tian2019fcos,zhou2019objects,cai2018cascade,he2017mask,ren2015faster} by reformulating object detection as a set prediction problem with bipartite matching. This eliminates the need for hand-crafted components such as non-maximum suppression and a region-proposal network, producing a truly end-to-end object detection pipeline. However, despite its elegance and performance, DETR has been shown to suffer from limited sample efficiency and slow convergence. Subsequent works built on DETR to tackle these issues, including DAB-DETR~\cite{liu2022dab}, DN-DETR~\cite{li2022dn} and Efficient-DETR~\cite{yao2021efficient}, which focus on improving DETR's queries, H-DETR~\cite{jia2022detrs} and Group-DETR~\cite{chen2022group}, that propose improvements on the matching algorithm between queries and objects, C-DETR~\cite{c_detr} and Def. DETR~\cite{def_detr} that propose methods for making DETR more training-efficient, and ViDT+~\cite{vidt}, which proposes unifying the detector's backbone and encoder with a reconfigured attention module, achieving even further training speed and performance improvements. Despite significant progress, however, transformer-based detectors remain sample-inefficient, highlighting the complementary nature and the importance of unsupervised pretraining methods.
+
+ % Figure environment removed
+ 
+ 
+\noindent \textbf{DETR pretraining:} Despite significant progress made with novel architectures, DETR-based approaches require long training with a lot of data to achieve strong performance. Their effectiveness, therefore, depends on abundant, extensively annotated training samples. Despite the success of self-supervised backbone pretraining in object detection, few methods have been proposed for DETR pretraining. The first among them, UP-DETR~\cite{dai2021up}, trained the detector to identify random boxes using query tokens. DETReg~\cite{bar2022detreg} subsequently used Selective Search~\cite{uijlings2013selective} to generate object proposals as annotations for the detector, combined with a distillation-based feature matching objective. DETReg was subsequently improved upon by JoinDet~\cite{joindet}, which replaced Selective Search with a dynamic object proposal method, and Siamese DETR~\cite{huang2023siamese}, which proposed a student-teacher architecture for pretraining.
+Notably, all of these works pretrain detectors in \textit{a class-unaware manner}, relying on auxiliary objectives to improve their discriminative capacity. Furthermore, \textit{they all freeze the detector's backbone encoder} during pretraining, as they suffer performance drops otherwise~\cite{dai2021up,bar2022detreg}.
+This is a significant limitation, as it prevents true end-to-end self-supervised training, and makes such frameworks heavily dependent on the quality of the pretrained backbone.
+
+\noindent \textbf{Self-supervised learning for dense prediction downstream tasks:} Recently, self-supervised learning has emerged as a powerful paradigm for learning representations from unlabeled visual data~\cite{moco,simclr,swav,dino}. Among such methods, a distinct line of research has focused on self-supervised training of image encoders that better capture local information in images~\cite{pixpro,detcon,soco,vangansbeke2021revisiting,densecl,huang2022learning,gokul2022refine,detco,slotcon,odin,bai2022point,karlsson2021vice,islam2023self,ding2022deeply,li2022univip,xie2021unsupervised}.
+Such encoders are particularly effective as backbones for detection/segmentation architectures, significantly improving their performance on dense prediction downstream tasks.
+Among self-supervised methods in this area, some propose pretext tasks related to semantic segmentation~\cite{odin,slotcon,gokul2022refine}, while others leverage object priors~\cite{detcon,soco,karlsson2021vice,li2022univip,xie2021unsupervised} to formulate effective training objectives.
+We emphasize, however, that the aforementioned works, including works such as SoCo~\cite{soco} that leverage components of detector frameworks, focus exclusively on training backbone encoders, not complete detection/segmentation architectures, and use objectives that are not applicable to the training of end-to-end object detection pipelines. Furthermore, despite their usefulness in a wide array of downstream tasks, and their applicability to \textit{some} dense prediction tasks such as semantic segmentation, backbones trained with these methods are not directly applicable to instance-level dense prediction tasks, and object detection in particular. These methods are, therefore, distinct from those that seek to pretrain detection architectures in a self-supervised, end-to-end manner.
+
+\noindent \textbf{Unsupervised object discovery:} Different from object detector pretraining, this task aims at correctly localizing objects in images in an unsupervised manner. Recently, this area has seen remarkable progress utilizing self-supervised models. Specifically, several works have proposed identifying objects based on local feature similarity~\cite{van2022discovering,wang2022freesolo,simeoni2021localizing,wang2022tokencut,simeoni2022unsupervised,melas2022deep,wang2023cut}. Distinctly,~\cite{vo2021large} treats localization as a ranking problem~,~\cite{bielski2022move} combines a MAE~\cite{MAE} architecture with a GAN~\cite{goodfellow2014generative}, ~\cite{seitzer2022bridging} combines slot attention and a reconstruction objective, and~\cite{shin2022unsupervised} clusters features from multiple encoders to produce annotations for salient object detection.
+The proposal(s) produced by these methods can then be used to train a detector or segmentation model, improving performance and allowing for multiple object discovery. Notably, methods such as~\cite{wang2022freesolo,zadaianchuk2022unsupervised,wang2023cut} also leverage self-training. We emphasize, however, that the main goal of works in this area is object discovery, not the training of powerful detectors. Accordingly, the detectors trained by these works typically are not evaluated by finetuning with annotated data. Furthermore, such methods typically restrict their proposals to the most confident few (often just one) to avoid false positives, which is not well suited for detector pretraining, where training benefits from a rich set of object proposals covering as many objects as possible, not only the few most prominent ones.
+
+\section{Method} 
+\label{sec:method}
+
+Our method aims to simplify and better align the pretraining with respect to the downstream task (class-aware detection). To this end, we produce object proposals in the form of \textit{bounding boxes and class pseudo-label} pairs in an unsupervised manner, and then employ a self-training strategy to pretrain and iteratively refine the detector.
+
+\subsection{Improving object proposals}
+\label{ssec:initialization}
+
+Examining existing methods, we note that object discovery works generate very limited initial proposals to facilitate high precision (see~\cref{sec:related_works}). On the other hand, methods like Selective Search~\cite{uijlings2013selective} generate many proposals, but their reliance on low-level priors such as color and texture make them very noisy and unsuitable to generate meaningful pseudo-labels. 
+
+We seek to address this gap by utilizing semantic information from self-supervised image encoders to produce rich object proposals and coherent pseudo-class memberships.
+Specifically, we extract feature maps using a pretrained self-supervised encoder and leverage a bi-level clustering strategy. The first level (termed local clustering) produces bounding box proposals and associated feature representations. The second level, termed global clustering, assigns class pseudo-labels to each proposal.
+Our method leads to rich and diverse region proposals (see Tab.~\ref{tab:rpm}) and is essential for the state-of-the-art results of SimDETR (see Tab.~\ref{tab:abl_proposals_tr}).
+
+\noindent \textbf{Unsupervised proposal extraction:} Given an input image $X\in \mathbb{R}^{3\times H\times W}$, we use a self-supervised pretrained encoder to extract feature maps $\mathbf{F}_l\in \mathbb{R}^{d_l\times H_l\times W_l}$ from each of the encoder's levels $l$.
+Given a feature map $\mathbf{F}$, we employ pixel-wise clustering to group semantically similar  features (local clustering). This results in a set of masks $\mathbf{M}=\{\mathbf{m}_k\}_{k=1:K}$, where $K$ represents the number of clusters, which is a user-defined parameter. In order to provide good coverage for all objects in the image, we apply clustering with different values $K \in \mathcal{K}$ and use feature maps from different layers $l \in\mathcal{L}$, leading to a set of masks $\mathbb{M}=\bigcup \{ \mathbf{M}^{l,K}\}_{K\in\mathcal{K},l\in\mathcal{L}}$. 
+
+Next, the different connected components of each mask are computed, leading to a set of regions $\mathbb{R}$. Each region $\mathbf{r} \in \mathbb{R}$ is then used to extract a bounding box (proposal) $b$ and a corresponding feature vector $f$, where $f$ is computed by average-pooling the last layer feature map $\mathbf{F}_L$ over $\mathbf{r}$. 
+
+\noindent \textbf{Proposal filtering:} Due to the repeated clustering runs, the process just described leads to noisy and overlapping proposals. We employ a number of filters to refine them, including merging proposals that have a high IoU, proposals with highly-related semantic content and proposals that are part of other proposals. This results in a set of $N(i)$ bounding box-feature vector pairs for image $i$, $\{ b_n,f_n\}_{n=1}^{N(i)}$.
+
+\noindent \textbf{Pseudo-class label generation:} We then cluster proposals across the whole dataset (global clustering) based on the feature vectors, i.e. we perform a single clustering round on $\{f_{n}^i\}_{n=1:N(i)}^{i=1:I}$. Class membership is then used as the pseudo-class label, $c \in \mathcal{C}$, for each of the proposals. This results in a training set $\mathcal{T}_0=\{X_i, \{(b^i_n,c^i_n)\} \}$.
+
+We used Spectral Clustering~\cite{ng2001spectral} for local and K-Means for global clustering as Spectral Clustering typically performs better but it cannot handle the millions of data points involved in the global clustering. However, any clustering algorithm may be used in either case.
+
+\subsection{Pretraining and Self-Training}
+\label{ssec:self-training}
+
+We can now use the training set $\mathcal{T}_0$ to train an object detector within the DETR framework. In particular, given an input image and its corresponding extracted object proposals $y$, the network predicts a set $\mathbf{\hat{y}}=\{ \hat{y}_{q} \}_{q=1}^{Q}$, where $\hat{y}_q=( \hat{b}_q, \hat{c}_q )$, that is, the predicted bounding box and predicted category. We note that the extracted proposals $y$ are padded to size $Q$ with $\varnothing$ (no object). Typically in DETR architectures, the ground truth and the predictions are put in correspondence via bipartite matching, formally defined as:
+
+\vspace{-0.15cm}
+\begin{equation}
+\hat{\sigma} = \argmin_{\sigma \in \mathfrak{S}_Q}\sum_q^Q\mathcal{L}(y_q, \hat{y}_{\sigma(q)})
+\end{equation}
+\vspace{-0.15cm}
+
+\noindent where $\mathfrak{S}_Q$ is the space of permutations of $Q$ elements. 
+
+The loss between $\mathbf{y}$ and $\mathbf{\hat{y}}$ is computed as a combination of a bounding box matching loss and a class matching loss: 
+
+\vspace{-0.15cm}
+\begin{eqnarray}
+\sum_{q=1}^Q\left(-log \hat{p}_{\hat{\sigma}(q)} (c_q)+ \text{ \large $\mathbf{1}$}_{\{c_q \neq \varnothing\}} \mathcal{L}_{box}(b_q,\hat{b}_{\hat{\sigma}(q)}) \right)
+\label{eq:detr_loss}
+\end{eqnarray}
+\vspace{-0.15cm}
+
+\noindent where $\hat{p}$ indicates the predicted per-class probabilities. The indicator function $\text{ \large $\mathbf{1}$}_{c_i \neq \emptyset}$ represents that the box loss only applies to predictions that have been matched to object proposals $y$. Minimizing this loss results in weights $\Theta_0$.
+
+Upon training the detector in this way, we observe that it can identify more objects than those in our original proposals. Critically, this includes smaller and more challenging objects, which constitute a stronger supervisory signal. We thus generate a new set of labels for image $i$ as $\{g(X_i;\Theta_0)\}$, where $g=(g_b,g_h)$ are the detection network, backbone and head respectively.
+ In self-training, pseudo-labels are typically filtered based on confidence. In our case, filtering based on the detector's confidence leads to the removal of small or challenging instances such as partially-occluded or uncommon objects. 
+Thus, we instead filter the new proposals so that any two boxes have an IOU lower than 0.55 (following~\cite{solovyev2021weighted}), with only the most confident box being kept when such conflicts exist. This leads to training set $\mathcal{T}_1$.
+
+A new set of weights $\Theta_i$ can be obtained by using training set $\mathcal{T}_i$ and using $\Theta_{i-1}$ to initialize the weights. Simultaneously, $\Theta_i$ can be used to generate a new training set $\mathcal{T}_{i+1}$. While this process can be iterated indefinitely, we notice optimal performance involves just two rounds of training, which we refer to as Stages 1 \& 2. Stage 1 training, including the proposal extraction process for $\mathcal{T}_{0}$ is shown in~\cref{fig:stage_1}.
+
+We highlight that, importantly, the proposed pretraining is very well-aligned with the downstream task, i.e. supervised class-aware object detection. Furthermore, it allows us to effectively pretrain \textit{both} the backbone and the detection head simultaneously. This is unlike other detector pretraining methods~\cite{dai2021up,bar2022detreg,joindet} that require freezing the backbone to avoid performance degradation.
+
+The whole method is summarized in Algorithm~\ref{alg:method}.
+
+\begin{algorithm}
+\caption{Pretraining}
+\label{alg:method}
+\begin{algorithmic}[1]
+\Require $\{X_i\}_{i=1}^I$, Net $g=(g_b,g_h)$, initial params. $\Theta_0$
+\State \Comment{Unsup. train set gen., Sec.~\ref{ssec:initialization}}
+\For{$i=1:N$}  
+\State ${\mathbf{F}_l} \gets g_b(X_i)$
+\State $\mathbb{M}_i \gets \bigcup \text{Cluster}( F_l, K )$ \Comment{$\;K \in \mathcal{K}, l \in \mathcal{L}$}
+\State $\mathbb{R}_i \gets $ Connected Components($\mathbb{M}_i$) 
+\State $\{b_n^i, f_n^i\}_{N(i)} \gets$ Filter$( \mathbb{R}_i )$ 
+\EndFor
+\State $\{c_n^i\} \gets $ K-Means$( \{f_n^i\}, K=C)$ \Comment{Pseudo-classes}
+\State $\mathcal{T}_0 \gets \left\{ X_i, \{(b_n,c_n)\}_{n=1}^{N(i)} \right\}_{i=1}^I$
+\State \Comment{Self-training (Sec.~\ref{ssec:self-training})}
+\For{$j$ stages}  
+\State $g(-; \Theta_{j+1} ) \gets $ Train $(\mathcal{T}_j, g)$  \Comment{Using eq.~\ref{eq:detr_loss}}
+\State $\mathcal{T}_{j+1} \gets $ Filter( $\{g(X_i;\Theta_j)\}_{i=1}^{I}$ )
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+
+\section{Experimental Setting} 
+\label{sec:experimental_setting}
+
+In order to compare with prior work on object detection pretraining, we follow DETReg~\cite{bar2022detreg} in terms of datasets, hyperparameters and experiments (namely, the full data and low data settings). In order to study the effectiveness of our method for unsupervised representation learning, in the absence of a pre-defined protocol, we use the ViDT+ detector and experiment with the most well-established datasets in object detection. The hyperparameters for each experiment are provided in detail in Appendix Section A. Unless stated otherwise, for methods other than SimDETR we report results from the respective papers, except where VIDT+ is used.
+
+While our method is, in principle, not restricted to DETR, we follow prior work~\cite{dai2021up, bar2022detreg, joindet} and focus on DETR-based architectures since a) DETR methods suffer from slow convergence and sample inefficiency, so they benefit the most from unsupervised pretraining methods, b) The end-to-end single-stage design is well suited for end-to-end representation learning, which we explore in~\cref{ssec:ssl_experiments}.
+
+\noindent \textbf{Datasets:} We use the training sets of ImageNet \cite{imagenet2015}, Open Images \cite{OpenImages2} and MS COCO \cite{coco2014} for unsupervised pretraining. For finetuning (with annotations) we use the training sets of MS COCO and PASCAL VOC~\cite{everingham2010pascal}. Results are reported for the corresponding validation sets, using the Average Precision (AP) and Average Recall (AR). Details on the datasets are provided in Appendix Section B.
+
+\noindent \textbf{Architectures:} We use Deformable DETR~\cite{def_detr} and ViDT+ \cite{vidt} in our experiments. 
+Def. DETR is used to compare with prior work for detector pretraining. Following~\cite{bar2022detreg}, a ResNet-50 backbone~\cite{he2016deep} is used, initialized with SwAV~\cite{swav}, pretrained on ImageNet. ViDT+ is a more recent state-of-the-art method, and is used to compare against unsupervised representation learning methods. Unless stated otherwise, its Swin-T~\cite{liu2021swin} transformer backbone is initialized with MoBY~\cite{xie2021self}, which is pretrained on ImageNet. We emphasize that, for both Def. DETR and ViDT+, their backbones were trained in a totally unsupervised manner.
+
+\section{Experiments}
+\label{sec:experimental_results}
+
+We highlight two main results, namely state-of-the-art results for detection pretraining and competitive results for self-supervised representation learning for detection, including pretraining on scene-centric data such as COCO \textbf{from scratch}. We complement these results with a comprehensive set of ablation studies.
+
+\subsection{Object detection pretraining}
+\label{ssec:od_pretrain}
+
+In order to validate our method in terms of object detection pretraining, we closely follow the benchmarks established by DETReg~\cite{bar2022detreg}. We use ViDT+ and Def. DETR as backbones and cover three settings, namely full data, semi-supervised and few-shot settings.
+
+\textbf{Full data regime:} The detectors are pretrained on ImageNet and then finetuned on detection datasets.
+We provide a set of comparisons with competing detector pretraining methods in~\cref{tab:main}, where we finetune on COCO. Interestingly, all prior work on DETR pretraining requires freezing the backbone. We quantitatively assess the impact of this requirement by making the DETReg backbone trainable, and observe steep performance degradation. Contrary to all these works, SimDETR supports a trainable backbone due to its better alignment of the pretraining and downstream tasks. Thus, we further include results from other self-supervised representation learning methods that focus on backbone-pretraining for detection, irrespective of whether they are within the DETR framework.
+We also report results for ImageNet pretraining and PASCAL VOC finetuning in~\cref{tab:pascal}.
+
+As~\cref{tab:main,tab:pascal} show, our method significantly outperforms competing detector pretraining methods across datasets and with both detector architectures. Furthermore, it also achieves the highest performance among self-supervised learning methods for detection. While in this case the different base detection frameworks make a direct comparison harder, we still find it a very encouraging result.
+
+\begin{table*}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c c c }
+    \toprule
+     \multirow{2}{*}{Detector} & \multirow{2}{*}{Backbone} & Backbone & Detector & Frozen & \multirow{2}{*}{AP} & \multirow{2}{*}{AP$_{50}$} & \multirow{2}{*}{AP$_{75}$} \\
+     &  & Pretraining & Pretraining & Backbone & & & \\
+     \midrule
+     \rowcolor{lightgray}
+     \multicolumn{8}{c}{Unsupervised representation learning for detection} \\
+     \multirow{6}{*}{Mask-RCNN~\cite{he2017mask} (x2)} & \multirow{6}{*}{ResNet50} & Supervised$^1$ & \multirow{6}{*}{-} & \multirow{6}{*}{-} & 41.6 & - & - \\
+      &  & MoCo v2~\cite{mocov2} &  &  & 41.7 & - & - \\
+       &  & SimCLR~\cite{simclr} &  &  & 41.6 & - & - \\
+      &  & DINO~\cite{dino} &  &  &42.3 & - & - \\
+      &  & SlotCon~\cite{slotcon} &  &  & 42.6 & 62.7 & 46.2 \\
+      &  & UniVIP~\cite{li2022univip} &  &  & 43.1 & - & - \\
+      \midrule
+     \multirow{7}{*}{FCOS*~\cite{tian2019fcos}} & \multirow{3}{*}{ResNet50} & Supervised$^1$ & \multirow{3}{*}{-} & \multirow{3}{*}{-} & 44.2 & - & - \\
+     &  & DetCon$_{B}$~\cite{detcon} &  & & 45.4 & - & - \\
+      &  & Odin~\cite{odin} &  &  & 45.6 & - & - \\
+    \cmidrule{2-8}
+       & \multirow{4}{*}{Swin-T} & Supervised$^1$ & \multirow{4}{*}{-} & \multirow{4}{*}{-} & 46.7 & - & - \\
+     &  & MoBY~\cite{xie2021self} &  &  & 47.6 & - & - \\
+     &  & DetCon$_{B}$~\cite{detcon} &  &  & 48.4 & - & - \\
+      &  & Odin~\cite{odin} &  &  & 48.5 & - & - \\
+      \midrule
+      \multirow{2}{*}{ViDT+~\cite{vidt}} & \multirow{2}{*}{Swin-T} & MoBY & \multirow{2}{*}{-} & \multirow{2}{*}{-} & 48.3 & 66.9 & 52.4 \\
+       &   & \textbf{SimDETR}$^{2}$ &  &  & \textbf{48.8} & \textbf{67.4} & \textbf{53.1} \\
+      \rowcolor{lightgray}
+      \midrule
+      \multicolumn{8}{c}{Unsupervised Detector pretraining} \\
+      Cascade R-CNN~\cite{cai2018cascade} & ResNet50 & DINO~\cite{dino} & CutLER~\cite{wang2023cut} & \xmark & 44.7 & - & - \\
+       \midrule
+     \multirow{6}{*}{Def. DETR~\cite{def_detr}} & \multirow{6}{*}{ResNet50} & Supervised$^1$ & - & - & 44.5 & 63.6 & 48.7 \\
+     &  & SwAV & - & - & 45.2 & 64.0 & 49.5 \\
+     &  & SwAV & UP-DETR~\cite{dai2021up} & \cmark & 44.7 & 63.7 & 48.6 \\
+      &  & SwAV & DETReg~\cite{bar2022detreg} & \cmark & 45.5 & 64.1 & 49.9 \\
+      &  & SwAV & JoinDet~\cite{joindet} & \cmark & 45.6 & 64.3 & 49.8 \\
+      &  & SwAV & Siamese DETR~\cite{huang2023siamese} & \cmark & 46.3 & 64.6 & 50.5 \\
+      &  & SwAV & \textbf{SimDETR} & \xmark & \textbf{46.7} & \textbf{65.4} & \textbf{50.9} \\
+     \midrule
+     \multirow{4}{*}{ViDT+~\cite{vidt}} & \multirow{4}{*}{Swin-T} & MoBY & - & - & 48.3 & 66.9 & 52.4 \\
+     &  & MoBY & DETReg & \cmark & 49.1 & 67.4 & 53.1 \\
+     &  & MoBY & DETReg & \xmark & 47.8 & 65.9 & 52.0 \\
+     &  & MoBY & \textbf{SimDETR} & \xmark & \textbf{49.6} & \textbf{68.2} & \textbf{53.8} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Lower section:} Results for detection pretraining methods. \textbf{Upper section:} Unsupervised representation learning methods (detector head is only trained during the downstream fine-tuning stage), with pretraining on ImageNet and finetuning on COCO. 1: Backbone trained on ImageNet classification with labels (baseline). 2: Backbone initialized with MoBY and pretrained with SimDETR (pretrained detection head was discarded).}
+  \label{tab:main}
+\end{table*}
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c }
+    \toprule
+    Method & $AP$ & $AP_{50}$ & $AP_{75}$ \\
+    \midrule
+    Supervised & 59.5 & 82.6 & 65.6 \\
+    SwAV~\cite{swav} & 61.0 & 83.0 & 68.1 \\
+    DETReg~\cite{bar2022detreg} & 63.5 & 83.3 & 70.3 \\
+    JoinDet~\cite{joindet} & 63.7 & 83.8 & 70.7 \\
+    \textbf{SimDETR~\cite{bar2022detreg}} & \textbf{64.8} & \textbf{84.6} & \textbf{72.7} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{PASCAL VOC results}. Def. DETR detectors were pretrained on ImageNet and finetuned PASCAL VOC.
+  }
+  \label{tab:pascal}
+\end{table}
+
+\textbf{Semi-supervised setting:} In this protocol unsupervised pretraining is conducted on COCO's train set, and $k\%$ of the train set's samples are subsequently used (with annotations) for finetuning.
+Results in~\cref{tab:semi_sup} demonstrate that SimDETR outperforms previous works by large margins, particularly in the more challenging settings with fewer labeled samples. 
+
+\setlength{\tabcolsep}{5pt}
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c c c c c }
+    \toprule
+    \multirow{2}{*}{Method} & \multicolumn{4}{c}{AP} \\
+    & 1\% & 2\% & 5\% & 10\% \\
+    \midrule
+    SwAV & 11.79$\pm$0.3 & 16.02$\pm$0.4 & 22.81$\pm$0.3 & 27.79$\pm$0.2 \\
+    DETReg~\cite{bar2022detreg} & 14.58$\pm$0.3 & 18.69$\pm$0.2 & 24.80$\pm$0.2 & 29.12$\pm$0.2 \\
+    JoinDet~\cite{joindet} & 15.89$\pm$0.2 & - & - & 30.87$\pm$0.1 \\
+    \textbf{SimDETR} & \textbf{18.19}$\pm$\textbf{0.1} & \textbf{21.80}$\pm$\textbf{0.2} & \textbf{26.90}$\pm$\textbf{0.2} & \textbf{30.97}$\pm$\textbf{0.2} &  \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Semi-supervised results}. Def. DETR detectors were pretrained on COCO's train set and finetuned on k\% labeled samples.
+    }
+  \label{tab:semi_sup}
+\end{table}
+
+\setlength{\tabcolsep}{6pt}
+
+\textbf{Few-shot setting:} Following~\cite{bar2022detreg}, we pretrain Def. DETR on ImageNet and report results for two settings. In the first, we finetune on COCO's 60 base classes, and then finetune again on $k\in \{10, 30\}$ instances from all classes. In the second, "extreme" setting, we skip finetuning on the base classes. Results are reported in~\cref{tab:few_shot} on the validation set's novel classes, and demonstrate that SimDETR not only outperforms DETReg by significant margins, but its performance without base class finetuning is very close to its performance with it. These results support that a) our method drastically reduces DETR architectures' dependency on annotated data, and b) SimDETR's learned representations are already class-aware, and the pseudo-labels produced by our method are good enough that SimDETR can align with COCO's classes with minimal (10-shot) supervision. We conduct a more in depth analysis of the few-shot setting outcomes in Appendix Section C.
+
+\begin{table}[h]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c c}
+    \toprule
+    \multirow{2}{*}{Method} & Base Class & \multicolumn{2}{c}{Novel Class AP} & \multicolumn{2}{c}{Novel Class AP$_{75}$} \\
+     & Finetuning & 10 & 30 & 10 & 30 \\
+     \midrule
+     DETReg~\cite{bar2022detreg} & \multirow{2}{*}{\xmark} & 5.6 & 10.3 & 6.0 & 10.9 \\
+     \textbf{SimDETR} &  & \textbf{10.3} & \textbf{14.5} & \textbf{10.9} & \textbf{15.1} \\
+      \midrule
+     DETReg~\cite{bar2022detreg} & \multirow{2}{*}{\cmark} & 9.9 & 15.3 & 10.9 & 16.4 \\
+     \textbf{SimDETR} &  & \textbf{12.4} & \textbf{18.9} & \textbf{13.1} & \textbf{20.4} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Few-shot results}. Def. DETR detectors were pretrained on ImageNet and finetuned on $k\in \{10, 30\}$ instances from each class. Results reported on the novel classes. DETReg results reproduced in our codebase using their published model checkpoint.}
+  \label{tab:few_shot}
+\end{table}
+
+\subsection{Self-supervised representation learning on scene-centric images} 
+\label{ssec:ssl_experiments}
+
+We first examine the ability of our method to learn self-supervised representations (i.e., train a backbone) that are suitable for detection. We begin by validating that SimDETR, when trained on scene-centric data (e.g. COCO), can perform competitively compared to ImageNet pretraining. Then we use SimDETR directly for self-supervised representation learning on scene-centric data (i.e., training from scratch on COCO/Open Images), showing promising results. Finally, we show that pretraining on COCO leads to representations that transfer to ImageNet under the linear-probe setting.
+
+\textbf{Object vs Scene-centric pretraining:} In the full data experiments in Sec.~\ref{ssec:od_pretrain} we followed prior literature and pretrained on object-centric data (ImageNet). In this section, we examine whether our method can achieve competitive performance by pretraining on scene-centric datasets instead. To that end, we pretrain ViDT+ on COCO and Open Images (keeping the initialization settings described in Sec.~\ref{sec:experimental_setting}), finetune on COCO's train set and present results on its validation set. These results are shown in~\cref{tab:open_images}.
+We further report the class-unaware object detection performance in terms of average recall (AR) as it hints at different behaviors between the two settings in this regard.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c c}
+    \toprule
+     Dataset & Stage & AP & AP$_{50}$ & AP$_{75}$ & AR$^{100}$ \\
+      \midrule
+      - & MoBY & 48.3 & 66.9 & 52.4 & - \\
+      \midrule
+      COCO & \multirow{3}{*}{Stage 1} & 48.8 & 67.6 & 53.0 & 23.9 \\
+      ImageNet &  & 48.9 & 67.4 & 52.9 & 25.9 \\
+      Open-Images &  & 48.9 & 67.5 & 52.9 & 24.5 \\
+     \midrule
+      COCO & \multirow{3}{*}{Stage 2} & 49.1 & 67.8 & 53.1 & 25.1 \\
+      ImageNet &   & \textbf{49.6} & \textbf{68.2} & 53.8 & 27.1 \\
+      Open Images &  & 49.4 & 67.9 & \textbf{53.9} & 25.5 \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Object-centric vs Scene-centric.} Finetuning results for pretraining on ImageNet vs. pretraining on COCO/Open Images.
+  }
+  \label{tab:open_images}
+\end{table}
+
+We observe that, in all cases, our method improves over the baseline, even on COCO, where we pretrain and finetune on the same set of data. Stage 1 achieves similar results across datasets, a significant finding which shows that SimDETR is: a) sample efficient, achieving similar performance pretraining on COCO and on the larger ImageNet and Open Images datasets, and b) flexible, being able to handle both object-centric and scene-centric data.
+Self-training (Stage 2) consistently leads to improved performance. However, Open Images pretraining outperforms COCO, indicating that, with enough training time, pretraining on a larger dataset is impactful.
+Furthermore, ImageNet pretraining outperforms the two scene-centric datasets, although by a small margin in the case of Open Images. We attribute this to the relative quality of object proposals produced for self-training. As seen by contrasting AR scores in~\cref{tab:open_images}, ImageNet's Stage 1 detector localizes more objects correctly, which likely leads to improved supervision when self-training.
+Overall, these results indicate that SimDETR does not require carefully curated object-centric data to achieve competitive results.
+
+\textbf{Self-supervised representation learning on scene-centric data:} Experiments conducted in previous sections uniformly initialize the backbone with weights obtained by self-supervised training on ImageNet. In this section, we evaluate the representation learning capacity of SimDETR by pretraining a ViDT+ detector from an \textit{untrained} backbone (from scratch) to examine whether independent backbone pretraining is indeed necessary.
+We pretrain on object-centric (ImageNet) and scene-centric (COCO \& Open Images) datasets and present results in~\cref{tab:from_scratch}. For completeness, we also provide results for other methods that focus on self-supervised backbone pretraining, noting that they use different detector architectures during finetuning.
+
+Results again show that SimDETR performs best with a well-curated, object centric pretraining dataset such as ImageNet, but is competitive even when trained on complex, scene-scentric images. Specifically, SimDETR performs on par with backbone-only ImageNet pretraining (MoBY) when applied to COCO, and outperforms it when applied to Open Images. This outcome supports our thesis, namely that unsupervised pretraining directly on scene-centric data with an object detection task is feasible and can be effective.
+
+We further evaluate the quality of the COCO-pretrained backbone by performing a linear-probe experiment on ImageNet. \cref{tab:linear_eval} shows SimDETR's performance as well as that of prior work. We note that prior work use a ResNet50 encoder and thus a direct comparison is hard. It is however clear that our method is competitive, despite being pretrained for object detection, highlighting the natural fit of SimDETR for general-purpose representation learning from scene-centric images.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c }
+    \toprule
+     Backbone & Detector & \multirow{2}{*}{Detector} & Pretraining & \multirow{2}{*}{AP} \\
+     Pretraining & Pretraining &  & Dataset &  \\
+     \midrule
+     MoBY ~\cite{xie2021self} & - & \multirow{3}{*}{FCOS*} & ImageNet & 47.6 \\
+     DetCon ~\cite{detcon} & - &  & ImageNet & 48.4 \\
+     Odin ~\cite{odin} & - &  & ImageNet & 48.5 \\
+      \midrule
+     - & - & \multirow{5}{*}{VIDT+} & ImageNet & 38.5 \\
+      MoBY~\cite{xie2021self} & - &  & ImageNet & 48.3 \\
+     - & \textbf{SimDETR} &  & COCO & 48.3 \\
+     - & \textbf{SimDETR} &  & Open Images & 48.8 \\
+     - & \textbf{SimDETR} &  & ImageNet & \textbf{49.2} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Pretraining from scratch}.
+  We pretrain SimDETR \textit{without backbone initialization} and finetune on COCO. For comparison, we finetune VIDT+ without pretraining and with a backbone pretrained with MoBY. We also provide results for~\cite{detcon,slotcon,odin,xie2021self} that perform self-supervised backbone-only pretraining.}
+  \label{tab:from_scratch}
+\end{table}
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c }
+    \toprule
+     Backbone Pretraining & Acc \\
+     \midrule
+     DenseCL~\cite{densecl} & 49.9 \\
+     VirTex~\cite{desai2021virtex} & 53.8 \\
+     MoCo~\cite{moco} & 49.8 \\
+     Van Gansbeke et al.~\cite{van2021revisiting} & 56.1 \\
+     \textbf{SimDETR} & \textbf{56.4} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{We pretrain SimDETR with VIDT+ on COCO's train set, and apply the backbone to linear evaluation on ImageNet. Results reported on ImageNet's validation set. Results from~\cite{van2021revisiting}.
+  }
+  \label{tab:linear_eval}
+\end{table}
+
+\subsection{Analysis and ablations}
+\label{ssec:ablations}
+
+Throughout this section we use ViDT+ and, unless stated otherwise, pretrain on ImageNet for 10 epochs per stage.
+
+\noindent \textbf{Impact of object proposals:} We evaluate our object proposal method in two ways: a) we examine how well it localizes objects by computing the Average Recall (AR) score on COCO's validation set (see~\cref{tab:rpm}), and b) we investigate its impact on SimDETR by replacing it with Selective Search, and present the outcomes (see~\cref{tab:abl_proposals_tr}). 
+
+\cref{tab:rpm} includes results both for our initial proposals (noted as SimDETR-St. 0), and the proposals generated by pretrained detectors. Results show that our approach is superior to Selective Search, that our framework leads to better localization results than DETReg, and that detector pretraining significantly improves over our initial proposals, supporting our decision to self-train. We also notice diminishing gains in terms of AR between Stages 1 and 2.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c }
+    \toprule
+     Object proposals & Detection Architecture & AR$^{100}$ \\
+     \midrule
+     Sel. Search & - & 10.9 \\
+      \textbf{SimDETR}-St. 0 & - & \textbf{13.4} \\
+      \midrule
+     DETReg & \multirow{3}{*}{ViDT+} & 21.5 \\
+     \textbf{SimDETR}-St. 1 &  & 25.9\\
+     \textbf{SimDETR}-St. 2 &  &\textbf{ 27.1} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Quality of proposals:} AR results on COCO's validation set. Upper section: methods for the initial extraction of object proposals. Lower section: proposals generated by detection/segmentation architectures trained on the initial proposals.}
+  \label{tab:rpm}
+\end{table}
+
+In~\cref{tab:abl_proposals_tr} we find that, using Selective Search proposals, SimDETR still outperforms the MoBY baseline, but we observe a performance drop relative to our object proposal method. We attribute this to two reasons: a) out method likely produces more discriminative descriptors $f$ by aggregating representations over a mask of semantically related pixels, rather than over a box, which is the case for Selective Search. This, in turn, leads to better pseudo-labels. b) Our proposals are more robust (see~\cref{tab:rpm}), and therefore provide better supervision. In summary, we conclude that SimDETR is robust to different object proposal methods, but greatly benefits from an appropriate method choice.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c }
+    \toprule
+     Method & Proposals & AP & AP$_{50}$ & AP$_{75}$ \\
+     \midrule
+     MoBY & - & 48.3 & 66.9 & 52.4 \\
+     \midrule
+     SimDETR-St. 1 & \multirow{2}{*}{Sel. Search} & 48.7 & 67.3 & 52.7 \\
+     SimDETR-St. 2 &  & 48.6 & 67.1 & 52.2 \\
+     \midrule
+     SimDETR-St. 1 & \multirow{2}{*}{Our Anns.} & 48.9 & 67.4 & 52.9 \\
+     SimDETR-St. 2 &  & \textbf{49.6} & \textbf{68.2} & \textbf{53.8}  \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Impact of initial proposals:} AP results on COCO's validation set, using different initial object proposal methods.}
+  \label{tab:abl_proposals_tr}
+\end{table}
+
+\noindent \textbf{Number of classes:} We ablate the number of pseudo-classes produced by the global clustering of object proposals. For this set of experiments, we pretrain and finetune on COCO's train set for 25 epochs each. Note this is a simplified (and cheaper) setting for the purpose of ablating.
+We find that, during pretraining, increasing the number of classes leads to decreased training accuracy (ACC) and class-unaware AR (measured on the validation set), which is expected, since increasing the number of classes makes the task harder. However, the AP score after finetuning increases, indicating that the pretrained detector is more powerful. Overall, results indicate that our method is fairly robust to the number of clusters chosen.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c }
+    \toprule
+     Classes & ACC & AR & AP \\
+     \midrule
+     1 & - & \textbf{25.2} & 41.2 \\
+    256 & \textbf{80.01} & 23.9 & 43.8 \\
+    512 & 75.13 & 24.0 & 43.9 \\
+    2048 & 53.75 & 23.9 & \textbf{44.1} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Number of classes}. Pretraining and finetuning on COCO, evaluation in terms of training accuracy, AR of the pretrained detector, and AP of the finetuned model. 1 class implies class-unaware pretraining.}
+  \label{tab:abl_clusters}
+\end{table}
+
+\noindent \textbf{Self-training stages:} We examine the impact of self-training in \cref{tab:abl_stages}, and find that it produces meaningful gains. We explore additional self-training with VIDT+~\cite{vidt}, but observe no benefits, and therefore limit self-training to one round throughout the paper.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c }
+    \toprule
+     Detector & Stage & AP & AP$_{50}$ & AP$_{75}$ \\
+     \midrule
+      \multirow{3}{*}{VIDT+~\cite{vidt}} & 1 & 48.9 & 67.4 & 52.9 \\
+      & \textbf{2} & \textbf{49.6} & \textbf{68.2} & 53.8 \\
+      & 3 & 49.6 & 68.0 & \textbf{53.9} \\
+      \midrule
+      \multirow{2}{*}{Def. DETR~\cite{def_detr}} & 1 & 46.1 & 64.6 & 50.3 \\
+      & \textbf{2} & \textbf{46.7} & \textbf{65.4} & \textbf{50.9} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Self-training rounds.} AP results for ViDT+ pretrained with SimDETR on ImageNet and finetuned on COCO. Avg. proposals per image are measured during training.}
+  \label{tab:abl_stages}
+\end{table}
+
+\noindent \textbf{Schedule length:} In~\cref{tab:epochs} we examine the impact of a longer training schedule on our method for both training stages by extending training from 10 to 25 epochs per stage. The results show that a longer training schedule can have some beneficial, yet marginal, effect. Interestingly, \cref{tab:epochs} highlights the importance of self-training, as two training stages totaling a combined 20 epochs (10 per stage) clearly outperform a single training round of 25 epochs.
+
+\begin{table}[t]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c }
+    \toprule
+     Stage & Epochs & AP & AP$_{50}$ & AP$_{75}$ \\
+     \midrule
+      1 & 10 & 48.9 & 67.4 & 52.9 \\
+      1 & 25 & 49.2 & 67.7 & 53.6 \\
+      \midrule
+      2 & 10 & 49.6 & 68.2 & 53.8 \\
+      2 & 25 & 49.7 & 68.1 & 54.2 \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{\textbf{Scheduler length.} AP results for varying training epochs. 10 and 25 epoch Stage 2 models are initialized from 10 and 25 epoch Stage 1 models respectively.}
+  \label{tab:epochs}
+\end{table}
+
+\section{Conclusion}
+
+We have proposed SimDETR, a novel method for self-supervised pretraining of an end-to-end object detector. Compared to prior work, our method aligns pretraining and downstream tasks through the careful construction of pseudo-labels and the use of self-training. We extensively evaluate SimDETR in typical object detector pretraining benchmarks and demonstrate that it consistently outperforms previous methods. However, unlike prior work, we show that SimDETR is also capable of effectively pretraining the backbone. This brings our method in line with the wider literature on self-supervised representation learning for detection. We again show competitive performance in this area and explore novel settings, specifically pretraining with scene-centric datasets and even pretraining from scratch. Overall, we believe our framework not only outperforms existing DETR pretraining methods, but also represents a promising step toward self-supervised, fully end-to-end object detection pretraining on uncurated images.
+
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{bib}
+}
+
+\clearpage
+
+\appendix
+
+\setcounter{figure}{0}
+\setcounter{table}{0}
+
+\section{Training Hyperparameters} \label{sec:hyperparams}
+
+In this section we provide detailed hyperparameters for each training setting included in the main paper. We use two detectors, Def. DETR~\cite{def_detr} and ViDT+ \cite{vidt}, and typically follow the training settings proposed in their respective papers for finetuning and DETReg~\cite{bar2022detreg} for pretraining. More specifically, unless stated otherwise, the following hyperparameters apply:
+
+\textbf{For Def. DETR}, we train SimDETR following~\cite{bar2022detreg}. Specifically, we pretrain for 5 epochs per stage on ImageNet with a batch size of 192 and a fixed learning rate of 0.0002. For finetuning, we train on COCO for 50 epochs and PASCAL VOC for 100 epochs, with a batch size of 32. The learning rate is set to 0.0002, and is decreased by a factor of 10 at epoch 40 and 100 for COCO and PASCAL VOC respectively.
+
+\textbf{For ViDT+}, we use the training hyperparameters proposed in~\cite{vidt}. Specifically, unless stated otherwise, ViDT+ is pretrained for 10 epochs per stage on ImageNet and Open Images, and for 50 epochs per stage on COCO, with batch size 128.
+In all cases, the learning rate is set to 0.0001 and follows a cosine decay schedule.
+
+Unless stated otherwise, we pretrain with 2048 pseudo-classes (i.e. we set the number of clusters for the global clustering step to 2048), and apply one round of self-training, following our findings in~\cref{tab:abl_stages}. Finally, during pretraining, we use the mosaic augmentation~\cite{bochkovskiy2020yolov4}.
+
+For specific experiments conducted in the paper, we note changes relative to the settings described above:
+
+\noindent \textbf{Full data regime:} Same as above.
+
+\noindent \textbf{Semi-supervised:} Following DETReg~\cite{bar2022detreg}, we finetune on COCO for 2,000 epochs for 1\% of samples annotated, 1,000 epochs for 2\% of samples, 500 epochs for 5\% of samples, and 400 epochs for 10\% of samples. The learning rate is kept fixed at 0.0002. Results in Table 3 are measured over 5 runs, with different, randomly sampled annotated samples.
+
+\noindent \textbf{Few-shot:} We finetune on COCO's base classes, using the splits proposed in~\cite{wang2020frustratingly}. For the standard few-shot setting we a) finetune on the base classes following the COCO finetuning settings outlined above, and b) finetune on the 10- and 30-shot sets for 30 and 50 epochs respectively, with a fixed learning rate of 0.0002 and 0.00004. For the extreme setting, we directly finetune on the 10- and 30-shot sets for 400 epochs with a learning rate of 0.0002 that is decreased by a factor of 10 after 320 epochs. Results in Table 4 correspond to the best validation score of each run during training, averaged over 5 runs, with k-shot samples corresponding to seeds 1-5 of~\cite{wang2020frustratingly}. When finetuning on the k-shot instances, the backbone is kept frozen in both settings.
+
+\noindent \textbf{Object vs Scene-centric pretraining:} Same as above.
+
+\noindent \textbf{Self-supervised representation learning on scene-centric data:} For these experiments, where the entire architecture is initialized from scratch (backbone \& detector), we train for 1,000 epochs on COCO, 100 epochs on ImageNet, and 70 epochs on Open Images. This allows for a fair comparison, with approximately the same number of training steps across datasets.
+
+
+\section{Datasets} \label{sec:datasets}
+In our paper, we use the training sets of ImageNet \cite{imagenet2015}, Open Images \cite{OpenImages2} and MS COCO (COCO) \cite{coco2014} for unsupervised pretraining. We use the training sets of MS COCO and PASCAL VOC~\cite{everingham2010pascal} for supervised finetuning and their validation sets for evaluation.
+ImageNet includes 1.2M object-centric images, classified with 1,000 labels and without object-level annotations. Open Images includes 1.7M scene-centric images, and a total of 14.6M bounding boxes with 600 object classes. COCO is a scene-centric dataset with 120K training images and 5K validation images containing 80 classes. PASCAL VOC is scene-centric and contains 20K images with object annotations covering 21 classes.
+
+\section{Convergence \& Alignment Analysis}
+
+In this section we discuss the convergence and alignment properties of SimDETR by analyzing the results of the "extreme" few-shot experiments. As discussed in Sec. 5 of the main paper, in this setting we pretrain Def. DETR on ImageNet, and then finetune directly on COCO's train set, using $k\in \{10, 30\}$ instances from all classes.
+
+In~\cref{fig:extreme_k10,fig:extreme_k30} we present the AP scores for SimDETR and DETReg during training, averaged over 5 runs and measured over the validation set's novel classes. As was noted in Sec. 5 of the main paper, SimDETR outperforms DETReg by large margins. Notably, however, it is also shown to converge much faster. More specifically, in~\cref{tab:few_shot_ap} we present results for 50 epochs of k-shot finetuning against the performance reached after 400 epochs. In both cases, we average the best validation score across 5 runs. We see that, at 50 epochs, SimDETR has already reached near-peak performance, while DETReg converges at a much slower rate.
+
+This means SimDETR effectively alleviates the sample inefficiency and slow convergence of DETR architectures, and makes our method particularly useful when annotations and/or computational resources are extremely scarce. These results provide further support for our conclusions in Sec. 5 of the main paper, namely that SimDETR is much better aligned with the downstream task, with learned object representations that are well suited for class-aware object detection, so that minimal training and supervision can lead to strong performance. 
+
+% Figure environment removed
+
+% Figure environment removed
+
+\begin{table}[h]
+  \begin{center}
+  \begin{footnotesize}
+  \begin{tabular}{ c c c c c c c}
+    \toprule
+    \multirow{2}{*}{Method} & \multirow{2}{*}{Epochs} & \multicolumn{2}{c}{Novel Class AP} & \multicolumn{2}{c}{Novel Class AP$_{75}$} \\
+     &  & 10 & 30 & 10 & 30 \\
+     \midrule
+     DETReg~\cite{bar2022detreg} & \multirow{2}{*}{50} & 1.9 & 3.4 & 1.8 & 3.52 \\
+     \textbf{SimDETR} &  & \textbf{8.32} & \textbf{13.9} & \textbf{8.06} & \textbf{14.4} \\
+      \midrule
+     DETReg~\cite{bar2022detreg} & \multirow{2}{*}{400} & 5.6 & 10.3 & 6.0 & 10.9 \\
+     \textbf{SimDETR} &  & \textbf{10.3} & \textbf{14.5} & \textbf{10.9} & \textbf{15.1} \\
+    \bottomrule
+  \end{tabular}
+  \end{footnotesize}
+  \end{center}
+  \caption{Results of "extreme" few-shot training for 50 epochs and 400 epochs.}
+  \label{tab:few_shot_ap}
+\end{table}
+ 
+\section{Visualization} \label{sec:viz}
+
+In~\cref{fig:viz} we provide examples visual examples of bounding boxes produced by Selective Search, our labeled object proposal method, and SimDETR, specifically a VIDT+ detector trained for two stages on ImageNet. To avoid clutter, for all three methods we only include objects whose predicted bounding boxes have an IOU higher than 0.5 with an object in the ground truth set.
+
+The images illustrate that self-training significantly improves the object discovery performance of SimDETR over the original region proposals. Notably, those include much smaller items, and much better performance in cluttered scenes. As stated in the main paper, this contributes to the performance of our framework and specifically the performance gains between stages.
+
+  % Figure environment removed
+
+\end{document}

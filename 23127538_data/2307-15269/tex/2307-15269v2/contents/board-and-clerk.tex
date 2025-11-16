@@ -1,0 +1,221 @@
+We first address the latency issue of existing DAG-based BFT consensus. According to \cite{Danezis_Kokoris-Kogias_Sonnino_Spiegelman_2022}, the average latency of Tusk under an asynchronous setting is seven asynchronous rounds. Our proposal uses the UTXO model to finalize some transactions' results before this number and thus improve the user experience. Before describing our protocol, we present an initial intuition regarding the interplay between the DAG data structure and the UTXO Model.
+
+
+\subsection{Intuition: DAG meets UTXO}
+
+Our first proposal is a new transaction commit rule that compares the ordering decided by the random leader in Tusk. The UTXO Model is designed to support parallelism, so we do not need a strict sequential order of all transactions. Considering that workers can ensure internal validity beforehand, the consensus algorithm only needs to identify double-spending transactions and agree on which transactions are invalid. 
+
+Currently, the existing DAG-based consensus algorithms rely on deterministic DAG traversal algorithms to determine the transaction order and the external validity. However, the proposer of the leader proposal often decides the order almost randomly based on how it arranged the proposals from the previous round. This approach requires significant work to determine the transaction's external validity. 
+
+Therefore, we propose a new commit rule that does not rely on the order of transactions in the batches, making the results of transactions more predictable before their commitment. We use the parallelism of the UTXO model in our approach. Given that the proposed phase has checked internal validity, our commit rule uses the DAG to finalize the external validity independent of the consensus algorithm. Consequently, any node can be confident about the results of most transactions (except double-spending transactions) after a certain number of rounds, which enables them to process the following transactions and, ultimately, reduce the actual latency of transaction commitment. 
+
+\subsection{Transaction States}
+
+We use the transaction state to represent its lifecycle in memory. The states can be:
+
+\begin{itemize}
+    \item \textbf{Verified}: A received transaction that has passed the internal validity check by a worker;
+    
+    \item \textbf{Submitted}: A verified transaction included in at least one single proposal;
+    
+    \item \textbf{Fast-committed}:  A submitted transaction that will be committed in the future with a confirmed result;
+    
+    \item \textbf{Committed}: A submitted transaction that the consensus algorithm has committed.
+\end{itemize}
+
+We use the fast-committed state to process transactions and apply changes to the state before committing them via the consensus algorithm. The fast-committed transactions use a shorter internal path to execute and enable the node to verify its following transactions. This feature is especially advantageous when the consensus algorithm takes a long time to select appropriate leaders for committing the DAG. 
+
+\subsection{The Novel Commit Rule}
+
+A local node must determine whether a transaction will succeed or fail to enable a fast-committed channel. Therefore, a procedure to decide the external validity of a transaction is required to reduce uncertainty when extending the DAG. Hence, we have made the following two changes to the proposal flow compared to Narwhal and Tusk:
+\begin{enumerate}
+    \item We require that any valid batch of transactions does not contain conflicting transactions. A batch is a wrapper of transactions that are submitted through a worker. It is reasonable to assume that the worker has verified all transactions in the batch, ensuring that transactions spending the same UTXO are not kept. It should be noted that different batches may have conflicting transactions since they may come from different workers.
+
+    \item We require that a node's proposal for round $r$ always includes its proposal for round $r-1$. This requirement ensures the basic consistency of the node's proposal. If a node's proposal at round $r$ is committed, so is its proposal at round $r-1$. This significantly improves the reliability of the projection of the external validity decision.
+\end{enumerate}
+Now, we provide some definitions describing our approach to determine external validity.
+
+\begin{definition}
+For a sub-DAG that begins with a node's proposal at round $r$ containing a transaction $tx$ for the first time, we say that the node votes for $tx$ at round $r$.
+\end{definition}
+
+A node generally votes for a transaction in one of two cases: (1) its proposal includes the transaction, or (2) its proposal links to a proposal from another node that already voted for the transaction. The vote is only kept for the minimum round. To be noticed, a node may vote for conflicting transactions at the same round; in this case, its vote is counted for both transactions. Figure~\ref{fig_TX} shows some typical cases for voting. 
+
+% Figure environment removed
+
+\begin{definition}~\label{def:ord}
+For any set of transactions, we define an ordering relationship $Ord$ such that there is only one stable sort of the set under $Ord$.
+\label{def_tx_ord}
+\end{definition}
+A straightforward example is ordering according to the hexadecimal representation of transaction IDs.
+
+\begin{definition}[External Validity-Commit Rule]
+For all transactions inside a sub-DAG to be committed by the consensus algorithm at even rounds, a transaction is successful only if more nodes have voted for it before any other transactions conflict. In other words, let $tx.I$ be the inputs of $tx$ and $\mathsf{TX_S}$ be the set of all submitted transactions. We commit $tx$ if:
+
+%$$\forall tx'\; s.t.\; tx'.I \cap tx. I \neq \phi.$$
+$$\forall tx' \in \mathsf{TX_S} \; : \; tx'.I \cap tx.I = \varnothing.$$
+Furthermore, it is also committed if
+\begin{equation}
+    |\{\text{nodes vote tx first}\}| > |\{\text{nodes vote }tx'\text{ first}\}|,\nonumber
+\end{equation}
+or otherwise if
+\begin{equation}
+\begin{split}
+  & tx >_{Ord} tx', \\
+  & |\{\text{nodes vote tx first}\}| = |\{\text{nodes vote tx' first}\}|.\nonumber \\
+\end{split}
+\end{equation}
+\label{def_tx_rule}
+\end{definition}
+
+%Given a sub-DAG, 
+Definition~\ref{def_tx_rule} allows for a deterministic outcome of the transaction's external validity. Transactions without conflicts are committed directly. For transactions with conflicts, we commit according to the votes from nodes, and any tie will be resolved by the deterministic order $Ord$ (given by Definition~\ref{def:ord}).
+
+Compared to~\cite{Danezis_Kokoris-Kogias_Sonnino_Spiegelman_2022}, we only change the commit rule. This new commit rule enables the node to pre-compute the votes for each transaction before the consensus decides the leader. We present Theorem~\ref{The_SuccessCase} in the center of our proposal correctness. Here, a node observes a transaction when a proposal that contains that transaction has been added to its DAG.
+\begin{theorem}
+    \label{The_SuccessCase}
+    When a node added a proposal $p$ to its DAG at an odd round $r$, if a transaction $tx$ has more than $2f+1$ votes from nodes and no valid conflicting transactions were observed, then $tx$ will eventually be committed as a successful transaction according to Definition~\ref{def_tx_rule}.
+\end{theorem}
+
+\begin{IEEEproof}
+    Recall that Definition~\ref{def_tx_rule} states that a transaction that has been included in more nodes earlier than other conflicting transactions will be committed, and the consensus layer commits a leader proposal only if $f+1$ proposals have included it in the next odd round.
+
+    Firstly, we demonstrate that the transaction will eventually be committed. As there are at least $2f+1$ nodes whose proposals indicate they have voted for the transaction $tx$, any proposal at round $r+1$ will contain the transaction. Thus, $tx$ will be committed by some proposal eventually.
+    
+    Next, we show this transaction will be committed successfully. If any proposal is to be committed before round $r$, it must have $f+1$ subsequent proposals, and thus, it will be in the sub-DAG starting from $p$. Hence, the node will observe any valid conflicting transaction that can be committed before round $r$. If a proposal $p'$ after round $r$ is selected as a leader, then its sub-DAG will have at least $2f+1$ proposals from round $r$, which implies that at most $f$ nodes will vote for conflicting transactions while at least $f+1$ will vote for $tx$. According to our commit rule, $p'$ can only commit $tx$.
+\end{IEEEproof}
+
+A proposal in an even round cannot trigger fast-commit since its vote on that round may not impact the leader's choice in the same round. The leader may encounter a tied vote in its sub-DAG case and commit a different transaction. According to Theorem~\ref{The_SuccessCase}, we can define the fast commit rule.
+
+\begin{definition}[Fast Commit Rule]
+    A transaction is fast committed with a successful result at an odd round if $2f+1$ nodes have voted it and no valid conflicting transactions are observed.
+    \label{def_fast_commit}
+\end{definition}
+
+This fast commit rule is derived from our new commit rule and Theorem~\ref{The_SuccessCase}, which does not affect the security claim of Tusk. Estimating the expected latency reduction using this fast commit rule is non-trivial. According to our experiments in section~\ref{sec:implementation}, we can reduce about half of the transactions' latency by 50\%, i.e., an average 25\% latency reduction.
+
+\subsection{Our Construction: Board and Clerk} 
+
+We propose a new consensus algorithm called ``Board and Clerk" to replace Tusk for applying our new commit rule. At a high level, Board decides on transaction results and fast-commit transactions, and Clerk agrees on the formal commitment. The algorithm operates as follows: After Narwhal commits a proposal, Board counts the votes from that proposal, keeps it in storage, and fast commits transactions if possible. Once the algorithm reaches the commit rule (\ie when processing a proposal of even round $r>4$), Clerk uses a global coin to select the leader. If the leader is valid according to the DAG, Clerk will output all uncommitted proposals from the leader's sub-dag, and Board can compute the transaction result accordingly for commitment.
+
+Board stores all the vote results and conflict information. More specifically, Board stores a map of \{transaction Id: vote record\} and a map of \{batch: vote record\}. Each vote record is a hash map between \{node Id: round\} that records the round number that a node voted for the element (transaction or batch). We use Board.AddTxVotes and Board.AddBatchVotes functions to denote updating the vote (insert the round for the node ID). 
+
+Board provides two open APIs: first, when a new proposal is added to the DAG, Board counts votes for the author node. Since proposals are added to the DAG after its ancestors, the first vote from a node to an element is always smaller than the later votes from that node to the same element. Algorithm~\ref{Alg_Count_Vote} highlights the flow for counting transactions' votes, which triggers the fast commitment channel.
+
+\begin{algorithm}[htbp]
+	\caption{Algorithm for counting transaction votes}
+	\label{Alg_Count_Vote}
+	\begin{algorithmic}[1]
+		\Require Proposal P
+        
+        \Function{Board.Process}{P}
+        
+        \State Initiate list B
+        \State P.round $\rightarrow$ round
+        \State P.author $\rightarrow$ voter
+        \For{ batch in P.batches}
+                \If{!Board.HaveSeen(batch)} 
+                    \State add the batch in B
+                \EndIf
+        \EndFor
+
+        \For{ batch in B}  %T}
+            \For{ tx in batch}
+                \State Board.Add(tx.txos, tx)
+                %\State Record the TXO info to the board
+                \If{Any TXO has more than one tx}
+                    \State Add tx to conflicted set
+                \EndIf
+            \EndFor
+            \State Board.AddTxVotes(batch.txs, voter, round)
+        \EndFor
+
+        \Comment{Counting Votes for sub-dag proposal}
+        \State P.parents $\rightarrow$ C
+        
+        \While{C is not empty} 
+            \State C.Pop() $\rightarrow$ parent
+            \State Board.AddBatchVotes(parent.batches, voter, round)
+            \If{any vote changed}
+                \Comment{new batch}
+                \State C.Concat(parent.parents)
+                \State Board.AddTxVotes(batch.txs, voter, round)
+                %\State Update votes for transactions in cert.
+            \EndIf
+        \EndWhile
+
+        \If{round is odd}
+            \Comment{Fast Commit}
+            \State Filter out transactions that are not conflicted and have more than 2f+1 votes.
+            \State Fast commit those transactions
+        \EndIf
+        \EndFunction
+
+\end{algorithmic}
+\end{algorithm}
+
+To aid the decision process of transaction states, we utilize internal states. To achieve this, we require the storage of node votes for different batches and transactions, with the added benefit of serving as a shortcut to avoid duplicated batches. Additionally, we must maintain records of conflicting transactions and the existing TXO-TX pairs, thus preventing the missing of any vital information regarding conflicts. To ensure smooth operation, we also use a cache to store transactions fast-committed to reject later conflicting transactions.
+
+The second API for the Board is triggered when Clerk commits a sub-DAG by the consensus, resulting in Board committing all transactions in the sub-DAG as required. Since the consensus algorithm only decides the leader for the previous round, we cannot directly use the latest vote counts, which include votes that are not to be committed. To avoid recounting votes, we define a frontier for each proposal.
+
+\begin{definition}
+A frontier $F$ of a proposal $p$ is a map between node IDs and their latest proposal round in the sub-DAG that begins with $p$.
+\end{definition}
+
+We can remove the vote records after the corresponding round in the frontier since the current commitment will not include those vote records. The flow for counting transaction results is outlined in Algorithm~\ref{Alg_TX_Result}.
+
+\begin{algorithm*}[htbp]
+	\caption{Algorithm for getting transaction results of a sub-DAG}
+	\label{Alg_TX_Result}
+	\begin{algorithmic}[1]
+		\Require A list of proposals P
+            \Ensure A set of successful transactions ST and a set of failed transactions FT
+            
+        \Function{Board.Commit}{P}
+        \State Init empty ST, FT
+        \State Set T as a list of all uncommitted TXs in the sub-DAG of P 
+        
+        \State Board.ConflictedTX() $\longrightarrow$ CT
+        \Comment{CT is the dictionary of conflicted TXO and its conflicted transaction pair according to TXO-TXs}
+        \State T.IntersectWith(CT.values) $\longrightarrow$ TxToProcess
+        \If{ TxToProcess = $\phi$}
+            \Comment{We can directly commit all as success}
+            \State ST.Add(T)
+            \State Return ST, FT
+        \Else
+            \State ST.Add(T.Except(TxToProcess))
+        \EndIf
+
+        \State Set M as a map of $<$TXO,TX$>$ with values from TxToProcess
+        \State M.sortbyKey()
+        \Comment{use a stable sort}
+        \State Compute frontier $F(P)$
+        \For{(txo,txs) in M}
+            \State Prune transaction vote records by F and remove vote records from nodes that are not earliest.
+            \State Sort txs with vote counts and $Ord$
+            \State Push the first tx in txs to ST and the remaining to FT
+            \For{ (txo', txs') in M}
+            \Comment{We need to check if other conflicted sets have been affected by this result}
+                \If{tx contains txo'}
+                    \State Push other tx' in txs' to FT
+                \EndIf
+                \State txs' = txs'.disjoint(txs)
+            \EndFor
+        \EndFor
+
+        \State Fast Commit other transactions according to ST, FT
+        \Comment{Some transactions might meet the fast commit rule by now, (\eg, the conflicted $tx$ is failed) or it is not processed now but doomed to fail (\eg, the conflicted $tx$ is succeeded now)}
+        \State Board.CleanUp
+        
+ 	\State Return ST, FT
+  \EndFunction
+
+\end{algorithmic}
+ 
+\end{algorithm*}
+
+\subsection{Theoretical Analysis}
+
+This work inherits the adversary model from Tusk~\cite{Danezis_Kokoris-Kogias_Sonnino_Spiegelman_2022}. Given $n$ parties in an asynchronous network of our consensus algorithm, a computationally bounded adversary can corrupt up to $f<n/3$ parties, denoted as faulty nodes. Our protocol shares the same rule for committing leader block as Tusk~\cite{Danezis_Kokoris-Kogias_Sonnino_Spiegelman_2022}, which allows our protocol to have the same security and liveness claim. The transaction result is determined by Algorithm~\ref{Alg_TX_Result}, which is deterministic according to the sequence of the leader block. Therefore, our protocol is as secure and live as Tusk~\cite{Danezis_Kokoris-Kogias_Sonnino_Spiegelman_2022}. 
+
+Compared to Tusk, our protocol introduces additional computation and storage costs to reduce the latency of fast-committed transactions. Generally, Board needs an additional space linear to the number of transactions for storing votes. Algorithm~\ref{Alg_Count_Vote} requires vote updating for each batch and transaction, which is linear to the number of nodes $N$ given the transaction number is also linear to the number of proposers. Algorithm~\ref{Alg_TX_Result} introduces a computation overhead of $O(m^2)$ for $m$ conflicted transactions. This overhead is negligible since $m$ is relatively small compared to the total transaction number. Some additional trade-off between computation and storage is possible. For example, in Algorithm~\ref{Alg_Count_Vote}, we use additional batch votes to filter out transactions with new votes. When committing proposals. Nodes running our protocol need more memory and computation power than Tusk. In the experiment section (Figure~\ref{fig_scale_nodes}), we will see the formal block latency of our protocol has little difference with Tusk if the computation and memory are not the bottlenecks.

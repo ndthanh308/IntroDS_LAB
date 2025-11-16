@@ -1,0 +1,157 @@
+
+
+
+% Figure environment removed
+
+
+
+\section{Method}
+
+
+We propose a two-stage training pipeline. In the first stage, we learn a base encoder and mixing network to achieve diverse results as presented in Section \ref{sec:first}.
+In the second stage, Section \ref{sec:second}, we learn skip connections to the generator to achieve high-fidelity reconstructions and seamless transitions between unerased and erased pixels.
+
+
+\subsection{First Stage: Diverse Results}
+\label{sec:first}
+
+Our method utilizes an architecture that includes an image encoder (E), mixing network (Mi), and StyleGAN2's mapping (Ma) and generator (G) networks \cite{karras2020analyzing}. We freeze the StyleGAN's mapping and generator networks as shown in Fig. \ref{fig:first-stage-arch}.
+We obtain erased images by multiplying them with a binary mask $\text{M}$ that defines the valid and erased pixels; $ \text{I}^e = \text{M} \odot \text{I}$.
+Before feeding the erased image to the encoder, we concatenate the binary mask $\text{M}$ with it. 
+We set a simple encoder \cite{richardson2021encoding} to project our erased images.
+Our encoder embeds erased images into $ \text{W}^+$ latent space.
+Our goal is to achieve diversity in our inpainting results.
+For that, we set a second pathway that utilizes StyleGAN's mapping network to sample random $z$'s and obtains $ \text{W}^+$ codes that lie in the natural space of StyleGAN.
+The encoded, $ \text{W}^{enc} $, and mapped, $ \text{W}^{rand} $, latent codes are fed to the mixing network. 
+We expect the mixing network to take the information of what is visible from the masked image and combine the missing information with the mapped latent codes.
+We equip the mixing network with a neural network and gating mechanism as follows: 
+
+\begin{equation}
+\label{eq:gating}
+\begin{split}
+    \text{W}^{comb}, g = \text{NN}( \text{W}^{enc} , \text{W}^{rand} )\\ 
+    \text{W}^{out} = \sigma(g) \cdot \text{W}^{comb} + (1-\sigma(g)) \cdot \text{W}^{rand} 
+\end{split}
+\end{equation}
+
+where $\sigma(.)$ is the sigmoid function.
+$\text{W}^{out}$ goes to the instance normalization layers of StyleGAN generator.
+
+In our experiments, we observe that the mixing network learns to ignore the $\text{W}^{rand}$.
+To achieve diversity, we propose a training pipeline with GAN-generated data as shown in Fig. \ref{fig:first-stage-training}.
+We first generate an image with $z_g$, and feed it to the mapping network to obtain $\text{W}^{rand}_g $. We synthesize the output image and erase a part of the image with a randomly generated mask,
+$\text{I}_g^e = \text{M} \odot \text{I}_g$.
+Our encoder encodes the erased image to $\text{W}^{enc}_g$.
+With these encodings, we generate two images, one that combines $\text{W}^{enc}_g$ with mapping of $z_g$ and another one with mapping of a randomly sampled different $z_r$ as given in Fig. \ref{fig:first-stage-training} (a) and (b), respectively.
+The generator outputs images $\text{I}_g^o$ and $\text{I}_r^o$ from these two different paths.
+The generation of $\text{I}_g^o$ has access to the full information that generated the image and therefore, if one can combine the encoded embedding with the mapping, one correctly can generate the input image. 
+On the other hand, the second path, $\text{I}_r^o$ image has only access to the information of unerased pixels and is not expected to reconstruct the input image faithfully for the erased parts. 
+To achieve this objective, we set the following losses to train the framework.
+
+% Figure environment removed
+
+\textbf{Reconstruction Losses.} For reconstructing the pixels correctly, we use  $L_2$ and perceptual losses.
+We use perceptual losses from VGG ($\Phi$) at different feature layers ($j$) between images.
+We output two images, $\text{I}_g^o$ and $\text{I}_r^o$ from the input image ($\text{I}_g$) that is erased, $\text{I}_g^e$.
+$\text{I}_g^o$ has access to the correct mapping as well as unerased image pixels, therefore this training pipeline is expected to generate the original input image as follows:
+
+\begin{equation}
+    \begin{split}
+        \mathcal{L}_{rg} = || {\text{I}_g^o} -  {\text{I}_g} ||_2 + |\Phi_{j}({\text{I}_g^o}) - \Phi_{j}({\text{I}_g} ) ||_2
+    \end{split}
+    \label{eqn:rec_g}
+\end{equation}
+
+
+On the other hand,  $\text{I}_r^o$ has only access to the unerased pixels of the original image and is expected to fill the missing information with a randomly sampled latent code. 
+Therefore, we only expect pixel-wise matching on the unerased images. 
+We find the reconstruction losses between the masked output image and erased input image as follows:
+
+\begin{equation}
+    \begin{split}
+        \mathcal{L}_{rr} = || {(\text{M} \odot \text{I}_r^o)} - { \text{I}_g^e} ||_2 
+        + |\Phi_{j}({\text{M} \odot \text{I}_r^o}) - \Phi_{j}({ \text{I}_g^e} ) ||_2
+    \end{split}
+    \label{eqn:rec_r}
+\end{equation}
+
+
+If the network is trained with Eq. \ref{eqn:rec_g} alone, the mixing network can ignore the input image and encoded features coming from it since full information is provided by the mapping network. Similarly, if the network is trained with only Eq. \ref{eqn:rec_r}, the mixing network ignores the mapping network.
+By using these reconstruction losses together, our framework learns to use the information encoded from both paths.
+Additionally, this training regularizes the encoder and mixing network to output latent codes that are in GAN's natural space which provides editable inversions.
+
+
+
+% Identity loss is calculated with a pre-trained network $A$. $A$ is an ArcFace model \cite{deng2019arcface} when training on the face domain and a domain specific ResNet-50 model \cite{tov2021designing} for our training on car class. 
+% \begin{equation}
+%     L_{rec-id} = (1 - \langle A(x),A(x')\rangle)+(1 - \langle A(x),A(x'')\rangle)
+% \end{equation}
+
+
+
+\textbf{Adversarial Losses.} We additionally output our final images as follows:
+
+\begin{equation}
+ \begin{split}
+    \text{I}^f = \text{M} \odot \text{I} + \text{(1-M)} \odot \text{I}^o
+\end{split}
+\label{eq:final}
+\end{equation}
+
+This step guarantees that the valid pixels are not modified as given in Fig. \ref{fig:first-stage-arch}.
+We expect these final images to look realistic and use adversarial guidance on the final images for both $\text{I}^f_g$ and  $\text{I}^f_r$ .
+We load the pretrained discriminator from StyleGAN training, $D$, and train the discriminator together with the encoder and mixing network.
+
+\begin{equation}
+ \begin{split}
+    L_{adv} = 2\log{ D( {\text{I}_g} )} + \log{(1-D({\text{I}^f_g}))} \\ + \log{(1-D({\text{I}^f_r}))}
+    \end{split}
+\end{equation}
+
+
+
+
+\textbf{Full Objective.}
+We use the overall objectives given below to optimize the parameters of the Encoder (E) and the mixing network (Mi). The hyperparameters are provided in Appendix.
+
+
+
+\begin{equation}
+    \begin{split}
+        \underset{E,Mi}{\min} \underset{D}{\max} \lambda_{a}\mathcal{L}_{adv} +  \lambda_{r1} \mathcal{L}_{rg} + \lambda_{r2} \mathcal{L}_{rr}   
+    \end{split}
+    \label{eqn:full_loss}
+\end{equation}
+
+
+
+\subsection{Second Stage: High-Fidelity Reconstruction}
+\label{sec:second}
+
+
+Previous works for image inversion show that low-rate latent codes, $W+$, do not have enough capacity for high-fidelity image reconstruction \cite{wang2022high, alaluf2022hyperstyle}. 
+There is too much information loss due to the bottleneck of projecting high-dimensional images to low-rate latent codes and this bottleneck limits the high-fidelity reconstructions.
+The same is observed by inpainting with image inversion works \cite{wang2022dual, yu2022high} as well.
+The high-fidelity reconstruction of visible pixels is even more crucial in the inpainting task because we combine the erased and generated pixels as given in Eq. \ref{eq:final}.
+When the generator is not able to reconstruct the valid pixels with high fidelity, the color discrepancies become very obvious in the final images.
+Previous methods \cite{wang2022dual, yu2022high, wang2022high, alaluf2022hyperstyle} suggest encoding information to higher-rate latent codes as well. 
+This is achieved by skip connections from the encoder to the generator on higher-resolution feature maps which are sometimes referred to as $F^+$ space.
+
+The balance of encoding information between $W^+$ and $F^+$ spaces is extensively studied for image inversion methods \cite{wang2022high, alaluf2022hyperstyle, pehlivan2022styleres}. That is because by encoding most of the information to $F^+$ space, one can guarantee a high-fidelity reconstruction. However, since the image is not projected to  $W+$ properly, it will not be editable which is the main goal of many inversion methods.
+That is the reason we adopt the two-stage training pipeline similar to state-of-the-art image inversion methods \cite{wang2022high, alaluf2022hyperstyle, pehlivan2022styleres}. 
+In the first stage, our method tries to reconstruct and inpaint images only by the encoded low-rate codes, $W^+$.
+Later, we reduce the information bottleneck by letting higher rate codes skipping from the input image to the generator.
+
+% \newcommand{\interpfigt}[1]{% Figure removed}
+% comparison images
+% smile removal
+% Figure environment removed
+
+The second-stage training takes the final output of the first-stage model that has gone through the masking as given in Eq. \ref{eq:final}. We train an encoder with skip connections to the StyleGAN generator.
+The encoder also takes the binary mask as input and can detect inconsistencies in the pixel level. 
+The same encoded $W^+$ is used for both generations. 
+However, in the first generation, there are no skip connections ($F^+$), and in the second stage, there are. 
+We also limit the number of skip connection layers and only feed to the feature maps with resolutions of $32\times32$, $64\times64$, and $128\times128$.
+We fine-tune the models with the same objective from the first stage, given in Eq. \ref{eqn:full_loss}.
+We provide the architectural and training details in Appendix.
+

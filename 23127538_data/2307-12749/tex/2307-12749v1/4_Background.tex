@@ -1,0 +1,129 @@
+\section{Preliminaries and Challenges}
+\label{sec:background}
+This section introduces the fundamental concepts of Transactional Stream Processing (TSP), elucidates the inherent limitations of existing TSPEs, and elaborates on the design challenges encountered in constructing an optimized TSPE. 
+% setting the stage for the introduction of \system.
+
+\subcompact
+\subsection{Background}
+We first provide the necessary background information on TSP, workload dependencies, and definitions related to state access operations, state transactions, and correct schedules.
+
+\subsubsection{Transactional Stream Processing}
+\label{subsubsec:tsp}
+TSPEs differ from traditional SPEs, such as Storm~\cite{storm} and Flink~\cite{flink}, in their ability to maintain shared mutable states that can be referenced and updated by multiple execution entities (i.e., threads). These shared mutable states are preallocated in memory and expanded when needed before processing. We adopt the definitions from previous work~\cite{S-Store,tstream} for state access operations and state transactions, as well as the notion of a correct schedule for maintaining transactional semantics.
+
+\paragraph{\textbf{State Access Operations:}}
+A state access operation is a read or write operation to shared mutable states, denoted as \underline{$O_i$ = $Read_{t}(k)$ or $Write_{t}(k, v)$}. 
+Timestamp ${t}$ is defined as the time of its triggering input event, while $k$ denotes the state to read or write that may be non-deterministic\footnote{See more discussions in Section~\ref{subsec:challenges}}, and $v$ denotes the value to write. 
+
+\paragraph{\textbf{State Transaction:}}
+The set of state access operations triggered by the processing of one input tuple is defined as one \emph{state transaction}, denoted as $txn_{t}$ = $< O_1, O_2, \ ... \ O_n >$. 
+Operations of the same transaction have the same timestamp.
+For brevity, we use the timestamp $t$ to differentiate different state transactions.
+
+\paragraph{\textbf{Correct Schedule:}}
+A schedule ($S$) of state transactions $txn_{t1}$, $txn_{t2}$, ..., $txn_{tn}$ is correct if it is \textbf{conflict equivalent} to $txn_{t1}$ $\prec$ $txn_{t2}$ $\prec$ $...$ $\prec$ $txn_{tn}$, where $\prec$ means that the left operand precedes the right operand.
+\label{def:schedule}
+
+
+\subsubsection{Workload Dependencies}
+\label{subsec:definition}
+To scale transactional stream processing, it is essential to maximize system concurrency while maintaining a correct schedule. However, this can be challenging due to the complex inter- and intra-dependencies among state transactions. By analyzing various TSPE applications~\cite{Arasu:2004:LRS:1316689.1316732,tstream,bidding,ACEP,Botan12,S-Store,Transactions2018}, we have identified three types of workload dependencies: logical, temporal, and parametric. These three types of dependencies play a crucial role in determining the scheduling of state transactions in TSPEs to maintain correctness and efficiency.
+% We use the Streaming Ledger (SL) as an example with three state transactions ($txn_1$, $txn_2$, and $txn_3$) to illustrate these dependencies shown in Figure~\ref{fig:dependencies_in_SL}. 
+\myc{
+We utilize the Streaming Ledger (SL) to demonstrate the dependencies depicted in Figure~\ref{fig:dependencies_in_SL}. 
+% SL is a real-world streaming application that handles input events related to money and asset transfers between accounts, and we examine three state transactions ($txn_1$, $txn_2$, and $txn_3$) within this context.
+SL represents a real-world stream application suggested by a recent commercial TSPE~\cite{Transactions2018} from data Artisans, and we examine three deposit/transfer transactions ($txn_1$, $txn_2$, and $txn_3$) within this context.
+}
+
+
+\paragraph{\textbf{Temporal Dependency (\td):}}
+\label{def:TD}
+% Temporal dependencies 
+\tds
+are created when state access operations must comply with the event sequence. Let us denote two state access operations as $O_i$ and $O_j$. A temporal dependency exists between $O_i$ and $O_j$ if the following conditions are met: 
+(1) Both $O_i$ and $O_j$ access the same state \emph{concurrently}; 
+(2) The timestamp of $O_i$ is larger than the timestamp of $O_j$;
+(3) $O_i$ and $O_j$ are not part of the same state transaction. 
+In simpler terms, $O_i$ temporally depends on $O_j$ when they access the same state, but $O_i$ has a later timestamp, and they belong to separate state transactions.
+
+\paragraph{\textbf{Parametric Dependency (\pd):}}
+\label{def:PD}
+% Parametric dependencies 
+\pds
+arise between two write operations if the value to be written in one operation is contingent upon the execution of another operation. Let us denote two write operations as $O_i=Write(k_i,v)$ and $O_j=Write(k_j, v')$ where $v = f(k_1, k_2, ..., k_m)$. A parametric dependency exists between $O_i$ and $O_j$ if the following conditions are met: 
+(1) $k_j \neq k_i$;
+(2) $k_j$ is included in the set ${k_1, k_2, ..., k_m}$;
+(3) The timestamp of $O_i$ is larger than the timestamp of $O_j$. 
+In other words, $O_i$ parametrically depends on $O_j$ when $O_i$'s write value is determined by the result of $O_j$, and $O_i$ has a later timestamp.
+
+\paragraph{\textbf{Logical Dependency (\ld):}}
+\label{def:LD}
+% Logical dependencies 
+\lds
+are essential in maintaining ACID properties. They stipulate that the aborting of a single operation necessitates the aborting of all operations within the same state transaction. In other words, operations $O_i$ and $O_j$ are considered to exhibit a logical dependency if they belong to the same state transaction. During the execution phase, operations can be scheduled without considering logical dependencies. However, if an operation $O_i$ is to be aborted, all other operations within the same transaction will also be aborted. This is in order to uphold the ACID properties by ensuring that aborting one operation results in aborting all operations of the same state transaction.
+
+% Figure environment removed
+
+\subcompact
+\subsection{Limitations of Existing TSPEs}
+\label{subsec:related_work}
+% In this subsection, we review the related work on Transactional Stream Processing Engines (TSPEs) and their scheduling strategies, focusing on two state-of-the-art TSPEs: S-Store and TStream.
+
+% % \subsubsection{S-Store}
+% \textbf{S-Store}~\cite{S-Store} splits shared mutable states into disjoint subsets called partitions. It schedules each state transaction as the unit of scheduling. S-Store enforces all three types of workload dependencies: temporal, parametric, and logical. State transactions with contended state accesses are serially executed in timestamp order, preserving temporal and parametric dependencies. Operations within the same transaction are also executed serially, preserving logical dependencies. This scheduling scheme has several advantages. It is easy to implement, minimizes context-switching overhead, and performs well when state transactions do not overlap. However, it offers limited parallelism when state transactions overlap, leading to reduced system performance.
+
+% \textbf{TStream}~\cite{tstream} adopts a different approach to scheduling. It partitions state transactions into atomic state access operations and assembles operations targeting the same state into timestamp-sorted groups called operation chains. These operation chains are executed in parallel as long as there are no \myc{parametric} dependencies among them. 
+% The remaining operation chains to process are left to the operating system.
+% TStream's scheduling strategy is driven by the need to enforce temporal dependencies. However, it may still suffer from random blocking (i.e., busy waiting) due to potentially unsolved parametric dependencies among operation chains. 
+% Furthermore, TStream overlooks logical dependencies, and aborts can only be handled when the current batch of state transactions is fully processed. 
+% This leads to significant wasted computation and costly rollback operations.
+
+In this subsection, we review the related work on TSPEs, focusing on two state-of-the-art TSPEs: S-Store and TStream.
+
+% \subsubsection{S-Store}
+\textbf{S-Store}~\cite{S-Store} splits shared mutable states into disjoint subsets called partitions. It schedules each state transaction as the unit of scheduling. S-Store enforces all three types of workload dependencies: temporal, parametric, and logical. State transactions with contended state accesses are serially executed in timestamp order, preserving temporal and parametric dependencies. Operations within the same transaction are also executed serially, preserving logical dependencies. This scheduling scheme has several advantages. It is easy to implement, minimizes context-switching overhead, and performs well when state transactions do not overlap. However, it offers limited parallelism when state transactions overlap, leading to reduced system performance.
+
+\textbf{TStream}~\cite{tstream} partitions state transactions into atomic state access operations and assembles operations targeting the same state into timestamp-sorted groups called operation chains. These operation chains are executed in parallel as long as there are no \myc{parametric} dependencies among them. 
+The remaining operation chains to process are left to the operating system.
+TStream's scheduling strategy is driven by the need to enforce temporal dependencies. However, it may still suffer from random blocking (i.e., busy waiting) due to potentially unsolved parametric dependencies among operation chains. 
+Furthermore, TStream overlooks logical dependencies, and aborts can only be handled when the current batch of state transactions is fully processed. 
+This leads to significant wasted computation and costly rollback operations.
+
+\emph{In summary}, existing approaches to TSPEs either actively track all types of dependencies with a serial schedule or implicitly resolve certain dependencies with locks. Both S-Store and TStream have their limitations in terms of parallelism and abort handling. There is a need for \myc{an optimized TSPE with improved scheduling strategy and execution paradigm} that can maximize system concurrency while maintaining correct schedules and efficiently handling aborts.
+
+\subcompact
+\subsection{Design Challenges}
+\label{subsec:challenges}
+Maintaining correctness and efficiency in TSPEs hinges on effectively addressing a host of challenges. These challenges span across dependency identification, state transaction scheduling, and operation execution. We identify three significant challenges:
+
+\paragraph{C1: Out-of-order Data Arrival:}
+Stream data processing is complicated by the unpredictable arrival order of data, which poses challenges in accurately identifying dependencies. Specifically, when the order of state transactions fails to align with their timestamps, potential discrepancies can emerge. For example, consider two state transactions, $txn_{1}$ and $txn_{2}$, as illustrated in Figure~\ref{fig:dependencies_in_SL}. While $txn_{2}$'s higher timestamp suggests that $O_{2}$ should depend temporally on $O_{1}$, the out-of-order arrival (i.e., $txn_{1}$ arriving after $txn_{2}$) can create a paradox. Mitigating this challenge necessitates TSPEs to develop mechanisms that accurately capture dependencies, regardless of the state transaction's arrival sequence.
+
+\paragraph{C2: Non-deterministic State Access:}
+For the correct execution of state transactions, it is essential to identify all dependencies before scheduling state access operations, implying that transactions should be aware in advance of all states they will interact with. 
+\myc{However, when state access is non-deterministic, meaning the accessed state is influenced by factors beyond the input event~\cite{Clonos}, immediate dependency determination becomes challenging.}
+This is further complicated in the scenario of range access, where an event triggers interaction with an arbitrary number of states, requiring precise tracking, ordering, and execution of the access operations for each state. Additionally, in the event of an abort, comprehensive rollback of all changes associated with the range access is critical. To address these challenges, TSPEs need to judiciously manage state access and ensure deterministic execution (Section~\ref{def:schedule}).
+
+\paragraph{C3: Window Operations:}
+Window operations~\cite{golab2}, which create temporal boundaries for data aggregation and processing, add further complexity to dependency identification and scheduling. 
+Dependencies may span across multiple windows, each of which can vary in size and can overlap with others, further complicating dependency tracking. 
+Sliding windows, which shift continuously over time, introduce an additional layer of complexity. 
+\myc{
+% Concurrent execution of multiple window operations also presents challenges, as each operation necessitates access to a particular state and collects input data within a window range, requiring intricate state management. 
+Concurrent execution of multiple window operations introduces complexities, as each operation requires access to specific states and collects input data within a designated window range. 
+This necessitates the implementation of sophisticated state management techniques to ensure accurate processing of window operations.
+}
+% Adding to these challenges, the handling of late-arriving data—common in stream processing scenarios—can influence previous window calculations and necessitate adjustments to already computed results, making temporal dependency maintenance and operation correctness even more challenging.
+% \curry{To maintain correctness and efficiency in TSPEs, it is crucial to address several challenges related to dependency identification, state transaction scheduling, and operation execution. These challenges include:}
+
+% \curry{\textbf{C1: Out-of-order:} 
+% The arbitrary order in which data arrives in stream processing poses challenges in accurately identifying dependencies. In particular, the order of state transactions may not align with their timestamps, leading to potential discrepancies in dependency identification. For instance, consider Figure~\ref{fig:dependencies_in_SL}, where we have two state transactions, $txn_{1}$ and $txn_{2}$. According to their timestamps, $O_{2}$ should have a temporal dependency on $O_{1}$, as $txn_{2}$ has a higher timestamp than $txn_{1}$. However, in practice, the arrival of state transactions may be out-of-order, meaning that $txn_{1}$ may arrive after $txn_{2}$. To address this challenge, TSPEs need to implement mechanisms that ensure dependencies are accurately captured, regardless of the arrival order of state transactions.}
+
+% \curry{
+% \textbf{C2: Non-deterministic state access:}
+% To guarantee the correct execution of state transactions, it is necessary to identify all dependencies before scheduling state access operations. It means that the state transaction needs some way to know in advance all states it will need to access. However, non-deterministic state access such as when the state to be accessed depends on something beyond the input event, makes it impossible to determine the existence of dependencies immediately. Additionally, handling aborts in non-deterministic state access must ensure that the state is rolled back exactly as it was before. To address this challenge, TSPEs need to carefully decide which state needs to be accessed and ensure determined execution (Section~\ref{def:schedule}).
+% Moreover, when a single event triggers access to an arbitrary number of states, i.e., range access, the complexities in dependency identification and scheduling multiply. This scenario requires not only the tracking of each state accessed but also the correct ordering and execution of these access operations. Furthermore, in the case of aborts, the TSPE must ensure a comprehensive rollback of all state changes associated with the range access.
+% }
+
+% \curry{\textbf{C3: Window operations:} 
+% Window operations~\cite{golab2} introduce additional complexity in dependency identification and scheduling. Window operations define temporal boundaries for aggregating and processing data, and dependencies may span across different windows. Moreover, executing multiple window operations requires accessing the correct version of the state associated with each window. To address this challenge, TSPEs need to accurately track dependencies that involve windowing operations and ensure correct execution within the specified windows.}

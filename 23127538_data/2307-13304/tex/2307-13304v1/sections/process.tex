@@ -1,0 +1,251 @@
+
+\begin{algorithm}[t]
+\caption{QuIP - Incoherence Pre-Processing}\label{algQuIPpre}
+\begin{algorithmic}[1]
+\Require $b \in \mathbb{N}$, $H \in \mathbb{R}^{n \times n}$ SPD, original $W \in \mathbb{R}^{m \times n}$, $\rho \in \R_+$, $\alpha \in [0,1]$
+\State \textbf{seeded sample} random two-factor orthogonal matrices $U \in \mathbb{R}^{m \times m}$ and $V \in \mathbb{R}^{n \times n}$
+\State $H = H + \alpha * \operatorname{mean}(\operatorname{diag}(H)) I$ \Comment{from OPTQ}
+\State $\tilde D \gets \sqrt[4]{ \diag{H} / \diag{W^T W} }$ \Comment{$\sqrt[4]{\;\;}$ applies element-wise}
+\State $W \gets W \tilde D$; 
+\;
+$H \gets \tilde D^{-1} H \tilde D^{-1}$ 
+\Comment{diagonal rescaling}\label{alg1rescale_a}
+\State $W \gets U W V^T$;
+\;
+$H \gets V H V^T$
+\Comment{incoherence}\label{alg1incoherent_a}
+\State $s \gets \rho \|W\|_F / \sqrt{mn}$;
+\;
+$W \gets \frac 12 (\frac 1s W + 1)$
+\Comment{reduced quantization range due to incoherency}\label{alg1reducedquant}
+\State \Return $W \gets \operatorname{clamp}(W * (2^b-1), 0, 2^b-1)$ \Comment{rescale $W$ to lie within $[0, 2^b-1]$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{QuIP - Incoherence Post-Processing}\label{algQuIPpost}
+\begin{algorithmic}[1]
+\Require $b \in \mathbb{N}$, $H \in \mathbb{R}^{n \times n}$ SPD, quantized $W \in [0, 2^b-1]^{m \times n}$, $s \in \R$ \& $\tilde D \in \R^{n \times n}$ (Alg~\ref{algQuIPpre})
+\State \textbf{seeded sample} random two-factor orthogonal matrices $U \in \mathbb{R}^{m \times m}$ and $V \in \mathbb{R}^{n \times n}$
+\State $W \gets s * \left( ( W / (2^b - 1) ) * 2 - 1 \right)$
+\State $W \gets U^T W V$;
+\;
+$H \gets V^T H V$
+\Comment{revert incoherence}
+\State \Return $W \gets W \tilde D^{-1}$ \Comment{revert diagonal rescaling}
+\end{algorithmic}
+\end{algorithm}
+
+
+
+Next, we leverage the above incoherence analysis to introduce \emph{incoherence processing}, the second step of the QuIP algorithm.
+Our strategy will be to pre-process weight and Hessian matrices to ensure the favorable incoherence properties outlined above.
+One straightforward way to make a symmetric matrix incoherent is to conjugate it by a uniform random orthogonal matrix: this will result in each of its eigenvalues being a random unit vector, whose entries will concentrate around magnitude $n^{-1/2}$. 
+
+Specifically, let $U \in \R^{m \times m}$ and $V \in \R^{n \times n}$ be two random orthogonal matrices.
+(Let's temporarily ignore how these matrices are generated, or how we would efficiently perform inference.)
+We ensure the weight and Hessian are incoherent with high probability through random orthogonal multiplications $\tilde H \gets V H V^T$ and $\tilde W \gets U W V^T$.
+Importantly, this transformation preserves the proxy quadratic form since $\operatorname{tr}(\tilde W \tilde H \tilde W^T) = \operatorname{tr}( (U W V^T) (V H V^T) (V W^T U^T) ) = \operatorname{tr}( W H W^T )$.
+
+\newcommand{\titleFastOrth}{Incoherence via Efficient Orthogonal Multiplication}
+\subsection{\titleFastOrth}\label{secFastOrth}
+\begin{toappendix}
+\subsection*{Subsection~\ref{secFastOrth} (\titleFastOrth)}
+\end{toappendix}
+If all we wanted to do was to store or transmit the weights of the quantized neural network, the above procedure would introduce no overhead, since we can generate a random orthogonal matrix from a seed---making it essentially free to store. However, for running \emph{inference} on a DNN, we need to multiply by the  weight matrix $W$, and here the need to manifest and multiply by $n \times n$ random orthogonal matrices $U, V$ would be prohibitive.
+
+To handle this, we propose to instead use a distribution over random orthogonal matrices for which multiplication is fast. Let $n = pq$ be a factorization of $n$ (where $p \approx q \approx \sqrt{n}$), and set $U = U_L \otimes U_R$ where $U_L$ is sampled uniformly from the $p \times p$ orthogonal matrices and $U_R$ is sampled uniformly from the $q \times q$ orthogonal matrices.  
+Multiplication of a vector $x \in \R^n$ by the matrix $U$ can be accomplished by reshaping to a $p \times q$ matrix, multiplying on the left by $U_L$ and the right by $U_R^T$, and then reshaping back: this takes $O(n (p + q)) = o(n^2)$ operations. Using more than two factors in this way is also possible, but using two suffices to make this preprocessing asymptotically non-dominant.
+
+\begin{toappendix}    
+\begin{lemma}[Theorem 2.4 from~\citet{lalley2018prob}
+]
+There exist constants $C$ and $A$ independent of $n$ such that for any function $F$ from the unit sphere in $n$ dimensions to $\R$ that is 1-Lipschitz relative to the Riemannian metric on the sphere,
+\[
+    \mathbf{P}_{x \sim \mathcal{S}_n}\left( F(x) - \mathbf{E}_{x \sim \mathcal{S}_n}[F(x)] \ge t \right)
+    \le
+    C \exp\left( -\frac{n t^2}{A} \right)
+\]
+\label{lemmaSphere}
+\end{lemma}
+
+\begin{lemma}
+    Let $B \in \mathbb{R}^{m \times n}$ be a matrix, and let $x$ be a random vector uniformly distributed on the unit sphere in $\R^n$. Then there exist global constants $A > 0$ and $C > 0$ independent of $m$ and $n$ such that
+    \[
+        \mathbf{P}\left( \norm{Bx}^2 \ge \frac{A \norm{B}_F^2}{n} \log\left( \frac{C}{\delta} \right) \right)
+        \le
+        \delta,
+    \]
+    \label{lemmaOneStep}
+\end{lemma}
+\begin{proof}
+Let
+\[
+    F(x) = \frac{\norm{Bx}}{\norm{B}_F}.
+\]
+Observe that
+\[
+    \nabla F(x) = \frac{B^T B x}{\norm{B x} \cdot \norm{B}_F},
+\]
+and so
+\[
+    \norm{\nabla F(x)} \le 1.
+\]
+Also observe that for $x$ drawn uniformly from the sphere in $n$ dimensions,
+\[
+    \Exv{F(x)} \le \sqrt{\Exv{F(x)^2}} = \frac{1}{\norm{B}_F} \cdot \sqrt{\Exv{ \norm{B x}^2 }}
+    =
+    \frac{1}{\sqrt{n}}.
+\]
+So, applying Lemma~\ref{lemmaSphere},
+\[
+    \mathbf{P}\left( \frac{\norm{Bx}}{\norm{B}_F} - \frac{1}{\sqrt{n}} \ge t \right)
+    \le
+    C \exp\left( -\frac{n t^2}{A} \right).
+\]
+If we let $\delta$ be
+\[
+    \delta = C \exp\left( -\frac{n t^2}{A} \right),
+\]
+then
+\[
+    \frac{A}{n} \log\left( \frac{C}{\delta} \right) = t^2
+\]
+Trivially, then, for some modified global constants $A'$ and $C'$,
+\[
+    \frac{A'}{n} \log\left( \frac{C'}{\delta} \right) = \left(t + \frac{1}{\sqrt{n}} \right)^2
+\]
+This means that
+\[
+    \mathbf{P}\left( \frac{\norm{Bx}^2}{\norm{B}_F^2} \ge \frac{A'}{n} \log\left( \frac{C'}{\delta} \right) \right)
+    \le
+    \delta,
+\]
+i.e.
+\[
+    \mathbf{P}\left( \norm{Bx}^2 \ge \frac{A' \norm{B}_F^2}{n} \log\left( \frac{C'}{\delta} \right) \right)
+    \le
+    \delta,
+\]
+This is what we wanted to prove.
+\end{proof}
+\end{toappendix}
+
+\begin{lemmarep}\label{lemFastInco}
+Let $H$ be a positive semi-definite matrix on $\R^{n \times n}$ and $W$ a matrix on $\R^{m \times n}$, and suppose that $m = p_1 \cdot p_2 \cdots p_k$ and $n = q_1 \cdot q_2 \cdots q_k$. Let $U_1, U_2, \ldots, U_k, V_1, V_2, \ldots, V_k$ be independent random orthogonal matrices on $\R^{p_i \times p_i}$ and $\R^{q_i \times q_i}$ respectively.
+Set $U$ as the Kronecker product $U = U_1 \otimes U_2 \otimes \cdots \otimes U_k$ and $V$ as $V = V_1 \otimes V_2 \otimes \cdots \otimes V_k$
+Then $V H V^T$ is $\mu_H$-incoherent with probability at least $1 - \delta$, and $U W V^T$ is $\mu_W$-incoherent with probability at least $1 - \delta$,
+where
+\[
+    \mu_H
+    =
+    A^{k/2} \log\left( \frac{C k n^2}{\delta} \right)^{k/2}
+    =
+    \tilde{\mathcal{O}}\left( 1 \right)
+    \;\;\text{and}\;\;
+    \mu_W
+    =
+    A^k \log\left( \frac{2 C k m n}{\delta} \right)^k
+    =
+    \tilde{\mathcal{O}}\left( 1 \right)
+\]
+for some global constants $A$ and $C$ independent of $n$ and $k$.
+\end{lemmarep}
+\begin{proof}
+    First we will prove what we want to prove about $H$; then we will prove what we want to prove about $W$. Let $Q$ be a matrix of eigenvectors of $H$.
+    Observe that since $Q$ is an orthogonal matrix (by the spectral theorem, because $H$ is symmetric), $Q e_j$ is a unit vector, i.e. $\norm{ Q e_j } = 1$. Call $Q e_j = y$. Also observe that
+    \[
+        e_i^T (U_1 \otimes U_2 \otimes \cdots \otimes U_k)
+        =
+        ((e_{i_1}^T U_1) \otimes (e_{i_2}^T U_2) \otimes \cdots \otimes (e_{i_k}^T U_k))
+    \]
+    for some indices $i_j$.
+    Call $e_{i_j}^T U_j = x_j^T$, and observe that the $x_j$ are all independent unit random vectors. So,
+    \[
+        \left( (U_1 \otimes U_2 \otimes \cdots \otimes U_k) Q \right)_{ij}
+        =
+        (x_1 \otimes x_2 \otimes \cdots \otimes x_k)^T y
+    \]
+    for random unit vectors $x_1, \ldots, x_k$ and unit vector $y$.
+    We can easily bound this with $k$ applications of Lemma~\ref{lemmaOneStep} and a union bound, yielding
+    \[
+        \mathbf{P}\left( \left( (x_1 \otimes x_2 \otimes \cdots \otimes x_k)^T y \right)^2 \ge \frac{A^k}{n} \log\left( \frac{C}{\delta} \right)^k \right)
+        \le
+        k \delta,
+    \]
+    Setting $\delta \mapsto \frac{\delta}{k n^2}$ yields
+    \[
+        \mathbf{P}\left( \left( (x_1 \otimes x_2 \otimes \cdots \otimes x_k)^T y \right)^2 \ge \frac{A^k}{n} \log\left( \frac{C k n^2}{\delta} \right)^k \right)
+        \le
+        \frac{\delta}{n^2},
+    \]
+    and unioning over all the entries of the large orthogonal matrix,
+    \[
+        \mathbf{P}\left( \max_{i,j} \; \Abs{ \left( (U_1 \otimes U_2 \otimes \cdots \otimes U_k) Q \right)_{ij} } \ge \sqrt{ \frac{A^k}{n} \log\left( \frac{C k n^2}{\delta} \right)^k } \right)
+        \le
+        \delta.
+    \]
+    
+    Next, for $W$, observe that if we flatten $W$, then $W/\norm{W}_F$ is a unit vector. Then any entry of the resulting matrix can be written as
+    \[
+        (x_1 \otimes x_2 \otimes \dots \otimes x_k)^T W (y_1 \otimes y_2 \otimes \dots \otimes y_k)
+    \]
+    where $x_1, \dots, x_k$ and $y_1, \dots, y_k$ are $k$ independent random unit vectors.
+    We can easily bound this with $2k$ applications of Lemma~\ref{lemmaOneStep} and a union bound, yielding
+    \[
+        \mathbf{P}\left( \left( 
+        (x_1 \otimes x_2 \otimes \dots \otimes x_k)^T W (y_1 \otimes y_2 \otimes \dots \otimes y_k)
+        \right)^2 \ge \frac{A^{2k}}{mn} \log\left( \frac{C}{\delta} \right)^{2k} \right)
+        \le
+        2 k \delta,
+    \]
+    Setting $\delta \mapsto \frac{\delta}{2 k m n}$ yields
+    \[
+        \mathbf{P}\left( \left( 
+        (x_1 \otimes x_2 \otimes \dots \otimes x_k)^T W (y_1 \otimes x_2 \otimes \dots \otimes y_k)
+        \right)^2 \ge \frac{A^{2k}}{mn} \log\left( \frac{2 C k mn}{\delta} \right)^{2k} \right)
+        \le
+        \frac{\delta}{m n},
+    \]
+    and unioning over all the $mn$ entries of the large orthogonal matrix,
+    \[
+        \mathbf{P}\left( \max_{i,j} \; \Abs{ e_i^T (U_1 \otimes U_2 \otimes \dots U_k) W (V_1 \otimes V_2 \otimes \dots \otimes V_k) e_j }  \ge \sqrt{ \frac{A^{2k}}{mn} \log\left( \frac{2 C k mn}{\delta} \right)^{2k} } \right)
+        \le
+        \delta.
+    \]
+    This is what we wanted to show.
+
+\end{proof}
+
+\textbf{Remarks.} This lemma means that multiplying by a random matrix in this family suffices to make a matrix incoherent with parameter $\mu$ only poly-logarithmic in the matrix size.
+
+
+\subsection{Additional Heuristics}\label{secAddHeur}
+We outline QuIP pre-processing and post-processing in Algorithms \ref{algQuIPpre} and \ref{algQuIPpost}, respectively.
+In line~\ref{alg1incoherent_a} of Algorithm~\ref{algQuIPpre}, we apply the aforementioned fast orthogonal multiplication procedure to ensure $W$ and $H$ are incoherent.
+We also randomly permute entries at the fast matrix multiplication step to prevent any correlation between attention heads from worsening performance. We introduce a number of additional heuristic improvements that further improve performance.
+
+\textbf{Incoherence-Based Heuristics.}
+Line~\ref{alg1rescale_a} diagonally rescales $W$ and $H$ to minimize $\ell(\hat W) \approx \trace{H} \|W\|_F^2$, effectively trading off the spectrum of these matrices to find a minimum.
+Motivated by the incoherence of $W$, Line~\ref{alg1reducedquant} computes the quantization range depending on the spectrum $\|W\|_F$, instead of the typical $\max_{i,j} |W_{ij}|$.
+Our full QuIP procedure is described in Algorithm~\ref{algQuIP}, which contains calls to the pre- and post-processing sub-steps in Algorithms~\ref{algQuIPpre} and~\ref{algQuIPpost}.
+
+\textbf{Greedy local search.}
+Our basic procedure yields a good initial guess with error guarantees. 
+We can further lower the proxy loss by running coordinate descent after LDLQ (but before post-processing), updating the weights in the same order as in the initial pass. See Supplement~\ref{suppExtraMethod} for full details.
+
+
+
+\begin{algorithm}[t]
+\caption{QuIP: Quantization with Incoherence Processing}\label{algQuIP}
+\begin{algorithmic}[1]
+\Require $b \in \mathbb{N}$, $H \in \mathbb{R}^{n \times n}$ SPD, $W \in \R^{m \times n}$, $\round \in \{\near, \stoch\}$, $\rho \in \R_+$, $\alpha \in [0,1]$
+\State \textbf{LDL decomposition} of $H = (\grave U + I) D (\grave U + I)^{-1}$
+\State $\hat W \gets \operatorname{Alg~\ref{algQuIPpre}}(b, H, W,  \rho, \alpha)$ \Comment{QuIP Incoherence Pre-Procesing}
+\State \textbf{for} $k \in \{1, \dots, n\}$ \textbf{do} 
+$\hat W_k \gets \operatorname{clamp}(\round( W_k + (W - \hat W) \grave U_k ), 0, 2^b-1)$ \Comment{LDLQ}
+\State \Return $\hat W \gets \operatorname{Alg~\ref{algQuIPpost}}(b, H, \hat W)$ \Comment{QuIP Incoherence Post-Processing}
+\end{algorithmic}
+\end{algorithm}
+
+

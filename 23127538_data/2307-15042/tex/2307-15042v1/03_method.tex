@@ -1,0 +1,99 @@
+% Figure environment removed
+\section{Method}
+We propose a new approach to synthesize long motion sequences using diffusion models. Our approach extends the classic DDPM framework to support injection of temporally-varying noise levels during the diffusion process. This extension enables entangling the \textit{temporal-axis} of the motion sequence with the \textit{time-axis} of the diffusion process. 
+In the particular case where the first frame in the sequence is mapped into the lowest noise level, the last frame to the highest level, and the mapping function is linear,  we can continuously synthesize arbitrarily many frames during inference - akin to a \textit{motion buffer}. In each diffusion step we get a clean frame at the beginning of the sequence, shift the frames in the stack by popping the clean frame, and append a new noisy frame (drawn from a Gaussian distribution) to the end of the sequence. Repeating this process during inference results in a new mechanism for long term motion synthesis.
+We describe below the motion representation (\ref{sec:motionrep}), novel diffusion framework (\ref{sec:diffusionmodels}), training (\ref{sec:training}) and inference procedure (\ref{sec:inference}). 
+
+\subsection{Motion representation}
+\label{sec:motionrep}
+We represent a motion sequence by a temporal set of $K$ poses that consists of root joint displacements with respect to the xz-plane ${\bf O_{xz}} \in \R^{K \times 2}$, root joint height $\bf{O_y}\in \R^{K}$, and joint rotations $\bbr \in \R^{K \times JQ}$, where $J$ is the number of joints and $Q$ is the number of rotation features. The rotations are defined in the coordinate frame of their parent in the kinematic chain, and represented by the 6D rotation features ($Q = 6$) proposed by Zhou \etal~\shortcite{zhou2019continuity}. To mitigate foot sliding artifacts, we incorporate foot \emph{contact labels} as a $C\cdot K$ binary values $\bbl\in\{0,1\}^{K\times C}$, which correspond to the contact labels of the foot joints. In our work, we let $C=4$, where the joints are the left(right) heels and toes. All the features are concatenated along the channel axis and we denote the full representation by 
+$\bbm \equiv [\bbo_{xz}, \bbo_{y}, \bbr,\bbl]\in \R^{K \times(JQ+C+3)}$. 
+
+\subsection{Diffusion 
+Models}
+\label{sec:diffusionmodels}
+
+Diffusion Denoising Probabilistic Models (DDPM)~\cite{sohl2015deep,ho2020denoising} are generative models that aim to approximate a given data distribution $q(m_0)$ with an easy and intuitive sampling mechanism that is inspired by diffusion processes in physics. In the particular case of motion synthesis, the data consists of fixed-length motion sequences. During training, the process starts by sampling a clean motion sequence $m_0$ from the dataset, then an IID Gaussian noise is added gradually to form a sequence of noisy motions which constitute the latent variables of the process \{$m_1,\ldots,m_T\}$.
+The latent sequence follows $q(m_1,\ldots,m_t\mid m_0)=\prod_{i=1}^{t}q(m_i\mid m_{i-1})$, where 
+a sampling step in the forward process (clean data to noise) is defined as a Gaussian transition $q(m_t\mid m_{t-1}):= \mathcal{N}(\sqrt{1-\beta_t}m_{t-1},\beta_t I)$ parameterized by a schedule $\beta_0,\ldots,\beta_T\in (0,1)$. When the total diffusion time step $T$ is large enough, the last noise vector $m_T$ nearly follows an isotropic Gaussian distribution.
+
+In order to sample from the distribution $q(m_0)$, we define the dual ``reverse process'' $p(m_{t-1}\mid m_t)$ from isotropic Gaussian noise $m_T$ to data by sampling the posteriors $q(m_{t-1} \mid m_t)$. Since the intractable reverse process $q(m_{t-1} \mid m_t)$ depends on the unknown data distribution $q(m_0)$, we approximate it with a parameterized Gaussian transition network $p_\theta(m_{t-1}\mid m_t):=\mathcal{N}(m_{t-1}\mid \mu_\theta(m_t,t),\Sigma_\theta(m_t,t))$. 
+
+As suggested by ~\cite{tevet2022human}, instead of predicting the noise as formulated by~\cite{ho2020denoising}, 
+we follow~\cite{ramesh2022hierarchical} and the network predicts the signal itself while solving the following optimization problem:
+
+\begin{equation}
+    \min_\theta L(\theta):=\min_\theta E_{m_0\sim q(m_0),w\sim N(0,I),t} \norm{m_0  -\mu_\theta(m_t,t)}^2,
+    \label{eq:diffusion_loss}
+\end{equation}
+
+which maximizes a variational lower bound. In addition, we find that it is best to fix the variance schedule on the reverse process, namely setting $\Sigma_\theta = \beta_t I$ for all time steps, so our model only needs to learn to predict the clean motion. For more details about DDPMs please refer to~\cite{sohl2015deep,ho2020denoising}. 
+
+
+\subsection{Teporally-Entangled Diffusion}
+\label{sec:training}
+
+Next, we extend the DDPM framework to support injection of temporally-varying noise levels during the diffusion process. The noise level becomes a function of the frame index and we discard the notion of the diffusion time-axis during training. Effectively, we are setting $T = K$ and identifying the diffusion time-axis and the motion temporal-axis. We propose two schemes for noise injection: 1) random schedule, and 2) monotonic schedule (we avoid the term linear schedule as it is commonly used to indicate a type of variance schedule ~\cite{nichol2021improved}). Note that these are \textit{not} variance schedules. Concretely, given a fixed variance schedule $\beta_{t_i} \in (0, 1), t_i\in \{0, 1, \ldots, T\}$, at each training step the random schedule is given by 
+\begin{equation}
+    [\beta_{t_1}, \beta_{t_2}, \ldots, \beta_{t_K}],\ t_i \sim \mathcal{U}(0, T).
+\end{equation}
+On the other hand, the monotonic schedule is given by 
+\begin{equation}
+    [\beta_{t_1}, \beta_{t_2}, \ldots, \beta_{t_K}],\ t_i =i.
+\label{eq:identity}
+\end{equation}
+The former gives a temporally-varying noise level while the latter gives a monotonically increasing noise level. 
+
+
+In practice, we use a mix of these two noise injection schemes during training, so the model learns to completely denoise a motion sequence with varying noise levels across frames. This enables us to create explicit entanglement between the time axis of the diffusion process and the temporal-axis of the motion - a unique property which will be exploited during inference.
+
+For each iteration during training, we sample from the dataset a motion sequence of length $K$, $[f_1, f_2, \ldots, f_K]$. The model is given the noise injected motion $[\Tilde{f_1}, \Tilde{f_2}, \ldots, \Tilde{f_K}]$ as input where 
+$$
+    \Tilde{f_i} \sim \mathcal{N}(\sqrt{\bar{\alpha}(t_i)}f_i, (1 - \bar{\alpha}(t_i) I),
+$$
+for $\bar{\alpha}(t_i) = \prod_{j=1}^{t_j} (1 - \beta_{t_j})$, and is tasked to predict the clean motion $[f_1, f_2, \ldots, f_K]$ directly. To give the network a mixture of the two types of noise injection, we assign $[\beta_{t_j}]_{j=1}^K$ using the random schedule or monotonic schedule with fixed probabilities $p$ and $1-p$. We set $p=\frac{2}{3}$ in practice. In particular, the training objective with the random schedule is similar to those of a pose-oriented diffusion model, where we view the entire motion sequence as a batch of poses with batch size $K$. And at each frame index, the model tries to learn a posterior
+$$
+    q^*(f^{t-1}\mid f^t)
+$$
+where the superscript indicates time in the diffusion time-axis, and $q^*(f^0)$ is the data distribution of individual poses. Then, the objective with monotonic noise schedule serves to provide additional supervision to ensure smooth transitions across frames during inference. 
+
+\subsubsection{Loss functions}
+As previously mentioned, the benefit of predicting the clean motions directly is that it gives access to regularizations that otherwise would be ill-defined for the mollified distributions. For instance, joint velocities cannot be properly regularized with loss terms for noisy motions. Due to the hierarchical nature of the human model, errors accumulate along the kinematic chains, thus errors on joint rotations should be weighted appropriately with respect to their positions in the hierarchy. Therefore, we add a positional loss loss defined as follows:
+\begin{equation}
+    \mathcal{L}_{\text{pos}} = \frac{1}{KJ}\sum^K_{t = 1}\norm{\FK(\hat{\bbr}_t, \hat{\bbo}_t) - \FK(\bbr_t, \bbo_t)}^2,
+\end{equation}
+where $\FK: \R^{JQ}\times \R^3\to \R^{3J}$ is a forward kinematics operator for a fixed skeleton $S$, and $\hat{\bbr}, \hat{\bbo}$ are the model predicted joint rotation and displacements and $\bbr, \bbo$ are the corresponding ground truth. In addition, since foot contact is vital to generating natural motions and enables using inverse kinematics as post-process, we further penalize errors accumulated at the foot joint with the following foot contact loss:
+\begin{equation}
+    \mathcal{L}_{\text{contact}} = \frac{1}{KC}\sum_{j}\sum_{t=1}^{K-1}\norm{\FK(\bbr_{t+1}, \bbo_{t+1})_j - \FK(\bbr_t, \bbo_t)_j}^2{\cdot} s(\bbl_{tj}),
+\end{equation}
+where \[
+    s = \frac{1}{1 + e^{-12(x-0.5)}}.
+\]
+This penalizes high foot velocity while having true contact labels, thus ensuring self-consistency of the generated motions. 
+
+\subsubsection{Training}
+    In summary, our full training loss is
+    \begin{equation}
+        \mathcal{L} = \lambda_{\text{diff}}\mathcal{L}_{\text{diff}}+\lambda_{\text{pos}}\mathcal{L}_{\text{pos}}+\lambda_{\text{contact}}\mathcal{L}_{\text{contact}}
+    \end{equation}
+    where $\mathcal{L}_{\text{diff}}$ corresponds to the diffusion loss specified by equation \eqref{eq:diffusion_loss}, and the $\lambda$ parameters determine the weights of the losses. 
+    
+Our diffusion network is inspired by the typical U-Net model used in the 2D image diffusion domain~\cite{rombach2022high}. In order for the network to process 1D signals, we use 1D convolutions striding over the temporal axis. We also use 1D attention blocks and skip connections so long term frame correlations are captured within the motion data.
+
+% Figure environment removed
+\subsection{Inference}
+\label{sec:inference}
+
+During inference, we take advantage of the monotonic noise schedule that our model trained on. We use a typewriting-like system, as depicted in Fig. \ref{fig:typewriter}. Our model maintains a buffer of frames with monotonically increasing noise, where the first frame in the buffer is mapped to the lowest noise level, and and the last to the highest, as described in~\eqref{eq:identity}. The model is designed to generate motion autoregressively. At the beginning, the buffer is initialized with a given motion sequence that is noised with increasing variance. Then, at each iteration, the model processes all the frames in the motion sequence in parallel and produces a progressively denoised sequence. At this point, the first frame in the sequence is completely clean and can be popped from the buffer. We sample a new frame from standard Gaussian distribution and push it into the motion sequence at the end of the buffer. The model can then iteratively perform this denoising mechanism. This mode of generation can be continued indefinitely as desired, and the resulting motion frames are collected frame by frame from the model output.
+
+    Concretely, let $M_\theta$ be our model and let $I = [\tilde{f}_1, \dots, \tilde{f}_K]$ be the initialization (clean motion that is noised with increasing variance) and let $F_{\text{out}}$ denote the (initially empty) set of output frames. At time step $t$, $t\in \{1, 2, \dots\}$, we have the update
+    \begin{align*}
+        &F_{\text{out}} = [F_{\text{out}}, M_\theta(I)_1],\\
+        &\tilde{f}_{i-1} = M_\theta(I)_{i}, \ i\in \{2, \dots K\}, \\
+        &\tilde{f}_K = X \sim \mathcal{N}(0, I),\\
+        &I = [\tilde{f}_1, \dots, \tilde{f}_K],
+    \end{align*}
+    where $M_\theta(I)_i$ denotes the $i$-th frame in the output of our model.
+
+
+We highlight the distinction from a typical inference pass in the standard diffusion process, which samples Gaussian noise using the full motion length and repeatedly denoises the entire motion. For such a generation scheme, all the frames are required to pass through the model $T$ times. Here, our inference scheme is able to output a new clean frame after only one forward pass of the model. At the same time, a newly sampled frame (pure noise) that gets pushed into the motion buffer will stay in the motion buffer for $T$ iterations, going through all diffusion time steps before getting added to the output. In short, our inference method enables faster autoregressive generation yet ensures that each frame of motion goes through the full diffusion process. 

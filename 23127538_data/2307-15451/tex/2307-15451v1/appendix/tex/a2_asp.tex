@@ -1,0 +1,247 @@
+\section{ASP Encodings}\label{sec:asp}
+    In this section, we describes the Answer Set Programming (ASP) encodings of \textsc{delphic} and of the traditional Kripke semantics for DEL. We assume that the reader is familiar with the basics concepts of ASP. 
+    %
+    Notably, our encodings make use of the \emph{multi-shot} solving strategy provided by the ASP-solver \emph{clingo}, which provides fine-grained control over grounding and solving of ASP programs, and is instrumental to implementing an incremental strategy for solving. For a detailed introduction on multi-shot ASP solving, we refer the reader to \cite{journals/tplp/Gebser2019,journals/tplp/Kaminski2023}.
+    
+    We developed our ASP encodings in such a way that \textsc{delphic} objects (\eg possibility/eventuality spectrums) and DEL objects (\eg MPKMs/MPEMs) are encoded by closely mirroring each other, and only differing in the two update operators (\ie union update and product update). This homogeneity is instrumental to obtain a fair experimental comparison of the two encodings, presented in Section 4 of the main paper. At the same time, as detailed later, we stress that the timings exhibited by our ASP encoding of the Kripke semantics are comparable to those shown by the state-of-the-art solver EFP 2.0 \cite{conf/icaps/Fabiano2020}, which also implements on the Kripke semantics.
+    %
+    Due to the similarity of the two encodings, in the following we use generic terms such as ``epistemic state/action'' and ``planning task'' to abstract away from which underlying semantics is actually chosen.
+
+    The \textsc{delphic} encoding presented in this section constitutes a contribution of this paper of independent interest. In fact, it generalizes the ASP-based epistemic planner \textsf{PLATO} \cite{journals/tplp/Burigana2020}, which implements a possibility-based semantics for a fragment of DEL \cite{conf/icaps/Fabiano2020}. 
+    Moreover, having an ASP-based solver for epistemic planning has several benefits. 
+    First, the declarative encoding of the \textsc{delphic} semantics allows for an implementation that is transparent and easier to inspect. 
+    Second, we exploited the Python API offered by \emph{clingo} to implement a graphical representation that shows the epistemic states visited by the planner. We thus obtain a practical and useful tool that allows to visualize the evolution of the system. This feature is instrumental in different tasks, such as designing new epistemic planning domains and debugging the correctness of implementations\footnote{The full code and documentation of the ASP encodings are available at 
+    %the following 
+    %\href{https://github.com/a-burigana/delphic_asp}{\emph{link}}
+    \url{https://github.com/a-burigana/delphic\_asp}.}. We concretely show a graphical comparison of the output of the two encodings in the appendix on a concrete domain instance (we do not directly report it here due to space reasons).
+    
+    The remainder of the section is as follows. First, we briefly describe how \emph{incremental solving} is achieved by the multi-shot solving technique (Section \ref{sec:multi-shot}). Then, we illustrate both encodings component by component: 
+    \begin{inparaenum}[\itshape (i)] 
+    \item formulae in Section \ref{sec:formuale-enc}, 
+    \item planning tasks in Section \ref{sec:task-enc}, 
+    \item epistemic states in Section \ref{sec:state-enc}, 
+    \item truth conditions in Section \ref{sec:truth-enc}, and 
+    \item update operators in Section \ref{sec:update-enc}).
+    \end{inparaenum}
+
+    \subsection{Multi-shot Encoding}\label{sec:multi-shot}
+        The multi-shot approach allows one to divide an ASP encoding into sub-programs, then handling grounding and solving of these sub-programs separately. In particular, this technique is useful to implement \emph{incremental solving}, which, at each time step, allows to extend the ASP program in order to look for solutions of increasing size. Intuitively, every step mimics a Breadth-First Search over the planning state space: at each time step $\asp{t}$, if a solution is not found (\ie there is no plan of length $\asp{t}$ that satisfies the goal), the ASP program is expanded to look for a longer plan.
+
+        To achieve incremental solving, we build on the approach by Gebser et al. \cite{journals/tplp/Gebser2019}, splitting our encodings in three subprograms:
+        \begin{enumerate*}
+            \item program $\asp{base}$, which contains all the static information (\ie input information on the planning task);
+            \item program $\asp{step(t)}$, where $\asp{t}{>}0$, which describes the evolution of the system (\ie updates semantics); and
+            \item program $\asp{check(t)}$, where $\asp{t}{\geq}0$, which verify the truth of formulae of the domain and, in particular, of the goal formula.
+        \end{enumerate*}
+        %
+        Here, $\asp{t}$ represents the current time step that is being considered. In the reminder of this section, when we describe components of the encodings pertaining to the sub-programs $\asp{step(t)}$ and $\asp{check(t)}$, we assume $\asp{t}$ fixed.
+
+    \subsection{Formulae}\label{sec:formuale-enc}
+        We represent epistemic formulae through nested ASP predicates. To enhance the performance of grounding and solving, we assume that all input formulae are given in a normal form where occurrences of the $\Box_i$ operators are replaced by the dual representation $\neg\Diamond_i\neg$, and where double negation is simplified.
+        %
+        Agents and atoms are represented by the ASP predicates $\asp{agent(AG)}$ and $\asp{atom(P)}$, respectively. 
+        A formula $\varphi$ is encoded inductively on its structure:
+        \begin{enumerate*}
+            \item $\varphi=\atom{p}$ is encoded by $\asp{p}$;
+            \item $\varphi=\neg\psi$ is encoded by $\asp{neg(PSI)}$;
+            \item $\varphi=\psi_1 \wedge \psi_2$ is encoded by $\asp{and(PSI_1, PSI_2)}$; and
+            \item $\varphi=\Diamond_i\psi$ is encoded by $\asp{dia(i, PSI)}$.
+        \end{enumerate*}
+
+    \subsection{Planning Tasks}\label{sec:task-enc}    
+        We now describe our ASP encoding of a planning task.
+
+        \mypar{Initial State.}
+        The initial state is given by the following ASP predicates:
+        \begin{enumerate*}
+            \item $\asp{w\_init(W)}$: $\asp{W}$ is an initial possibility/possible world;
+            \item $\asp{r\_init(W_1, W_2, AG)}$: in $\asp{W_1}$, agent $\asp{AG}$ considers $\asp{W_2}$ to be possible;
+            \item $\asp{v\_init(W, P)}$: atom $\asp{P}$ is true in $\asp{W}$;
+            \item $\asp{dw\_init(W)}$: $\asp{W}$ is a designated possibility/world.
+        \end{enumerate*}
+
+        \mypar{Actions.}
+        To obtain efficient encodings of the two semantics, and directly support existing benchmarks from the literature, we introduce two features in the definition of actions, namely \emph{(global) action preconditions} and \emph{observability conditions}.
+
+        An action precondition is specified with the ASP predicate $\asp{action\_pre(ACT, PRE)}$ and represents the applicability of the action as a whole. This is syntactic sugar: action preconditions do not modify the expressiveness of epistemic actions, and one can always get an equivalent epistemic action that does not employ them.
+
+        Observability conditions provide a useful way to compactly represent epistemic actions. Namely, agents are split into \emph{observability groups} classifying different perspectives of agents w.r.t.~an action. For instance, in Example 2, %\ref{ex:e_model}
+        agent $a$ is \emph{fully observant}, since it is the one that performs the action, whereas agent $b$ is oblivious, since it does not know that the action is taking place. Then, as we show below, the information regarding which eventuality/event are considered to be possible is lifted to observability groups. Each action must then specify the observability conditions for each agent, assigning each agent to an observability group. This strategy yields an much more succinct representation since each action needs to be substantiated for each group combination, rather than for each agent combination.
+        
+        We are now ready to describe the ASP encoding of an action $\asp{ACT}$:
+        \begin{enumerate*}
+            \item $\asp{e(ACT, E)}$: $\asp{E}$ is an eventuality/event of $\asp{ACT}$;
+            \item $\asp{q(ACT, E_1, E_2, GR)}$: in $\asp{E_1}$, the observability group $\asp{GR}$ considers $\asp{E_2}$ to be possible;
+            \item $\asp{obs(ACT, AG, GR, COND)}$: agent $\asp{AG}$ is in the observability group $\asp{GR}$ if the condition $\asp{COND}$ is satisfied by the current epistemic state;
+            \item $\asp{pre(ACT, E, PRE)}$: the precondition of $\asp{E}$ is $\asp{PRE}$;
+            \item $\asp{post(ACT, E, P, POST)}$: the postcondition of $\asp{P}$ in $\asp{E}$ is $\asp{POST}$;
+            \item $\asp{de(ACT, E)}$: $\asp{E}$ is a designated eventuality/event of $\asp{ACT}$.
+        \end{enumerate*}
+
+        We also define some auxiliary ASP predicates that will be used in the update encodings (Section \ref{sec:update-enc}), namely $\asp{idle(ACT, E)}$ and $\asp{inertia(ACT, E, P)}$, which are calculated at the beginning of the ASP computation. The former predicate states that $\asp{E}$ does not affect the worlds in any way (\eg $e_2$ in Example 2 is idle). %\ref{ex:e_model}
+        The latter predicate states that atom $\asp{P}$ is not changed by the postconditions of $\asp{E}$.
+
+        \mypar{Goal.}
+        The goal of a planning task is represented by the ASP $\asp{goal(F)}$ predicates. It is possible to declare multiple goal formulae, so that the goal condition of the planning task is the conjunction of all these $\asp{goal}$ predicates.
+
+    \subsection{Epistemic States}\label{sec:state-enc}
+        The components of an epistemic state that must be represented (in \textsc{delphic} as well as in the traditional DEL semantics) are four:
+        \begin{inparaenum}[\itshape (i)]
+            \item possibilities/possible worlds;
+            \item information states/accessibility relations;
+            \item valuation of propositional atoms;
+            \item designated possibilities/worlds.
+        \end{inparaenum}
+        %We now describe each component.
+        
+
+        \mypar{Possibilities and Possible Worlds.}
+        To describe possibilities and possible worlds, we make use of the ASP predicate $\asp{w(t, W, E)}$. A possibility/world needs three variable to be univocally identified:
+        \begin{compactitem}
+            \item $\asp{t}$: represents the time instant when the possibility/world was created. In the initial state, the time is set to $\asp{0}$;
+            \item $\asp{W}$: represents the possibility/world that is being updated;
+            \item $\asp{E}$: represents the eventuality/event that is updating $\asp{W}$.
+        \end{compactitem}
+
+        As at planning time new possibilities/worlds are created dynamically, we are faced with the challenge of finding a suitable ASP representation that correctly and univocally encodes the worlds that are being updated during each action. This is best explained with an example. Suppose we update the possibility/world $\asp{w(t{-}1, W, E)}$ with the eventuality/event $\asp{e(ACT, F)}$ and let $\asp{w(t, X, F)}$ be the result of the update. Intuitively, we can see $\asp{X}$ as representing the world being updated (\ie $\asp{w(t{-}1, W, E)}$). Thus, the challenge we are facing here is to find a suitable representation for $\asp{X}$.
+
+        On the one hand, when encoding possibilities, we have to bear in mind that at each time step, we might end up updating possibilities that were previously calculated at any time in the past. As a result, to correctly and univocally encode $\asp{X}$, we need to keep track of the following information:
+        \begin{inparaenum}[\itshape (i)]
+            \item the time when a possibility was created;
+            \item the identifier of the possibility; and
+            \item the eventuality that created it.
+        \end{inparaenum}
+        As a result, we represent $\asp{X}$ as the ASP tuple $\asp{(t{-}1, W, E)}$.
+
+        On the other hand, when encoding possible worlds, we can always be sure that at each time step we are updating worlds that were created at precisely that time. Thus, the ASP encoding of a possible world is slightly simplified and we represent $\asp{X}$ with the ASP tuple $\asp{(W, E)}$.
+
+        Finally, the initial possibilities/worlds are calculated from the initial state representation with the ASP rule $\asp{w(0, W, null)}$ \texttt{:-} $\asp{w\_init(W).}$, where $\asp{null}$ is a placeholder that indicates that no action occurred before time $\asp{t}$.
+
+        \begin{example}\label{ex:asp-worlds}
+            The possibilities of Example 6 are represented in ASP as follows:%\ref{ex:union-update}
+            \begin{inparaenum}[\itshape (i)]
+                \item $\poss{w_1}$: $\asp{w(0, w_1, null)}$;
+                \item $\poss{w_2}$: $\asp{w(0, w_2, null)}$; and
+                \item $\poss{v_3}$: $\asp{w(1, (0, w_1, null), e_1)}$.
+            \end{inparaenum}
+            Again, notice that, in the ASP encoding of possibilities, we are able to reuse previously calculated information.
+
+            Similarly, the possible worlds of Example 3 are represented in ASP as:%\ref{ex:product-update}
+            \begin{inparaenum}[\itshape (i)]
+                \item $v_1$: $\asp{w(1, (w_1, null), e_2)}$;
+                \item $v_2$: $\asp{w(1, (w_2, null), e_2)}$; and
+                \item $v_3$: $\asp{w(1, (w_1, null), e_1)}$.
+            \end{inparaenum}
+        \end{example}
+
+        \mypar{Information States and Accessibility Relations.}
+        Let $\asp{w(Tw, W, Ew)}$ and $\asp{w(Tv, V, Ev)}$ be the ASP representations of two possibilities $\poss{w}$ and $\poss{v}$. Since the possibilities contained in the information states of $\poss{w}$ might have been calculated at any time step in the past, in order to encode the fact that $\poss{v} \in \poss{w}(i)$ (where $i \in \agentSet$), we need to keep track of the time when $\poss{v}$ was created. As a result, the resulting encoding is given by the ASP predicate $\asp{r(Tw, W, Ew, Tv, V, Ev, I)}$.
+
+        Let now $\asp{w(Tw, W, Ew)}$ and $\asp{w(Tv, V, Ev)}$ refer to two possible worlds $w$ and $v$. When representing accessibility relations, we can always be sure that when $w R_i v$, the ASP representation of the worlds $w$ and $v$ share the same time value (\ie $\asp{Tw = Tv}$). Thus, we can simplify the encoding as follows: $\asp{r(Tw, W, Ew, V, Ev, I)}$.
+
+        \begin{example}\label{ex:asp-rels}
+            The information states of Example 6 %\ref{ex:union-update}
+            are represented in ASP as follows (we do not further expand the information states of $\poss{w_1}$ and $\poss{w_2}$ as they refer to previously calculated information):
+            \begin{compactitem}
+                \item $\poss{v_3} {\in} \poss{v_3}(a)$: $\asp{r(1, (0, w_1, null), e_1, 1, (0, w_1, null), e_1, a)}$;
+                \item $\poss{w_1} {\in} \poss{v_3}(b)$: $\asp{r(1, (0, w_1, null), e_1, 0, w_1, null, b)}$; and
+                \item $\poss{w_2} {\in} \poss{v_3}(b)$: $\asp{r(1, (0, w_1, null), e_1, 0, w_2, null, b)}$.
+            \end{compactitem}
+
+            The accessibility relations of Example 3 %\ref{ex:product-update}
+            are represented in ASP as follows:
+            \begin{compactitem}
+                \item $v_3 R_a v_3$: $\asp{r(1, (w_1, null), e_1, (w_1, null), e_1, a)}$;
+                \item $v_3 R_b v_1$: $\asp{r(1, (w_1, null), e_1, (w_1, null), e_2, b)}$;
+                \item $v_3 R_b v_2$: $\asp{r(1, (w_1, null), e_1, (w_2, null), e_2, b)}$; and
+                \item $v_x R_i v_y$: $\asp{r(1, (w_x, null), e_2, (w_y, null), e_2, i)}$, for each $x,y \in \{1, 2\}$ and $i \in \{a,b\}$.
+            \end{compactitem}
+        \end{example}
+
+        \mypar{Valuations.}
+        For each atom $\asp{P}$, we encode the fact that $\asp{P}$ is true in the possibility/world $\asp{w(t, W, E)}$ with the ASP predicate $\asp{v(t, W, E, P)}$. We only represent \emph{true} atoms. The initial valuation is calculated from the initial state representation with the ASP rule $\asp{v(0, W, null, P)}$ \texttt{:-} $\asp{v\_init(W, P)}$.
+
+        \mypar{Designated Possibilities and Worlds.}
+        A designated possibility/world is represented by the ASP predicate $\asp{dw(t, W, E)}$, where variables $\asp{t}$, $\asp{W}$ and $\asp{E}$ have the same meaning as in $\asp{w(t, W, E)}$. The initial designated possibilities/worlds are calculated from the initial state representation with the ASP rule $\asp{dw(0, W, null)}$ \texttt{:-} $\asp{dw\_init(W)}$.
+
+    \subsection{Truth Conditions}\label{sec:truth-enc}
+ For space constraints, we abbreviate the representation $\asp{Tx, X, Ex}$ of a possibility/world as $\asp{\bar{X}}$.
+        Truth conditions of formulae are encoded by predicate $\asp{holds(t, W, E, F)}$, defined by induction on the structure of formulae as follows:
+
+        {\centering
+            \begin{tabular}{l@{}l}
+                $\asp{holds(\bar{W}, P)}$             & \texttt{:-~} $\asp{v(\bar{W}, P), atom(P).}$ \\
+                $\asp{holds(\bar{W}, neg(F))}$        & \texttt{:-~} $\asp{not\ holds(\bar{W}, F).}$ \\
+                $\asp{holds(\bar{W}, and(F_1, F_2))}$ & \texttt{:-~} $\asp{holds(\bar{W}, F_1), holds(\bar{W}, F_2).}$ \\
+                $\asp{holds(\bar{W}, dia(AG, F))}$    & \texttt{:-~} $\asp{r(\bar{W}, \bar{V}, AG), holds(\bar{V}, F).}$
+            \end{tabular}
+        \par}
+
+    \subsection{Update Operators}\label{sec:update-enc}
+        We now describe the ASP encodings of the update operators. As the encodings differ, we present them individually. 
+        
+        \mypar{Union Update.}
+        Let the ASP representations of a possibility spectrum $\poss{W}$ at time $\asp{t}$ and of an eventuality spectrum $\pem{ACT}$ be given. We now show how the encoding of the update $\poss{W'} = \poss{W} \utimes \pem{E}$ is obtained. We adopt again the short representation for possibilities/worlds ($\asp{\bar{X}}$). 
+        We point out that the following ASP rules have a one-to-one correspondence with Definition 19. %\ref{def:update_pem}
+        First, the designated possibilities of $\poss{W'}$ are determined by the following ASP rules:
+
+        {\centering
+            \begin{tabular}{@{}l@{}l@{}l}
+                $\asp{dw(t, \bar{W}, E)}$ & \texttt{:-~} & $\asp{dw(\bar{W}), de(ACT, E), pre(ACT, E, PRE),}$ \\
+                                          &              & $\asp{holds(\bar{W}, PRE).}$
+            \end{tabular}
+        \par}
+
+        To describe how possibilities are updated, we need the following ASP predicate:
+
+        {\centering
+            \begin{tabular}{@{}l@{}l@{}l}
+                $\asp{qt(t, E, F, I)}$   & \texttt{:-~} & $\asp{q(ACT, E, F, GR), obs(t, I, GR).}$
+            \end{tabular}
+        \par}
+        
+        \noindent That is, we evaluate the observability conditions of each agent to determine the information states of the action. From this, we can obtain all the updated possibilities recursively:
+
+        {\centering
+            \begin{tabular}{@{}l@{}l@{}l}
+                $\asp{w(t, \bar{W}, E)}$ & \texttt{:-~} & $\asp{dw(t, \bar{W}, E), de(ACT, E).}$ \\
+                $\asp{w(t, \bar{W}, E)}$ & \texttt{:-~} & $\asp{w(t, \bar{V}, F), pre(ACT, E, PRE), \textnormal{-}idle(ACT, E),}$ \\
+                                         &              & $\asp{r(\bar{V}, \bar{W}, I), qt(t, F, E, I), holds(\bar{W}, PRE).}$
+            \end{tabular}
+        \par}
+
+        \noindent The first rule states that a designated possibility is a possibility. Let now $\poss{v'} = \poss{v} \utimes \pem{f}$. Then, the second rule states that for any $\poss{w}$ and $\pem{e}$ such that $\poss{w} \in \poss{v}(i)$, $\pem{e} \in \pem{f}(i)$ and $\poss{w} \models \pem{e}(\atom{pre})$, we create $\poss{w'} = \poss{w} \utimes \pem{e}$. Notice that we require that the eventuality $\pem{e}$ is not \emph{idle}. An eventuality/event is idle when its precondition is $\top$ and when its postconditions are the identity function. In this way, we do not copy redundant information.
+
+        Let now $\asp{\bar{W}'}$ and $\asp{\bar{V}'}$ stand for $\asp{t, \bar{W}, E}$ and $\asp{t, \bar{V}, F}$, respectively, and let $\asp{\bar{U}}$ stand for $\asp{Tu, \bar{U}, Eu}$. We encode information states as follows:
+
+        {\centering
+            \begin{tabular}{@{}l@{}l@{}l}
+                $\asp{r(\bar{W}', \bar{V}', I)}$ & \texttt{:-~} & $\asp{r(\bar{W}, \bar{V}, I), qt(t, E, F, I).}$ \\
+                $\asp{r(\bar{W}', \bar{U}, ~I)}$ & \texttt{:-~} & $\asp{r(\bar{W}, \bar{U}, I), qt(t, E, F, I), Tu{\leq}t, idle(ACT, F).}$
+            \end{tabular}
+        \par}
+
+        \noindent The first rule states that if $\poss{w'} = \poss{w} \utimes \pem{e}$ and $\poss{v'} = \poss{v} \utimes \pem{f}$ are both created at time $\asp{t}$ and it holds that $\poss{v} \in \poss{w}(i)$ and $\pem{f} \in \pem{e}(i)$, then $\poss{v'} \in \poss{w'}(i)$. The second rule states that if $\poss{w'} = \poss{w} \utimes \pem{e}$ is created at time $\asp{t}$ and it holds that $\poss{u} \in \poss{w}(i)$ and there exists an eventuality $\pem{f}$ such that $\pem{f} \in \pem{e}(i)$ and $\poss{u} = \poss{u} \utimes \pem{f}$, then $\poss{u} \in \poss{w'}(i)$. In this way, we are able to reuse previously calculated information when encoding information states of possibilities.
+		
+        Finally, %having $\asp{\bar{W}'}$ as above, 
+we encode the valuation of atoms as follows:
+
+        {\centering
+            \begin{tabular}{@{}l@{}l@{}l}
+                $\asp{v(\bar{W}', P)}$ & \texttt{:-~} & $\asp{post(ACT, E, P, POST), holds(\bar{W}, POST).}$ \\
+                $\asp{v(\bar{W}', P)}$ & \texttt{:-~} & $\asp{inertia(ACT, E, P), v(\bar{W}, P).}$
+            \end{tabular}
+        \par}
+
+        \noindent The first rule states that if $\poss{w} \models \pem{e}(\atom{p})$, then $\poss{w'}(p) {=} 1$. The second rule states that if there are no postconditions associated to an atom (represented by the ASP predicate $\asp{inertia}$), then in $\poss{w'}$ we keep the truth value assigned to $p$ in $\poss{w}$.
+        
+        \mypar{Product Update.}
+            Let the ASP representations of a MPKM $(M, W_d)$ at time $\asp{t}$ and of a MPEM $(\E, E_d)$ be given. The following ASP rules have a one-to-one correspondence with Definition 6. %\ref{def:update_em}
+            Designated worlds and valuation of atoms are defined in the same way as in the previous case. As above, let $\asp{\bar{W}'}$ and $\asp{\bar{V}'}$ stand for $\asp{t, \bar{W}, E}$ and $\asp{t, \bar{V}, F}$, respectively. Then, updated possible worlds and accessibility relations are encoded as:% follows:
+
+            {\centering
+                \begin{tabular}{@{}l@{}l@{}l}
+                    $\asp{w(t, \bar{W}, E)}$         & \texttt{:-~} & $\asp{w(\bar{W}), e(ACT, E), holds(\bar{W}, PRE).}$ \\
+                    $\asp{r(\bar{W}', \bar{V}', I)}$ & \texttt{:-~} & $\asp{r(\bar{W}, \bar{V}, I), qt(t, E, F, I).}$
+                \end{tabular}
+            \par}

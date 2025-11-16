@@ -1,0 +1,88 @@
+\section{Our Proposed LLM Cluster} \label{sec:sys-req}
+
+In this section, we propose a new network design specifically for LLM clusters. We parameterize our design with a mathematical model and put forward a comprehensive set of guidelines to determine parameters for such clusters.
+
+\subsection{Rail-only Network Design}
+We propose a network architecture that diverts from the any-to-any paradigm across all GPUs. Figure~\ref{fig:rail-only} illustrates our network architecture, which we name \textit{rail-only}. Compared to a conventional rail-optimized GPU cluster, shown in Figure~\ref{fig:rail-optimized}, our network keeps the HB domains and provides connectivity \textit{only across the same rail}. 
+
+A straightforward way to realize our proposed architecture is to remove the spine switches from Figure~\ref{fig:rail-optimized} and re-purpose all the uplinks connecting rail switches to the spine as down-links to GPUs. Hence, each rail is connected by a dedicated but separate \fattree network. In the rest of this paper, we base our analysis on this realization of the rail-only network, though other technologies are also suitable for other rail interconnections (\S\ref{sec:discussions}).
+
+Our rail-only network architecture removes network connectivity across GPUs with different ranks in different rails. However, such communication is still possible by forwarding the data through HB domains. For instance, a message from \texttt{GPU 1, Domain 1} to \texttt{GPU 2, Domain 2} can be first routed through the first HB domain to \texttt{GPU 2, Domain 1} and then be transmitted to the final destination through the network. Although our analysis shows that LLM traffic does not require such forwarding, this connectivity might be needed for control messages, measurement, or training other DNN models in this cluster. We provide more discussions on handling other DNN models in Section~\ref{sec:discussions}.
+
+
+% Figure environment removed 
+
+\subsection{Rail-only Network Analysis} \label{subsec:itertime}
+
+Table~\ref{tab:parameters} describes the parameters used in our analysis. We consider a network with $N$ GPUs and an HB domain of size $K$. The bandwidth for each HB domain is $B_F$ and the network bandwidth is $B_S$. We focus on the analysis of using hybrid two-stage data and model parallelism as the parallelization strategy and derive a mathematical model for the training iteration time and optimal model parallel group size. 
+
+\begin{table}[t]
+\scriptsize
+\centering
+\renewcommand{\arraystretch}{0.92} 
+\linespread{1.05}\selectfont\centering
+    \begin{tabular}{|p{0.8cm}|p{7cm}|}
+    \hline
+    \textbf{Name} & \textbf{Description} \\ \hline
+    $N$              & Total number of GPUs in the cluster, $N=N_M\cdot N_{Df}\cdot N_{Ds}$\\ \hline
+    $N_M$            & Number of GPUs participating in a model parallel group \\ \hline
+    $N_{Df}$         & Number of GPUs participating in the first level data parallel group \\ \hline 
+    $N_{Ds}$         & Number of GPUs participating in the second level data parallel group \\ \hline
+    $K$              & HB domain size, $K=N_M\cdot N_{Ds}$\\ \hline
+    $d_{model}$      & LLM Embedding dimension \\ \hline
+    $M_{flop}$       & Amount of flops required for an iteration of training \\ \hline
+    $M_{cc}$         & Rounds of collective communication needed for MP. This number is 8 for GPT and OPT (one multi-head attention layer per transformer block) and 12 for PaLM (two multi-head attention layers per transformer block) \\ \hline
+    $l$              & Number of transformer block layers \\ \hline
+    $B_{F}$          & HB domain bandwidth \\ \hline
+    $B_{S}$          & GPU Network bandwidth \\ \hline
+    $C$              & GPU Compute Speed (flops)\\ \hline
+    $S_T$            & Size of a transformer block \\ \hline 
+    $b$              & Batch size \\ \hline \hline
+    $T_c$            & Compute time of a transformer block \\ \hline
+    $T_{Df}$         & Communication time for first level DP \\ \hline
+    $T_{Ds}$         & Communication time for second level DP \\ \hline
+    $T_{M}$          & Communication time for MP \\ \hline    
+    \end{tabular}
+    \vspace*{-2mm}
+    \caption{Variables used in our analysis.}
+    \vspace*{-3mm}
+    \label{tab:parameters}
+\end{table}
+
+The aggregate time required for a single iteration is the sum of computation and communication times, formulated as $T_{iter}=T_c+T_{Df}+T_{Ds}+T_M$.
+We model the computational duration of the model as the ratio of the required amount of floating point operations to the aggregate FLOPs of the cluster. As for the collective communication durations, we calculate the bandwidth time only since the latency term is constant for our choice of collective communication algorithm and small relative to the bandwidth term. For all three types of communication, we base our calculations on bandwidth and latency optimal collective communication algorithms implemented with all-to-all communication within connected sets of GPUs. 
+The total iteration time is:
+\begin{align*} 
+    T_{iter}=\frac{M_{flop}}{NC} &+l(\frac{2 S_T (N_{Df}-1)}{NB_S}+ \\
+    \frac{1}{B_F}(\frac{2S_T(N_{D_s}-1)}{K} &+\frac{2M_{cc}bd_{model}(N_M-1)}{N})) \numberthis \label{eq:iter_time_rail}
+\end{align*}
+Leveraging this formula, we can calculate the optimal $N_M$:
+\begin{equation} \label{eq:optimal_nm}
+    N_M^* = \frac{\sqrt{N S_T}}{2\sqrt{2bM_{cc}d_{model}}}
+\end{equation}
+Intriguingly, $N_M^*$ is independent of $K$, $B_F$, and $B_S$, indicating no dependency on the size of the HB domain or the exact bandwidth of any interconnect.
+
+\subsection{What Is the Ideal Size of an HB Domain?} \label{subsec:hbd-size}
+
+The question that naturally follows the design process is, \textit{what should be the ideal size of the HB domain?} In Figure~\ref{fig:iter_time_dom_sz}, we vary the HB domain size ($K$) and plot the training iteration time for GPT3 and OPT3-175B for GPU clusters of sizes 16384, 32768, and 65536 GPUs. For each cluster size, we use the respective optimal $N_M^*$ calculated from the bandwidth and computational ability parameters of GH200. We also compute the training iteration time of "Any-to-Any 7.2~Tbps" as the ideal-case performance. Recall that this design point represents the idealized scenario where \textit{every GPU} is connected with a full-bisection NVLink fabric, or equivalently the case where $K=N$, and is unattainable in practice. The ideal case uses a non-hierarchical \allreduce algorithm to harness the uniform high-bandwidth interconnect, and its iteration time is:
+\begin{align*} 
+T_{iter}^{ideal}=\frac{M_{flop}}{NC}+\frac{l}{B_F N}(&2 S_T (\frac{N}{N_M^*}-1) \\
++&2M_{cc}bd_{model}(N_M^*-1)) \numberthis \label{eq:iter_time_roof}
+\end{align*}
+
+% Figure environment removed
+
+As depicted in Figure~\ref{fig:iter_time_dom_sz}, the performance gain decreases as the HB domain size goes up. A transition of HB domain size from 32 to 64 accounts for a $28\%$ and $33\%$ reduction in training iteration times for GPT3 and OPT3-175B, respectively, whereas an increment from 512 to 1024 merely realizes a gain of $3.8\%$ and $5.3\%$. This reduction in communication time gain can be attributed to Amdahl's law, as the computation time of the DNN remains constant across all instances. We argue that the current GH200 supercomputer, with an HB domain of size 256, is well-suited to the demands of LLM training today, provided an appropriate batch size is chosen. We defer the analysis of batch size in Section~\ref{subsec:batch-size}. At the same time, prospective technological advancements augmenting this size will further benefit the training performance, reducing the training iteration time closer to that of the ideal case without requiring any-to-any connectivity in the network across HB domains. 
+
+\subsection{Impact of Batch Size on Network Design} \label{subsec:batch-size}
+
+Equation~\ref{eq:optimal_nm} indicates that with an increase in batch size $b$, the optimal model parallel group size shrinks. In this case, more data parallel communications can fit within the HB domain and thus benefit the overall performance. A comparative analysis between Figure~\ref{fig:iter_time_dom_sz}a and~\ref{fig:iter_time_dom_sz}b reveals this benefit since the GPT3 and OPT3-175B models have practically identical model structures, and the discrepancies in training iteration time come from the choice of batch size ($3.2M$ tokens for GPT3 versus $2M$ tokens for OPT3-175B). 
+
+To further understand the impact of batch size on training time, we analyze the performance of a PaLM-540B model on a 32768 GPU cluster while changing the HB domain size from $K=256$ to $1024$. 
+During training, the PaLM model automatically changes its batch size from 512 to 2048 sequences ($1M$ to $4M$ tokens). 
+Figure~\ref{fig:iter_time_palm}a plots the change in iteration time as the batch size varies. The iteration time exhibits the same trajectory for all HB domain sizes; however, due to Amdahl's law, the \textit{relative performance} (the ratio to the iteration time for an HB domain size to that of the ideal case) improves as the batch size increases. Figure~\ref{fig:iter_time_palm}b represents this trend. When $K=256$, the relative performance increases from $60\%$ to $81\%$ as the batch size goes up from 512 to 2048 sequences. 
+
+Prior studies have shown that LLM training benefits from a larger batch size~\cite{kaplan2020scaling, gpt3}, making it a perfect fit for our rail-only design. Additionally, while the batch size parameter is typically an ML-centric metric for optimization, our analysis indicates that the impact of batch size on the comprehensive training performance goes beyond the total number of iterations required for convergence. 
+ 
+% Figure environment removed
+

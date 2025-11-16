@@ -1,0 +1,140 @@
+\section{Learning to Achieve Examples Offline}
+\label{sec:method}
+
+Offline RL methods typically require regularization, and our method will employ regularization in two ways. First, we regularize the policy with an additional behavioral cloning term, which penalizes the policy for sampling out-of-distribution actions. Second, our method uses the Q-function for the behavioral policy, so it performs one (not many) step of policy improvement.  These regularizers mean that our approach is not guaranteed to yield the optimal policy. \looseness=-1
+
+\subsection{Preliminaries}
+\label{sec:prelims}
+
+We assume that an agent interacts with an MDP with states $s \in \gS$, actions $a$, a state-only reward function $r(s) \ge 0$,
+initial state distribution $p_0(s_0)$ and dynamics $p(s_{t+1} \mid s_t, a_t)$. We use $\tau = (s_0, a_0, s_1, a_1, \cdots)$ to denote an infinite-length trajectory. The likelihood of a trajectory under a policy $\pi(a \mid s)$ is $\pi(\tau) = p_0(s_0) \prod_{t=0}^\infty p(s_{t+1} \mid s_t, a_t) \pi(a_t \mid s_t)$. The objective is to learn a policy $\pi(a \mid s)$ that maximizes the expected, $\gamma$-discounted sum of rewards:
+$\max_\pi \E_{\pi(\tau)}\left[\sum_{t=0}^\infty \gamma^t r(s_t)\right]. \label{eq:rl}$
+We define the Q-function for policy $\pi$ as the expected discounted sum of returns, conditioned on an initial state and action:
+\begin{equation}
+    Q^\pi(s, a) \triangleq \E_{\pi(\tau)}\left[\sum_{t=0}^\infty \gamma^t r(s_t) \bigg \vert \substack{s_0 = s\\a_0 = a}\right]. \label{eq:q-vals}
+\end{equation}
+We will focus on the offline (i.e., batch RL) setting. Instead of learning by interacting with the environment (i.e., via trial and error), the RL agent will receive as input a dataset of trajectories $\gD_\tau = \{\tau \sim \beta(\tau) \}$ collected by a behavioral policy $\beta(a \mid s)$. We will use $Q^\beta(s, a)$ to denote the Q-function of the behavioral policy.
+
+\paragraph{Specifying the reward function.}
+In many real-world applications, specifying and measuring a scalar reward function is challenging, but providing examples of good states (i.e., those which would receive high rewards) is straightforward. Thus, we follow prior work~\citep{fu2018variational, zolna2020offline, eysenbach2021replacing, xu2019positive, zolna2020taskrelevant} in assuming that the agent does not observe scalar rewards (i.e., $\gD_\tau$ does not contain reward information). Instead, the agent receives as input a dataset $\gD_* = \{s^*\}$ of high-reward states $s^* \in \gS$. These high-reward states are examples of good outcomes, which the agent would like to achieve. The high-reward states are not labeled with their specific reward value.
+
+To make the control problem well defined, we must relate these success examples to the reward function. We do this by assuming that the frequency of each success example is proportional to its reward: good states are more likely to appear (and be duplicated) as success examples.
+\begin{assumption} \label{as:1}
+Let $p_\tau(s)$ be the empirical probability density of state $s$ in the trajectory dataset, and let $p_*(s)$ as the empirical probability density of state $s$ under the high-reward state dataset. We assume that there exists a positive constant $c$ such that $r(s) = c \frac{p_*(s)}{p_\tau(s)}$ for all states $s$.
+\end{assumption}
+This is the same assumption as~\citet{eysenbach2021replacing}.
+This assumption is important because it shows how example-based control is universal: for any reward function, we can specify the corresponding example-based problem by constructing a dataset of success examples that are sampled according to their rewards. We assumed that rewards are non-negative so that these sampling probabilities are positive. \looseness=-1
+
+This assumption can also be read in reverse. When a user constructs a dataset of success examples in an arbitrary fashion, they are implicitly defining a reward function. In the tabular setting, the (implicit) reward function for state $s$ is the count of the times $s$ occurs in the dataset of success examples. 
+Compared with goal-conditioned RL~\citep{kaelbling1993learning}, defining tasks via success examples is more general. By identifying what all the success examples have in common (e.g., laundry is folded), the RL agent can learn what is necessary to solve the task and what is irrelevant (e.g., the color of the clothes in the laundry). 
+We now can define our problem statement as follows:
+\begin{definition}
+In the \textbf{offline example-based control} problem, a learning algorithm receives as input a dataset of trajectories $\gD_\tau = \{\tau\}$ and a dataset of successful outcomes $\gD_* = \{s\}$ satisfying Assumption~\ref{as:1}. The aim is to output a policy that maximizes the RL objective (Eq.~\ref{eq:rl}).
+\end{definition}
+This problem setting is appealing because it mirrors many practical RL applications: a user has access to historical data from past experience, but collecting new experience is prohibitively expensive. Moreover, this problem setting can mitigate the challenges of reward function design.
+Rather than having to implement a reward function and add instruments to measure the corresponding components, the users need only provide a handful of observations that solved the task. This problem setting is similar to imitation learning, in the sense that the only inputs are data. However, unlike imitation learning, in this problem setting the high-reward states are not labeled with actions, and these high-reward states may not necessarily contain entire trajectories.
+
+
+\begin{wrapfigure}[13]{R}{0.325\textwidth}
+\centering
+% Figure removed 
+\caption{\footnotesize Our method will use contrastive learning to predict which states might occur at some point in the future.}
+\label{fig:gamma-model}
+\end{wrapfigure}
+
+Our method will estimate the discounted state occupancy measure,
+\begin{align}
+    p^\beta(s_{t+} = s \mid s_0, a_0) &\triangleq (1 - \gamma) \sum_{t=0}^\infty \gamma^t p_t^\pi(s_t = s \mid s_0, a_0),
+\end{align}
+where $p_t^\beta(s_t \mid s, a)$ is the probability of policy $\beta(a \mid s)$ visiting state $s_t$ after exactly $t$ time steps.
+Unlike the transition function $p(s_{t+1} \mid s_t, a_t)$, the discounted state occupancy measure indicates the probability of visiting a state at any point in the future, not just at the immediate next time step.
+In tabular settings, this distribution corresponds to the successor representations~\citep{dayan1993improving}. To handle continuous settings, we will use the contrastive approach from recent work~\citep{mazoure2020deep, eysenbach2022contrastive}. We will learn a function $f(s, a, s_f) \in \mathbbm{R}$ takes as input an initial state-action pair as well as a candidate future state, and outputs a score estimating the likelihood that $s_f$ is a real future state. The loss function is a standard contrastive learning loss(e.g.,~\citet{ma2018noise}), where positive examples are triplets of a state, action, and future state:
+\begin{equation*}
+    \max_f \gL(f; \gD_\tau) \triangleq \E_{p(s, a), s_f \sim p^\beta(s_{t+} \mid s, a)}\left[\log \sigma(f(s, a, s_f)) \right] + \E_{p(s, a), s_f \sim p(s)}\left[\log (1 - \sigma(f(s, a, s_f))) \right],
+\end{equation*}
+where $\sigma(\cdot)$ is the sigmoid function. At optimality, the implicit dynamics model encodes the discounted state occupancy measure:
+\begin{equation}
+    f^*(s, a, s_f) = \log p^\beta(s_{t+} = s_f \mid s, a) - \log p_\tau(s_f).
+\end{equation}
+
+
+We visualize this implicit dynamics model in Fig.~\ref{fig:gamma-model}. Note that this dynamics model is policy dependent. Because it is trained with data collected from one policy ($\beta(a \mid s)$), it will correspond to the probability that \emph{that} policy visits states in the future. Because of this, our method will result in estimating the value function for the behavioral policy (akin to 1-step RL~\citep{brandfonbrener2021offline}), and will not perform multiple steps of policy improvement. Intuitively, the training of this implicit model resembles hindsight relabeling~\citep{kaelbling1993learning, andrychowicz2017hindsight}.  However, it is generally unclear how to use hindsight relabeling for single-task problems. Despite being a single-task method, our method will be able to make use of hindsight relabeling to train the dynamics model.
+
+
+
+
+
+\subsection{Deriving Our Method}
+
+The key idea behind out method is that this implicit dynamics model can be used to represent the Q-values for the example-based problem, up to a constant. The proof is in Appendix~\ref{appendix:proofs}.
+
+\begin{lemma}
+Assume that the implicit dynamics model is learned without errors. Then the Q-function for the data collection policy $\beta(a \mid s)$ can be expressed in terms of this implicit dynamics model:
+\begin{align}
+    Q^\beta(s, a)
+    &= \frac{c}{1-\gamma} \E_{p_*(s^*)}\left[ e^{f(s, a, s^*)} \right].
+\end{align}
+\end{lemma}
+
+
+
+So, after learning the implicit dynamics model, we can estimate the Q-values by averaging this model's predictions across the success examples. We will update the policy using Q-values estimated in this manner, plus a regularization term:
+{\begin{equation}
+    \min_\pi \gL(\pi; f, \gD_*) \triangleq -(1 - \lambda) \E_{\pi(a \mid s)p(s), s^* \sim \gD_*}\left[e^{f(s, a, s^*)} \right] - \lambda \E_{s, a \sim \gD_\tau}\left[\log \pi(a \mid s) \right]. \label{eq:critic-loss}
+\end{equation}
+In our experiments, we use a weak regularization coefficient of $\lambda = 0.5$.
+
+
+\begin{wrapfigure}[17]{r}{0.5\textwidth}
+    \centering
+    \vspace{-1.2em}
+    % Figure removed%
+    \vspace{-0.5em}%
+    \caption{\footnotesize 
+    If the state-action representation $\phi(s, a)$ is close to the representation of a high-return state $\psi(s)$, then the policy is likely to visit that state. Our method estimates Q-values by combining the distances to all the high-return states (Eq.~\ref{eq:q-vals}).
+    }
+    \label{fig:geometry}
+\end{wrapfigure}
+
+It is worth comparing this approach to prior methods based on learned reward functions~\citep{xu2019positive, fu2018variational, zolna2020offline}. Those methods learn a reward function from the success examples, and use that learned reward function to synthetically label the dataset of trajectories. Both approaches can be interpreted as learning a function on one of the datasets and then applying that function to the other dataset.
+Because it is easier to fit a function when given large quantities of data, we predict that our approach will outperform the learned reward function approach when the number of success examples is small, relative to the number of unlabeled trajectories.
+Other prior methods~\citep{eysenbach2021replacing,SQIL2020Reddy} avoid learning reward functions by proposing TD update rules that are applied to both the unlabeled transitions and the high-return states. However, because these methods have yet to be adapted to the offline RL setting, we will focus our comparisons on the reward-learning methods.
+
+\subsection{A Geometric Perspective}
+
+Before presenting the complete RL algorithm, we provide a geometric perspective on the representations learned by our method. Our implicit models learns a representation of state-action pairs $\phi(s, a)$ as well as a representation of future states $\psi(s)$. One way that our method can optimize these representations is by treating $\phi(s, a)$ as a prediction for the future representations.\footnote{Our method can also learn the opposite, where $\psi(s)$ is a prediction for the previous representations.} Each of the high-return states can be mapped to the same representation space. To determine whether a state-action pair has a large or small Q-value, we can simply see whether the predicted representation $\phi(s, a)$ is close to the representations of any of the success examples. Our method learns these representations so that the Q-values are directly related to the Euclidean distances\footnote{When representations are normalized, the dot product is equivalent to the Euclidean norm. We find that unnormalized features work better in our experiments.} from each success example. Thus, our method can be interpreted as learning a representation space such that estimating Q-values corresponds to simple geometric operations (kernel smoothing with an RBF kernel~\citep[Chpt.~6]{hastie2009elements}) on the learned representations. While the example-based control problem is more general than goal-conditioned RL (see Sec.~\ref{sec:prelims}), we can recover goal-conditioned RL as a special case by using a single success example.
+
+\subsection{A Complete Algorithm}
+
+We now build a complete offline RL algorithm based on these Q-functions.
+We will call our method \textsc{Learning to Achieve Examples Offline} (LAEO).
+Our algorithm will resemble one-step RL methods, but differ in how the Q-function is trained. After learning the implicit dynamics model (and, hence, Q-function) we will optimize the policy. The objective for the policy is maximizing (log) Q-values plus a %
+regularization term, which penalizes sampling unseen actions:\footnote{For all experiments except Fig.~\ref{fig:examplebased}, we apply Jensen's inequality to the first term, using $\E_{\pi(a \mid s), s^* \sim p_*(s)}[f(s, a, s^*)]$.}
+\begin{align}
+    \max_\pi \; & (1 - \lambda) \log \E_{\pi(a \mid s)p_\tau(s)}\left[Q(s, a) \right] + \lambda \E_{(s, a) \sim p_\tau(s, a)}\left[\log \pi(a \mid s) \right] \nonumber \\
+    &=  (1 - \lambda) \log \E_{\pi(a \mid s), s^* \sim p_*(s)}\left[e^{f(s, a, s^*)} \right] + \lambda \E_{(s, a) \sim p_\tau(s, a)}\left[\log \pi(a \mid s) \right]. \label{eq:policy-loss}
+\end{align}
+
+\begin{wrapfigure}[8]{R}{0.5\textwidth}
+\vspace{-1.2em}
+\begin{minipage}{0.5\textwidth}
+\begin{algorithm}[H] \footnotesize
+    \caption{{\small Learning to Achieve Examples Offline}}\label{alg:method}
+    \begin{algorithmic}[1]
+    \State \textbf{Inputs}: dataset of trajectories $\gD = \{\tau\}$, \phantom{.............} dataset of high-return states $\gD_* = \{s\}$.
+    \State Learn the model via contrastive learning: \phantom{...............} $f \gets \argmin_f \gL(f; \gD_\tau)$ \Comment{Eq.~\ref{eq:critic-loss}}
+    \State Learn the policy: $\pi \gets \argmin_\pi \gL(\pi; f, \gD_*)$ \Comment{Eq.~\ref{eq:policy-loss}}
+    \State \textbf{return} policy $\pi(a \mid s)$
+    \end{algorithmic}
+\end{algorithm}
+\end{minipage}
+\end{wrapfigure}
+
+
+As noted above, this is a one-step RL method: it updates the policy to maximize the Q-values of the behavioral policy.
+Performing just a single step of policy improvement can be viewed as a form of regularization in RL, in the same spirit as early stopping is a form of regularization in supervised learning. Prior work has found that one-step RL methods can perform well in the offline RL setting. Because our method performs only a single step of policy improvement, we are not guaranteed that it will converge to the reward-maximizing policy. We summarize the complete algorithm in Alg.~\ref{alg:method}.
+
+
+
+
+

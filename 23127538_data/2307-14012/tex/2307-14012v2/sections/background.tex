@@ -1,0 +1,154 @@
+\section{Background}
+%
+\subsection{Diffusion Models}
+We consider Gaussian diffusion models initially proposed by \cite{sohl2015deep} and further improved by \cite{song2019generative} and \cite{ho2020denoising}.
+Starting with a sample from the data distribution $\x_0 \sim q(\cdot)$, we construct a Markov chain of latent variables $\x_1,\ldots,\x_T$ by iteratively introducing Gaussian noise to the sample
+\begin{align}
+    q(\x_t|\x_{t-1}) = \normal{\x_t; \sqrt{1 - \beta_t} \x_{t-1}, \beta_t I},
+\end{align}
+where $\beta_t \in [0, 1), \, \forall t = 1, \dots, T$ are known.
+For large enough $T$ we have $q(\x_T) \approx \normal{\x_T; 0, I}$.
+
+A diffusion model learns to gradually denoise samples by modelling the distribution of the previous sample in the chain $\pEbm(\x_{t-1} \mid \x_t), t = 1, \dots, T$.
+Approximate samples from the data distribution $q(\x_0)$ are obtained by starting from $\x_T \sim \normal{0, 1}$ and sequentially sampling less noisy versions of the sample until the noise is removed.
+This is called the \textit{reverse process}.
+
+The reverse distribution is typically modelled as
+\begin{align}
+    p_\theta(\x_{t-1}|\x_t) = \normal{\x_{t-1}; \mu_\theta(\x_t, t), \Sigma_\theta(x_t, t)},
+\end{align}
+since the posterior, reverse, distribution $q(\x_{t-1}|\x_t)$ can be effectively approximated by a Gaussian distribution,
+when the magnitude $\beta_t$ of the noise added at each step is sufficiently small.
+The mean of this distribution is parameterised as 
+\begin{align}
+    \mu_\theta(\x_t, t) &= \dfrac{1}{\sqrt{\alpha_t}} \left( \x_t - \dfrac{\beta_t}{\sqrt{1 - \alphaBar_t}} \epsilon_\theta(\x_t, t) \right),
+%     \Sigma_\theta(\x_t, t) &= \hat{\beta_t}.
+\end{align}
+where the parameters $\alpha_t$ and $\alphaBar_t$ are functions of $\{ \beta_t \}_{t=1}^T$ \cite{ho2020denoising}. 
+The noise prediction model $\epsilon_\theta(\x_t, t)$ is typically parameterised as a neural network and learned from data.
+A common choice is to set  $\Sigma_\theta(x_t,t) = \beta_t I$, which we assume throughout this paper unless stated otherwise.
+
+A useful property that simplifies the training is that the conditional diffusion probability $q(\x_t|\x_0)$ can be computed in closed form
+\begin{equation}
+    \label{eq:diff:forward_proc_x0}
+    q(\x_t \mid \x_0) = \normal{\x_t; \sqrt{1 - \sigma_t^2} \x_0, \sigma_t^2 I},
+\end{equation}
+for any $t$, where $\sigma_t$ is a function of $\{ \beta_t \}_{t=1}^T$. We refer to \cite{ho2020denoising} for a detailed derivation.
+
+\subsection{Energy-based models}
+Energy based-models (EBM) represent probability distributions with a scalar, non-negative energy function $\energy$,
+by assigning low energy to regions of the input space where the probability is high and high energy to regions where the distribution has little or no support:
+\begin{equation}
+  \label{eq:ebm}
+  \pEbm(\x_t, t) = \frac{1}{\partFn(t)} \exp \left(- \energy(\x_t, t) \right),
+  \quad \partFn(t) = \int \exp \left(- \energy(\x_t, t) \right) \dd \x_t.
+\end{equation}
+Here, we let $\energy$ depend on the time step $t$ to make the connection to diffusion models more apparent.
+This can be interpreted as a sequence of energy functions, one for each diffusion step $t$.
+The normalisation constant $\partFn$ is typically intractable, prohibiting computing a normalised density.
+However, $\partFn$ does not depend on the input $\x_t$, making the so-called \textit{score function} easy to compute for an EBM:
+\begin{equation}
+  \label{eq:ebm:score}
+  \gradX \log \pEbm(\x_t, t) = - \gradX \energy(\x_t, t), 
+\end{equation}
+even though the gradient of the energy function can be costly to compute in practice.
+%
+
+\subsection{Energy and score parameterised diffusion models}
+The foundation of this paper is that the diffusion noise prediction model $\epsP(\x_t, t)$ can be interpreted as estimating a quantity proportional to the score function of the marginal distribution $q(\cdot)$ at diffusion step $t$ \cite{song2021scorebased}
+\begin{align}
+  \epsP(\x_t, t) \approx -\sigma_t \gradX \log q(\x_t).
+\end{align}
+This property provides a connection between diffusion and energy-based models. We can now model 
+\begin{align}
+\label{eq:score_noise_connection}
+    \frac{1}{\sigma_t}\epsP(\x_t, t) = -\gradX \log \pEbm(\x_t, t) =  \gradX \energy(\x_t, t).
+\end{align}
+That is, the marginal distribution $q(\x_t)$ can be approximated using either an energy function $\energy$ or a noise prediction model $\epsP$.
+This results in two methods for parameterising the model of $q(\x_t)$:
+the \textit{energy parameterisation}, using $\energy$, and the \textit{score parameterisation}, using $\epsP$.
+
+Both parameterisations have their advantages and disadvantages.
+The energy parameterisation can evaluate the density $\pEbm(\x_t, t)$ up to a normalisation $\partFn(t)$, which enables various MCMC methods.
+Furthermore, by making the score equal to the gradient of an actual scalar function, we ensure a proper score, i.e., a conservative vector field.
+On the other hand, to evaluate the score function, $\energy$ must be explicitly differentiated, which can be costly.
+
+The score parameterisation is more flexible since it predicts an arbitrary vector field.
+There is limited empirical evidence that this results in better sampling performance with the diffusion process \cite{du2023reduce}, although it has been suggested that this performance difference is mainly due to model architecture \cite{salimans2021should}.
+Regardless, the fact that the score parameterisation directly estimates the score function makes it more efficient for sampling with the reverse process, and the score parameterisation is, by far, the more popular variant.
+
+This paper aims to develop methods that improve the standard sampling with the reverse process while still retaining the ability to compose pre-trained diffusion models.
+Since the score parameterised diffusion models are more prevalent, developing similarly corrected MCMC samplers for the score parameterisation is desirable.
+
+\section{MCMC sampling for diffusion models}
+MCMC sampling is a promising strategy for improving diffusion model sampling since it can be used in combination with the reverse process.
+Just like the reverse process, there are MCMC methods which base their kernels on the score function, such as the Unadjusted Langevin Algorithm (U-LA) and the Unadjusted Hamiltonian Monte Carlo (U-HMC) \cite{roberts2002mala,duane1987hmc,neal1996bayes}.
+For example, with U-LA we use the kernel
+\begin{align}
+    \mcKern{\x^{\tau+1} \mid \x^{\tau}} 
+    = \normal{\x^{\tau + 1}; \x^{\tau} + \langStep_t \gradX \log \pEbm(\x^{\tau}, t), 2 \langStep_t I },
+\end{align}
+at diffusion step $t$, where $\x^0 = \x_t$, $\langStep_t$ is the step size, and the chain is iterated for $\mcSteps$ steps.
+
+These methods are called unadjusted, since as $\mcSteps$ grows, these samplers will converge to the target distribution, but only for infinitesimal step sizes $\langStep_t$.
+By adding, for instance, a Metropolis--Hastings (MH) correction step, we can sample with larger step sizes and still converge to the target distribution \cite{metropolis1953mh,hasting1970mh}.
+With the correction, we sample a candidate $\xCand \sim \mcKern{\cdot \mid \x^\tau}$ and accept it as the new iterate with probability
+\begin{align}
+    \label{eq:mh:acc_prob}
+    \acc = \min \left( 1, \frac{\pEbm(\xCand, t)}{\pEbm(\x^\tau, t) } \frac{\, \mcKern{\x^\tau \mid \xCand}}{ \mcKern{\xCand \mid \x^\tau }} \right).
+\end{align}
+That is, we set the new iterate $\x^{\tau+1} = \xCand$ with probability $\acc$, otherwise $\x^{\tau+1} = \x^\tau$.
+
+The model $\pEbm$ appears in the acceptance probability as a ratio, meaning that we do not require a normalised density to compute $\acc$, since the normalisation constant depends only on the relative probability between the current and proposed sample.
+Furthermore, if $\pEbm$ is an EBM (see \cref{eq:ebm}), the probability ratio can be expressed as 
+\begin{align}
+    \label{eq:mh:rel_energy}
+    \frac{\pEbm(\xCand, t)}{\pEbm(\x^\tau, t) }
+    % = \frac{ \exp( -\energy(\xCand, t)) }{ \exp( -\energy(\x^\tau, t)) }
+    = \exp( \energy(\x^\tau, t) - \energy(\xCand, t) ).
+\end{align}
+This means that with an EBM we can evaluate the MH acceptance probability to construct an adjusted MCMC sampler.
+This is an important advantage compared to the score parameterisation, where we only have access to $\gradX \log \pEbm$ (see \cref{eq:score_noise_connection}). 
+
+\subsection{Sampling from composed models}
+Augmenting the reverse process with additional MCMC sampling appears to be important in diffusion model composition \cite{song2019generative,du2023reduce},
+which combines pre-trained score functions to sample from new marginal distributions using the reverse process.
+The most common form of model composition is called \textit{guidance} \cite{dhariwal2021diffbeatgan}, where the goal is to sample from a distribution conditioned on a class label $y$
+\begin{align}
+\label{eq:guidance:post}
+    q(\x_0 \mid y) \propto q(\x_0) q(y \mid \x_0).
+\end{align}
+This is achieved by composing a score function from an unconditional diffusion model (using \cref{eq:score_noise_connection}) for the marginal distribution and a classifier for the likelihood 
+\begin{align}
+    \label{eq:guidance:score}
+    \gradX \log p_{\theta'}(\x_t \mid y, t) = \gradX \log \pEbm(\x_t, t) + \lambda \gradX \log \pCfull (y \mid \x_t, t),
+\end{align}
+i.e., the classifier guides the reverse process by modifying the score function towards samples whose predicted class is $y$.
+In practice, a hyperparameter $\lambda$ is introduced in order to control the strength of the guidance.
+
+Several proposed variations exist for the guidance model.
+The most straightforward way is to learn a sequence of classifiers for each noise level $t$, which was proposed by \cite{dhariwal2021diffbeatgan}, which we term \textit{classifier-full guidance}.
+Another option is to use a single noise-free classifier $p(y | \x_0)$ and use the score function to de-noise the input $\x_0 \approx \xHat(\x_t, t)$, this method is called \textit{reconstruction guidance} \cite{chung2023reconstrguidance,ho2022guidance,song2023guidance}.
+Finally, there is \textit{classifier-free guidance}, which does not use a classifier but composes a conditional and an unconditional diffusion model \cite{ho2021classifierfree}. Note that this no longer corresponds to sampling from the posterior distribution in \cref{eq:guidance:post}.
+
+In \cite{du2023reduce}, they investigate further forms of compositions: products, mixtures, and negations.
+For example, they model a product distribution as
+\begin{equation}
+    \label{eq:comp:prod}
+    \qProd(\x_0) \propto \prod_i q^i(\x_0).
+\end{equation}
+While this factorisation generally only holds at $t=0$, they form a composed model
+\begin{equation}
+    \label{eq:comp:prod:ebm}
+    \pProd(\x_t, t) \propto \prod_i \pEbmi^i(\x_t, t)
+    = \exp \left( - \sum_i \energyi^i(\x_t, t) \right)
+\end{equation}
+and perform MCMC sampling with this as the target distribution, resulting in increased sampling performance.
+Note that the composition in \cref{eq:comp:prod:ebm} is also viable with a score parameterisation, where the composed score
+\begin{equation}
+    \label{eq:comp:prod:score}
+    \gradX \log \pProd(\x_t, t) \propto \gradX \log \prod_i \pEbmi^i(\x_t, t) 
+    = \sum_i \gradX \log \pEbmi^i(\x_t, t)
+    = - \frac{1}{\sigma_t} \sum_i \epsPi^i(\x_t, t)
+\end{equation}
+is the sum of the component scores.

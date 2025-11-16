@@ -1,0 +1,805 @@
+\documentclass{article}
+
+
+% if you need to pass options to natbib, use, e.g.:
+%     \PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2023
+
+
+% ready for submission
+%\usepackage{neurips_2023}
+
+
+% to compile a preprint version, e.g., for submission to arXiv, add add the
+% [preprint] option:
+%     \usepackage[preprint]{neurips_2023}
+
+
+% to compile a camera-ready version, add the [final] option, e.g.:
+%     \usepackage[final]{neurips_2023}
+
+
+% to avoid loading the natbib package, add option nonatbib:
+\usepackage[nonatbib,preprint]{neurips_2023}
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{makecell}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{wrapfig}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{wrapfig}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{caption}
+
+\def\qz#1{{\color{red}{\bf [Qz:} {\it{#1}}{\bf ]}}}
+\def\eg{\emph{e.g.,}}
+\def\Eg{\emph{E.g.,}}
+\def\etal{\emph{et al.}}
+\def\etc{\emph{etc.}}
+\def\ie{\emph{i.e., }}
+\def\vs{\emph{v.s.}}
+\newcommand{\ig}{\textit{i}.\textit{e}.}
+
+\title{Scaling TransNormer to 175 Billion Parameters}
+
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to break the
+% lines. Using \AND forces a line break at that point. So, if LaTeX puts 3 of 4
+% authors names on the first line, and the last on the second line, try using
+% \AND instead of \And before the third author name.
+
+\author{
+{\normalsize
+$^{2}$Zhen Qin$^\sharp$,
+$^{1,2}$Dong Li$^\sharp$,
+$^{1,2}$Weigao Sun$^\sharp$,
+$^{1,2}$Weixuan Sun$^\sharp$,
+$^{1,2}$Xuyang Shen$^\sharp$,
+}\\
+{\normalsize
+\textbf{
+ $^{2}$Xiaodong Han, $^{2}$Yunshen Wei, $^{2}$Baohong Lv,  $^{1}$Fei Yuan, $^{2}$Xiao Luo,
+ }
+}\\
+{\normalsize
+\textbf{
+ $^{1}$Yu Qiao,
+ $^{1,2}$Yiran Zhong\thanks{Yiran Zhong is the corresponding author. Email: \texttt{zhongyiran@gmail.com}. $\sharp$ indicates equal contribution.}}
+}\\
+$^{1}$Shanghai AI Laboratory, $^{2}$OpenNLPLab\\
+ \texttt{https://github.com/OpenNLPLab/TransnormerLLM} 
+}
+
+
+
+
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+We present TransNormerLLM, the first linear attention-based Large Language Model (LLM) that outperforms conventional softmax attention-based models in terms of both accuracy and efficiency. TransNormerLLM evolves from the previous linear attention architecture TransNormer~\cite{qin-etal-2022-devil} by making advanced modifications that include positional embedding, linear attention acceleration, gating mechanism, tensor normalization, and inference acceleration and stabilization. 
+Specifically, we use LRPE~\cite{qin2023linearized} together with an exponential decay to avoid attention dilution issues while allowing the model to retain global interactions between tokens.
+Additionally, we propose Lightning Attention, a cutting-edge technique that accelerates linear attention by more than twice in runtime and reduces memory usage by a remarkable four times.
+To further enhance the performance of TransNormer, we leverage a gating mechanism to smooth training  and a new tensor normalization scheme to accelerate the model, resulting in an impressive acceleration of over $20\%$. 
+Furthermore, we have developed a robust inference algorithm that ensures numerical stability and consistent inference speed, regardless of the sequence length, showcasing superior efficiency during both training and inference stages.
+Scalability is at the heart of our model's design, enabling seamless deployment on large-scale clusters and facilitating expansion to even more extensive models, all while maintaining outstanding performance metrics. Rigorous validation of our model design is achieved through a series of comprehensive experiments on our self-collected corpus, boasting a size exceeding 6TB and containing over 2 trillion tokens. To ensure data quality and relevance, we implement a new self-cleaning strategy to filter our collected data.
+we plan to open-source our pre-trained models, fostering community-driven advancements in the field and positioning our work as a stepping-stone toward exploring efficient transformer structures in LLMs.
+\end{abstract}
+
+\section{Introduction}
+The field of Natural Language Processing (NLP) has been revolutionized by the advent of large-scale language models (LLMs)~\cite{touvron2023llama, biderman2023pythia,brown2020language}. These models have demonstrated exceptional performance across a multitude of tasks, elevating abilities to comprehend, generate, and interact with human languages in computational frameworks. Previous language modeling development has predominantly centered around Transformer architectures, with seminal models such as vanilla Transformer~\cite{vaswani2017attention}, GPT series~\cite{radford2018improving,radford2019language, brown2020language}, BERT~\cite{devlin-etal-2019-bert}, and BART~\cite{lewis2019bart} standing as standard backbones in related fields. The success of Transformer architectures is premised on the softmax attention mechanism, which discerns dependencies among input tokens in a data-driven scheme and has global position awareness, offering the model an effective way to handle the long-range dynamism of natural language.
+
+Nevertheless, conventional Transformers are not without their constraints. Primarily, their quadratic time complexity with respect to the sequence length limits their scalability and hampers efficiency in terms of computational resources and time during the training and inference stages. Numerous efficient sequence modeling methods have been proposed in an attempt to reduce the quadratic time complexity to linear~\cite{katharopoulos2020transformers,choromanski2021rethinking,zhen2022cosformer,zheng2023efficient,zheng2022linear}. However, there are two reasons that prohibit them to be applied to LLMs: 1) their performance in language modeling is often unsatisfactory; 2) they do not demonstrate speed advantages in real-world scenarios.
+
+In this paper, we introduce TransNormerLLM, the first linear attention-based LLM that surpasses conventional softmax attention in both accuracy and efficiency. The development of TransNormerLLM builds upon the foundations of the previous linear attention architecture, TransNormer~\cite{qin-etal-2022-devil}, while incorporating a series of advanced modifications to achieve superior performance. The key enhancements in TransNormerLLM include positional embedding, linear attention acceleration, gating mechanism, tensor normalization, and inference acceleration. 
+
+One notable improvement is the replacement of the TransNormer's DiagAttention with Linear Attention to enhance global interactions. To address the issue of dilution, we introduced LRPE~\cite{qin2023linearized} with exponential decay. Lightning Attention, a novel technique that significantly accelerates linear attention during training is introduced, resulting in a more than two-fold improvement, while also reducing memory usage by four times with IO awareness. Furthermore, we simplified GLU and Normalization, with the latter leading to a 20\% overall speedup. A robust inference algorithm ensures the stability of numerical values and constant inference speed, regardless of the sequence length, thereby enhancing the efficiency of our model during both training and inference stages.
+
+To validate the efficacy of TransNormerLLM, we meticulously collect a large corpus that is more than $6$TB in size and contains over $2$ trillion tokens. We develop a new self-cleaning strategy to filter the collected corpus to ensure data quality. We expand the original TransNormer model ranging from 385M to 175B parameters as illustrated in Table~\ref{transnormer_models} and conduct a series of comprehensive experiments and ablations on our corpus, demonstrating superior performance to softmax attention-based methods as well as faster training and inference speed.
+
+We are committed to fostering community-driven advancements in the field of LLMs. To this end, we plan to open-source our pre-trained models, enabling researchers and practitioners to build upon our work and explore efficient transformer structures in LLMs.
+
+\begin{table}[t]
+\small
+    \caption{\textbf{TransNormerLLM Model Variants.} }
+    \label{transnormer_models}
+    \centering
+    \renewcommand{\arraystretch}{1}
+    \setlength{\tabcolsep}{0.32cm}
+    \begin{tabular}{cccccc}
+    \hline
+    
+        Model Size & Non-Embedding Params & Layers & Model Dim & Heads & Equivalent Models \\ \hline
+        385M & 384,974,848 & 24 & 1024 & 8 & Pythia-410M  \\ 
+        1B & 992,165,888 & 16 & 2048 & 16 & Pythia-1B  \\ 
+        3B & 2,876,006,400 & 32 & 2560 & 20 & Pythia-2.8B  \\ 
+        7B & 6,780,547,072 & 30 & 4096 & 32 & LLAMA-6.7B  \\ 
+        13B & 12,620,195,840  & 36 & 5120 & 40 & LLAMA-13B  \\ 
+        65B & 63,528,009,728 & 72 & 8192 & 64 & LLAMA-65B  \\ 
+        175B & 173,356,498,944 & 88 & 12288 & 96 & GPT-3  \\ 
+        \hline
+    \end{tabular}
+\end{table}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Related Work}
+
+\subsection{Transformer-based LLMs}
+In recent years, the field of Large Language Models (LLMs) has experienced significant advancements. Adhering to the scaling laws~\cite{kaplan2020scaling}, various LLMs with over 100 billion parameters have been introduced, such as GPT-3~\cite{brown2020language}, Gopher~\cite{rae2022scaling}, PaLM~\cite{2204.02311}, GLM~\cite{du2022glm} and \emph{etc.}. More specialized models like Galactica~\cite{taylor2022galactica} have also emerged for specific domains like science.
+A notable development is Chinchilla~\cite{hoffmann2022training}, an LLM model with 70 billion parameters that redefines these scaling laws, focusing on the number of tokens rather than model weights. Furthermore, LLaMA~\cite{touvron2023llama} has also sparked interest due to its promising performance and open-source availability.
+The discourse around LLMs also encompasses the dynamics between open-source and closed-source models. Open-source models such as BLOOM~\cite{workshop2023bloom}, OPT~\cite{zhang2022opt}, LLaMA~\cite{touvron2023llama}, Pythia~\cite{biderman2023pythia} and Falcon~\cite{penedo2023refinedweb} are rising to compete against their closed-source counterparts, including GPT-3~\cite{brown2020language} and Chinchilla~\cite{hoffmann2022training}. To speed up training, Sparse Attention~\cite{1904.10509,beltagy2020longformer} was introduced, but among large models, only GPT-3 adopted it~\cite{brown2020language,2210.15424}.
+
+
+\subsection{Non-Transformer-based LLMs Candidates}
+Despite the proliferation of Transformer-based large models in the research community, a portion of recent work has prioritized addressing its square space-time complexity. This focus has led to the exploration and development of a series of model architectures that diverge from the traditional Transformer structure. Among them, four significant contenders—linear transformers, state space model, long convolution, and linear recurrence—have shown promising results as substitutes for self-attention (SA) modules when modeling long sequences. These alternatives are favored for their superior asymptotic time complexity and competitive performances.
+
+\paragraph{Linear Transformer}
+Linear Transformer decomposes Softmax Attention into the form of the inner product of hidden representations, which allows it to use the "Right Product Trick," where the product of keys and values is computed to avoid the quadratic $n \times n$ matrix. Different methods utilize various hidden representations. For example, ~\cite{katharopoulos2020transformers} uses 1+elu as an activation function, ~\cite{zhen2022cosformer} uses the cos function to approximate the properties of softmax, and ~\cite{ke2021rethinking,zheng2022linear,zheng2023efficient} approximates softmax through theoretical approaches. Although its theoretical complexity is $O(nd^2)$, the actual computational efficiency of Linear Attention becomes quite low when used in causal attention due to the need for \textit{cumsum} operations~\cite{hua2022transformer}. On the other hand, most Linear Transformers still exhibit a certain performance gap compared to traditional Transformers~\cite{katharopoulos2020transformers,liu2022neural}.
+\paragraph{State Space Model}
+State Space Model is based on the State Space Equation for sequence modeling~\cite{s4}, using special initialization~\cite{2008.07669,s4d}, diagonalization assumptions~\cite{gupta2022DSS}, and some techniques~\cite{h3} to achieve performance comparable to Transformers. On the other hand, due to the characteristics of the State Space Equation, it enables inference to be conducted within constant complexity~\cite{s4}.
+\paragraph{Long Convolution}
+Long convolution models~\cite{qin2023toeplitz,simplelongconv} utilize a kernel size equal to the input sequence length, facilitating a wider context compared to traditional convolutions. Training these models involves the efficient $O(n\log n)$ Fast Fourier Transforms (FFT) algorithm. However, long convolutions pose certain challenges, such as the need for causal convolution inference, which necessitates caching all historical computations similar to SA's key-value (KV) cache. The memory requirements for handling long sequences, coupled with the higher inference complexity compared to RNNs, make them less ideal for processing long sequences.
+\paragraph{Linear RNN}
+Linear RNNs, in contrast, stand out as more suitable replacements for SA in long-sequence modeling. A notable example is the RWKV ~\cite{peng2023rwkv} model, a linear RNN-based LLM that has shown competitive performance against similarly scaled GPT models.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{TransNormerLLM}
+\subsection{Architecture Improvement}
+In this section, we thoroughly investigate each module of the network and propose several improvements to achieve an optimal balance between efficiency and performance. Below, we outline the key designs of each block along with the inspiration behind each change. We conduct an ablation study on each of these modifications in Sec.~\ref{section: experiment}.
+
+
+\subsubsection{Improvement 1: Position encoding}
+In TransNormer, DiagAttention is used at the lower layers to avoid dilution issues. However, this leads to a lack of global interaction between tokens. 
+In TransNormerLLM, we leverage LRPE~\cite{qin2023linearized} with exponential decay~\cite{alibi,qin2023toeplitz} to address this issue, retaining full attention at the lower layers. The overall expression of our position encoding is as follows:
+\begin{equation}
+a_{st}=\mathbf q_s^{\top} \mathbf k_t \lambda^{s-t}\exp^{i\theta(s-t)}.
+\label{eq: pe}
+\end{equation}
+which we call it LRPE-d - Linearized Relative Positional Encoding with exponential decay. Similar to the original LRPE, we set $\theta$ to be learnable.
+
+Note that this position encoding is fully compatible with Linear Attention, as it can be decomposed with respect to $s$ and $t$ separately.
+The value of $\lambda$ for the $h$-th head in the $l$-th layer (assuming there are a total of $H$ heads and $L$ layers) is given by:
+\begin{equation}
+\label{eq:decay}
+\lambda =\exp\left(-\frac{8h}{H}\times \left(1-\frac{l}{L}\right) \right).
+\end{equation}
+Here, $\frac{8h}{H}$ corresponds to the decay rate of the $h$-th head, while $ \left(1-\frac{l}{L}\right)$ corresponds to the decay rate of the $l$-th layer. The term $ \left(1-\frac{l}{L}\right)$ ensures that the Theoretical Receptive Fields (TRF)~\cite{2307.10156} at the lower layers is smaller compared to the higher layers, which aligns with TransNormer's motivation. It should be noted that the decay rate in the last layer is set to 1, allowing each token to attend to global information. We choose $\lambda$ to be non-learnable since we empirically found that gradients become unstable when $\lambda$ is learnable, leading to NaN values.
+
+
+
+\subsubsection{Improvement 2: Gating mechanism}
+Gate can enhance the performance of the model and smooth the training process. In TransNormerLLM, we adopted the approach from Flash~\cite{hua2022transformer} and used the structure of Gated Linear Attention (GLA) in token mixing:
+\begin{equation}
+\mathrm{TokenMixer}: \mathbf{O}=\mathrm{Norm}(\mathbf{Q} \mathbf{K}^{\top}\mathbf{V})\odot \mathbf{U},
+\label{eq: gla1}
+\end{equation}
+
+where:
+\begin{equation}
+\mathbf Q=\phi(\mathbf X \mathbf W_q),\mathbf K=\phi(\mathbf X \mathbf W_k),\mathbf V=\mathbf X \mathbf W_v,\mathbf U=\mathbf X \mathbf W_u.
+\label{eq: gla2}
+\end{equation}
+
+We chose $\phi$ to be $1+elu$. We found that the specific choice of $\phi$ has a minimal impact on the results, as shown in Table~\ref{tab:gla_act}.
+
+To further accelerate the model, we propose Simple GLU (SGLU), which removes the activation function from the original GLU structure as the gate itself can introduce non-linearity. Therefore, our channel mixing becomes:
+\begin{equation}
+\mathrm{ChannelMixer}:\mathbf {O}=[\mathbf V\odot \mathbf U]\mathbf W_o,\\
+\mathbf V=\mathbf X \mathbf W_v,\mathbf U=\mathbf X \mathbf W_u,
+\label{eq: glu}
+\end{equation}
+We empirically find that not using an activation function does not lead to any performance loss, as demonstrated in Table~\ref{tab:glu_act}.
+
+\subsubsection{Improvement 3: Tensor normalization}
+We employ the NormAttention introduced in TransNormer~\cite{qin-etal-2022-devil} as follows:
+\begin{equation}
+\mathbf{O}=\mathrm{Norm}((\mathbf{Q} \mathbf{K}^{\top})\mathbf{V})
+\label{eq: norm attention}
+\end{equation}
+This attention mechanism eliminates the softmax and scaling operation. Moreover, it can be transformed into linear attention through right multiplication:
+\begin{equation}
+\mathbf{O}=\mathrm{Norm}(\mathbf{Q} (\mathbf{K}^{\top}\mathbf{V}))
+\label{eq: norm attention 2}
+\end{equation}
+This linear form allows for recurrent prediction with a complexity of $O(nd^2)$, making it efficient during inference. Specifically, we only update $\mathbf{K}^{\top}\mathbf{V}$ in a recurrent manner without computing the full attention matrix.
+In TransNormerLLM, we replace the RMSNorm with a new simple normalization function called SimpleRMSNorm, abbreviated as SRMSNorm:
+\begin{equation}
+\mathrm{SRMSNorm}(\mathbf x)=\frac{\mathbf x}{\|\mathbf x \|_2/\sqrt d}.
+\end{equation}
+We empirically find that using SRMSNorm does not lead to any performance loss, as demonstrated in the ablation study in Table.~\ref{tab:norm}.
+
+\begin{wrapfigure}[22]{r}{0.5\textwidth}
+  \centering
+    % Figure removed
+    \vspace{-5mm}
+  \captionof{figure}{Architecture overview of the proposed model. 
+  Each transformer block is composed of a Simple Gated Linear Unit (SGLU) for channel mixing and a Gated Linear Attention for token mixing. 
+  We apply pre-norm for both modules.}  
+  \label{fig:arch}
+  
+\end{wrapfigure}
+
+
+\subsubsection{The overall structure}
+The overall structure is illustrated in Figure~\ref{fig:arch}.
+In this structure, the input $\mathbf X$ is updated through two consecutive steps: First, it undergoes Gated Linear Attention (GLA) with the application of SimpleRMSNorm (SRMSNorm) normalization. Then, it goes through the Simple Gated Linear Unit (SGLU) with SRMSNorm normalization again. This overall architecture helps improve the model's performance based on the PreNorm approach. The pseudo-code of the overall process is as follows:
+\begin{equation}
+\begin{gathered}
+\mathbf X = \mathbf X + \mathrm{GLA}(\mathrm{SRMSNorm}(\mathbf X)), \\
+\mathbf X = \mathbf X + \mathrm{SGLU}(\mathrm{SRMSNorm}(\mathbf X)).
+\end{gathered}
+\end{equation}
+
+\subsection{Training Optimization}
+\subsubsection{Lightning Attention}
+The structure of linear attention allows for efficient attention calculation with a complexity of $O(nd^2)$ through right-multiplication. However, for causal prediction, right-multiplication is not efficient as it necessitates \textit{cumsum} computation~\cite{hua2022transformer}, which hinders parallelism training. 
+As a result, during training, we continue to use the conventional left-multiplication version.
+To accelerate attention calculations, we introduce the Lightning Attention algorithm inspired by~\cite{dao2023flashattention2,dao2022flashattention}, which makes our linear attention IO-friendly.
+It computes the following expression:
+\begin{equation}
+\mathbf O= (\mathbf Q\mathbf K^{\top} \odot \mathbf M)\mathbf V.
+\end{equation}
+Here, $\mathbf M$ is the attention mask which enables lower triangular causal masking and positional encoding.
+In the Lightning Attention, we split the inputs $\mathbf{Q}, \mathbf{K}, \mathbf{V}$ into blocks, load them from slow HBM to fast SRAM, then compute the attention output with respect to those blocks. Then we accumulate the final results.
+The computation speed is accelerated by avoiding the operations on slow HBM.
+The implementation details of Lightning Attention are shown in Algorithm~\ref{algo:lightning attention fw pseudo} for forward pass and Algorithm~\ref{algo:lightning attention bw pseudo} for backward pass. Note that there is a faster implementation for gradient computation that will be released in the future.
+\begin{algorithm}
+\small
+    \caption{Lightning Attention Forward Pass}
+    \label{algo:lightning attention fw pseudo}
+    \begin{algorithmic}
+    \State{\textbf{Input:} $\mathbf Q,\mathbf K,\mathbf V \in \mathbb{R}^{n \times d}$, attention mask $\mathbf{M }\in \mathbb{R}^{n \times n} $, 
+    block sizes $B_c,B_r$;}
+    \State{\textbf{Initialize:} $\mathbf O=\mathbf 0 \in \mathbb{R}^{n \times d}$;}
+     \State{Divide $\mathbf Q$ into $T_r = \frac{n}{B_r}$ blocks $\mathbf Q_1, \mathbf Q_2, ...\mathbf Q_{T_r}$ of size $B_r \times d$ each. }
+     \State{Divide $\mathbf K,\mathbf V$ into $T_c = \frac{n}{B_c}$ blocks $\mathbf K_1, \mathbf K_2, ...\mathbf K_{T_c}, \mathbf V_1, \mathbf V_2, ...\mathbf V_{T_c} $ of size $B_c \times d$ each.}
+     \State{Divide $\mathbf O$ into $T_r = \frac{n}{B_r}$ blocks $\mathbf O_1, \mathbf O_2, ...\mathbf O_{T_r}$ of size $B_r \times d$ each.}
+     \State{Divide $\mathbf M$ into $T_r \times T_c$ blocks $\mathbf M_{11}, \mathbf M_{12}, ...\mathbf M_{T_r,T_c}$ of size $B_r \times B_c$ each.}
+    \For{$1 \leq i \leq T_r$}
+        \State{Load $\mathbf Q_i \in \mathbb{R}^{B_r \times d}$ from HBM to on-chip SRAM.}
+        \State{Initialize $ \mathbf{O}_i= \mathbf 0 \in \mathbb{R}^{B_r \times d}$ on SRAM.}
+        \For{$1 \leq j \leq T_c$}
+            \State{Load $\mathbf K_j, \mathbf V_j \in \mathbb{R}^{B_c \times d}$ from HBM to on-chip SRAM.}
+            \State{Load $\mathbf M_{ij} \in \mathbb{R}^{B_c \times B_c}$ from HBM to on-chip SRAM.}
+            \State{On chip, compute $\mathbf A_{ij} = [\mathbf Q_i \mathbf K_j^{\top }] \odot \mathbf M_{ij}\in \mathbb{R}^{B_r \times B_c}$.}
+            \State{On chip, compute $\mathbf{O}_i = \mathbf{O}_i + \mathbf A_{ij}\mathbf V_j \in \mathbb{R}^{B_r \times d}$.}
+      \EndFor
+      \State{Write $\mathbf O_i$ to HBM as the $i$-th block of $\mathbf O$.}
+      \EndFor
+      \State{return $\mathbf O$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\small
+    \caption{Lightning Attention Backward Pass}
+    \label{algo:lightning attention bw pseudo}
+    \begin{algorithmic}
+    \State{\textbf{Input:} $\mathbf Q,\mathbf K,\mathbf V,\mathbf{dO} \in \mathbb{R}^{n \times d}$, attention mask $\mathbf{M }\in \mathbb{R}^{n \times n} $,  on-chip SRAM of size $M$, block sizes $B_c,B_r$;}
+    \State{\textbf{Initialize:} $\mathbf{dQ}=\mathbf{dK}=\mathbf{dV}=\mathbf 0 \in \mathbb{R}^{n \times d}$;}
+     \State{Divide $\mathbf Q$ into $T_r = \frac{n}{B_r}$ blocks $\mathbf Q_1, \mathbf Q_2, ...\mathbf Q_{T_r}$ of size $B_r \times d$ each. }
+     \State{Divide $\mathbf K,\mathbf V$ into $T_c = \frac{n}{B_c}$ blocks $\mathbf K_1, \mathbf K_2, ...\mathbf K_{T_c}, \mathbf V_1, \mathbf V_2, ...\mathbf V_{T_c} $ of size $B_c \times d$ each.}
+     \State{Divide $\mathbf O,\mathbf {dO}$ into $T_r = \frac{n}{B_r}$ blocks $\mathbf O_1, \mathbf O_2, ...\mathbf O_{T_r},\mathbf {dO_1}, \mathbf {dO_2}, ...\mathbf {dO_{T_r}}$ of size $B_r \times d$ each}
+     \State{Divide $\mathbf M$ into $T_r \times T_c$ blocks $\mathbf M_{11}, \mathbf M_{12}, ...\mathbf M_{T_r,T_c}$ of size $B_r \times B_c$ each.}
+    \For{$1 \leq j \leq T_c$}
+        \State{Load $\mathbf K_j, \mathbf V_j \in \mathbb{R}^{B_c \times d}$ from HBM to on-chip SRAM.}
+        \State{Initialize $ \mathbf{dK}_j=\mathbf{dV}_j= \mathbf 0 \in \mathbb{R}^{B_c \times d}$ on SRAM.}
+        \For{$1 \leq i \leq T_r$}
+             \State{Load $\mathbf Q_i,\mathbf O_i,\mathbf {dO}_i \in \mathbb{R}^{B_r \times d}$ from HBM to on-chip SRAM.}
+             \State{Load $\mathbf M_{ij} \in \mathbb{R}^{B_c \times B_c}$ from HBM to on-chip SRAM.}
+             \State{Initialize $ \mathbf{dK}_j=\mathbf{dV}_j= \mathbf 0 \in \mathbb{R}^{B_c \times d}$ on SRAM.}           
+            \State{On chip, compute $\mathbf A_{ij} = [\mathbf Q_i \mathbf K_j^{\top}]\odot \mathbf M_{ij} \in \mathbb{R}^{B_r \times B_c}$.}
+              \State{On chip, compute $\mathbf {dV}_{j} =  \mathbf {dV}_{j}+\mathbf A_{ij}^{\top} \mathbf{dO}_i \in \mathbb{R}^{B_c \times d}$.}
+            \State{On chip, compute $\mathbf {dA}_{ij} =  [\mathbf {dO}_{i}\mathbf V_j^{\top}] \odot \mathbf M_{ij} \in \mathbb{R}^{B_r \times B_c}$.}
+           \State{On chip, compute $\mathbf {dK}_{j} =  \mathbf {dk}_{j}+\mathbf {dA}_{ij}^{\top} \mathbf{V}_j \in \mathbb{R}^{B_c \times d}$.}
+             \State{Load $\mathbf{dQ}_i$ from HBM to SRAM, then on chip, compute $\mathbf {dQ}_{i} =  \mathbf {dK}_{i}+\mathbf {dA}_{ij} \mathbf{K}_j \in \mathbb{R}^{B_r \times d}$,}
+             \State{write back to HBM.}
+      \EndFor
+     \State{Write $\mathbf {dK}_j,\mathbf {dV}_j$ to HBM as the $j$-th block of $\mathbf {dK}, \mathbf {dV}$.}
+      \EndFor
+      \State{retun $\mathbf {dQ, dK, dV}$}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Model Parallelism}
+
+To effectively carry out the large-scale pre-training of TransNormerLLM, we have focused our efforts on system optimization from a variety of angles. It is critical to emphasize that the term "large-scale" refers to two aspects: first, the model has a large number of parameters, and second, the computational infrastructure has a large number of GPU nodes. These factors result in a variety of practical challenges, including GPU memory constraints, decreased computation efficiency, slow communication speeds, \emph{etc.}. Addressing these issues is critical to the successful implementation of the large-scale pre-training process.
+
+We use the Fully Sharded Data Parallel (FSDP)~\cite{zhao2023pytorch} approach in our study to distribute all model parameters, gradients, and optimizer state tensors across the entire cluster. This strategic partitioning reduces memory occupancy on each individual GPU, optimizing memory utilization.
+To improve efficiency even further, we use Activation Checkpointing~\cite{shoeybi2019megatron}, which reduces the number of activations cached in memory during the backward pass. Instead, when calculating the gradients, these activations are removed and recomputed. This technique aids in more efficient computations and resource conservation.
+Furthermore, we use Automatic Mixed Precision (AMP)~\cite{micikevicius2017mixed} to reduce GPU memory consumption while also accelerating computation speed. It is worth noting that throughout our experiments, we utilize BFloat16~\cite{kalamkar2019study} due to its observed beneficial impact on the training stability of large TransNormerLLM models.
+
+In addition to the aforementioned efforts, we go deeper into system engineering optimization by performing model parallelism on linear transformers, which is heavily inspired by Nvidia's Megatron-LM model parallelism~\cite{shoeybi2019megatron}.
+Each transformer layer in the conventional transformer model consists of a self-attention block followed by a two-layer multi-layer perceptron (MLP) block. When using Megatron-LM model parallelism, it is used independently on these two blocks. Similarly, within the TransNormerLLM structure, which is also made up of two main blocks, SGLU and GLA, we perform model parallelism on each of them separately. The detailed model parallelism strategies are shown below.
+
+\paragraph{Model Parallelism on SGLU}
+Recall the SGLU structure in Eq. \ref{eq: glu}:
+\begin{equation}
+\mathbf O=[(\mathbf X \mathbf W_v) \odot (\mathbf X \mathbf W_u)]\mathbf W_o,
+\label{eq: mp_glu}
+\end{equation}
+Its model parallel version goes with:
+\begin{align}
+[\mathbf {O}'_1, \mathbf {O}'_2]&=\mathbf X[\mathbf W_v^1, \mathbf W_v^2] \odot \mathbf X[\mathbf W_u^1, \mathbf W_u^2],\\
+&=[\mathbf X \mathbf W_v^1, \mathbf X \mathbf W_v^2] \odot [\mathbf X \mathbf W_u^1, \mathbf X \mathbf W_u^2],
+\label{eq: mp_glu_1}
+\end{align}
+which split the weight matrices $\mathbf W_v$ and $\mathbf W_u$ along their column and obtain an output matrix split along its column too.
+Then the separated output $[\mathbf O_1, \mathbf O_2]$ is multiplied by another matrix which is split along its row as:
+\begin{equation}
+\mathbf {O}=[\mathbf O_1', \mathbf O_2'] 
+\left[\begin{array}{cc}
+     \mathbf W_o^1  \\
+     \mathbf W_o^2
+\end{array}\right]=\mathbf O_1' \mathbf W_o^1 + \mathbf O_2' \mathbf W_o^2
+\label{eq: mp_glu_output}
+\end{equation}
+This whole procedure splits three GEMMs into the SGLU blocks across multiple GPUs and introduces only a single all-reduce operation in both the forward and backward passes, respectively. 
+
+\paragraph{Model Parallelism on GLA}
+
+Recall the GLA block in Eqs. \ref{eq: gla1} and \ref{eq: gla2}, model parallelism on GLA as follows:
+\begin{equation}
+[\mathbf{O_1}, \mathbf{O_2}]=\mathrm{SRMSNorm}(\mathbf{Q} \mathbf{K}^{\top}\mathbf{V})\odot \mathbf{U},
+\label{eq: mp_gla1}
+\end{equation}
+where:
+\begin{align}
+\mathbf Q&=\phi(\mathbf X [\mathbf W_q^1, \mathbf W_q^2])=[\phi(\mathbf X \mathbf W_q^1), \phi(\mathbf X \mathbf W_q^2)],\\
+\mathbf K&=\phi(\mathbf X [\mathbf W_k^1, \mathbf W_k^2])=[\phi(\mathbf X \mathbf W_q^1), \phi(\mathbf X \mathbf W_q^2)],\\
+\mathbf V&=\mathbf X [\mathbf W_v^1, \mathbf W_v^2],\mathbf U=\mathbf X [\mathbf W_u^1, \mathbf W_u^2],
+\label{eq: mp_gla2}
+\end{align}
+Note that in implementation, we use the combined QKVU projection to improve computation efficiency.
+The obtained split output matrix $[\mathbf{O_1}, \mathbf{O_2}]$ again is multiplied by a weight matrix split along its column axis which is similar to Eq. \ref{eq: mp_glu_output}.
+
+\subsection{Robust Inference}
+In this section, we discuss the inference problem in TransNormerLLM. It is important to note that the formula~\ref{eq: pe} can be decomposed into the following form:
+\begin{equation}
+a_{st}=(\mathbf q_s \lambda^s \exp^{i\theta s})^{\top}(\mathbf k_t \lambda^{-t} \exp^{i\theta t}).
+\end{equation}
+This allows TransNormerLLM to perform inference in the form of an RNN~\cite{katharopoulos2020transformers}. Details of the procedure are shown in Algorithm~\ref{algo:origin}. However, it is worth noting that $\lambda < 1$, which results in:
+\begin{equation}
+\|\mathbf q_s \lambda^s \exp^{i\theta s}\|_2= \|\mathbf q_s\|_2 \lambda^s \to 0,\\
+\|\mathbf k_t \lambda^{-t} \exp^{i\theta t}\|_2= \|\mathbf k_t\|_2 \lambda^{-t} \to \infty,
+\end{equation}
+leading to numerical precision issues.
+
+To avoid these issues, we propose a Robust Inference Algorithm in~\ref{algo:robust}. Since $\|\mathbf q_s \exp^{i\theta s} \|=\|\mathbf q_s \|$, $\|\mathbf k_t \exp^{i\theta t} \|=\|\mathbf k_t \|$, for simplicity, we will omit LRPE~\cite{qin2023linearized} in the subsequent discussions, considering only $a_{st}=\mathbf q_s^{\top} \mathbf k_t \lambda^{s-t} .$
+
+% Figure environment removed
+    
+We will use induction to prove:
+\begin{equation}
+[\mathbf {kv}]_t=\lambda^{-t}[{\mathbf {\overline{kv}}}]_t.
+\end{equation}
+
+Thus, both the Origin Inference Algorithm and the Robust Inference Algorithm yield the same results.
+
+\textbf{Base Case ($n=1$):}
+\begin{equation}
+\begin{aligned}
+[\mathbf {kv}]_1 & =([\mathbf {kv}]_0+\mathbf {k_1} \lambda^{-1} \mathbf {v}_1^{\top})\\
+&=\lambda^{-1}(\mathbf {k_1}  \mathbf {v}_1^{\top})\\
+&= \lambda^{-1}[{\mathbf {\overline{kv}}}]_1 .
+\end{aligned}
+\end{equation}
+
+Thus, the base case is true. Let us assume the statement holds for $n=m-1$, i.e., $[\mathbf {kv}]_{m-1}=\lambda^{-(m-1)}[{\mathbf {\overline{kv}}}]_{m-1}$. Then, when $n=m$:
+\begin{equation}
+\begin{aligned}
+ [\mathbf {kv}]_m &= [\mathbf {kv}]_{m-1} + \mathbf {k_m} \lambda^{-m} \mathbf {v}_m^{\top}\\
+&=\lambda^{-(m-1)}[{\mathbf {\overline{kv}}}]_{m-1} + \mathbf {k_m} \lambda^{-m} \mathbf {v}_m^{\top}\\
+&=\lambda^{-m}(\lambda [{\mathbf {\overline{kv}}}]_{m-1} + \mathbf {k_m}\mathbf {v}_m^{\top})\\
+&=\lambda^{-m} [{\mathbf {\overline{kv}}}]_m,
+\end{aligned}
+\end{equation}
+the statement holds. Therefore, by induction, the statement holds for all $n\geq 1$.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Corpus}
+We gather an extensive corpus of publicly accessible text from the internet, totaling over $700$TB in size. The collected data are processed by our data preprocessing procedure as shown in Figure~\ref{fig:data_preprocess}, leaving a $6$TB cleaned corpus with roughly 2 trillion tokens. We categorize our data sources to provide better transparency and understanding. The specifics of these categories are outlined in Table~\ref{tab:pretraing_data}. 
+
+\subsection{Data Preprocessing}
+% Figure environment removed
+
+Our data preprocessing procedure consists of three steps: 1). rule-based filtering, 2). deduplication, and 3). a self-cleaning scheme. Before being added to the training corpus, the cleaned corpus needs to be evaluated by humans.
+
+\paragraph{Rule-based filtering}
+The rules we used to filter our collected data are listed as follows:
+\begin{itemize}[noitemsep,topsep=0pt,parsep=0pt,partopsep=0pt]
+    \item \emph{Removal of HTML Tags and URLs:} The initial step in our process is the elimination of HTML tags and web URLs from the text. This is achieved through regular expression techniques that identify these patterns and remove them, ensuring the language model focuses on meaningful textual content.
+    \item \emph{Elimination of Useless or Abnormal Strings:} Subsequently, the cleaned dataset undergoes a second layer of refinement where strings that do not provide value, such as aberrant strings or garbled text, are identified and excised. This process relies on predefined rules that categorize certain string patterns as non-contributing elements.
+    \item \emph{Deduplication of Punctuation Marks:} We address the problem of redundant punctuation marks in the data. Multiple consecutive punctuation marks can distort the natural flow and structure of sentences when training the model. We employ a rule-based system that trims these duplications down to a single instance of each punctuation mark.
+    \item \emph{Handling Special Characters:} Unusual or special characters that are not commonly part of the language's text corpus are identified and either removed or replaced with a standardized representation.
+    \item \emph{Number Standardization:} Numerical figures may be presented in various formats across different texts. These numbers are standardized into a common format to maintain consistency.
+    \item \emph{Preservation of Markdown/LaTeX Formats:} While removing non-textual elements, exceptions are made for texts in Markdown and LaTeX formats. Given their structured nature and ubiquitous use in academia and documentation, preserving these formats can enhance the model's ability to understand and generate similarly formatted text.
+\end{itemize}
+
+\paragraph{Deduplication}
+To ensure the uniqueness of our data and avert the risk of overfitting, we employ an efficient de-duplication strategy at the document or line level using MinHash and Locality-Sensitive Hashing (LSH) algorithms. This combination of MinHash and LSH ensures a balance between computational efficiency and accuracy in the deduplication process, providing a robust mechanism for data deduplication and text watermark removal. 
+
+\paragraph{Self-cleaning scheme}
+Our data self-cleaning process involves an iterative loop of the following three steps to continuously refine and enhance the quality of our dataset. An issue of using model-based data filters is that the filtered data will have a similar distribution as the evaluation model, which may have a significant impact on the diversity of the training data. Assuming that the majority of the pre-processed data is of high quality, we can train an evaluation model on the entire set of pre-processed data, and the model will automatically smooth the data manifold distribution and outlet low-quality data while retaining the majority of the diversities. 
+
+The self-cleaning scheme unfolds as follows:
+\begin{itemize}[noitemsep,topsep=0pt,parsep=0pt,partopsep=0pt]
+    \item \emph{Evaluation Model:} We train a 385M model on the pre-processed corpus to act as a data quality filter. 
+    \item \emph{Model-Based Data Filtering:} We use the evaluation model to assess each piece of data with perplexity. Only data achieving a score above a certain threshold is preserved for the next step. Low-quality data are weeded out at this stage.
+    \item \emph{Human Evaluation:} We sample a small portion of the filtered data and manually evaluate the quality. 
+\end{itemize}
+
+These steps are repeated in cycles, with each iteration improving the overall quality of the data and ensuring the resulting model is trained on relevant, high-quality text. This self-cleaning process provides a robust mechanism for maintaining data integrity, thereby enhancing the performance of the resulting language model.
+
+
+% ===========================
+\begin{table}[t]
+\small
+    \caption{\textbf{Statistics of our corpus.} For each category, we list the number of epochs performed on the subset when training on the 2 trillion tokens, as well as the number of tokens and disk sizes. We also list the table on the right according to the language distribution.  }
+    \label{tab:pretraing_data}
+    \centering
+    \begin{minipage}{0.6\textwidth}
+        \centering
+        \setlength{\tabcolsep}{3.2mm}
+        \renewcommand{\arraystretch}{1.0}
+        \begin{tabular}{lcrr}
+        \hline
+        Dataset & Epochs & Tokens & Disk size \\ \hline
+        Academic Writings & 1.53 & 200 B & 672 GB \\ 
+        Books & 2.49 & 198 B & 723 GB \\
+        Code & 0.44 & 689 B & 1.4 TB \\
+        Encyclopedia & 1.51 & 5 B & 18 GB \\
+        Filtered Webpages & 1.00 & 882 B & 3.1 TB \\
+        Others & 0.63 & 52 B & 154 GB \\ \hline
+        Total & - & 2026 B  & 6 TB \\ \hline
+        \end{tabular}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}{0.4\textwidth}
+        \centering
+        \setlength{\tabcolsep}{3.4mm}
+        \renewcommand{\arraystretch}{1.27}
+        \begin{tabular}{lrr}
+        \hline
+        \\[-1em]
+        Language & Tokens & Disk size \\ \hline
+        English & 743 B & 2.9 TB \\
+        Chiese & 555 B & 1.7 TB \\
+        Code & 689 B & 1.4 TB \\
+        Others & 39 B & 89 GB \\ \hline
+        Total & 2026 B & 6 TB \\ \hline
+        \end{tabular}
+    \end{minipage}%
+\end{table}
+
+% ===========================
+
+\subsection{Tokenization}
+We tokenize the data with the Byte-Pair Encoding (BPE) algorithm. Notably, to enhance compatibility with Chinese language content, a significant number of common and uncommon Chinese characters have been incorporated into our vocabulary. In cases where vocabulary items are not present in the dictionary, the words are broken down into their constituent UTF-8 characters. This strategy ensures comprehensive coverage and flexibility for diverse linguistic input during model training.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Experiments}
+\label{section: experiment}
+We use PyTorch~\cite{NEURIPS2019_9015} and Trition~\cite{Tillet2019TritonAI} to implement TransNormerLLM in Metaseq framework~\cite{zhang2022opt}. Our model is trained using Adam optimizer~\cite{kingma2017adam}, and we employ FSDP to efficiently scale our model to NVIDIA A100 80G clusters. We additionally leverage the model parallel as appropriate to optimize performance. In ablation studies, all models are trained on a sampled corpus from our corpus with 300B tokens. In order to reduce the fluctuation of Losses and PPLs in the tables below, we compute the average Losses and PPLs of the last 1k iterations as the final metrics.
+
+
+\subsection{Architecture Ablations}
+\paragraph{Transformer \emph{vs} TransNormerLLM} 
+We carried out a meticulous series of comparative tests between our TransNormerLLM and Transformer, spanning over an array of disparate sizes. The comparative performance of these models is clearly illustrated in Table~\ref{tab:transf_vs_transn}. 
+Under identical configurations, it becomes evident that our TransNormerLLM exhibits a superior performance profile compared to Transformer. We observed that TransNormerLLM outperformed Transformer by a remarkable 5\% at the size of 385M. More importantly, as the size reached 1B, this superiority became even more pronounced, with an advantage of 9\% for TransNormerLLM over Transformer.
+% ==================
+\begin{table}[h]
+\centering
+    \small
+    \caption{\textbf{Transformer \emph{vs} TransNormerLLM.} TransNormerLLM performs better than Transformer in size of 385M and 1B under identical configurations by 5\% and 9\%, respectively.}
+    \label{tab:transf_vs_transn}
+    \setlength{\tabcolsep}{4.6mm}
+    \begin{tabular}{cccccccc}
+    \hline
+    \\[-1em]
+    \multicolumn{2}{c}{Model Size}  & \multicolumn{3}{c}{385M}  & \multicolumn{3}{c}{1B}               \\ 
+    \cmidrule(lr){1-2} \cmidrule(lr){3-5} \cmidrule(lr){6-8}  
+    \\[-1em]
+    \multicolumn{2}{c}{Method}      & \multicolumn{1}{c}{Updates} & Loss & PPL  & \multicolumn{1}{c}{Updates} & Loss& PPL   \\ \hline
+    \\[-1em]
+    \multicolumn{2}{c}{Transformer} & 100K                         & 2.362 &5.16 & 100K                         & 2.061 &4.765 \\ %\hline
+    \multicolumn{2}{c}{TransNormerLLM} & 100K                         & 2.247 &4.765 & 100K                         & 1.896 &3.728\\ \hline
+\end{tabular}
+\end{table}
+
+
+
+% ==================
+\begin{wraptable}[6]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-5mm}
+    \caption{\textbf{TransNormer \emph{vs} TransNormerLLM.} TransNormerLLM leads the best results.}
+    \label{tab:transnormers}
+    \centering
+    \setlength{\tabcolsep}{1.2mm}
+    \vspace{-2mm}
+        \begin{tabular}{lllll}
+        \hline
+        \\[-1em]
+        Method & Params & Updates & Loss & PPL \\ \hline
+        \\[-1em]
+        TransNormerLLM & 385M & 100K & 2.247 &4.765 \\ %\hline
+        TransNormer-T1 & 379M & 100K & 2.290 &4.910 \\ %\hline
+        TransNormer-T2 & 379M & 100K & 2.274 &4.858\\ \hline
+    \end{tabular}
+\end{wraptable}
+
+\paragraph{TransNormer \emph{vs} TransNormerLLM} 
+We compare the original TransNormer and the improved TransNormerLLM and the results are shown in Table~\ref{tab:transnormers}. TransNormerLLM exhibited an enhancement of 2\% and 1\% respectively, while significantly faster.
+
+
+% ================== PE ==================
+\begin{wraptable}[8]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-4.mm}
+    \caption{\textbf{Positional encoding.} The combination of LRPE+LRPE-d leads the most optimal outcome.}
+    \vspace{-2mm}
+    \label{tab:pe}
+    \centering
+    \setlength{\tabcolsep}{2mm}
+         \begin{tabular}{lllll}
+    \hline
+        PE Methods & Params & Updates & Loss &PPL\\ \hline
+         LRPE-d & 385M & 100K & 2.247 & 
+         4.765 \\ 
+          APE & 386M & 100K & 2.387 & 5.253\\
+           LRPE & 385M & 100K & 2.287 & 4.899 \\ 
+        Exp-Decay & 385M & 100K & 2.267 & 4.834 \\ 
+       \hline
+    \end{tabular}
+\end{wraptable}
+\paragraph{Positional Encoding} In the positional encoding experiment, we conducted a series of tests, comparing LRPE-d, APE (absolute positional encoding), LRPE, and Exp-Decay (exponential decay). As evident from Table~\ref{tab:pe}, our proposed enhancement has already shown an improvement over the original model. Moreover, the final scheme demonstrated a 2\% improvement over the LRPE method.
+
+\begin{wraptable}[4]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-9.2mm}
+    \caption{\textbf{Ablations on decay temperature.} The results of decay temperature proved to be superior.}
+    \label{tab:temperature}
+    \centering
+    \vspace{-2mm}
+    \setlength{\tabcolsep}{1.6mm}
+        \begin{tabular}{lllll}
+        \hline
+            Temperature & Params & Updates & Loss &PPL \\ \hline
+            w/ temperature & 385M & 100K & 2.247 &4.765\\ %\hline
+            w/o temperature & 385M & 100K & 2.258 &4.804 \\ \hline
+    \end{tabular}
+\end{wraptable}
+We also perform ablations on the decay temperature $\left(1-\frac{l}{L}\right)$ in Eq.~\ref{eq:decay}. The perplexity of the TransNormerLLM is reduced by adding the decay temperature, as shown in Table~\ref{tab:temperature}.
+
+% ================== GATE ==================
+\begin{wraptable}[5]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-0mm}
+    \caption{\textbf{Ablations on gating mechanism.} The performance with the gate proved to be superior.}
+    \vspace{-2mm}
+    \label{tab:gate}
+    \centering
+    \setlength{\tabcolsep}{2.5mm}
+        \begin{tabular}{lllll}
+        \hline
+            Gate & Params & Updates & Loss &PPL\\ \hline
+            w/ gate & 385M & 100K & 2.247  &4.765 \\
+            w/o gate & 379M & 100K & 2.263 &4.820 \\ \hline
+    \end{tabular}
+\end{wraptable}
+\paragraph{Gating mechanism} We conduct ablation studies to examine the effect of including the gating mechanism. As observed in Table~\ref{tab:gate}, gate enabled the reduction of the loss value from 2.263 to 2.247.
+% ==================
+
+
+% % ==================
+\begin{wraptable}[7]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-4.5mm}
+    \caption{\textbf{Ablations on GLA activation functions.} The results obtained from different activation functions were virtually identical.}
+    \vspace{-2mm}
+    \label{tab:gla_act}
+    \centering
+    \setlength{\tabcolsep}{2.4mm}
+         \begin{tabular}{lllll}
+        \hline
+        GLA Act & Params & Updates & Loss &PPL \\ \hline
+        1+elu	& 385M	& 100K	& 2.247	& 4.765 \\
+        Swish & 385M & 100K & 2.236 & 4.728\\ 
+        No Act & 385M & 100K & 2.281 &4.880 \\ \hline
+    \end{tabular}
+\end{wraptable}
+\paragraph{GLA Activation Functions} 
+We conducted experiments on the GLA (Gated Linear Units) structure with respect to the activation function. The outcomes from Table ~\ref{tab:gla_act} reveal that the impact of the activation function on the final results was not substantial. Hence, taking this into account, we opted for $1+elu$ in our approach.
+
+% ==================
+\begin{wraptable}[7]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-4.5mm}
+    \caption{\textbf{Ablations on GLU activation functions.} The exclusion of the activation function had no negative impact on the results.}
+    \vspace{-2mm}
+    \label{tab:glu_act}
+    \centering
+    \setlength{\tabcolsep}{2.4mm}
+         \begin{tabular}{lllll}
+        \hline
+        GLU Act & Params & Updates & Loss &PPL \\ \hline
+        No Act & 385M & 100K & 2.247 &4.765 \\ %\hline
+        Swish & 385M & 100K & 2.254 & 4.788\\ \hline
+    \end{tabular}
+\end{wraptable}
+\paragraph{GLU Activation Functions} 
+We conduct an experiment by removing the activation function within the Gated Linear Units (GLU) structure. As shown in Table~\ref{tab:glu_act}, the results reveal that this alteration had a negligible impact on the final outcome. As a result, we decide to adopt the Simple Gated Linear Units (SGLU) structure in our final model configuration.
+
+
+
+% ================== NORM ==================
+\begin{wraptable}[8]{r}{.5\linewidth}
+    \centering
+  \small
+  \vspace{-4.0mm}
+    \caption{\textbf{Normalization functions.} The deviation in results among the bellowing normalization functions is minimal.}
+    \label{tab:norm}
+    \centering
+    \vspace{-2mm}
+    \setlength{\tabcolsep}{2mm}
+     \begin{tabular}{lllll}
+    \hline
+        Norm Type & Params & Updates & Loss &PPL \\ \hline
+        SRMSNorm & 385M & 100K & 2.247 &4.765 \\ %\hline
+        RMSNorm & 385M & 100K & 2.247  & 4.766\\ %\hline
+        LayerNorm & 385M & 100K & 2.247 &4.765 \\ \hline
+    \end{tabular}
+\end{wraptable}
+
+
+\paragraph{Normalization functions} In our study, we conducted a series of ablation tests employing various normalization methods including SRMSNorm, RMSNorm and LayerNorm. The results indicate that there is almost no difference among these methods when applied to TransNormerLLM. Nevertheless, during the course of our testing, we revisited and re-engineered the SRMSNorm using Triton. As it is shown in Figure ~\ref{fig:norm}, empirical evidence supports that our modification offers a significant boost in computational speed when operating with larger dimensions, compared to the PyTorch implementation methods.
+
+
+% Figure environment removed
+
+ 
+
+% Figure environment removed
+
+\paragraph{Lighning Attention} We conducted a speed and memory footprint comparison between our Lightning Attention compared and the baseline, which is the PyTorch implementation of the NormAttention~\cite{qin-etal-2022-devil}.
+Figure~\ref{fig: flash} (left) reports the runtime in milliseconds of the forward + backward pass.
+Runtime grows quadratically with respect to sequence length, but our Lightning Attention operates significantly faster, at least $2\times$ faster than the PyTorch implementation. 
+Figure~\ref{fig: flash} (right) reports the memory footprint of Lightning Attention compared to the baseline.
+The memory footprint of Lightning Attention grows linearly with sequence length, which is up to $4\times$ more memory efficient than the baseline when the sequence length is 8192.
+Our proposed Lightning Attention achieves superior efficiency.
+
+% Figure environment removed
+
+\subsection{System Optimization}
+
+\subsubsection{Model Parallelism}
+We conduct a series of experiments with a 7B TransNormerLLM model to investigate the performance of model parallelism on TransNormerLLM in terms of speed and memory. These tests are carried out on a single Nvidia DGX node that houses eight A100 80G GPUs linked by NVLink. In this experiment, FSDP is enabled and Flash Attention~\cite{dao2022flashattention} is used on the Transformer. Table~\ref{tab:model_parallel} shows the results for training speed and memory consumption.
+
+It can be seen that model parallelism has a significant effect on memory conservation, as increasing the number of partitions for the model results in lower memory consumption per GPU. Due to NVLink constraints, we kept the dimension of model parallelism within 8 in all of our experiments. The TransNormerLLM-7B model requires only 24.1GB of memory on a single GPU when the model parallel size is set to 8, representing a significant memory reduction of 62.3\% when compared to the model parallel size of 1. In comparison, the Transformer-7B model consumes 28.7GB of memory under the same configuration. While model parallelism conserves memory, it is worth noting that training speed is only marginally reduced. TransNormerLLM consistently outperforms Transformer by a wide margin.
+
+
+
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{2.4mm}
+\caption{\textbf{Model Parallelism Performance.} We compare the model parallelism performance of Transformer-7B with Flash Attention and TransNormerLLM-7B with Lightning Attention on a single A100 node with NVLink. All experiments use a batch size of 2 and a context length of 2048.}
+\label{tab:model_parallel}
+\begin{tabular}{cccccc}
+\toprule
+\small
+Model & Model Parallel Size & Tokens/s & Allocated Memory/GPU & Memory Saved \\
+\midrule
+\multirow{4}{*}{Transformer-7B} & 1 & 26896.1 & 66.3 GB &  - \\
+ & 2 & 24973.7 & 44.6 GB & 32.7\% \\
+ & 4 & 22375.8 & 40.2 GB & 39.4\% \\
+ & 8 & 19973.6 & 28.7 GB & 56.7\% \\
+\midrule
+\multirow{4}{*}{TransNormerLLM-7B} & 1 & 32048.6 & 64.0 GB & - \\
+ & 2 & 29750.4 & 41.0 GB & 35.9\% \\
+ & 4 & 27885.2 & 36.3 GB & 43.3\% \\
+ & 8 & 24280.0 & 24.1 GB & 62.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Stress Tests on Model Size and Context Length}
+A series of stress tests are performed to assess the efficacy of the designed system optimization strategy. The model is scaled up to 175B, which is the largest released version of the TransNormerLLM model. However, this augmentation poses significant training challenges. We use a wide range of distributed training techniques to effectively train such a large model, with the goal of reducing GPU memory consumption while increasing computational and communication efficiencies. To ensure the feasibility of training these massive TransNormerLLM models, Lightning Attention, FSDP, Model Parallelism, AMP, and Activation Checkpointing are used. For the Transformer models, we use Flash Attention~\cite{dao2022flashattention} in all experiments.
+
+\paragraph{Model Size}
+
+We perform training experiments on variously sized Transformer and TransNormerLLM models using a large-scale A100 80G GPU cluster, as shown in Table~\ref{tab:175b_speed}. To achieve the maximum speed for various model sizes, we keep the context length constant at 2048 and increased the batch size until we reached the GPU memory limit. TransNormerLLMs consistently outperform their Transformer counterparts in terms of computation speed. This observation validates the TransNormerLLM model's advantageous linear computational complexity, reinforcing its efficacy.
+
+\begin{table}[h]
+\small
+\centering
+\setlength{\tabcolsep}{6mm}
+\caption{\textbf{Efficiency of training models with different sizes.} For comparative purposes, we keep the context length fixed at 2048 and increased the batch size for both transformer and TransNormerLLM to achieve their maximum speeds without encountering out-of-memory issues.}
+\label{tab:175b_speed}
+\begin{tabular}{cccc}
+\toprule
+Model & Model Size & Tokens/sec/GPU & Allocated Memory/GPU \\
+\midrule
+\multirow{4}{*}{Transformer} & 7B & 3362.7 & 72.5 GB \\
+ & 13B & 1735.6 & 70.6 GB \\
+ & 65B & 318.2 & 73.2 GB \\
+ & 175B & 106.2 & 69.5 GB \\
+\midrule
+\multirow{4}{*}{TransNormerLLM} & 7B & 4081.0 & 71.9 GB \\
+ & 13B & 2104.3 & 73.8 GB \\
+ & 65B & 406.9 & 69.4 GB \\
+ & 175B & 136.6 & 70.3 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\paragraph{Context Length}
+One of the strengths of TransNormerLLM lies in its utilization of linear attention computation, which exhibits computational and storage complexities linearly correlated with the sequence length. 
+To validate this outstanding characteristic of TransNormerLLM, we conduct training experiments on Transformer and TransNormerLLM models with varying parameter sizes. While maintaining a batch size of 1, we aim to maximize the context length. All experiments run on a small cluster with 64 A100 GPUs. The results, as presented in Table \ref{tab:context_length}, demonstrate the remarkable long context length training capability of TransNormerLLM. Under comparable computational resources, the TransNormerLLM model exhibits the ability to train with longer context lengths compared to conventional Transformer models and achieve higher computational speeds in the process.
+
+
+\begin{table}[t]
+\small
+\centering
+\setlength{\tabcolsep}{3mm}
+\caption{\textbf{Maximum context length for training Transformer and TransNormerLLM.} We compare the maximum context lengths with different model sizes between Transformer and TransNormerLLM on 64 A100 80G GPUs. All experiments use a batch size of 1.}
+\label{tab:context_length}
+\begin{tabular}{ccccc}
+\toprule
+Model & Model Size & Context Length & Relative Speed & Allocated Memory/GPU \\
+\midrule
+\multirow{4}{*}{Transformer} & 7B & 37K & 1 & 71.1 GB \\
+ & 13B & 24K & 1 & 68.0 GB \\
+ & 65B & 19K & 1 & 73.3 GB \\
+ & 175B & 10K & 1  & 66.9 GB \\
+\midrule
+\multirow{4}{*}{TransNormerLLM} & 7B & 48K & 1.21 & 65.8 GB \\
+ & 13B & 35K & 1.23 & 61.0 GB \\
+ & 65B & 23K & 1.29 & 68.2 GB \\
+ & 175B & 12K & 1.35 & 63.5 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Conclusion}
+We introduced TransNormerLLM in this paper, an improved TransNormer that is tailored for LLMs. Our TransNormerLLM consistently outperformed Transformers in both accuracy and efficiency and can be effectively scaled to 175 billion parameters. Extensive ablations demonstrate the effectiveness of our modifications and innovations in position encoding, gating mechanism, activation functions, normalization functions, and lightning attentions. To support the training of TransNormerLLM, we collected a large corpus that exceeds 6TB and contains over two trillion tokens. A novel self-clean strategy was utilized to ensure data quality and relevance. Our pre-trained models will be released to foster community advancements in efficient LLM.
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibliographystyle{neurips_2023}
+\bibliography{main}
+
+\end{document}

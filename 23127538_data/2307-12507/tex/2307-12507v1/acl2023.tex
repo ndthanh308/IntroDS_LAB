@@ -1,0 +1,1050 @@
+\pdfoutput=1
+
+\documentclass[11pt]{article}
+
+\usepackage{ACL2023}
+
+\usepackage{times}
+\usepackage{latexsym}
+
+\usepackage[T1]{fontenc}
+
+\usepackage[utf8]{inputenc}
+
+\usepackage{microtype}
+
+\usepackage{inconsolata}
+
+
+\usepackage{graphicx}
+
+\newcommand{\peng}[1]{\textcolor{blue}{[Peng] #1}}
+\newcommand{\question}[1]{\textcolor{green}{[Question] #1}}
+
+\newcommand{\ym}[1]{\textcolor{red}{[ym] #1}}
+
+\newcommand{\hy}[1]{\textcolor{red}{[hy] #1}}
+
+\def\RQone{Does the secret language phenomenon exist in different language models?}
+\def\RQtwo{Does secret language depend on specific context?}
+
+\input{utils}
+
+\title{Investigating the Existence of ``Secret Language'' in Language Models}
+
+
+\author{Yimu Wang, Peng Shi, and Hongyang Zhang \\
+  University of Waterloo\\
+  \texttt{\{yimu.wang,peng.shi,hongyang.zhang\}@uwaterloo.ca}\\
+  }
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+In this paper, we study the problem of secret language in NLP, where current language models (LMs) seem to have a hidden vocabulary that allows them to interpret absurd inputs as meaningful concepts. 
+We investigate two research questions: ``\RQone'' and ``\RQtwo'' 
+To answer these questions, we introduce a novel method named \textit{SecretFinding}, a gradient-based approach that can automatically discover secret languages in LMs. 
+We conduct experiments on five representative models (Electra, ALBERT, Roberta, DistillBERT, and CLIP) finetuned on four NLP benchmarks (SST-2, MRPC, SNLI, and SQuAD) and a language-grounding benchmark (MSCOCO). 
+Our experimental results show that even when we replace the most important words with others that are semantically dissimilar to the original words
+in a sentence, LMs do not consider the new sentence semantically dissimilar to the original, as the output does not change with a high probability. 
+This phenomenon holds true across the five models and five tasks and gives a positive answer to the first research question. 
+As for the second research question, we find that the secret language discovered by \textit{SecretFinding} is quite general and could even be transferred to other models in the black-box settings, such as GPT-3 and ChatGPT. 
+Finally, we discuss the causes of secret language, how to eliminate it, potential connection to memorization, and ethical implications.
+Examples of secret language found by \textit{SecretFinding} are available on \href{https://huggingface.co/spaces/anonymousauthors/ACL23_SecretLanguage}{HuggingFace}.
+\end{abstract}
+
+
+\section{Introduction}\label{sec:intro}
+
+% Figure environment removed
+
+
+
+Artificial general intelligence~(AGI) has received significant attention partially thanks to the new advances of foundation models such as ChatGPT~\cite{openai_2023} and DALL-E~\cite{DBLP:journals/corr/abs-2204-06125}.
+The ultimate goal of AGI is to develop models that are expected to achieve human-level performance~\cite{frank2004phrase,KAAN201885,EHRLICH1981641,branigan_pickering_2017,amigo-etal-2006-mt}  on intellectual tasks~\cite{imamura-etal-2009-discriminative,ettinger-2020-bert,eisape-etal-2020-cloze,kuribayashi-etal-2021-lower,millet-dunbar-2022-self}.
+Narrowing down to natural language processing (NLP),
+the target is to build linguistic systems that behave like humans, such as ``understanding'' the contents of documents~\cite{keller-2010-cognitively,gulordava-etal-2018-colorless,futrell-etal-2019-neural,wang-etal-2019-human,luo-etal-2019-reading,testoni-bernardi-2021-looking} or predicting next words~\cite{,eisape-etal-2020-cloze}.
+
+
+
+
+
+
+
+Nevertheless, the behaviors of current NLP models~\cite{jia-liang-2017-adversarial,mccoy-etal-2019-right,li-etal-2020-bert-attack,DBLP:journals/corr/abs-2010-09997} are far from perfect: they are unpredictable and sometimes do not align with human's common knowledge.
+The first misalignment is that model sometimes cannot understand what is similar, \ie, synonyms of words. 
+For example, changing ``film'' to ``movie'' might lead to the change of output of language models~\cite{ribeiro-etal-2018-semantically}. 
+This kind of substitution can be seen as the semantic substitution, \eg, paraphrasing words or replacing with their synonyms~\cite{li-etal-2020-bert-attack}. 
+This problem~\cite{zhou-etal-2021-defense,alshemali-kalita-2020-generalization,li-etal-2020-bert-attack} has been well studied in the last few decades. As a remedy, synonyms and semantically similar sets can be enumerated and one can directly set supervision to force the models to learn the relationships.
+
+The second misalignment that NLP researchers have ignored for a long time is that model seems not to know what is dissimilar. 
+Recently, \citet{DBLP:journals/corr/abs-2206-00169} have noticed that for DALLE-2~\cite{DBLP:journals/corr/abs-2204-06125}, ``Apoploe vesrreaitais'' means ``birds'' and ``Contarra ccetnxniams luryca tanniounons'' (sometimes) means ``bugs'' or ``pests''. 
+Different from the above synonyms replacement in a sentence, this kind of substitution changes the semantic meaning of a sentence. 
+While human is actually able to distinguish the substitution from the original sentence, we find that language models (LMs) fail to achieve it. 
+We notice that, there are some word pairs that other LMs confuse with. 
+For example, replacing the hypothesis ``The women are doing \textcolor{blue}{yoga}.'' with ``The women are doing \textcolor{red}{burg}.'' is a non-semantic substitution. 
+However, given the premise ``Women exercising one woman has a green mat and black outfit on.'',  DistillBERT model~\cite{DBLP:journals/corr/abs-1910-01108} gives the same output ``entailment''. 
+Another example is replacing ``\textcolor{blue}{English}'' with ``\textcolor{red}{Repl}'' in questions while keeping the text the same using a public Question-Answering (QA) model Roberta~\cite{DBLP:journals/corr/abs-1907-11692}. 
+Roberta will output exactly the same answer though substituting ``\textcolor{red}{Repl}'' for ``\textcolor{blue}{English}'' significantly changes the semantic meaning of the questions. 
+Throughout the paper, we call the model language that misaligns with human's natural language as \textit{secret language}. 
+The existence of secret language indicates that LMs may not be able to tell what is dissimilar as well as humans.
+Further, the behaviour of LMs on secret language is typically unpredictable, which might raise significant security or ethical concerns.
+
+
+In this work, 
+towards creating human-like linguistic systems, 
+we answer two research questions (RQ) on \textit{secret language} of language models (see Figure~\ref{fig:intro}).
+RQ1: \RQone\ 
+RQ2: \RQtwo\ 
+Answering RQ1 and RQ2 sheds light on the nature of ``secret language'' of LMs, which can in turn guide the development of more advanced human-like linguistic systems. 
+Additionally, this can also help us identify potential bias or limitations in LMs, which can be important for ensuring fair and responsible use of machine learning models.
+
+As shown in the aforementioned examples, we find that DistillBERT cannot distinguish \textcolor{blue}{yoga} from \textcolor{red}{burg}. 
+For RQ1, we try to understand whether we can observe the similar phenomenon in other LMs: do ALBERT or other LMs have their own secret language as well?
+RQ1 addresses whether the secret language is a common feature across different LMs.
+Understanding this reveals how widely the phenomenon of secret language occurs in LMs and whether it is a fundamental problem of LMs. 
+We call this phenomenon as \textit{macro-existence} of secret language. 
+RQ2 addresses whether a secret language phenomenon, \eg, ``\textcolor{blue}{yoga}'' is indistinguishable from ``\textcolor{red}{burg}'', only exists for a certain sentence.
+For example, given a sentence $s$, substituting ``\textcolor{red}{burg}'' for ``\textcolor{blue}{yoga}'' gets the same output. 
+For another sentence $s^{'}$, will substituting ``\textcolor{red}{burg}'' for ``\textcolor{blue}{yoga}'' get the same output too?
+We call this phenomenon as the \textit{micro-existence} of secret language.
+
+
+
+\medskip
+\noindent
+\textbf{Our contributions.}
+Our work tackles the two research questions and presents the first algorithm that can automatically find secret language.
+\begin{itemize}
+\item 
+We propose a novel gradient-based method, \textit{SecretFinding}, to find the secret language in LMs (see Algorithm~\ref{alg:SecretFinding}). 
+Different from \citet{DBLP:journals/corr/abs-2206-00169}, which only provides limited number of examples of secret language in DALLE-2 by prompting the model with manually-crafted sentences, our approach is the \textit{first} method that is able to \textit{automatically} find secret language for any LMs and tasks \textit{without} any human knowledge.
+\vspace{-0.2cm}
+\item
+We select five representative NLP tasks with five language models to investigate the above two research questions. Though our method is white-box, we show that it works in the black-box setting by transferring the secret language of one language model to another.
+We also discuss the causes of secret language, how to eliminate it, potential connection to memorization, and ethical implications. Examples of secret language found by \textit{SecretFinding} are available on \href{https://huggingface.co/spaces/anonymousauthors/ACL23_SecretLanguage}{HuggingFace}.
+\end{itemize}
+
+
+\section{Our Approach}
+
+% Figure environment removed
+
+
+In this section, we design a principled approach to find secret language. 
+Specifically, we first identify the words that are crucial to the model's decision, and then find their substitutions with our proposed \textit{SecretFinding} (Algorithm~\ref{alg:SecretFinding}). 
+Finally, to ensure the substitutions are words semantically dissimilar to the original word, following \citet{ren-etal-2019-generating}, we use WordNet~\cite{DBLP:journals/cacm/Miller95} to build a synonym sets for each substituted word and filter the secret language. 
+The overall procedure is shown in Figure~\ref{fig:scheme}.
+
+Before proceeding, we present our notations.
+We denote a sentence by $s = [word_1, \ldots, word_i, \ldots, word_n]$, where $word_i$ is the $i$-th word and the length of sentence is $n$. 
+The substitution of the $i$-th word in the sentence $s$ is denoted as $s^{'}_{i} = [word_1, \ldots, word_i^{'}, \ldots, word_n]$, where $word_i^{'}$ is a new word. 
+Given the model $f(\cdot)$, if $f(s) == f(s^{'})$, we call that the substitution $word_i^{'}$ is a secret language of $word_i$. 
+If we are substituting more than one word in a sentence, we add more indices to the subscripts. 
+For example, $s^{'}_{1,2,3}$ means that the $1$-st, $2$-nd, and $3$-rd words are replaced.
+
+\subsection{Deciding which words to replace}
+In order to better understand why secret language exists, we propose a fine-grained method for deciding which word in a sentence should be replaced. 
+To demonstrate that the secret language is general, we first replace words that play the most important role in the NLP tasks, such as natural language inference and question answering. 
+This is because replacing the least important words is meaningless, which will not change the semantic meaning of the sentence with a high probability. 
+For example, given the sentence ``The women are doing yoga'', replacing ``The'' with another word might not significantly change the semantic meaning of the sentence.
+
+There are several methods for weighting the importance of words, \ie, Integrated Gradients (IG; \citet{pmlr-v70-sundararajan17a}), attention-based importance~\cite{wiegreffe-pinter-2019-attention} (while there is a counterpoint~\cite{jain-wallace-2019-attention} claiming that attention cannot be used for explanation), Local Interpretable Model Explanations (LIME, ~\cite{ribeiro-etal-2016-trust}), and SHAP~\cite{NIPS2017_8a20a862}. 
+However, some studies~\cite{DBLP:journals/corr/abs-1910-02065,10.1145/3375627.3375830,DBLP:journals/corr/abs-2009-11023}
+have argued that, except for IG, the other methods cannot be trusted. 
+Therefore, we use IG to decide the importance of each word in a sentence. 
+We defer the details of IG to the Appendix~\ref{sec: IG details}. 
+
+Different from other methods~\cite{prasad-etal-2021-extent} that use the absolute value of IG, we use the value of IG to proxy the importance of each word, as our goal of using IG is to determine the contribution of each word to the final output. 
+By sorting the value of IG, we get the importance ranking of each word.
+
+\subsection{SecretFinding for finding secret language}
+
+To answer RQ1 and RQ2, we design a principled approach that is able to efficiently and automatically find a secret language given a sentence and a language model. 
+However, as the language space is discrete, it is hard to find a substitution directly using gradient-based algorithms. 
+Previous method~\cite{DBLP:journals/corr/abs-2206-00169} found the secret language, \eg, ``Apoploe vesrreaitais'' means``birds'' and ``Contarra ccetnxniams luryca tanniounons'' means ``bugs'' or ``pests'', by prompting DALLE-2 with manually-crafted sentences~\cite{DBLP:journals/corr/abs-2204-06125}. 
+Another solution might be by reinforcement learning~\cite{li-etal-2020-bert-attack}. 
+But this line of research requires huge query and computational complexity and is less applicable in our case.
+
+\begin{algorithm}[t!]
+\caption{SecretFinding $(s, f, t, l, \eta, e)$}\label{alg:SecretFinding}
+\begin{algorithmic}[1]
+\Require Input sentence $s = (word_1, \ldots, word_n)$, model $f(\cdot)$, tokenizer $t(\cdot)$, the index of words that are intended to change $l \in [n]^{m}$, step size $\eta$, step $E$. 
+\State Get the one-hot representation $\mathbf{r}_{onehot} \leftarrow [\mathbf{r}_{onehot, 1}, \ldots, \mathbf{r}_{onehot, n}] \in \{0,1\}^{n \times n_{words}}$ of each word $word$ in the input sentence $S$ given the tokenizer $t$;
+\State Initialize noise as $\mathbf{z}_i \sim \mathcal{N} (0,1), \forall i \in \mathbf{l}$ and $\mathbf{z}_i \leftarrow \mathbf{0}, \forall i \notin \mathbf{l}$;
+\For{$e\in[E]$}
+\State Get the perturbed outputs as $\hat{y} \leftarrow f(\mathbf{r}_{onehot} + \mathbf{z})$;
+\State Get the loss $loss \leftarrow CrossEntropy(f(\mathbf{r}_{onehot}), \hat{y})$;
+\State Update noise as $\mathbf{z}_{i} \leftarrow \mathbf{z}_{i} - \eta \operatorname{sign}(\frac{\partial loss}{\partial \mathbf{z}_{i}}), \forall i \in \mathbf{l}$;
+\If {$f(\mathbf{r}_{onehot} + \mathbf{z}) == y$}
+\State Break;
+\EndIf
+\EndFor
+\State Get the index of perturbed word in the word dict of tokenizer as $wordindex \leftarrow \argmax (\mathbf{r}_{onehot} + \mathbf{z})$;\\
+\Return The perturbed word with the decoding function of tokenizer.
+\end{algorithmic}
+\end{algorithm}
+
+To this end, we present a novel gradient descent-based method, namely \textit{SecretFinding}, that can efficiently find a secret language. 
+\textit{SecretFinding} automatically finds the secret language given a model $f$, a sentence $s$, and a set of index words that we intend to change, as shown in Algorithm~\ref{alg:SecretFinding}. 
+The index of the words that are intended to be changed is represented by a vector $\mathbf{l} \in [n]^{m}$, where $m$ is the number of words that we want to change.
+
+Specifically, given a sentence $s$, we first map words to one-hot vectors by the word dictionary of tokenizer as $\mathbf{r}_{onehot} = [\mathbf{r}_{onehot, 1}, \ldots, \mathbf{r}_{onehot, n}] \in \{0,1\}^{n \times n_{words}}$, where $n_{words}$ is the size of word dictionary of the tokenizer.
+Next, we initialize a noise $\mathbf{z}$ whose elements in $\mathbf{l}$ are sampled from the Gaussian distribution with mean $0$ and variance $1$ while other elements are set as $\mathbf{0}$. 
+Then, we obtain a replacement of the original sentence by adding the noise $\mathbf{z}$ to the one-hot representation $\mathbf{r}_{onehot}$. 
+However, we cannot ensure that this replacement satisfies our requirements of keeping the output the same with the label $y$.
+To address this, we use gradient descent to update the noise vector $\mathbf{z}$ in order to find a replacement that satisfies our requirements.
+We measure the distance between the outputs of the modified and the original sentences using the cross entropy loss $loss = CrossEntropy(f(\mathbf{r}_{onehot} + \mathbf{z} ), f(\mathbf{r}_{onehot}))$ and then update the noise with the sign of gradient $\frac{\partial loss}{\partial \mathbf{noise}}$. 
+Note that we use the sign of the gradient in order to force the elements of the noise vector to be a vector whose elements are all integer, which allows us to map the modified one-hot representation back to words.
+After $E$ predefined epochs or when the output of the modified sentence $f(\mathbf{r}_{onehot} + \mathbf{z} )$ equals to the output of the original sentence  $f(\mathbf{r}_{onehot})$, we stop the updates and obtain perturbed words by applying the decoder of tokenizer to $\argmax(r_{onehot} + \mathbf{z})$.
+
+By optimizing the noise iteratively, we are able to find a replacement more efficiently than manual querying or reinforcement learning. 
+For each sentence, we run this algorithm by $10$ times with step $E=1,000$ and different initializations of $\mathbf{z}$ to find the secret language.
+
+\subsection{Filtering out semantically similar replacements}
+
+However, we notice that sometimes, \textit{SecretFinding} returns replacements that are semantically similar to the original sentence.
+For example, the output of \textit{SecretFinding} might be ``The church is filled with song.'' while the original sentence is ``The church is filled with melody.''
+To address this issue, we construct a synonym set for each word using WordNet~\cite{DBLP:journals/cacm/Miller95}.
+After finding a substitution for a word, we check whether the substitution is in the synonym set of the original word.
+If it is true, we remove the substitution.
+Otherwise, we treat the substitution as a secret language w.r.t. the original word.
+
+\section{Evaluation}
+
+With the proposed \textit{SecretFinding}, which is able to automatically find the secret language, and IG, which shows the importance of each word in a sentence, we are ready to investigate RQ1 and RQ2.
+
+\subsection{Experimental settings}
+
+\begin{table}[t!]
+\centering
+\caption{Our experimental settings on models, tasks, and datasets.}
+\label{tab: model dataset selection}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+Models & Tasks                     & Datasets     \\
+\midrule
+\midrule
+Electra     &Sentiment analysis &  GLUE (SST-2) \\
+ALBERT      &Paraphrase         &  GLUE (MRPC)  \\
+DistillBERT & NLI                & SNLI         \\
+Roberta     & QA                 & SQuAD       \\
+\midrule
+CLIP     & Image-text retrieval                & MSCOCO       \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-0.5em}
+\end{table}
+
+
+\begin{table*}[ht!]
+\centering
+\caption{Accuracy (\%) of \emph{SecretFinding} on multi-sentence tasks when we replace various numbers of words.}
+\vspace{-0.5em}
+\label{tab: acc on multisentences}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llccccccccccc}
+\toprule
+\multirow{2}{*}{Tasks} &\multirow{2}{*}{Datasets}     & \multirow{2}{*}{Splits} & \multicolumn{10}{c}{Number of words to be replaced}                                 \\
+                             &              &          & 1     & 2     & 3     & 4     & 5     & 6     & 7     & 8     & 9     & 10    \\\midrule\midrule
+\multirow{2}{*}{Paraphrase}&\multirow{2}{*}{GLUE (MRPC)} & Train                  & 99.51 & 99.29 & 98.88 & 98.31 & 97.57 & 96.59 & 95.39 & 94.47 & 92.18 & 89.72 \\
+ &                            & Test                   & 97.73 & 96.58 & 96.17 & 96.34 & 95.48 & 93.62 & 93.16 & 92.46 & 90.26 & 87.88\\
+                        \midrule
+\multirow{2}{*}{NLI} & \multirow{2}{*}{SNLI}                  & Train                  & 95.08 & 95.38 & 93.05 & 88.00 & 81.63 & 75.63 & 70.51 & 65.42 & 62.39 & 59.47 \\
+ & & Test                   & 94.51 & 95.16 & 92.96 & 89.01 & 82.05 & 76.31 & 70.68 & 65.83 & 62.57 & 59.30 \\ \midrule
+\multirow{2}{*}{QA}&\multirow{2}{*}{SQuAD}   & Train                  & 91.86 & 86.68 & 80.22 & 71.63 & 69.70 & 62.20 & 48.50 & 39.20 & 31.10 & 23.40 \\
+                         && Validation             & 89.32 & 82.83 & 75.00 & 65.40 & 67.20 & 55.00 & 44.30 & 34.00 & 23.30 & 18.30 \\
+                             \bottomrule
+\end{tabular}%
+}
+\vspace{-0.5em}
+\end{table*}
+
+We answer the two research questions using five language models~\cite{DBLP:journals/corr/abs-1910-01108,DBLP:conf/iclr/LanCGGSS20,DBLP:journals/corr/abs-1907-11692,DBLP:conf/iclr/ClarkLLM20,DBLP:conf/icml/RadfordKHRGASAM21}. For each model, we select its representative NLP task and benchmark. 
+The models with respect to different tasks and benchmarks are shown in Table~\ref{tab: model dataset selection}. 
+The details of these models and datasets~\cite{bowman-etal-2015-large,dolan-brockett-2005-automatically,rajpurkar-etal-2016-squad,DBLP:conf/iclr/WangSMHLB19,DBLP:conf/eccv/LinMBHPRDZ14} are deferred to the the Appendix.
+All the experiments are run on an A100 GPU.
+
+We fix premises, text, and the second sentence in the NLI, QA, and paraphrase tasks and try to find secret language of hypothesis, questions, and the first sentences, respectively. 
+For the task of sentiment analysis and image-text retrieval, we find the secret language of the sentence. 
+As our proposed \textit{SecretFinding} algorithm is randomly initialized and the initialization affects the success rate of finding secret language, we use 10 restarts for each data sample. 
+We report the accuracy as the percentage of data for which at least one semantically dissimilar replacement can be found in 10 restarts, calculated as follows:
+\begin{equation*}
+    \small
+    acc = \frac{\sum_{i \in [n]} \mathbf{I}( \sum_{j \in [10]}\mathbf{I}(f(x^{'}_{i, j}) == y) > 0)}{n}\,,
+\end{equation*}
+where $n$ is the number of data, $\mathbf{I} (cond) = 1$ when $cond$ is true, and $\mathbf{I} (cond) = 0$ otherwise. $x^{'}_{i, j}$ is the $j$-th replacement of $x_i$ found by \textit{SecretFinding}.
+
+\subsection{RQ1: \RQone}
+
+% Figure environment removed
+
+\begin{table*}[ht!]
+\centering
+\caption{Examples from the train and test splits of SNLI on DistillBERT.}
+\label{tab:SNLI-train-examples}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{1.3in} | p{6in} | p{1.3in}}
+\toprule
+Premise            & `An elderly couple dances next to a table where a boy is sitting with his head down.'       & \multirow{3}{*}{Train: \textcolor{red}{contradiction}} \\
+Original Hypothesis                 & `A young man has his head on the table.'                              &                                \\
+Changed Hypothesis                  & `acity documenting Christina stoolicroboat FullyMarcoclintonkey'      &                                \\
+\midrule
+Premise                             & `A skier in electric green on the edge of a ramp made of metal bars.' & \multirow{3}{*}{Train: \textcolor{blue}{entailment}}    \\
+Original Hypothesis                 & `The skier was on the edge of the ramp.'                              &                                \\
+Changed Hypothesis & ` waterways subsistenceAGuntary on assigned fluct coincided journalistic Myrgrounds'           &                                \\
+                                    \midrule
+Premise                             & `A white horse is pulling a cart while a man stands and watches.'     & \multirow{3}{*}{Train: \textcolor{yellow}{neutral}}       \\
+Original Hypothesis                 & `A man is watching a horse race.'                                     &                                \\
+Changed Hypothesis                  & `urionSecure facets facilitates renovated philanthrop PROV clock'     &                                \\
+\midrule
+Premise & 'This church choir sings to the masses as they sing joyous songs from the book at a church.' & \multirow{3}{*}{Test: \textcolor{red}{contradiction}} \\
+Original Hypothesis      & `The church has cracks in the ceiling.'                           &                                \\
+Changed Hypothesis       & ` rhySov PetraWeb caffe drains Kennedy Many'                      &                                \\
+\midrule
+Premise                  & `Four young girls playing in the water.'                          & \multirow{3}{*}{Test: \textcolor{blue}{entailment}}    \\
+Original Hypothesis      & `Four girls are swimming.'                                        &                                \\
+Changed Hypothesis       & ` · devices Additional Game groundwork'                           &                                \\
+\midrule
+Premise & `A blond-haired doctor and her African american assistant looking threw new medical manuals.' & \multirow{3}{*}{Test: \textcolor{yellow}{neutral}}       \\
+Original Hypothesis      & `A doctor is studying'                                            &                                \\
+Changed Hypothesis       & `ZEledge quicker rave'                                            &                                \\
+\bottomrule
+\end{tabular}%
+% \vspace{-0.5em}
+}
+\end{table*}
+
+We first investigate RQ1. 
+For each task and dataset, we replace 1-10 words in a sentence with secret language found by our algorithm.
+The detailed analysis of three multi-sentence tasks and the analysis of results on sentiment analysis and image-text retrieval are deferred to Appendix~\ref{sec: appendix RQ1}.
+
+\medskip
+\noindent
+\textbf{Quantitative results on three multi-sentence tasks.} 
+Quantitative results on MRPC (ALBERT), SNLI (DistillBERT), and SQuAD (Roberta) can be found in Table~\ref{tab: acc on multisentences}. 
+We also show the accuracy on three multi-sentence tasks in Figure~\ref{fig: acc multisentence}. 
+As expected, the accuracy for finding semantically dissimilar replacements is inversely proportional to the number of words to be replaced.
+This is because the more words are changed, the more dissimilar the replacement will be compared to the original sentence.
+The accuracy on the train and test splits of MRPC and SNLI achieves the highest value when 2 words are replaced, which might be due to the randomness of \textit{SecretFinding} algorithm. 
+Specifically, for SNLI, we notice that the length of 7,868 and 7,758 hypotheses in the train and test splits is no more than 10. 
+This means that when we change 10 words in a hypothesis, more than 77\% of the train and test split data are changed to sentences that do not share any words with the original sentence or contain any words semantically similar to words in the original sentence. 
+And even in this case, we can still find a completely different sentence that has the same output as the original sentence, with accuracy of 59.47\% and 59.30\% in the train and test splits, respectively.
+This shows that to some extent, the model is not able to distinguish the semantic meaning of sentences. 
+We show some examples of hypotheses that have been completely changed while the output remains the same in Tables~\ref{tab:SNLI-train-examples}.
+It is worth noting that in these examples, the hypotheses have been changed to completely different sentences, but the classification results remain the same and the model actually can output ``neutral'' as the \textbf{changed hypotheses are not related to the premises}.
+Similar conclusion can be made on the paraphrase and QA tasks, which demonstrates that current models, such as DistillBERT, Roberta and ALBERT, still cannot fully understand the meaning of sentences. 
+
+\subsection{RQ2: \RQtwo}
+
+Next, we investigate RQ2 using two examples from Section~\ref{sec:intro}, \ie, ``yoga'' vs. ``burg'' and ``English'' vs. ``Repl''. 
+The results are shown in Table~\ref{tab: not dependent on sentences}. 
+
+\begin{table}[t!]
+\centering
+\caption{Experimental results on the universality of secret language. 
+``Sub'' refers to the secret language.
+}
+\label{tab: not dependent on sentences}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{p{0.7in} | p{1.3in} | l | c}
+\toprule
+From                           & Sub  & Test on            & Accuracy  \\
+\midrule\midrule
+\multirow{2}{*}{Roberta} & \multirow{2}{*}{English (Repl)}    & ALBERT (GLUE (MRPC)) & 4 / 4    \\
+&& DistillBERT (SNLI) & 61 / 80   \\
+                               &                                  &  Roberta (SQuAD)      & 408 / 498 \\\midrule
+\multirow{2}{*}{DistillBERT}  & \multirow{2}{*}{yoga (burg)}     & ALBERT (GLUE (MRPC)) & 0 / 0
+   \\
+                               &                                  & DistillBERT (SNLI)       & 162 / 231       \\
+                               &                                  & Roberta (SQuAD)        & 10 / 11       \\
+                               \midrule\midrule
+\multirow{3}{*}{ALBERT} & \multirow{3}{*}{scientists (sunderland)}    & ALBERT (GLUE (MRPC)) & 8 / 8    \\
+&& DistillBERT (SNLI) & 58 / 63    \\
+                               &                                  & Roberta (SQuAD)      & 50 / 96 \\\midrule
+\multirow{3}{*}{ALBERT} & \multirow{3}{*}{because (resistance)}    & ALBERT (GLUE (MRPC)) & 74 / 74\\
+&& DistillBERT (SNLI)       & 1,510 / 1,587     \\
+                               &                                  & Roberta (SQuAD)      & 166 / 221 \\\midrule
+\multirow{3}{*}{DistillBERT} & \multirow{3}{*}{people (async)}    & ALBERT (GLUE (MRPC)) & 163 / 163    \\
+&& DistillBERT (SNLI)       & 45,946 / 47,947     \\
+                               &                                  & Roberta (SQuAD)      & 1,759 / 1,759 \\\midrule
+\multirow{3}{*}{DistillBERT} & \multirow{3}{*}{boy (unsett)}    & ALBERT (GLUE (MRPC)) & 25 / 25    \\
+&& DistillBERT (SNLI)       & 29,782 / 32,066     \\
+                               &                                  & Roberta (SQuAD)      & 69 / 69 \\\midrule
+                               \multirow{3}{*}{Roberta} & \multirow{3}{*}{year (Pref)}    & ALBERT (GLUE (MRPC)) & 460 / 460    \\
+&& DistillBERT (SNLI) & 749 / 797    \\
+                               &                                  & Roberta (SQuAD)      & 2,311 / 4,442 \\\midrule
+\multirow{3}{*}{Roberta} & \multirow{3}{*}{50 (title)}    & ALBERT (GLUE (MRPC)) & 180 / 180    \\
+&& DistillBERT (SNLI)       & 160 / 230     \\
+                               &                                  & Roberta (SQuAD)      & 313 / 467 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-0.5cm}
+\end{table}
+
+\medskip
+\noindent
+\textbf{Is ``burg'' a universal secret language of ``yoga''  in various context?}
+The results show that when replacing ``yoga'' with ``burg'', the outputs of 162 samples out of 231 samples in SNLI remain the same for samples that originally contain ``yoga''. 
+This suggests that ``burg'' may be a universal secret language of ``yoga'' on the SNLI dataset.
+
+\medskip
+\noindent
+\textbf{Is ``Repl'' a universal secret language of ``English'' in various context?}
+Our experiments show that ``Repl'' might be a universal secret language of ``English'' as the outputs of 408 out of 498 samples in SQuAD that originally contain ``English''remain the same if one replaces ``English'' with ``Repl''.
+The results of these two experiments suggest that the secret language is likely to be universal and independent of specific sentences (micro-existence) when fixing the model, as the accuracy is very high. 
+
+Another question that we are interested in is, ``Is the secret language dependent on specific models?'' 
+To answer this question, we test the secret language that we find using one model (\eg, DistillBERT) on another model (\eg, Roberta). 
+The corresponding results are shown in Table~\ref{tab: not dependent on sentences}. 
+These results indicate that the secret language may not only be \textit{independent of the specific context}, but is also \textit{independent of the specific models} as the secret language that we find on DistillBERT and Roberta is able to transfer to each other with a high accuracy. 
+More experimental details can be found in Tables~\ref{tab: black-albert}, \ref{tab: black-distillbert}, and \ref{tab: black-roberta} in the Appendix. 
+
+
+\subsection{Black-box settings via transferability}
+As a case study, inspired by the previous results on transferring secret languages found on one model to another model (Table~\ref{tab: not dependent on sentences}), we transfer the secret languages found on GPT-2~\cite{radford2019language} and Roberta to GPT-3~\cite{DBLP:conf/nips/BrownMRSKDNSSAA20} and ChatGPT~\cite{openai_2023}. 
+We randomly sample several questions from SQuAD, manually mask the most important words according to human experts, and replace the resulting questions with secret languages found in the GPT-2 and Roberta model. 
+Finally, the original question and the new question with secret languages are fed into GPT-3 with the prompt, ``Answer the following question. /n Question: \{Question\} /n Answer: '', where \{Question\} represents original and new questions. 
+As for ChatGPT, we directly feed the question into the model. 
+We present the results in Table~\ref{tab:GPT-3}. 
+We notice that, the words with higher frequency seem to be easier to find secret languages in this transfer-based method, as ``amazon forest'' appears more often than ``Turner'', ``'Vernon'', and ``Gaussian integer expression'' in human language. 
+This might be due to the model's bias towards popular concepts in human language. 
+Besides, as ChatGPT is a variant of GPT-3.5 with reinforcement learning from human feedback, it can distinguish secret languages better than GPT-3 and reply with ``I can not understand what you mean by ...''
+So, it might be promising to have humans in the loop to encourage LMs to understand language in the future as ChatGPT.
+
+\begin{table}[t!]
+\centering
+\caption{Examples of transferring the secret language of GPT-2 (top-4 tables) and Roberta (bottom-2 tables) to GPT-3 and ChatGPT.
+The words that our algorithm selects are marked as \textcolor{blue}{blue}, while their secret languages are marked as \textcolor{red}{red}.
+``AO'' and ``AR'' refer to answers to the original questions and the changed questions, respectively. 
+``NA'' refers to not understanding the questions.}
+\label{tab:GPT-3}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{m{4in}}
+\toprule
+\textbf{Question}: Which name is also used to describe the Amazon rainforest in \textcolor{blue}{English} (\textcolor{red}{Repl})?    \\
+\textbf{AO}:   {Amazon Jungle or the Amazonia} (GPT-3 and ChatGPT)                                                                   \\
+\textbf{AR}:   \textcolor{blue}{Amazon Jungle or the Amazonia} (GPT-3 and ChatGPT)                                                                   \\
+\midrule
+\textbf{Question}: What method was used to clear forest for crop cultivation in the \textcolor{blue}{amazon forest} (\textcolor{red}{am104141})?    \\
+\textbf{AO}:   Slash and burn (GPT-3 and ChatGPT)                               \\
+\textbf{AR}:   \textcolor{blue}{Slash and burn} (GPT-3 and ChatGPT)                                                                    \\
+\midrule
+\textbf{Question}: Who designed the \textcolor{blue}{Turner} (\textcolor{red}{Herm}) and \textcolor{blue}{Vernon}(\textcolor{red}{>>>>}) galleries that were built in 1858-9?            \\
+\textbf{AO}:   Charles Barry (GPT-3), Sydney Smirke (ChatGPT)    \\
+\textbf{AR}:   \textcolor{red}{Sir Charles Barry} (GPT-3), \textcolor{red}{NA} (ChatGPT)                                                                  \\
+\midrule
+\textbf{Question}: What do a and b represent in a \textcolor{blue}{Gaussian integer expression} (\textcolor{red}{eless rand Blueprintued})?                        \\
+\textbf{AO}: a and b represent the real and imaginary parts of the Gaussian integer expression. (GPT-3 and ChatGPT) \\
+\textbf{AR}: \textcolor{red}{a is the lower bound and b is the upper bound.} (GPT-3), \textcolor{red}{NA} (ChatGPT)   \\
+\bottomrule
+\toprule
+\textbf{Question}: What sits \textcolor{blue}{on top} (\textcolor{red}{gib Logo}) of the Main Building at Notre Dame?                        \\
+\textbf{AO}: Golden Dome (GPT-3 and ChatGPT) \\
+\textbf{AR}: Golden Dome (GPT-3 and ChatGPT)   \\
+\midrule
+\textbf{Question}: \textcolor{blue}{What} (\textcolor{red}{Brady}) is one possible serious \textcolor{blue}{side} (\textcolor{red}{Godd}) effect of over-using antibiotics?                        \\
+\textbf{AO}: kill off the good bacteria (GPT-3), development of antibiotic-resistant bacteria (ChatGPT) \\
+\textbf{AR}: Antibiotic resistance (GPT-3), development of antibiotic-resistant bacteria (ChatGPT)    \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-0.4cm}
+\end{table}
+
+
+\section{Discussions}
+
+
+In this section, we discuss implications related to the phenomenon of secret language.
+
+
+
+
+
+\medskip
+\noindent
+\textbf{Why does secret language exist?} 
+Secret language in NLP models may be caused by two factors: the training strategy and the training dataset. 
+The training strategy can influence the development of secret language. 
+For example, the pretraining procedure of BERT~\cite{devlin-etal-2019-bert} involves a task, Masked LM, in which 15\% of the tokens are replaced with a random token with a probability of 10\%, which may contribute to the existence of secret language in BERT-based models. 
+Additionally, the use of supervision~\cite{kuribayashi-etal-2021-lower} to align the model's output with the ground truth may lead to confusion about what is dissimilar, especially when the model is not allowed to output ``don't know'' if it is fed with semantically meaningless words.
+On the other hand, training datasets also matters. 
+For example, bias in datasets can negatively affect the performance and behavior of NLP models~\cite{sen-etal-2022-counterfactually}. 
+Bias exists in datasets when certain groups or categories of people are underrepresented or misrepresented. 
+It has been shown that bias in a dataset can lead to biased behavior of NLP models~\cite{shah-etal-2020-predictive,bertsch-etal-2022-evaluating}, such as unfairly associating certain words or concepts with certain groups of people~\cite{sap-etal-2019-risk,davidson-etal-2019-racial,wolfe-caliskan-2021-low}, or making decisions that disproportionately affect certain groups~\cite{tsuchiya-2018-performance,hall-maudslay-etal-2019-name,wich-etal-2020-impact}. 
+And as shown in Tables~\ref{tab: black-albert}, \ref{tab: black-distillbert}, and \ref{tab: black-roberta}, the secret languages of ``\textcolor{blue}{Asian}'', ``\textcolor{blue}{Male}'', ``\textcolor{blue}{Dog}'', and ``\textcolor{blue}{Male}'' are ``\textcolor{red}{worst}'', ``\textcolor{red}{notable}'', ``\textcolor{red}{Indonesian}'', and ``\textcolor{red}{bats}'', respectively, illustrating the significant bias of language models towards certain groups of people.
+Moreover, the hardness of different tasks and benchmarks plays a significant role. 
+As shown in Tables~\ref{tab: black-albert}, \ref{tab: black-distillbert}, and \ref{tab: black-roberta} in the Appendix, models finetuned on challenging benchmarks, such as SQuAD and SNLI, which require a deeper understanding than paraphrase benchmarks such as GLUE (MRPC), show stronger ability in distinguishing secret language.
+
+\medskip
+\noindent
+\textbf{How to eliminate secret language?} 
+To address this issue, it may be helpful to avoid using any training strategies that might create random tokens and to reduce the bias in the training dataset, including factors such as gender~\cite{zhao-etal-2017-men,park-etal-2018-reducing,zhao-etal-2019-gender} and word frequency~\cite{wolfe-caliskan-2021-low,patel-pavlick-2021-stated}. 
+On the other hand, recent study such as ``Chain-of-thought'' has demonstrated the reasoning ability of large LMs, and it is promising to further explore the reasoning power of these models for higher understanding of the human language. 
+Additionally, incorporating knowledge from multiple modalities~\cite{yao-wan-2020-multimodal,long-etal-2021-generative}, such as visual~\cite{shah-etal-2016-shef,delbrouck-dupont-2017-empirical,calixto-etal-2017-using,li-etal-2021-vision} and speech~\cite{di-gangi-etal-2019-must,li-etal-2021-multilingual} data, may also be helpful. 
+Lastly, as shown in Tables~\ref{tab: black-albert}, \ref{tab: black-distillbert}, and \ref{tab: black-roberta}, models finetuned on challenging benchmarks (such as SQuAD and SNLI) appear to be better equipped to defend against secret language than models finetuned on simpler benchmarks (such as GLUE's MRPC task). 
+So using challenging benchmarks might help.
+
+
+
+
+\medskip
+\noindent
+\textbf{Connection to memorization in NLP. }
+Secret language could be caused by memorization: 
+if an NLP model is simply memorizing words or phrases without truly understanding their meanings, it may cause the model to interpret secret language incorrectly. 
+The memorization in NLP might be due to three reasons. 
+One reason is that the model has not been trained on a diverse and representative dataset~\cite{li-wisniewski-2021-neural,thakkar-etal-2021-understanding}, which can cause it to simply memorize words and phrases without truly understanding their meaning. 
+Another reason is that the model is not trained properly~\cite{raunak-etal-2021-curious}, which can cause it to rely on memorization rather than learning to understand and interpret language accurately. 
+Additionally, some NLP models are designed to rely on memorization~\cite{tanzer-etal-2022-memorisation}, including some self-regression based LMs that are trained to predict the next word in a sentence based on the words that come before it. 
+More intuitively, if NLP models only memorize the most important patterns in sentences without understanding the sentences, secret language may occur because substituting the words that are not memorized will not change the output. 
+
+
+
+
+
+
+\section{Conclusion}
+The ultimate goal of NLP is to create systems that behave or perform better than humans. 
+However, many studies have showed that NLP models have their own understanding of language and may not understand what is similar.
+For example, replacing words with their synonyms in sentences can change the output of LMs. 
+This problem has been well studied in recent years, but the dual problem---understanding what is dissimilar, seems to have been ignored by the NLP community for a long time. 
+A recent study by \citet{DBLP:journals/corr/abs-2204-06125} shows that current LMs seem to have their own hidden vocabulary that can be used to interpret absurd inputs as meaningful concepts, which poses significant security and interpretability challenges for NLP models. 
+In this study, we address two research questions towards the ultimate goal of developing human-like NLP systems: ``\RQone'' and ``\RQtwo'' 
+To answer these questions, we propose a novel method called \textit{SecretFinding} to find secret languages in LMs and conduct experiments on five representative tasks and five representative models.
+Our experimental results show that the secret language is common across different models, as \textit{SecretFinding} can even replace the whole sentence with another one that seems random, but produces the same output as the original sentence. 
+We also find that the secret language found by \textit{SecretFinding} is general and could be transferred to other models, including GPT-3~\cite{DBLP:conf/nips/BrownMRSKDNSSAA20} and ChatGPT~\cite{openai_2023}.
+
+
+\section*{Limitations}
+In this work, we present the first method, \textit{SecretFinding}, that is able to automatically find secret language. 
+However, as it is a gradient-based (white-box) method, it would be interesting to explore black-box methods. 
+Additionally, this work only investigates the existence of secret language and the potential reasons for its existence. 
+Understanding secret language could provide valuable insights into the limitations of LMs in learning to behave like humans. 
+Furthermore, we may be able to identify and address the limitations of LMs, such as grasping the nuances~\cite{levi-etal-2019-identifying} and complexities of human communication~\cite{zhu-etal-2022-multi}. 
+Moreover, as secret language poses severe ethical problems~\cite{pmlr-v81-dwork18a}, such as ALBERT and DistillBERT thinking ``Asian'' equals to ``worst'' (Table~\ref{tab: black-distillbert}), it is important to figure out how to eliminate the secret language phenomenon and improve the reasoning ability of LMs for more transparent and interpretable LMs~\cite{saxon-etal-2021-modeling,shi-etal-2021-neural}.
+
+\section*{Ethics Statement}
+
+
+Unfortunately, secret language have a significant negative ethical impact because it provides a backdoor~\cite{DBLP:conf/ndss/LiuMALZW018,DBLP:journals/access/DaiCL19,kurita-etal-2020-weight,li-etal-2021-backdoor} for NLP models. 
+It can hinder the effectiveness of NLP systems and limit their ability to accurately process and understand inputs. 
+Further, the behaviour of a model when it comes to a secret language will be unpredictable to humans~\cite{shah-etal-2020-predictive,bertsch-etal-2022-evaluating}. 
+It may be used for malicious purposes, such as bypassing systems designed to identify hate speech, spam, or other unwanted content~\cite{waseem-hovy-2016-hateful,zhou-etal-2019-early,vidgen-etal-2020-detecting,pramanick-etal-2021-detecting,nozza-etal-2022-measuring}. 
+This could make negative social consequences and raises significant ethical concerns. 
+As shown in Tables \ref{tab: black-distillbert}, and \ref{tab: black-roberta}, the secret languages of ``\textcolor{blue}{Asian}'' and ``\textcolor{blue}{China}'' are ``\textcolor{red}{worst}'' and ``\textcolor{red}{bats}'', which raises ethical concerns about the use of language models. 
+Therefore, understanding secret language may allow us to better defend against the potential misuse of LMs.
+It will be important to address these potential negative impacts towards encouraging LMs to behave and think more like humans.
+
+\bibliography{anthology,custom}
+\bibliographystyle{acl_natbib}
+
+\appendix
+
+\clearpage
+
+
+\section{Related Work}
+
+Over the last few decades, deep neural networks (DNNs) have achieved tremendous success~\cite{DBLP:journals/nature/LeCunBH15} in computer vision~\cite{he2016deep}, speech recognition~\cite{deng2013new}, natural language processing (NLP)~\cite{DBLP:journals/corr/abs-1907-11692}, and \textit{etc.}
+However, DNNs are often found to exhibit unexpected behaviors that differ from human cognition and decision-making processes. 
+
+For example, humans are able to do a wide range of cognitive tasks~\cite{stanovich2011rationality,book} including consistently generalizing their linguistic understanding to out of domain contexts~\cite{Carlson1997TheGB,GenericityBehrens2005,SPROUSE2013219} without extensive extra instructions or with common sense knowledge.
+Furthermore, humans are able to quickly learn new tasks with language~\cite{carlson1977reference,CIMPIAN200819}. 
+Generally, humans are able to have consistent behaviours and good generalization ability. 
+In contrast, current NLP models, including language models (LMs), have been found to be limited in their ability to perform these tasks~\cite{DBLP:conf/nips/BrownMRSKDNSSAA20,DBLP:journals/corr/abs-2112-11446}.
+Therefore, one possible way to improve the generalization of LMs is to build human-like linguistic systems~\cite{DBLP:journals/corr/abs-1811-06052,linzen-2020-accelerate}. 
+
+
+
+
+
+
+
+
+
+\citet{Gelman2004Learning,DUPOUX201843} argue that human's generalization ability probably arises from the \emph{conceptual frameworks} (understanding of language) formed during the learning of a language.
+However, researchers have found that LMs seem to have their own understanding of language~\cite{DBLP:journals/corr/abs-2206-00169}, which sometimes does not align with human's understanding of language. 
+One area of concern where LMs have been found to differ significantly from humans is adversarial robustness~\cite{ren-etal-2019-generating,DBLP:journals/tist/ZhangSAL20,wang-etal-2022-measure}, which aims to improve the ability of models to understand and use language in a semantically meaningful way. 
+In NLP, this includes the ability to identify and use synonyms and related words, as well as the ability to understand and use language in a contextually appropriate manner. 
+Inspired by \citet{DBLP:journals/corr/SzegedyZSBEGF13}, who first demonstrated that the predictions of a DNN could be easily changed by applying imperceptible changes to input images, even though those changes were imperceptible to human eyes, NLP researchers have found that NLP models can be easily fooled by synonyms~\cite{li-etal-2020-bert-attack,morris-etal-2020-reevaluating,garg-ramakrishnan-2020-bae}. 
+This lack of robustness to semantically similar inputs can be a problem, as it can lead to the production of misleading or confusing output. 
+To address this, numerous methods~\cite{gardner-etal-2020-evaluating,DBLP:conf/iclr/KaushikHL20,zhou-etal-2021-defense,DBLP:conf/aaai/SchlegelNB21} have been proposed to improve this robustness ability of NLP models. 
+
+
+Another area of concern in NLP is the phenomenon of ``secret language''~\cite{DBLP:journals/corr/abs-2206-00169}, where models generate seemingly nonsensical or unrelated responses to certain inputs. 
+This can be a problem because it can lead to the production of misleading or confusing output, which can have serious consequences in applications such as machine translation~\cite{freitag-etal-2022-natural} or automated customer service~\cite{liang-etal-2021-learning-neural}. 
+Thus, there is a need to better understand and address the causes of secret languages in NLP models. 
+It could assist us in developing more transparent and interpretable LMs~\cite{saxon-etal-2021-modeling,shi-etal-2021-neural}, which would be beneficial for a range of applications, including those with important ethical or social implications~\cite{pmlr-v81-dwork18a}.
+
+In this paper, we identify the ``secret language'' and propose two research questions to investigate the existence of ``secret language''. 
+Specifically, we first propose a novel method to empirically find the secret language given models, namely \textit{SecretFinding}. 
+Then we select five representative tasks of NLP, \ie, paraphrase, sentiment analysis, question answering, natural language inference, and image-text retrieval, to testify whether the ``secret language'' occurs among different models (RQ1) and tasks and whether the ``secret language'' is dependent on specific sentences (RQ2).
+
+\section{Details of integrated gradient}\label{sec: IG details}
+Specifically, the integrated gradient along the $i$-th dimension for an input $x$ and baseline $x^{'}$ is defined as
+\begin{equation*}
+    IG_i(x) = (x_i - x^{'}_i) \int_{\alpha=0}^{1}\frac{\partial f(x^{'} + \alpha (x - x^{'}))}{\partial x_i}\ d\alpha\,,
+\end{equation*}
+where $x_i$ and $x_i^{'}$ are the $i$-th element of $x$ and $x^{'}$.
+The final integrated gradient is obtained by summing the integrated gradient along all dimensions
+\begin{equation*}
+    IG(x) = \sum_i IG_i(x)\,.
+\end{equation*}
+
+% Figure environment removed
+
+\begin{table*}[ht!]
+\centering
+\caption{Four examples from the train and test splits of GLUE (MRPC).}
+\label{tab: mrpc examples train}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{p{5.7in}|p{1in}}%
+\toprule
+\textbf{Sentence1:} Media Editor Jon Friedman contributed to this story                             & \multirow{3}{*}{equivalent (train)}    \\
+\textbf{Replaced Sentence1:} ashvili bo living kom caucasus shutter109eros lilly colourful          &                                                \\
+\textbf{Sentence2:} Jon Friedman is media editor for CBS.MarketWatch.com in New York .              &                                                \\
+\midrule
+\textbf{Sentence1:} ISC and NASCAR officials declined to comment .                                  & \multirow{3}{*}{equivalent (train)}    \\
+\textbf{Replaced Sentence1:} studyclo postseason burst refueling annual investing algae  auditioned &                                                \\
+\textbf{Sentence2:} NASCAR officials could not be reached for comment Tuesday .                     &                                                \\
+\midrule
+\textbf{Sentence1:} Orange shares jumped as much as 15 percent .                                    & \multirow{3}{*}{equivalent (test)}     \\
+\textbf{Replaced Sentence1:} gon consolationham enabling albeittidae drops declining fist artwork   &                                                \\
+\textbf{Sentence2:} France Telecom shares dropped 3.6 percent while Orange surged 13 percent .      &                                                \\
+\midrule
+\textbf{Sentence1:} Total Information Awareness is now Terrorism Information Awareness .            & \multirow{3}{*}{not equivalent (test)} \\
+\textbf{Replaced Sentence1:} milkggio christinaesca summonhanna finalized starecrim riley           &                                                \\
+\textbf{Sentence2:} The new name will be Terrorism Information Awareness .                          &          \\         
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\begin{table*}[ht!]
+\centering
+\caption{Four examples from the train and validation splits of SQuAD.}
+\label{tab: QA examples train}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{m{8in}}%
+\toprule
+\textbf{Text (train):} `Beyoncé announced a hiatus from her music career in January 2010, heeding her mother's advice, "to live life, to be inspired by things again". During the break she and her father parted ways as business partners. Beyoncé's musical break lasted nine months and saw her visit multiple European cities, the Great Wall of China, the Egyptian pyramids, Australia, English music festivals and various museums and ballet performances.'                             \\
+\textbf{Answer:}  `her mother'                                                                                                                                                 \\
+\textbf{Question:  } `Who inspired this hiatus?'                                                                                                                                  \\
+\textbf{Replaced Question:   } `<s>Removeornings Ma slic consciousness'                                                                                                                     \\
+\midrule
+\textbf{Text (train): } `On January 7, 2012, Beyoncé gave birth to a daughter, Blue Ivy Carter, at Lenox Hill Hospital in New York under heavy security. Two days later, Jay Z released "Glory", a song dedicated to their child, on his website Lifeandtimes.com. The song detailed the couple's pregnancy struggles, including a miscarriage Beyoncé suffered before becoming pregnant with Blue Ivy. Blue Ivy's cries are included at the end of the song, and she was officially credited as "B.I.C." on it. At two days old, she became the youngest person ever to appear on a Billboard chart when "Glory" debuted on the Hot R\&B/Hip-Hop Songs chart.'               \\
+\textbf{Answer:}                 `Blue Ivy Carter'             \\
+\textbf{Question:}              `What was the name of Beyonce's daughter?'                                                                                                                   \\
+\textbf{Replaced Question:}     `<s> arteryorio signalsahsfdceived newly tweet personalities denying'                                                                                        \\
+\bottomrule
+\toprule
+\textbf{Text (validation):}               `Despite waiving longtime running back DeAngelo Williams and losing top wide receiver Kelvin Benjamin to a torn ACL in the preseason, the Carolina Panthers had their best regular season in franchise history, becoming the seventh team to win at least 15 regular season games since the league expanded to a 16-game schedule in 1978. Carolina started the season 14–0, not only setting franchise records for the best start and the longest single-season winning streak, but also posting the best start to a season by an NFC team in NFL history, breaking the 13–0 record previously shared with the 2009 New Orleans Saints and the 2011 Green Bay Packers. With their NFC-best 15–1 regular season record, the Panthers clinched home-field advantage throughout the NFC playoffs for the first time in franchise history. Ten players were selected to the Pro Bowl (the most in franchise history) along with eight All-Pro selections.' \\
+\textbf{Answer:}              `DeAngelo Williams'   \\
+\textbf{Question:}           `Which Carolina Panthers running back was waived?'    \\
+\textbf{Replaced Question:}  `<s> nicotine):aband Drawingldom nut Batmandelay opposite'   \\
+\midrule
+\textbf{Text (validation):}                `Westwood One will carry the game throughout North America, with Kevin Harlan as play-by-play announcer, Boomer Esiason and Dan Fouts as color analysts, and James Lofton and Mark Malone as sideline reporters. Jim Gray will anchor the pre-game and halftime coverage.'    \\
+\textbf{Answer:}              `Westwood One'        \\                                                                                                       \textbf{Question:}           `What radio network carried the Super Bowl?'        \\
+\textbf{Replaced Question:}  `<s> TSignt inquirecairica floOU road'                                                                                                   \\   \bottomrule                                                                                                      
+\end{tabular}%
+}
+\end{table*}
+
+
+% Figure environment removed
+
+\begin{table*}[ht!]
+\centering
+\caption{Illustration of the top 10 most frequent secret languages of the most important words selected by IG on ALBERT from the train and test splits of GLUE (MRPC).}
+\label{tab:MRPC-most-frequent-secrete-language}
+\begin{tabular}{l|l}
+\toprule
+Words & Top 10 Frequent Secret Languages   (Train)                                  \\
+\midrule
+said        & tunis, machine, sichuan, 1857, quality, 81, unless, edited, sweden, his, pose   \\
+for         & compatible, give, wong, relics, cius, cop, ominous, want, consent, joy          \\
+that        & twi, armed, bearing, 1867, arthur, glaring, zar, halftime, progressive, autonom \\
+he          & glen, female, hurting, famous, feature, radiated, jeu, 1913, hyper, petro       \\
+percent     & dressed, ame, overlord, ikki, heinrich, fuji, west, paint, ossi, rash           \\
+\bottomrule
+\toprule
+Words & Top 10 Frequent Secret Languages  (Test)                                  \\
+\midrule
+said        & rad, fabio, moderator, apo, gyr, education, elaine, loki, i, utter          \\
+for         & monte, will, building, physically, radi, spun, bug, leiden, phar, de        \\
+that        & v, back, world, marathi, violence, vers, sky, rotation, pen, sort           \\
+people      & gul, accessibility, picked, bean, son, linguistic, fold, skidded, 1965, cam \\
+percent     & goat, 600, mus, ramos, harmless, yu, wound, furlong, nh, raj                \\
+\bottomrule
+\end{tabular}%
+\end{table*}
+
+
+\begin{table*}[ht!]
+\centering
+\caption{Illustration of the top 10 most frequent secret languages of the most important words selected by IG on DistillBERT from the train and test splits of SNLI.
+Words ``/21955'', ``/47119'', ``/48018'', and ``/49316'' are four special words that cannot be represented in LaTeX, while 21955, 47119, 48018, and 49316 are their indices in the dictionary of the tokenizer.
+``<s>'' is a special token. }
+\label{tab:SNLI-most-frequent-secrete-languages}
+\begin{tabular}{l|l}
+\toprule
+Words & Top 10 Frequent Secret Languages    (Train)                                \\
+\midrule
+man         & /21955, <s>, /47119, Jewish, sym, Whereas, Ru,  consume, colon, Chief      \\
+woman       & /21955, <s>, Poker, Hirosh, Vest, sodium, copies, cab, reconnect, iazep    \\
+Two         & /21955, <s>, Mech, func, drama, Natural, Broadway, Lanka, casualty, aped \\
+dog         & /21955, <s>, /47119, Barrel, emp, puls, basket,  pedigree, /50195,    evolved \\
+people      & /21955, <s>, /47119, async, deeper, people, Copy,  tha, Looking, Charges       \\
+\bottomrule
+\toprule
+Words & Top 10 Frequent Secret Languages  (Test)                                                             \\
+\midrule
+man         & /21955, <s>, /47119, /49316, Damon, Loc, peg,  009, figure, bes                              \\
+woman       & /21955, <s>, uamb, checkpoints, winding, /48018, guilt, 119, po, Splash                  \\
+Two         & /21955, <s>, ē, destroyer, unfolding, Celeb, unemployment, artic, Business, physical \\
+dog         & /21955, <s>, /47119, hner, NI, Jr, GOP,  crispy, Assad, Previous                         \\
+boy         & <s>, /21955, /47119, unsett, sensitive, ••••, rounds, stranded, lots, priced           \\
+\bottomrule
+\end{tabular}%
+\end{table*}
+
+\begin{table*}[ht!]
+\centering
+\caption{Illustration of the top 10 frequent secret languages of the most important words selected by IG on Roberta from the train and validation split of SQuAD.
+Words ``/21955'', ``/47119'', and ``/49093'' are three special words that cannot be represented in LaTeX, while 21955, 47119, and 49093 are their indices in the dictionary of the tokenizer.
+``<s>'' is a special token.}
+\label{tab:SQuAD-most-frequent-secrete-languages}
+\begin{tabular}{l|l}
+\toprule
+Words  & Top 10 Frequent Secrete Languages     (Train)                                            \\
+\midrule
+the    & /21955, <s>, /47119, noon, Benjamin, sshd, dataset, don, ELS, mercenary         \\
+What   & /21955, /47119, <s>, Aure, frog, obsessive, excerpts, restrained, Ply, shop        \\
+did    & /21955, <s>, /47119, conv, 409, adjustment, particip, afforded, organisms, band \\
+year   & /21955, Pref, →, tries, /49093, picked, pedoph, lay, Restau, 647                \\
+called & /21955, Enter, ud, England, hinges, iot, Geh, pay, Sem, loads      \\
+\bottomrule
+\toprule
+Words & Top 10 Frequent Secrete Languages   (Test)                                                      \\
+\midrule
+the   & /21955, <s>, /47119, displeasure, Ginny, encount, 950, passion, =-=-, trilogy, infiltration \\
+What  & /21955, /47119, <s>, truth, rencies, Nun, VAL, Auto, Dawn, opped                           \\
+did   & /21955, <s>, /47119, caravan, anny, metaph, barren, andra, officers                       \\
+year  & /21955, <s>, /47119, realistic, theless, giving, Diagn, troublesome, Tomorrow, lockout    \\
+50    & /21955, <s>, title, inguished, ussed, wikipedia, Robb ,Plenty, ises, commend       \\
+\bottomrule
+\end{tabular}%
+\end{table*}
+
+In the tasks of paraphrase, NLI and QA, $x$ is constructed directly by stacking all the words as $x = [CLS, A ids, SEP, SEP, B ids, SEP]$, where $CLS$ and $SEP$ are two special tokens, $A ids$ are the first sentence, question and premise, and $B ids$ are the second sentence, text and hypothesis. 
+$x^{'}$ is constructed as $x^{'} = [CLS, REFs, SEP, SEP, REFs, SEP]$, where $REFs$ is a stack of the special token $REF$ which has the same length with $Aids$ or $Bids$. 
+In image-text retrieval and sentiment analysis, $x$ is constructed directly by stacking all the words as $x = [CLS, A ids, SEP]$, while $x^{'}$ is constructed as $x^{'} = [CLS, REFs, SEP]$, where $Aids$ is the text.
+
+\section{Evaluation}
+
+\subsection{Details of experimental settings}
+
+\textbf{Models selection. }
+We use DistilBERT~\cite{DBLP:journals/corr/abs-1910-01108}, ALBERT~\cite{DBLP:conf/iclr/LanCGGSS20}, Roberta~\cite{DBLP:journals/corr/abs-1907-11692}, Electra~\cite{DBLP:conf/iclr/ClarkLLM20}, and CLIP~\cite{DBLP:conf/icml/RadfordKHRGASAM21}. 
+These five models are pretraining models and finetuned on SNLI, GLUE (MRPC), SQuAD, GLUE (SST-2), and MSCOCO.
+
+
+
+\textbf{Dataset selection. }
+As for the datasets, we use Stanford Natural Language Inference (SNLI,
+\citet{bowman-etal-2015-large}), GLUE (MRPC)~\cite{dolan-brockett-2005-automatically}, Stanford Question Answering Dataset (SQuAD, \citet{rajpurkar-etal-2016-squad}), GLUE (SST-2)~\cite{DBLP:conf/iclr/WangSMHLB19}, and MSCOCO~\cite{DBLP:conf/eccv/LinMBHPRDZ14}. 
+Stanford Natural Language Inference (SNLI, \citet{bowman-etal-2015-large}) is a collection of 570k human-written English sentence pairs manually labeled for balanced classification with the labels entailment, contradiction, and neutral. 
+GLUE~\cite{DBLP:conf/iclr/WangSMHLB19} is a collection of natural language understanding tasks including question answering, sentiment analysis, and textual entailment, and we use the ``MRPC'' (paraphrase) and ``SST-2'' subsets (sentiment analysis) of GLUE. 
+MRPC~\cite{dolan-brockett-2005-automatically} is a corpus of sentence pairs automatically extracted from online news sources, with human annotations for whether the sentences in the pair are semantically equivalent using
+SST-2~\cite{socher-etal-2013-recursive} is consisted of 67,349 training samples and 1,821 testing samples from movie reviews and human annotations of their sentiment. 
+Stanford Question Answering Dataset (SQuAD, \citet{rajpurkar-etal-2016-squad}) is a reading comprehension dataset, consisting of 100,000 questions posed by crowdworkers on a set of Wikipedia articles, where the answer to every question is a segment of text, or span, from the corresponding reading passage, or the question might be unanswerable. 
+
+For each dataset, we use the first 10,000 samples from the training and testing subsets to answer our research questions, while for SQuAD, when replacing more than 4 words, we only evaluate on the first 1,000 samples due to the limitation of computational resources. 
+Besides, for MSCOCO, we only evaluate on the first 1,000 samples. 
+
+% Figure environment removed
+
+
+
+\subsection{RQ1: \RQone}\label{sec: appendix RQ1}
+
+In this part, we present the left analysis on answering RQ1.
+
+\textbf{Detailed Quantitative results on three multi-sentence benchmarks. }
+Quantitative results can be found in Table~\ref{tab: acc on multisentences} and Figure~\ref{fig: acc multisentence}. 
+We first notice that there are a huge number of samples with hypotheses, or questions that are less than 10 words as shown in Figure~\ref{fig:multi-sentences-length-hist}.
+As the accuracy of replacing 10 words is higher than the percent of samples with hypotheses, or questions that are less than 10 words, lots of samples can be fully replaced by a completely different sentence while keeping output the same. 
+This may be because the model relies on heuristics that are effective for frequent example types~\cite{mccoy-etal-2019-right}. 
+We show some examples that have been completely changed while the output remains the same in Tables~\ref{tab:SNLI-train-examples}, \ref{tab: mrpc examples train}, and \ref{tab: QA examples train}. 
+Next, to examine whether ALBERT, DistillBERT, and Roberta consistently focus on the same words in the train and test (validation) splits, we plot the most important words according to IG in Figure~\ref{fig: word cloud on MRPC}. 
+We notice that three different models perform good consistency on choosing the most important words. 
+``year'', ``said'', ``share'', ``two'', and ``percent'' are frequently captured by ALBERT. 
+DistillBERT shows its preference for nouns and pronouns such as ``man'', ``people'', ``dog'', and ``woman''. 
+As SQuAD is mainly collected on Wikipedia, Roberta mainly focuses on the words that play the most important role in the questions, \eg, ``year'', ``name'', ``called'', ``first'', and ``school''. 
+Besides, we also cluster the words we replace according to their tag in the sentence and the statistics are shown in Figure~\ref{fig: multi-setence tagging num} (a)\footnote{We use spaCy for tagging the words.}. 
+It is surprising that most of the words chosen by IG belong to ``PUNCT'', ``PRON'', ``ADV'', and ``DET''. 
+But at the same time, while humans also pay attention to ``VERB'' words, models seem not to treat ``VERB'' words as the most important words in sentences. 
+To understand the tag of their secret languages, we also draw a Sankey figure showing the tag of the most important (top 1) words by IG and their secret language in Figure~\ref{fig: multi-setence tagging num} (b). 
+Though the tag of most of the chosen words is ``PUNCT'', we notice that most of their secret language are ``NOUN'', ``PROPN'', and ``VERB''. 
+That actually corresponds with humans understanding of languages more as ``NOUN'', ``VERB'', and ``PROPN'' are always the essential components of a sentence (verb, subject, and object). 
+Following ``NOUN'', ``VERB'', and ``PROPN'', a number of secret languages belong to ``ADJ'', ``NUM'', and ``ADV''. 
+Following that, we present the top 10 frequent secret languages of the most important words in the train and test (validation) splits in Tables~\ref{tab:MRPC-most-frequent-secrete-language}, \ref{tab:SNLI-most-frequent-secrete-languages}, and \ref{tab:SQuAD-most-frequent-secrete-languages}. 
+Due to the randomness of \textit{SecretFinding}, the secret languages from the test and train splits are different while some special tokens and words consistently appear. 
+
+
+\begin{table*}[ht!]
+\centering
+\caption{
+Accuracy (\%) of \emph{SecretFinding} on the GLUE (SST-2) when we replace various numbers of words.}
+\label{tab: glue sst-2}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccccc}
+\toprule
+\multirow{2}{*}{Dataset}      & \multirow{2}{*}{Split} & \multicolumn{10}{c}{Number of Words Replaced}                                 \\
+
+                              &                        & 1     & 2     & 3     & 4     & 5     & 6     & 7     & 8     & 9     & 10    \\ \midrule
+\multirow{2}{*}{GLUE (SST-2)} & Train                  & 96.60 & 96.99 & 97.30 & 97.49 & 97.67 & 97.63 & 97.69 & 97.85 & 97.89 & 97.99 \\
+                              & Test                   & 95.77 & 94.56 & 94.34 & 94.07 & 93.52 & 94.29 & 93.68 & 93.30 & 93.35 & 93.35\\ 
+                              \bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+
+
+% Figure environment removed
+
+\textbf{Quantitative results on sentiment analysis (single-sentence).} 
+Quantitative results on SST-2 (Electra) can be found in Table~\ref{tab: glue sst-2}. 
+We also draw the lines of accuracy on three multi-sentence tasks in Figure~\ref{fig: acc singlesentence}. 
+We notice that as this task is much simpler than multi-sentence tasks, the accuracy is really high and not proportional to the number of words we replace. 
+Besides, the trend of accuracy on the train and test splits is different. 
+As the accuracy on the train split is proportional to the number of words we replace, that on the test split is inversely proportional. 
+This might be due to the fact that this task is of sentence classification and models are actually memorizing all the training data. 
+However, as the most of single-sentence tasks are actually not suitable for answering RQ1 including sentiment analysis\footnote{Most of the single-sentence tasks requires the classification results on a sentence. As semantically changing the sentence some time does not change the label, \eg, changing ``This film is good.'' (positive) to ``The song is sweet.'' (positive), }, we only list the results for \textbf{showing the power of \textit{SecretFinding}} and do not do further analysis on these empirical results or relate these results to RQ1. 
+
+\begin{table*}[ht!]
+\centering
+\caption{
+Accuracy (\%) of \emph{SecretFinding} on MSCOCO when we replace various numbers of words.}
+\label{tab: mscoco}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccccc}
+\toprule
+\multirow{2}{*}{Dataset}      & \multirow{2}{*}{Split} & \multicolumn{10}{c}{Number of Words Replaced}                                 \\
+
+                              &                        & 1     & 2     & 3     & 4     & 5     & 6     & 7     & 8     & 9     & 10    \\ \midrule
+\multirow{2}{*}{MSCOCO} & Train                  & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 \\
+                              & Validation                   & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00 & 100.00\\ 
+                              \bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\textbf{Quantitative results on text-image retrieval (single-sentence).} 
+Quantitative results on CLIP (MSCOCO) can be found in Table~\ref{tab: mscoco}. 
+As this task only requires correctly retrieving the image paired with the input sentence, it is much easier than other NLP tasks for finding secret languages.
+\textit{SecretFinding} only needs to find a sentence that is closer to the representation of a ground-truth image than the representations of other images in the gallery. 
+And as the gallery is also limited, \textit{SecretFinding} is able to find a replacement that is semantically dissimilar from the original sentence for every sentence. 
+Similar to the results on sentiment analysis, the results on text-image retrieval are actually not suitable for answering RQ1 and we report the results on text-image retrieval only for showing the power of \textit{SecretFinding} too.
+
+\begin{table*}[ht!]
+\centering
+\caption{
+Experimental results (black-box) on the universality of secret language found on ALBERT (GLUE (MRPC)). }
+\label{tab: black-albert}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{m{1in}|m{1in}|m{1in}m{1in}m{1in}m{1in}m{1in}m{1in}}%
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{VERB}                    & \multicolumn{2}{c}{PRON}                      & \multicolumn{2}{c}{ADV}                  \\
+                      &                          & becomes (drugged)     & challenged (zem)    & them (amphitheater) & anything (naturalist)   & simply (venomous) & almost (umu)         \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 4 / 4                 & 1 / 1               & 97 / 97             & 11 / 11                 & 8 / 8             & 20 / 20              \\
+DistillBERT           & SNLI                     & 8 / 11                & 7 / 7               & 1428 / 2258         & 267 / 334               & 3 / 4             & 139 / 204            \\
+Roberta               & SQuAD                    & 2 / 19                & 1 / 24              & 16 / 582            & 1 / 19                  & 1 / 10            & 5 / 63               \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{ADJ}                     & \multicolumn{2}{c}{PROPN}                     & \multicolumn{2}{c}{SCONJ}                \\
+                      &                          & average (libertarian) & second (determined) & ministry (islander) & hepatitis (maclean)     & if (collectors)   & because (resistance) \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 58 / 58               & 92 / 92             & 5 / 5               & 2 / 2                   & 471 / 471         & 74 / 74              \\
+DistillBERT           & SNLI                     & 9 / 10                & 150 / 176           & 0 / 0               & 0 / 0                   & 6241 / 7564       & 1510 / 1587          \\
+Roberta               & SQuAD                    & 117 / 327             & 283 / 593           & 1 / 15              & 1 / 1                   & 357 / 3800        & 166 / 221            \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{DET}                     & \multicolumn{2}{c}{NOUN}                      & PUNCT             & PART                 \\
+                      &                          & that (stefano)        & another (deflect)   & death (adapting)    & \textcolor{red}{scientists (sunderland)} & = (appearances)   & or (machine)                    \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 820 / 820             & 57 / 57             & 70 / 70             & 8 / 8                   & 30 / 30           &        3541 / 3541              \\
+DistillBERT           & SNLI                     & 2879 / 3146           & 2865 / 3238         & 121 / 159           & 58 / 63                 & 3 / 3             &     84584 / 99147                 \\
+Roberta               & SQuAD                    & 205 / 5007            & 500 / 588           & 260 / 405           & 50 / 96                 & 15 / 18           &     11561 / 35235                 \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & AUX                   & CCONJ               & ADP                 & NUM                     &                   &                      \\
+                      &                          & have (promised)       & plus (tiger)        & alongside (caliber) & 1997 (malaysia)         &                   &                      \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 372 / 372             & 10 / 10             & 3 / 3               & 7 / 7                   &                   &                      \\
+DistillBERT           & SNLI                     & 2800 / 3724           & 12 / 20             & 75 / 79             & 0 / 0                   &                   &                      \\
+Roberta               & SQuAD                    & 2873 / 3423           & 12 / 14             & 21 / 26             & 28 / 50                 &         \\
+            \bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+
+
+
+\begin{table*}[ht!]
+\centering
+\caption{
+Experimental results (black-box) on the universality of secret language found on DistillBERT (SNLI). 
+}
+\label{tab: black-distillbert}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{m{1in}|m{1in}|m{1in}m{1in}m{1in}m{1in}m{1in}m{1in}}
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{VERB}            & \multicolumn{2}{c}{PRON}            & \multicolumn{2}{c}{ADV}          \\
+                       &                          & training (breakthrough)              & ordering (sav)                  & Nothing (cedes) & Everyone (Speed)  & Near (IoT)           & Outside (Appearance)                  \\
+                       \midrule
+ALBERT                 & GLUE (MRPC)              &    9 / 9            &       1 / 1             & 0 / 0           & 1 / 1             &       6 / 6      &    1 / 1                \\
+DistillBERT            & SNLI                     &    383 / 439            &        161 / 173            & 85 / 86         & 376 / 448         &       24 / 24      &      41 / 42              \\
+Roberta                & SQuAD                    &   42 / 64             &        5 . 7            & 0 / 0           & 0 / 0             &      16 / 67       &           3 / 28         \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{ADJ}             & \multicolumn{2}{c}{PROPN}           & \multicolumn{2}{c}{SCONJ}        \\
+                       &                          & \textcolor{red}{Asian ( worst)} & \textcolor{red}{Male ( notable)}   & Billy ( Hom)    & \textcolor{red}{Dog (Indonesian)}  & While (spective)           & as (Wisconsin)                  \\
+                       \midrule
+ALBERT                 & GLUE (MRPC)              & 5 / 5          & 4 / 4              & 2 / 2           & 2 / 2             &     18 / 18        &          2758 / 2758          \\
+DistillBERT            & SNLI                     & 1279 / 1786    & 102 / 108          & 20 / 38         & 439 / 922         &     142 / 154        &      48409 / 59720              \\
+Roberta                & SQuAD                    & 2 / 100        & 0 / 5              & 0 / 4           & 11 / 35           &     31 / 33        &       26014 / 34993             \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{DET}             & \multicolumn{2}{c}{NOUN}            & PUNCT       & PART               \\
+                       &                          & All (TERN)     & Some ( Nike)       & Human (Merc)    & Students ( tall)  & . (charged) & not ( settlements) \\
+                       \midrule
+ALBERT                 & GLUE (MRPC)              & 36 / 36        & 21 / 21            & 6 / 6           & 0 / 0             &   5792 / 5792          & 492 / 492          \\
+DistillBERT            & SNLI                     & 256 / 342      & 7360 / 9592        & 525 / 538       & 152 / 212         &      435059 / 455983       & 4637 / 8410        \\
+Roberta                & SQuAD                    & 32 / 166       & 7 / 142            & 8 / 94          & 0 / 9             &   1334 / 1545          & 166 / 2666         \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Dataset} & AUX            & CCONJ              & ADP             & NUM               &             &                    \\
+                       &                          & is (Distance)              & Neither (Imperial) & At ( Articles)  & Seven (Character) &             &                    \\
+                       \midrule
+ALBERT                 & GLUE (MRPC)              &   2534 / 2534             & 3 / 3              & 109 / 109       & 9 / 9             &             &                    \\
+DistillBERT            & SNLI                     &    251073 / 263000            & 15 / 29            & 287 / 303       & 117 / 125         &             &                    \\
+Roberta                & SQuAD                    &    14157 / 35280            & 0 / 0              & 19 / 699        & 2 / 42            &             &                \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\begin{table*}[ht!]
+\centering
+\caption{
+Experimental results (black-box) on the universality of secret language found on Roberta (SQuAD). 
+}
+\label{tab: black-roberta}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{m{1in}|m{1in}|m{1in}m{1in}m{1in}m{1in}m{1in}m{1in}}%
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{VERB}                & \multicolumn{2}{c}{PRON}          & \multicolumn{2}{c}{ADV}             \\
+                      &                          & Using (sequent)     & wrote (aturation) & What (chieve)     & Her (nat)     & When (father) & Typically (Ezekiel) \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 1 / 1               & 14 / 14           & 7 / 7             & 28 / 28       & 15 / 15       & 1 / 1               \\
+DistillBERT           & SNLI                     & 3 / 3               & 51 / 54           & 4 / 6             & 123 / 137     & 10 / 13       & 0 / 0               \\
+Roberta               & SQuAD                    & 10 / 12             & 11 / 376          & 39356 / 42319     & 31 / 108      & 3796 / 6115   & 0 / 4               \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{ADJ}                 & \multicolumn{2}{c}{PROPN}         & \multicolumn{2}{c}{SCONJ}           \\
+                      &                          & \textcolor{red}{American (culation)} & Natural (tex)     & September (esson) & \textcolor{red}{China (bats)}  & Once (ATURES) & Because (Christian) \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 108 / 108           & 1 / 1             & 33 / 33           & 22 / 22       & 4 / 4         & 4 / 4               \\
+DistillBERT           & SNLI                     & 449 / 518           & 1 / 2             & 5 / 5             & 51 / 143      & 2 / 4         & 2 / 2               \\
+Roberta               & SQuAD                    & 49 / 1020           & 15 / 17           & 3 / 74            & 151 / 370     & 10 / 12       & 36 / 41             \\
+\bottomrule
+\toprule
+\multirow{2}{*}{Task} & \multirow{2}{*}{Dataset} & \multicolumn{2}{c}{DET}                 & \multicolumn{2}{c}{NOUN}          & PUNCT         & PART                \\
+                      &                          & All (culture)       & Each (igroup)     & All (culture)     & Each (igroup) & ? (coni)      & 's (ession)         \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 36 / 36             & 3 / 3             & 36 / 36           & 3 / 3         &       12 / 12        & 1077 / 1077         \\
+DistillBERT           & SNLI                     & 266 / 342           & 23 / 25           & 266 / 342         & 23 / 25       &      16 / 20         & 6635 / 6876         \\
+Roberta               & SQuAD                    & 72 / 166            & 14 / 15           & 72 / 166          & 14 / 15       &       87127 / 97048        & 7765 / 9163         \\
+\bottomrule
+\toprule
+Task                  & Dataset                  & AUX                 & CCONJ             & ADP               & NUM           &               &                     \\
+                      &                          & Was (alia)          & while (Copenhagen)                 & Against (EO)      & Three (Aim)   &               &                     \\
+                      \midrule
+ALBERT                & GLUE (MRPC)              & 58 / 58             &       88 / 88            & 6 / 6             & 15 / 15       &               &                     \\
+DistillBERT           & SNLI                     & 31 / 34             &         8557 / 10292          & 3 / 3             & 7522 / 7906   &               &                     \\
+Roberta               & SQuAD                    & 76 / 321            &         123 / 161          & 11 / 18           & 24 / 40       &               &          \\          
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+\begin{table*}[ht!]
+\centering
+\caption{Examples of transferring the secret language of Roberta to GPT-3 and ChatGPT (Dec 15 Version).
+The words that our algorithm selects for substitution are marked as \textcolor{blue}{blue}, while their secret languages are marked as \textcolor{red}{red}.
+``NA'' refers to not understanding the questions.}
+\label{tab: more on ChatGPT and GPT3}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+Questions                                                            & GPT-3                                                   & ChatGPT                                          \\
+\midrule
+Which \textcolor{blue}{program} at Notre Dame \textcolor{blue}{offers} a Master of Education degree?     & the College of Education                                & a Master of Education                            \\
+Which \textcolor{red}{Mand} at Notre Dame\textcolor{red}{atives} a Master of Education degree?         & NA                                                      & a Master of Education                            \\
+\midrule
+When did Beyoncé \textcolor{blue}{rise to} fame?                                       & NA                                                      & 1990s                                            \\
+When did Beyoncé\textcolor{red}{uk benefic} fame?                                     & Beyoncéuk benefic fame in the late 1990s as lead singer & 1990s                                            \\
+\midrule
+When \textcolor{blue}{was} the \textcolor{blue}{Luria}-Delbruck experiment?                              & 1943                                                    & 1943                                             \\
+When\textcolor{red}{age} the\textcolor{red}{drawnuria}-Delbruck experiment?                            & 1940                                                    & NA                                               \\
+\midrule
+\textcolor{blue}{When} did antibiotics revolutinzed medicine?                          & 1940                                                    & 1928                                             \\
+\textcolor{red}{isively} did antibiotics revolutinzed medicine?                        & Yes                                                     & 1940s                                            \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\textbf{What tasks are suitable for answering RQ1 and RQ2.} 
+Actually, most of the single-sentence tasks and cross-modal tasks do not require a fully understanding of the semantic meaning of language.  
+Compared with these tasks, multi-sentence tasks are more suitable. 
+Multi-sentence tasks always require models to understand the relationship between two sentences and then make predictions such as answering questions or classification results on the understanding of two sentences. 
+So, when we only change one sentence while keeping another one the same\footnote{If we change one sentence while keeping another unchanged and the output keeps the same, it indicates that the relationship between two input sentences from the model side does not change and actually shows that the original sentence and the changed sentence are the same in the eye of LMs.}, it becomes a perfect testbed of our research questions. 
+That is also the reason why we only put the results on three multi-sentence tasks in the main body of our paper. 
+
+
+
+\subsection{RQ2: \RQtwo}
+
+In this part, we present the left analysis on answering RQ2. Specifically, we present more results on transferring secret language to other models (black-box settings) and sentences to validate whether secret language depends on models or sentences.
+
+
+To present more results on transferring secret language to other models (black-box settings) and sentences, we randomly select 22 words, whose POS tags include 2 ``VERB'', 2 ``PRON'', 2 ``ADV'', 2 ``ADJ'', 2 ``PROPN'', 2 ``SCONJ'', 2 ``DET'', 2 ``NOUN'', 1 PUNCT'', 1 ``PART'', 1 ``AUX'', 1 ``CCONJ'', 1 ``ADP'', and 1 ``NUM'', and their corresponding secret languages from each model and dataset.
+Quantitative results are shown in Tables~\ref{tab: black-albert}, \ref{tab: black-distillbert}, and \ref{tab: black-roberta}.
+Generally, all the secret language can fool ALBERT with a 100\% accuracy while that on DistillBERT is lower than that on ALBERT. 
+Accuracy on Roberta is the lowest, indicating that some secret languages might not work. 
+That might be because ALBERT has been finetuned on a ``simple'' task (dataset), \ie, Paraphrase (GLUE (MRPC)), compared with QA (SQuAD) and NLI (SNLI). 
+And the ``simple'' task, paraphrase, does not require a deep understanding of sentences as QA and NLI do. 
+So, these results actually suggest that it would be beneficial to finetune or pretrain models on large datasets and complex tasks.
+
+Moreover, we present the results on transfering the secret languages found on Roberta to GPT-3 and ChatGPT in Table~\ref{tab: more on ChatGPT and GPT3} to complement our black-box settings in Discussions. 
+
+
+
+
+
+
+
+
+
+
+\end{document}

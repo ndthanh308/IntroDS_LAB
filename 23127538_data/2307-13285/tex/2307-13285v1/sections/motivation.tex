@@ -1,0 +1,110 @@
+\section{Background and Motivation \label{motivation}}
+In this section, we provide background on request cloning and motivate the necessity of in-network request cloning for microsecond-scale RPCs.
+
+\subsection{Latency Variability in RPCs}
+Modern online services consist of a set of microservices, and the interaction between the microservice applications is often done by RPCs~\cite{servicefabric,breakwater}.
+To guarantee good user experience, online services have strict SLOs, which are generally expressed as tail latency.
+The runtime of RPCs is typically short as a few to tens of microseconds~\cite{shinjuku,alto}.
+Therefore, data center systems that host the services are expected to provide low tail latency with high throughput.
+
+Unfortunately, variability in service times makes it challenging to ensure low tail latency.
+The processing latency of requests in a server is stochastic and sometimes can be 15 times larger than the median latency~\cite{laedge}.
+Various factors contribute to the service-time variability, which include load fluctuation, interrupts, garbage collection, background tasks, OS scheduling, power management, and so on~\cite{laedge,dean13,vulimiri13, dolly, xu14a,rpcvalet,chronos}.
+Therefore, the service time of RPCs typically follows a heavy-tailed distribution~\cite{rpcvalet,dean13,breakwater}, which may violate the SLO of the services.
+
+
+\subsection{Cloning for Microsecond-Scale RPCs}
+One efficient technique to mask service-time variability is request cloning.
+The idea is simple as follows.
+The client sends multiple copies of a request to different servers and takes the fastest response.
+Optionally, the client may cancel unfinished slower requests.
+Recent results show that two clones are enough, and canceling slower requests does not bring meaningful benefits~\cite{laedge}.
+Owing to its simplicity and efficiency, cloning has been adopted in various works over the past decade~\cite{vulimiri13, dolly, xu14a,laedge,powerofd,redundancy}.
+There are two approaches for cloning.
+One is traditional client-based cloning~\cite{vulimiri13}, which we call \cc in short, and the other is coordinator-based cloning~\cite{laedge}.
+Unfortunately, these approaches are not enough to serve microsecond-scale RPC workloads.
+
+\textbf{Client-based cloning (\cc).}
+With this, clients perform request cloning in a distributed manner~\cite{vulimiri13} as illustrated in Figure~\ref{fig:motiv-com} (a).
+The client typically sends two duplicate requests to servers.
+One limitation is that cloning is only beneficial within a specific load range.
+The latency is degraded significantly after a tipping point, which typically lies between 25\% and 50\% of the load.
+This is due to the static and load-agnostic cloning of the client, as it always sends duplicate requests regardless of system load.
+This static cloning also degrades maximum throughput by half as server loads become double.
+
+\textbf{Coordinator-based cloning.}
+This approach uses a coordinator node to perform request cloning in a centralized manner as shown in Figure~\ref{fig:motiv-com} (b).
+\sota~\cite{laedge} is the state-of-the-art coordinator-based solution.
+Unlike \cc, \sota is dynamic and load-aware.
+The coordinator only replicates requests if at least two servers are idle.
+If only one server is available, the request is forwarded without replication.
+In the case where all servers are busy, the coordinator enqueues the request in a request queue and waits for an idle server.
+The buffered request is dispatched to a server upon receiving a response.
+
+Unfortunately, this is still far from a solution for microsecond-scale RPCs.
+The cloning decision needs to be as fast as possible since RPCs want to be processed as if they are local functions.
+However, it takes an order of microseconds to perform request cloning in the coordinator.
+Because of this, \sota targets millisecond-scale workloads, which can tolerate the latency overhead.
+
+The other limitation is that the coordinator is not scalable because it relies on the CPU to handle requests. 
+Unfortunately, the CPU has inherently limited performance even with kernel-bypass networking like RDMA, which can reduce CPU usage for packet processing.
+Therefore, the coordinator can be a performance bottleneck easily and provide limited throughput for only a few servers.
+Furthermore, the \sota coordinator should process redundant slower responses to dispatch another request, making throughput worse.
+It is possible to use multiple coordinators to scale out.
+However, this causes burdensome costs to build and maintain a tier of coordinators.
+
+% Figure environment removed
+
+
+
+\subsection{The Case for In-Network Cloning}
+\textbf{Design goal and key idea.}
+Our goal is to perform request cloning dynamically and quickly at scale for microsecond-scale RPCs.
+The key idea to achieve the goal is to perform cloning decisions in the switch by leveraging the capability of programmable switch ASICs like Intel Tofino~\cite{tofinonodate} and Cavium Xpliant~\cite{xpliantnodate}.
+We can achieve high performance using the switch since it is optimized for packet processing.
+In particular, a switch can process a few billion packets per second, whereas a commodity server can handle a few million packets per second.
+Furthermore, the per-packet processing delay is guaranteed in hundreds of nanoseconds.
+Therefore, we propose \sys, an in-network dynamic request cloning system as shown Figure~\ref{fig:motiv-com} (c).
+
+\textbf{Comparison to existing works.}
+Table~\ref{table:comparison} summarizes the difference between \sys and the existing solutions.
+\cc can scale out to multiple servers and does not incur excessive latency overhead for cloning decisions.
+However, as it statically replicates requests regardless of system load, throughput is limited.
+Despite dynamic cloning, \sota does not provide scalability, high throughput, and low latency overhead as it uses a server-based cloning coordinator.
+Unlike the existing works, \sys can clone requests dynamically at scale with high throughput and a nanosecond-scale latency overhead as cloning is performed in the network switch.
+
+\textbf{Challenges.}
+Designing an in-network cloning system does not mean merely implementing the existing dynamic cloning mechanism on the network switch.
+This is because the switch has strict resource constraints and timing requirements.
+When designing a custom switch data plane, we should address several technical challenges as follows.
+\begin{itemize}[noitemsep]
+\item{
+The switch contains only 10-20MB of limited memory.
+This implies that we cannot queue requests in the switch memory as \sota does, and we need a new mechanism to check whether servers are idle or busy.
+}
+\item{
+It is impossible to access data stored in the memory twice for a single pass because each data is statically allocated to a specific stage at compile time.
+This means that it is challenging to check the state of two candidate servers for cloning decisions.
+}
+\item{
+In a similar vein, we should carefully design a mechanism to filter redundant slower responses while minimizing memory footprints.
+}
+\end{itemize}
+
+
+\begin{table}[t]  
+\center
+\caption{Comparison to existing works.\label{table:comparison}} 
+\footnotesize
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{ } & \textbf{C-Clone~\cite{vulimiri13}} & \textbf{\sota~\cite{laedge}}  & \textbf{\sys}\\ \hline\hline
+Cloning point & Client & Coordinator & Switch  \\
+Dynamic cloning & $\times$ & $\surd$ & $\surd$  \\
+Scalability & $\surd$  & $\times$& $\surd$  \\
+High throughput & $\times$ & $\times$& $\surd$  \\
+Low latency overhead& $\surd$  & $\times$& $\surd$  \\
+\hline
+\end{tabular}
+\end{table}
+

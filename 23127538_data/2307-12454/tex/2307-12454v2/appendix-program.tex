@@ -1,0 +1,321 @@
+We explain the program and experiments of Section~7 in more detail.  The source code (GraySD.hs) is available from the archive \cite{githubUB}.
+
+
+\subsection{Nondeterminism}
+\label{sub-program-nondet}
+%
+Using the primitives of the Haskell libraries
+\verb|Concurrent| and \verb|Exception|
+we can implement nondeterministic choice through a program
+\verb|ambL| that picks from a list nondeterministically
+a terminating element (if exists). Although in our application 
+we need only binary choice, we implement arbitrary finite choice
+since it is technically more convenient and permits more applications,
+e.g.\ Gaussian elimination (Section~8.4).
+%
+\begin{verbatim}
+import Control.Concurrent
+import Control.Exception
+
+ambL :: [a] -> IO a
+ambL xs = 
+  do { m <- newEmptyMVar ; 
+       acts <- sequence 
+                 [ forkIO (do { y <- evaluate x ; putMVar m y }) 
+                    | x <- xs ] ;
+       z <- takeMVar m ;        
+       x <- sequence_ (map killThread acts) ;
+       seq x (return z)
+     }
+\end{verbatim}
+Comments:
+%
+\begin{itemize}
+\item \verb|newEmptyMVar| creates an empty mutable variable, 
+\item \verb|forkIO| creates a thread,
+\item \verb|evaluate| evaluates its argument to head normal form,  
+\item \verb|putMVar m y| writes \verb|y| into the mutable variable \verb|m| 
+       provided \verb|m| is empty,
+\item the line \verb|seq x (return z)| makes sure that the threads are killed 
+      before the final result \verb|z| is returned. 
+\end{itemize}
+
+
+\subsection{Extracting data}
+\label{sub-program-data}
+%
+We define the domain $D$ (Section~2) and a program \verb|ed| on $D$
+(`extract data') that, using \verb|ambL|,  nondeterministically selects 
+a terminating argument of the constructor Amb.
+%
+\begin{verbatim}
+data D = Nil | Le D | Ri D | Pair(D, D) | Fun(D -> D) | Amb(D, D)
+
+ed :: D -> IO D
+ed (Le d) = do { d' <- ed d ; return (Le d') }
+ed (Ri d) = do { d' <- ed d ; return (Ri d') }
+ed (Pair d e) = do { d' <- ed d ; e' <- ed e ; return (Pair d' e') }
+ed (Amb a b) = do { c <- ambL [a,b] ; ed c } ;
+ed d = return d
+\end{verbatim}
+%
+\verb|ed| can be seen as an implementation of the operational semantics 
+in Section~3.
+
+\subsection{Gray code to Signed Digit Representation conversion}
+\label{sub-program-gray}
+%
+We read-off the programs extracted in the Sections~5 and~6
+to obtain the desired conversion function.
+Note that this is nothing but a copy of the programs in those sections
+  with type annotations for readability. The programs work without
+  type annotation because Haskell infers their types.
+The Haskell types contain only one type $D$.
+Their types as CFP-programs are shown as comments in the code below. 
+
+\paragraph{From Section~5.}
+%
+\begin{verbatim}
+mapamb :: (D -> D)  -> D -> D  -- (B -> C) -> A(B) -> A(C)
+         -- (A(B) is the type of Amb(a,b) where a,b are of type B)
+mapamb = \f -> \c -> case c of {Amb(a,b) -> Amb(f $! a, f $! b)}
+
+conSD :: D -> D    -- 2 x 2 -> A(3) 
+         -- (2 = 1+1, etc. where 1 is the unit type)
+conSD = \c -> case c of {Pair(a, b) ->
+      Amb(Le $! a, 
+          Ri $! (case b of {Le _ -> bot; Ri _ -> Nil}))}
+\end{verbatim}
+
+\paragraph{From Section~6.}
+%
+\begin{verbatim}
+gscomp :: D -> D  -- [2] -> A(3) 
+gscomp (Pair(a, Pair(b, p))) = conSD (Pair(a, b))
+
+onedigit :: D -> D -> D   -- [2] -> 3 -> 3 x [2]
+onedigit  (Pair(a, Pair (b, p))) c = case c of {
+       Le d -> case d of {
+              Le _ -> Pair(Le(Le Nil), Pair(b,p));
+              Ri _  -> Pair(Le(Ri Nil), Pair(notD b,p))
+        };
+        Ri _  -> Pair(Ri Nil, Pair(a, nhD p))}
+
+notD :: D -> D   -- 2 -> 2
+notD a = case a of {Le _ -> Ri Nil; Ri _ -> Le Nil}
+
+nhD :: D -> D  -- [2] -> [2]
+nhD (Pair (a, p)) = Pair (notD a, p)
+
+s :: D -> D    -- [2] -> A(3 x [2])
+s p = mapamb (onedigit p) (gscomp p)
+
+mon :: (D -> D) -> D -> D   -- (B -> C) -> A(3 x B) -> A(3 x C)
+mon f p = mapamb (mond f) p  
+   where  mond f (Pair(a,t)) = Pair(a, f t)
+
+gtos :: D -> D    -- [2]  -> [3] 
+gtos = (mon gtos) . s
+\end{verbatim}
+
+\subsection{Gray code generation with delayed digits}
+\label{sub-program-delay}
+%
+Recall that Gray code has the digits $1$ and $ -1$, modelled
+as \verb|Ri Nil| and \verb|Le Nil|. A digit may as well be undefined ($\bot$) 
+in which case it is modelled by a nonterminating computation (such as \verb|bot| below).
+%
+To exhibit the nondeterminism in our programs we generate digits with different
+computation times. For example, \verb|graydigitToD 5| denotes the digit $1$ computed in
+$500000$ steps, while \verb|graydigitToD 0| does not terminate and therefore 
+denotes $\bot$.
+%
+\begin{verbatim}
+delay :: Integer -> D
+delay n  | n > 1     = delay (n-1)
+         | n == 1    = Ri Nil
+         | n == 0    = bot
+         | n == (-1) = Le Nil
+         | n < (-1)  = delay (n+1)
+bot = bot
+
+graydigitToD :: Integer -> D  
+graydigitToD a | a == (-1) = Le Nil
+               | a == 1    = Ri Nil
+               | True      = delay (a*100000)
+\end{verbatim}
+
+
+The function \verb|grayToD| lifts this to Gray codes, that is, 
+infinite sequences of partial Gray digits 
+represented as elements of $D$:
+%
+\begin{verbatim}
+-- list to Pairs
+ltop :: [D] -> D
+ltop = foldr (\x -> \y -> Pair(x,y)) Nil
+
+grayToD :: [Integer] -> D
+grayToD = ltop . (map graydigitToD)
+\end{verbatim}
+%
+For example, \verb|grayToD (0:5:-3:[-1,-1..])| denotes the Gray code
+$\bot:1:-1:-1,-1,\ldots$ where the first digit does not terminate, the second digit (1)
+takes 500000 steps to compute and the third digit (-1) takes 300000 steps.
+The remaining digits (all $-1$) take one step each.
+
+\subsection{Truncating the input and printing the result}
+\label{sub-io}
+%
+The program $\gtos$ transforms Gray code into signed digit representation, 
+so both, input and output are infinite. To observe the computation, 
+we truncate the input to some finite approximation which $\gtos$ will
+map to some finite approximation of the output. This finite output
+is a nondeterministic element of $D$ 
+(i.e.~it may contain the constructor \verb|Amb|) 
+from which we then can extract nondeterministically a deterministic 
+data using the function \verb|ed| which can be printed.
+
+In the following we define the truncation and the printing 
+of deterministic finite data.
+
+\paragraph{Truncating $d\in D$ at depth $n$.}
+%
+\begin{verbatim}
+takeD :: Int -> D -> D
+takeD n d | n > 0 = 
+  case d of
+    {
+      Nil        -> Nil ;
+      Le a       -> Le (takeD (n-1) a) ;
+      Ri a       -> Ri (takeD (n-1) a) ;
+      Pair(a, b) -> Pair (takeD (n-1) a, takeD (n-1) b) ;
+      Amb(a,b)   -> Amb(takeD (n-1) a, takeD (n-1) b) ;
+      Fun _      -> error "takeD _ (Fun _)" ;
+    }
+            | otherwise = Nil
+\end{verbatim}
+
+\paragraph{Showing a partial signed digit.}
+%
+\begin{verbatim}
+dtosd :: D -> String
+dtosd (Le (Ri Nil)) = " 1"
+dtosd (Le (Le Nil)) = "-1"
+dtosd (Ri Nil)      = " 0"
+dtosd _             = " bot"
+\end{verbatim}
+
+\paragraph{Printing an element of $D$ that represents a finite deterministic 
+signed digit stream.}
+%
+\begin{verbatim}
+prints :: D -> IO ()
+prints (Pair (d,e)) = putStr (dtosd d) >> prints e
+prints Nil          = putStrLn ""
+prints _ = error "prints: not a partial signed digit stream"
+\end{verbatim}
+
+\subsection{Experiments}
+\label{sub-experiments}
+%
+As explained in Section~7,
+there are three Gray codes of $0$:
+\begin{eqnarray*}
+a &=& \ \ \bot:1:-1,-1,-1,\ldots\\
+b &=& \ \ \, 1:1:-1,-1,-1,\ldots\\
+c &=& -1:1:-1,-1,-1,\ldots
+\end{eqnarray*}
+%
+and the set of signed digit representations of $0$ is
+$A \cup B \cup C$ where
+%
+\begin{eqnarray*}
+A &=& \{0^\omega\}\\
+B &=& \{0^k\!:\!1\!:\!(-1)^\omega \mid k \geq 0\}\\
+C &=& \{0^k\!:\!(-1)\!:\!1^\omega \mid k \geq 0\}. 
+\end{eqnarray*}
+%
+Our \verb|gtos| program 
+nondeterministically produces 
+an element of $A$ for input $a$,
+an element of $A \cup B$ for input $b$, 
+and an element of $A \cup C$ for input $c$.
+As the following results show, 
+the obtained value depends on 
+the speed of computation of the individual Gray-digits.
+%
+
+\bigskip
+
+Input $b$:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (1:1:[-1,-1..])))) >>= prints
+ 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 bot
+\end{verbatim}
+
+Input $c$:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (-1:1:[-1,-1..])))) >>= prints
+-1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 bot
+\end{verbatim}
+
+\bigskip
+
+Input $a$ (demonstrating that the program can cope with an undefined digit):
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (0:1:[-1,-1..])))) >>= prints
+ 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 bot
+\end{verbatim}
+
+\bigskip
+
+Input $b$ with delayed first digit:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (2:1:[-1,-1..])))) >>= prints
+ 0 0 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 bot
+\end{verbatim}
+
+\bigskip
+
+Same, but with more delayed first digit:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (10:1:[-1,-1..])))) >>= prints
+ 0 0 0 0 0 0 0 0 0 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 bot
+\end{verbatim}
+
+\bigskip
+
+Input $1,1,1,\ldots$ which is the Gray code of  $1/3$:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD ([1,1..])))) >>= prints
+ 1-1 1-1 1-1 1-1 1-1 1-1 1 0-1-1 1-1 1-1 1-1 1-1 bot
+\end{verbatim}
+
+\bigskip
+
+Same, but with delayed first digit:
+\begin{verbatim}
+*GraySD> ed (takeD 50 (gtos (grayToD (2:[1,1..])))) >>= prints
+ 0 1 1-1 1-1 1-1 1-1 0 1 1-1 1-1 1-1 1-1 1-1 1-1 bot
+\end{verbatim}
+
+To see that the last two results are indeed approximations of signed digit 
+representations of $1/3$, one observes that in the signed digit 
+representation \verb|0 1| means the same as \verb|1-1| ($0+1/2 = 1-1/2$), 
+so both results are equivalent to
+\begin{verbatim}
+ 1-1 1-1 1-1 1-1 1-1 1-1 1-1 1-1 1-1 1-1 1-1 1-1 bot
+\end{verbatim}
+which denotes $1/3$.
+
+\bigskip
+
+Note that since our experiments use the nondeterministic program \verb|ed|,
+the results obtained with a different computer may differ from the ones 
+included here.
+%
+Our theoretical results ensure that, whatever the results are, 
+they will be correct.
+
+%\end{document}

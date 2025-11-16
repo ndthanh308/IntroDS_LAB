@@ -1,0 +1,111 @@
+\section{Approach}
+\label{approach}
+
+In this section we introduce and compare three recent approaches to offline RL. For all methods, we begin with a pre-trained language model $\pi_\beta$ trained via teacher-forcing, and use this to generate the offline dataset $\mathcal{D}$. 
+% . For offline RL methods (4.1 - 4.3), this model is used to generate the offline dataset $\mathcal{D}$. 
+
+\subsection{Fine Tune on Top Returns}
+% TODO: A gentle introduction
+The simplest approach is to fine-tune a model on ``top'' demonstrations, \textit{i.e.} teacher forcing on top returns (TF-Top) % \footnote{TODO: Best practice}
+
+We define a subset of the dataset $\mathcal{D}_{\mathrm{top}}$ that has high returns above a specified threshold, where return is the cumulative reward until the end of the episode, $\hat{Q}(s_t, a_t) = \sum_{t}^T r_t$. The gradient update is simply the log-likelihood gradient on the data subset $\mathcal{D}_{\mathrm{top}}$,
+\begin{equation}
+\begin{aligned}
+&\underset{s_t, a_t \sim \mathcal{D}_{\mathrm{top}}}{\mathbb{E}} \left[ \nabla_{\theta} \log \pi_\theta (a_t | s_t) \right] \, , \\
+ \text{where  }\; & \mathcal{D}_{\mathrm{top}} = \{ (s_t, a_t) \in \mathcal{D} \; | \; \hat{Q}(s_t, a_t) \geq 1 - \delta \} \, .
+\end{aligned}
+\end{equation}
+Here, $\delta$ is a specified threshold defining a ``good enough'' return. $\delta$ can be computed by taking the top percentile of all returns $\hat{Q}(s_t, a_t)$ \footnote{Note that $\hat{Q}(s_t, a_t) \leq 1$.}. Since we use a terminal undiscounted reward, the return for any token along the sequence is the same as the final reward received at the end of the sequence. Additionally, if the reward is binary $\{0, 1\}$, $\mathcal{D}_{\mathrm{top}}$ selects sequences corresponding to the reward $1$.
+
+However, one artifact of this approach is that it only increases likelihood of ``good'' tokens, but doesn't necessarily decrease the likelihood of ``bad'' tokens. This is because we \emph{discard} trajectories with low return that were likely under the original TF policy $\pi_{\beta}$, rather than using them to update the model's parameters in the opposite direction. 
+
+% \begin{equation}
+% \begin{aligned}
+% &\underset{s_t, a_t \sim \mathcal{D}_{\mathrm{top}}}{\mathbb{E}} \left[ \nabla_{\theta} \log \pi_\theta (a_t | s_t) \right] \\
+%  \text{where  }\; & \mathcal{D}_{\mathrm{top}} = \{ (s_t, a_t) \in \mathcal{D} \; | \; \hat{Q}(s_t, a_t) \geq 1 - \delta \}
+% \end{aligned}
+% \end{equation}
+
+\subsection{Decision Transformers: Condition on Return}
+
+Decision Transformer (DT) \cite{chen2021decision} is an approach that reduces offline reinforcement learning to supervised learning. The core idea of DT is to learn the return-conditional distribution of actions in each state, and then define a policy by sampling from the distribution of actions that receive high returns.
+
+Given a data point $(s_t, a_t)$, we take its return $\hat{Q}(s_t, a_t)$, tokenize it, and then fine tune a model by conditioning on this return token. The gradient update is simply the log-likelihood,
+\begin{equation}
+\begin{aligned}
+\underset{s_t, a_t \sim \mathcal{D}}{\mathbb{E}} \left[ \nabla_{\theta} \log \pi_\theta (a_t | s_t, \hat{Q}(s_t, a_t)) \right]
+\end{aligned}
+\end{equation}
+At test time, we condition the model on the highest return $\hat{Q}_{top}$, \textit{i.e.} we sample sequences from $\pi_\theta(. | s_t, \hat{Q}(s_t, a_t) = \hat{Q}_{top} )$. 
+We implement DT by quantizing the return $\hat{Q}(s_t, a_t)$ into $K$ bins, assigning a token for each bin, training a conditional model and at test time conditioning on the top bin. For binary rewards $\{0, 1\}$, this is equivalent to training a model on $r=0$ and $r=1$ tokens, and then conditioning on $r=1$ at test time.
+
+One advantage of decision transformer over fine-tuning on top returns is that the model is trained to explicitly learn a decision boundary between different returns. However, both approaches have the theoretical drawback of requiring "trajectory coverage" \cite{brandfonbrener2022does}, \emph{i.e.} the training dataset must contain trajectories starting from the initial state $s_0$ that sees high return. This can be challenging in general because the number of data points needed increases exponentially with the length of the trajectory.
+
+\subsection{Off-Policy Q-Learning}
+A canonical approach to RL is Q-learning~\cite{watkins1992q}. We use an offline variant, Implicit Q-learning (ILQL) \cite{snell2022ilql}, as an off-policy Q-learning method architected for language models.
+
+ILQL adds two extra heads to the pre-trained model, the action value head $Q_\theta(s_t, a_t)$ and the state value head $V_\psi(s_t)$. The state value $V_\psi(s_t)$ denotes the value of the sequence $s_t$, while the action value $Q_\theta(s_t, a_t)$ denotes the utility of a token $a_t$ given a sequence $s_t$. Hence the advantage $A(s_t,a_t) = Q_\theta(s_t, a_t) - V_\psi(s_t)$ is the utility of next token $a_t$ over any other alternate token. 
+
+Before we describe how both heads are trained, we first note that ILQL does not explicitly train a policy. Instead, it defines an \emph{implicit} policy by taking the logits from pre-trained model $\pi_\beta$ and rescaling it by a weighted advantage: 
+\begin{equation}
+\begin{aligned}
+\pi_\theta(a_t | s_t)  = \pi_\beta(a_t | s_t) \exp \left(\eta (Q_\theta(s_t, a_t) - V_\psi(s_t)) \right) 
+\end{aligned}
+\end{equation}
+The loss for the  $Q_\theta(\cdot)$  head has two terms. The first is the temporal difference (TD) error coming from the Bellman equation. The second is a regularization for the policy to be close to the pre-trained policy $\pi_\beta$. The gradient update is a sum of these two terms:
+% \vspace{-2em}
+\begin{align}
+\begin{split}
+\underset{ \substack{s_t, a_t, \\ s_{t+1} \sim \mathcal{D}}}{\mathbb{E}} &\left[ \nabla_{\theta} 
+ Q_{\theta} (s_t, a_t) \underbrace{( r(s_t, a_t) + V_{\psi}(s_{t+1}) - Q_{\theta} (s_t, a_t) )}_{ \text{Temporal Difference Error}} \right]  \\
+& \qquad \qquad - \alpha \underset{}{}\mathbb{E}_{s_t \sim \mathcal{D}} \nabla_\theta KL( \pi_{\beta} (.|s_t) || \pi_\theta (. | s_t) ) \, ,
+\end{split}
+\end{align}
+\vspace{-2em}
+% \end{equation}
+
+% where the first term pushes up the Q value on actions with higher estimated return, and pushes down on lower ones. The second term keeps it close to the pre-trained policy.
+
+Value head $V_\psi(s_t)$ is trained to approximate argmax of Q, \textit{i.e.} on constrained Bellman operator with expectile regression.  
+\begin{equation}
+\underset{ \substack{s_t, a_t \sim \mathcal{D}}}{\mathbb{E}} \nabla_\psi || Q_{\theta} (s_t, a_t) - V_{\psi}(s_t)||^{\tau} \, ,
+\end{equation}
+where $||u||^\tau = (\tau - \mathbbm{1}(u < 0)) u^2$ is the $\tau$ expectile. 
+
+We \textit{improve upon original ILQL} \cite{snell2022ilql} by regularizing against logits of the pre-trained TF policy $\pi_\beta$ instead of the demonstrated data $\mathcal{D}$. This is more suited for settings where we may not have a lot of demonstrated data.
+
+% This leads to better training stability and prevents overfitting to the demonstrated data.
+% \subsection{Online RL: Proximal Policy Optimization}
+
+\subsection{On-Policy RL: PPO}
+In addition to the offline RL approaches, we also compare against an online RL algorithm: Proximal Policy Optimization~\cite{schulman2017proximal}. PPO is a variant of a policy gradient approach that rolls out a trajectory with the current policy $\pi_\theta$ to sample $(s_t, a_t)$, estimates the advantage $A(s_t, a_t)$, and updates policy to maximize advantage while staying close to old policy $\pi_{\theta_{\text{old}}}$ The gradient update is,
+\begin{equation}
+\begin{aligned}
+\underset{s_t, a_t \sim \pi_\theta}{\mathbb{E}} \left[ \frac {\nabla_{\theta}\pi_\theta (a_t | s_t)}{ \pi_{\theta_{\text{old}}} (a_t | s_t)} A (s_t, a_t)\right]
+\end{aligned}
+\end{equation}
+
+% Note the key difference between offline RL and PPO is the on-policy samples rather than using dataset $\mathcal{D}$
+\subsection{Comparison between Approaches}
+
+% % Figure environment removed
+
+\textbf{When is DT and Q-learning comparable?} While DT is relatively simple and faster to train, it has a more restrictive requirement of data coverage than Q-learning. Intuitively, it is unable to stitch together suboptimal trajectories that overlap into a better policy. However, for MDPs where such stitching is not possible, e.g. a tree, DT and ILQL are comparable in performance. We hypothesize that dialogue text generation belongs to this class of MDPs.
+
+% The performance gap of DT~\cite{brandfonbrener2022does} in the limit of infinite samples and deterministic transitions is $\text{poly}(\frac{C}{\alpha}, T, \epsilon)$, where $C$ is the coverage of optimal state distribution, $\alpha$ is the coverage of optimal trajectory distribution, $T$ is the horizon and $\epsilon$ is the approximation error. In comparison, the performance gap of Q-learning is $\text{poly}(C, T, \epsilon)$. 
+
+% We now introduce a Tree MDP (Fig.~\ref{fig:tree_mdp}). The tree structure captures the characteristic of dialogue utterance generation MDPs, where a state $s_t$ can only be reached by traversing a particular path from the root $s_1$. The reward is terminal, $1$ at the left most leaf and $0$ everywhere. Let $\rho$ be the probability of reaching the left most leaf node under the behavior policy. Then both state coverage $C=\frac{1}{\rho}$ and trajectory coverage $\alpha=\rho$. Thus both DT and Q-learning enjoy \emph{similar} performance bounds of $\text{poly}(\frac{1}{\rho}, T, \epsilon)$.
+
+\textbf{When is DT and TF Top comparable?} While DT makes use of more data than TF Top, it does deal with a more complex function class (conditioning on returns). Intuitively, DT should expect to do better than TF Top only when the data TF Top throws away provides valuable information. If that information is already captured by  base TF model, then both DT and TF Top are likely to be similar.
+
+% However, the two are equivalent if we consider a partitioned model that splits on $\hat{Q}(s_t, a_t) \geq 1 - \delta$
+% $$
+% \pi_\theta (a_t | s_t, \hat{Q}(s_t, a_t)) =\begin{cases}
+% 			\pi_{\theta_1} (a_t | s_t), & \hat{Q}(s_t, a_t) \geq 1 - \delta\\
+%             \pi_{\theta_2} (a_t | s_t), & \text{otherwise}
+% 		 \end{cases}
+% $$
+
+
+
+

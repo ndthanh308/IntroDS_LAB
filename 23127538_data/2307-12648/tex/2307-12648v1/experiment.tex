@@ -1,0 +1,233 @@
+\section{Attacking Real-World RISC-V Applications}\label{sec:experiment}
+
+In order to show the feasibility of JOP attacks in the RISC-V
+architecture, we decided to test it on an embedded application: Mongoose
+web server, and more precisely the provided http-server, in which we
+introduced a memory corruption vulnerability.
+
+Mongoose web server is a target of choice because it can be interacted with
+from the network. While its features would probably be restricted in real-life
+scenarios, it is still very relevant to demonstrate JOP feasibility. The aim of the
+attacker in our scenario is to remotely read the private part of the target's
+root SSH key, which is base64-encoded and stored on disk.
+
+Mongoose is developed in C. We compiled it for RISC-V 32 bits using GCC,
+disabling Position-Independent Executable (PIE). It aims to run over a Linux
+system, and dynamically links to the libc. In order to keep the attack as
+portable as possible, we only relied on the application itself for the memory
+corruption and execution-flow hijacking. Every gadget used then has been found
+on the libc, which has been compiled with modern binary protections, using
+\emph{-fstack-protector-all -D\_FORTIFY\_SOURCE=2}, and the second level of
+optimization (\emph{-O2}). Both operating system and target application were
+executed and validated on a RISC-V CVA6 32-bit softcore
+design\footnote{\url{https://github.com/openhwgroup/cva6}}~\cite{zaruba2019cost}
+running Linux, deployed on a Genesys2 FPGA.
+
+In the following subsections, we explain how we were able to steal the key
+stored on disk using exclusively JOP thanks to an ADG, by crafting a malicious
+HTTP request.
+
+\subsubsection{Attack Model}
+
+The attack we realized in our experiment relies on a memory vulnerability, for
+instance a format string vulnerability, allowing to highjack the execution flow
+of the target application. We did not activate ASLR on the target application,
+since it can be bypassed by different techniques, and is out of scope of this
+research~\cite{Shacham05}. Figure~\ref{fig:vuln-diff} shows the diff of the
+original Mongoose code with the vulnerability we introduced.
+
+% Figure environment removed
+
+We also made the hypothesis that, during the reconnaissance phase of the attack,
+the attacker is able to access an exact twin of the target application (either
+by rebuilding it with the same options and environment, or by acquiring an
+device running said application), and run it with a debugger. Thus, potential
+anti-debug, anti-reverse or anti-tampering measures are not considered within
+the scope of our experiment.
+
+\subsubsection{Attack overview}
+
+The crafting of the attack consists in five steps divided between the two first
+stages of the cyber kill chain: reconnaissance and weaponization.
+
+The three steps involved in the reconnaissance stage are:
+\begin{itemize}
+	\item identification of a memory vulnerability;
+	\item identification of available gadgets in the application;
+	\item definition of the attack aim.
+\end{itemize}
+The two steps involved in the weaponization stage are:
+\begin{itemize}
+	\item crafting of the JOP chain;
+	\item crafting of the malicious payload.
+\end{itemize}
+
+As a first step the attacker must identify a memory vulnerability allowing to
+hijack the execution flow toward the initializer gadget. This step is not covered
+in detail in this document, but many techniques and tools exist in order to
+identify such vulnerabilities~\cite{Younan04codeinjection}.
+
+In our experiment, we inserted a format string vulnerability within the target
+application, allowing an attacker to perform arbitrary writes. We used it to
+overwrite the Global Offsets Table (GOT) entry of the fflush function of the 
+stdio C library --- which is called right after the vulnerable printf.
+
+\subsubsection{Identifying gadgets}
+
+The identification of available gadgets in the application is the most important
+stage in the attack, as it decides which assets can be targeted by the attack.
+Too few, or not diverse enough gadgets will restrict the range of available
+targets in the best case, or make the attack impossible in the worst case. In
+our experiment, we searched for gadgets using RaccoonV, an open-source tool we
+built in order to automate the gadget discovery based on queries.
+Figure~\ref{fig:rv_sample} shows an output example of a simple query using RaccoonV.
+
+% Figure environment removed
+
+In this example, we queried for gadgets in the libc, that loads the immediate 0
+(\texttt{{-}-op=li {-}-imm=0}) in the register \reg{a2} (\texttt{{-}-rr=a2}),
+and is at most 1 (\texttt{{-}-max=1}) instruction long (excluding the gadget 
+linker i.e. the final JALR instruction).
+The attacker can then focus on the gadget offsets (left column of the output).
+
+As the dispatcher gadget is among the hardest to find, it is strongly
+encouraged to find one first, and to build the attack around. After a first
+analysis, we found 10 potentially viable dispatcher gadgets in the libc, and
+analyzed each by hand. Luckily enough, we found an ADG, described in
+Section~\ref{sec:riscv-jop} and illustrated in
+Figure~\ref{fig:dispatcher_gadget_libc}. Its self-linking instruction is
+conditional, and in order to use it without breaking the chain, we must ensure
+\reg{s0} remains inferior than \reg{s1}.
+
+% Figure environment removed
+
+Finding an initializer gadget in the libc which allows setting \reg{s0} and
+\reg{s1}, and does not use \reg{ra} as the linking register was a difficult
+task, but thanks to the ADG, more candidate were
+available and we managed to find one, illustrated in
+Figure~\ref{fig:init_gadget_libc}. It has two side-effects: the loading of \reg{ra}
+from the stack and the stack pointer increment. While the former has no
+importance, the latter needs to be fixed later with functional gadgets in order
+for the attack to remain stealth. Values loaded from the stack pointer
+\reg{sp} and the frame pointer \reg{s0} can be arbitrarily set through the
+format string vulnerability before handling the execution to the initializer
+gadget.
+
+% Figure environment removed
+
+Using these two gadgets to build the JOP attack allows using functional gadgets
+ending in \reg{ra}, which are the most common. For instance, out of 7915 unique
+gadgets found in the libc with RaccoonV, 4557 end in a jump to \reg{ra}.
+
+\subsubsection{Definition of attack objective}
+
+The objective of the attack is to be decided from (1) system assets accessible
+by the application and (2) available functional gadgets identified. The first
+part requires acquiring a deep understanding of the target application and system.
+For the second part, binary access and static analysis is sufficient.
+
+From our experience, having a large number of compatible functional gadgets (4557 in our
+case) gives the attacker enough freedom to build advanced attack codes as long as
+the attack does not involve complex code patterns such as loops or conditions.
+
+In our experiment, our objective is to read the root private SSH key file used
+to administrate the server without being detected. Knowing this key allows a
+third party to perform any action at the most privileged level on the remote
+machine, such as stealing personal or confidential information, performing
+website defacing, but also installing more advanced, and potentially persistent malware. We define the attack code as the
+C code equivalent shown in Figure~\ref{fig:attack_code}.
+
+% Figure environment removed
+
+The first \emph{openat} argument is ignored when the path is absolute. We used
+5 as the file descriptor to write the key as it turned to be the first file
+descriptor assigned to clients by the HTTP server. If it is free when the
+attacker sends the malicious request, the attacker's request will be assigned it.
+
+\subsubsection{Design of the JOP chain}
+
+Once the functional gadgets are identified and the objective of the attack is
+defined, the actual gadget chain can be crafted. In our case, it consists in a
+chain of 3 syscalls and a cleanup step, in order to be able to return to
+original code to the original execution flow without being detected (e.g. by 
+making the program crash or being detected by the shadow stack). Using RaccoonV, 
+we managed to build the distgadget chain shown in Figure~\ref{fig:jopchain}, in which ``\ldots'' mark instructions which are not useful in the attack (but still have side effects).
+
+% Figure environment removed
+
+Some gadgets have side-effects e.g. modifying' the stack pointer or loading
+registers from the stack \Circled{1}. While the former is fixed by the cleanup
+part of the JOP chain, the latter will need to be considered while forging our
+payload. The gadget that subtracts \reg{sp} \Circled{2} is not present in the
+original code: it is a valid instruction starting at an unexpected offset,
+often called shifted offset of misaligned instruction. For read and write
+syscalls, we need \reg{a2} to be big enough to process the whole file
+($\approx$3kb). The most appropriate gadget we found is one that increments
+\reg{a2} by 4 \Circled{3}, we used this gadget 651 times to achieve this goal.
+For each system call, we found gadgets in the libc that set \reg{a7} to the
+right identifier, and performs the syscall e.g. the \emph{openat} one \Circled{4}.
+
+At the end of the dispatch table, we also added the address of the original code
+we want to jump back to. This address will be called by the dispatcher gadget as
+any functional gadget, so we must return to the code at some point where it will 
+not return beyond this new stack entry to avoid being detected by the shadow 
+stack. In our case, we decided to jump back to the http-server main loop. 
+However, to return to this point without making the program crash, we must 
+reset some registers at their expected values. To do so, we used the epilogue 
+of the function we hijacked as a last gadget before returning to original code.
+
+At the end of the dispatch table, we also added the address of the original code
+we want to jump back to. This address will be called by the dispatcher gadget as
+any functional gadget so we must return to the code at some point where it will not
+return beyond the resulting shadow stack entry. In our case, we decided to jump
+back in the http-server main loop. However, to return to this point without
+making the program crash, we must reset some registers at their expected values.
+To do so, we used the epilogue of the function we hijacked as a last gadget
+before returning to original code.
+
+\subsubsection{Initialization of the attack}
+
+Once the chain has been designed, it can be encoded in the dispatch table. We
+use a sequential table, which addresses all the gadgets, including repetitions
+of the same gadgets like in the case of incrementing \reg{a2}, and ends with
+the address we want to return to in the original code. We can then forge our
+malicious HTTP POST request body that will trigger the format string
+vulnerability to set addresses that will be assigned to registers by the
+initializer gadget, and overwrite the fflush GOT entry, effectively redirecting
+execution-flow toward the initializer gadget. We also append the dispatch
+table, and the path of the file we want to read next to the format string. In
+the end, the request body is 3075 bytes long, which is acceptable for a POST
+request. Figure~\ref{fig:mongoose_attack} illustrates the fully-fledged JOP
+attack.
+
+% Figure environment removed
+
+While not related with JOP, in order for the attack to be stealth, we need to
+restore the fflush GOT entry we modified. To do so, a second HTTP request
+triggering the same format string vulnerability does the job. We can either
+patch it with the actual fflush address if we know it, or set it back to the
+default Procedure Linkage Table (PLT) stub address, to let the dynamic linker resolve 
+its address again at the next invocation.
+
+\subsection{Results and Limitations}
+
+By using the techniques presented in this section, we were able to steal the
+private SSH key of the root user stored on target's disk. While not implemented
+in our target processor the attack should not trigger the shadow stack
+detection. The server still runs fine after the attack, and other clients can
+still interact with it normally.
+
+As of today, it seems that landing pads could not be defeated with these
+techniques. To do so, we would need to use bigger gadgets --- and eventually
+full functions --- which may become impractical.
+
+\subsection{Next Steps}
+
+% - Test on hardware implementations?
+% - Examine the feasability of using gadgets starting with landing pads to
+%   bypass this mitigation?
+
+As far as we know, there is no publicly available implementation of a standalone
+RISC-V shadow stack, without other CFI mitigations such as landing pads. For
+this reason, while we can theoretically bypass it, we were not able to test our
+attack against an actual shadow stack implementation. This is left as future work.

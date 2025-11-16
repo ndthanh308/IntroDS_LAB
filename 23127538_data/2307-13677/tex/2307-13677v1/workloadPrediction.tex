@@ -1,0 +1,112 @@
+\section{Determining Optimal Configurations}\label{sec:workload_prediction}
+%The key to efficiently accomplishing the \textit{hybrid} approach that exploits SL and VM together is workload prediction, where several of the system metrics are taken into consideration for reliable decision-making. However, although multiple workload prediction schemes have been proposed \cite{ernest, vanir, selecta, paris, optimus, cherrypick, optimuscloud, crystalLp, rpss}, but none of these works have considered SLs for optimal resource determination and therefore, lack in ad-hoc workload handling.
+\subsection{Workload Prediction} \label{subsec:wrkPredDetails}
+While many workload prediction systems have been proposed \cite{ernest, vanir, selecta, paris, optimus, cherrypick, optimuscloud, crystalLp, rpss, juggler}, 
+%\textbf{KO: Check the list of prediction systems are the same throughout the paper. Some are inconsistent} \textcolor{red}{ADM: checked and corrected!}
+none of these works have considered SL to determine compute resource configurations. 
+In this section, we introduce how Smartpick predicts query workload to determine the optimal configuration.
+
+\noindent\textbf{Feature Determination}:
+%\subsection{Feature Determination}
+Precisely predicting the query completion time is one of the key aspects of Smartpick. To this end, we thoroughly analyzed what parameters uniquely determine query completion time. Based on multiple initial runs, we deduced the rich set of features that govern this behavior, which are summarized in Table \ref{tab:fea-wp}. When new queries are submitted to an already trained model, the \textit{query-duration} feature will act as the best estimation for completion time. Likewise, different \textit{instances} will be traversed, and the best combination of VMs and SLs will be determined for efficiently executing a new incoming job. %This is discussed in detail in Section \ref{impl}.
+Having determined the features, we next explored several approaches \cite{ernest, optimus, fim} for modeling these parameters into query completion time, however, all of these approaches rely heavily on the implicit relationship across the parameters, which can be very difficult to model. Therefore, in our design, we incorporate black-box model for optimal compute-resource determination.
+
+\noindent\textbf{Problem Formulation}:
+%\subsection{Problem Formulation} \label{wpFormulation}
+We choose decision-tree based Random Forest (RF) technique for quantifying the query completion time. This is preferred over other deep learning neural networks because it is computationally less intensive and requires significantly less training data \cite{rf-inexp, rf-inexp2, rf-inexp3, rf-inexp4}. Moreover, it reduces model over-fitting through the technique of ensemble learning \cite{rf-red-overfit}. Equation \ref{eq:bl} provides the formulation for the RF regressor, where $\beta$ is the rich set of identified features and \textit{$RF_t$} is the expected completion time.  
+\begin{equation}
+	f(\beta)=RF_t
+	\label{eq:bl}
+\end{equation} 
+Although this regressor can accurately model the underlying system, the search space involved for exhaustive navigation is huge. Our initial experiments show around \textit{1 minute} of prediction latency when both VMs and SLs are involved for optimality determination. Given the time-sensitivity of data analytics workloads, exhaustive search proves a hindrance for efficient model performance. Therefore, we add a Bayesian Optimizer (BO) module to navigate the search space effectively. The BO in its raw form cannot be used for workload prediction of ad-hoc queries since this leads to a significant compute cost for the resource determination. We discuss these challenges in detail in Section \ref{RFBOAdv}. Hence, we modify the BO technique to tune it in accordance with cost-effectiveness. 
+
+Two primary components are associated with the BO, i.e., objective and surrogate functions. Equation \ref{eq:ob} defines the objective function which is tailor-made for Smartpick. In this equation, $RF_t$ is the predicted query completion time from the RF regressor and $\delta$ is the noise value which follows normal distribution. The surrogate function is chosen to be a \textit{Gaussian Process Regressor}, since they demonstrate several remarkable characteristics. First, the variance in prediction accurately models the noise in observations, and second, it can precisely generate values for newer data points \cite{gps}.
+%https://hal.archives-ouvertes.fr/cel-01618068/document
+\begin{equation}
+	maximize: - (RF_t + \delta)
+	\label{eq:ob}
+\end{equation} 
+For the acquisition function, there are several choices - Expected Improvement (EI), Probability of Improvement (PI) and Upper Confidence Bound (UCB) \cite{acq-types}. For Smartpick, we incorporate PI over the other options because it is similar to EI and simpler \cite{pipref}, as well as, it is one of the most widely used acquisition functions for optimizers \cite{widelyused-acqs}. Thus, PI helps in efficiently exploiting/exploring the search space for optimal/near-optimal compute resource configurations in the form of tuples: $\{nVM, nSL\}$, where nVM is the desired number of VMs and nSL is the 
+desired number of SLs. The termination criteria of the search are aligned with the improvement to (estimated) query completion time. If the improvement does not increase by 1\% for 10 consecutive searches, the model returns the accomplished core configurations for VMs and SLs.
+
+\begin{table}
+	\centering
+	\caption{Features for Workload Prediction}
+	\label{tab:fea-wp}
+	\scalebox{0.7} {\begin{tabular}{ll}
+			\hline
+			Feature&Comments\\
+			\hline
+			\textbf{instances}& Number of VMs and SLs used\\
+			input-size& Size of input in bytes\\
+			start-time-epoch& Initial job submit time in epoch\\
+			total-memory& Total memory of available workers\\
+			available-memory& Available memory of available workers\\
+			memory-per-executor& Memory assigned to each executor\\
+			num-waiting-apps& Number of applications in wait state\\
+			total-available-cores& Number of available cores\\
+			\textbf{query-duration} & Completion time of a given query\\
+			\hline
+	\end{tabular}}
+	%\vspace{-4mm}
+\end{table}
+
+% Figure environment removed
+
+\subsection{Why RF + BO is better than others?}\label{RFBOAdv}
+Techniques proposed in latent factor collaborative filtering \cite{selecta}, 
+machine learning models \cite{paris}, online fitting \cite{optimus},
+Bayesian optimization \cite{cherrypick}, sampling \cite{ernest}, 
+and a mix of other tools \cite{vanir} - work great when the search space involves only one type of compute resource (i.e., VMs). Some recent works utilized RF and BO to predict the workloads, 
+e.g., OptimusCloud \cite{optimuscloud} uses RF and CherryPick \cite{cherrypick} uses BO. 
+Since they considered a single instance type as compute resource, they may
+simply add SLs as a new instance type in order to incorporate them. 
+This approach, however, will lead to a huge search space for optimality, 
+which \textbf{cannot} be traversed in a timely and cost-efficient way 
+as they use RF and BO separately. 
+To understand the benefits of the RF + BO approach, we tune 
+our prediction model for OptimusCloud (RF-only) and CherryPick (BO-only) 
+to incorporate both VMs and SLs. 
+To compare different approaches, i.e., RF-only, BO-only, and RF + BO, 
+we use performance-cost ratio ($PC_r$) \cite{perf-cost-ratio} that can be 
+computed as shown in Equation \ref{eq:perfCost}. Here, \textit{Time} denotes the inference latency, whereas \textit{cost} denotes the compute charges incurred for model creation.
+\begin{equation}
+	PC_r = \frac{1/Time}{1+cost}
+	\label{eq:perfCost}
+\end{equation}
+We put same inputs (features) to each prediction model 10 times to see
+how each model works. 
+Figure \ref{fig:allComp} shows our preliminary simulation results that is scaled to a multiple of 100 (higher
+is better). It is evident that OptimusCloud \cite{optimuscloud} gives the worst $PC_r$ value because of the large overhead arising from search complexity. Moreover, CherryPick \cite{cherrypick} has better search complexity because of the surrogate design (of BO) but incurs a higher cost from the projected execution runs on live VM and SL instances. Overall, we observed the best $PC_r$ values for Smartpick since it not only reduces the search time complexity but also incurs a lower cost from the enhanced \textit{RF + BO} approach.
+
+\subsection{Optimal Configurations with Preferences}\label{subsec:tradeoff}
+Although optimal resource determination leads to minimum query latency, this may not be feasible for some applications that are sensitive to budget requirements. For these applications, some additional query latency 
+would be tolerable for reducing operational cost, i.e., cost-performance tradeoff. 
+Therefore, Smartpick supports a cost-performance tradeoff knob ($\epsilon$) that can be tuned as per the application's target cost-performance goals. 
+%This can be achieved in two ways: 1. proportionally scaling down the determined SLs and VMs, and 2. carefully navigating the tradeoff space for next available optimum. The first option is simple as we proportionally reduce the number of VM and SL instances based on the knob.
+%For example, setting the $\epsilon$ value to 0.5 indicates half number of SL and VM instances from the optimal configurations determined for best performance. 
+%However, we could see that it leads to significantly high query completion times without a smoother navigation of cost-performance tradeoff.
+Given the knob, Smartpick may proportionally scale down the determined SLs and VMs.
+For example, setting the $\epsilon$ value to 0.5 halves the numbers of SL and VM instances from the optimal configurations determined for best performance.
+While this approach is simple, we observed that this would lead to significantly high query completion times without a smoother navigation of cost-performance tradeoff.
+%This can be achieved in two ways: 1. proportionally scaling down the determined SLs and VMs, and 2. carefully navigating the tradeoff space for next available optimum. The first option is simple as we proportionally reduce the number of VM and SL instances based on the knob.
+
+%Instead, we incorporate the second approach in Smartpick, which optimizes resource determination based on the tolerance level set i.e., $\epsilon$. The BO module of Smartpick uses a list of estimated times ($ET_l$) to track the candidate solutions explored for final optimum. This list is traversed before the final resource determination, so that, desired cost-performance goals can be met. Equation \ref{eq:troff2} shows the objective function that is modelled for a finer and precise control of tradeoff; $T_{est.}$ is the estimated time under consideration, $t_{vm}$ is the estimated VM time, $t_{sl}$ is the estimated SL time, $C_{vm}$ denotes compute cost per instance of VM, $C_{sl}$ denotes compute cost per instance of SL, $C_{best}$ is the cost value associated with optimal configuration and $T_{best}$ is the optimum time determined by Smartpick. 
+Instead, Smartpick optimizes resource determination based on the tolerance level set i.e., $\epsilon$. %The BO module of 
+Smartpick uses a list of estimated times ($ET_l$) to track the candidate solutions explored for the final optimum. This list is traversed before the final resource determination to meet desired cost-performance goals. Equation \ref{eq:troff2} shows the objective function that is modeled for finer and more precise control of tradeoff; $T_{est.}$ is the estimated time under consideration, $t_{vm}$ is the estimated VM time, $t_{sl}$ is the estimated SL time, $C_{vm}$ denotes compute cost per instance of VM, $C_{sl}$ denotes compute cost per instance of SL, $C_{best}$ is the cost value associated with optimal configuration and $T_{best}$ is the optimum time determined by Smartpick. 
+\begin{equation}
+	\begin{aligned}
+		\max_{t} \quad & T_{est.}; \hspace{0.5em} T_{est.} \hspace{0.5em} \in \hspace{0.5em} ET_l\\
+		\textrm{s.t.} \quad & {nVM} \times t_{vm} \times C_{vm} + {nSL} \times t_{sl} \times C_{sl} \leq C_{best}\\
+		&T_{best} \times (\epsilon + 1) \geq T_{est.}\\
+	\end{aligned}
+	\label{eq:troff2}
+\end{equation}
+
+It aims to find higher query estimation times ($T_{est.}$) that is within the specified limits, i.e., tolerable additional latency ($2^{nd}$ constraint), 
+but draws minimum compute cost ($1^{st}$ constraint). For instance, $\epsilon$ = 0.2 specifies a tolerance level of 20\% above the optimum value ($T_{best}$), but the actual cost could be lower for a reduced query latency. 
+This is not always guaranteed though and the optimization problem helps ascertain the required values as shown in Section \ref{subsec:tradeoffspaceEval}.
+
+%, and thus other data analytics systems can utilize the workload prediction module as an external prediction system. 
+%A detailed discussion on the implementation of this approach is presented in Section \ref{workloadpredImpl}.
+%We will show how two recent systems utilize Smartpick as an external prediction systems. 

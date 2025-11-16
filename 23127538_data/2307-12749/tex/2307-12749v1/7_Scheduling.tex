@@ -1,0 +1,110 @@
+\section{Scheduling: \tpg-Based Decision-Making}
+\label{sec:scheduling}
+This section details the scheduling strategy of \system, a dynamic, multi-dimensional approach that capitalizes on the \tpg for efficient and correct stream processing task execution. 
+
+The \system scheduling strategy operates on three dimensions.
+\textit{Exploration Strategies:} These define how the \tpg is traversed for scheduling operations. The goal is to balance the depth and breadth of exploration for optimizing the concurrency-overhead trade-off (Section~\ref{subsec:explore}).
+\textit{Scheduling Unit Granularities:} These pertain to the task size that is scheduled, which can range from individual state access operations to entire state transactions. Finer granular units facilitate more parallelism, potentially at the expense of increased overhead (Section~\ref{subsec:granularity}).
+\textit{Abort Handling Mechanisms:} These strategies manage transaction aborts, affecting overall system performance and consistency (Section~\ref{subsec:abort_handling}).
+
+
+\begin{table*}[t]
+\centering
+\caption{Scheduling decisions at three dimensions}
+\label{tab:decisions}
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{|p{3.5cm}|p{1.5cm}|p{5.5cm}|p{5.5cm}|}
+\hline
+\textbf{Dimension}                                      & \textbf{Decision} & \textbf{Pros} & \textbf{Cons} \\ \hline
+Exploration Strategy        & \se      &    \change{Threads can run in parallel with minimum coordination}  &  \change{BFS: Sensitive to workload imbalance / DFS: High memory access overhead}   \\ \cline{2-4} 
+                                               & \nse     &   \change{More parallelism opportunities}   &   \change{Higher message-passing overhead}   \\ \hline
+Scheduling Granularity & \fsu     &    \change{Better system scalability}  &   \change{High context switching overhead}  \\ \cline{2-4} 
+                                               & \csu     &   \change{Lower context switching overhead}   &    \change{Less scalable and more sensitive to load imbalance}  \\ \hline
+Abort Handling     & \ea      &    \change{Less wasted computing efforts}   &  \change{High context switching overhead}   \\ \cline{2-4} 
+                                               & \la      &  \change{Less context switching overhead}    &   \change{More wasted computing efforts}   \\ \hline
+\end{tabular}%
+}
+\end{table*}
+
+Each of these dimensions assists \system in adapting to different workload patterns and system states. Table~\ref{tab:decisions} summarizes potential decisions within each dimension.
+To optimize these dynamic scheduling decisions, we further introduce a heuristic decision model. This model evaluates the current workload characteristics at runtime, enabling appropriate scheduling decisions (Section~\ref{subsec:model}).
+% Designed to adapt to fluctuating workload characteristics, \system's scheduling strategy boasts greater concurrency compared to existing TSPEs. It deviates from a single scheduling paradigm, dynamically deciding across three dimensions: \textit{Exploration Strategies:} The method to traverse the \tpg for operation scheduling, which balances exploration depth and breadth to strike an optimal balance between concurrency and overhead (Section~\ref{subsec:explore}). \textit{Scheduling Unit Granularities:} The task size to be scheduled, which can range from individual state access operations to entire state transactions. Finer granular units facilitate greater parallelism, albeit at the potential cost of increased overhead (Section~\ref{subsec:granularity}). \textit{Abort Handling Mechanisms:} The strategy for handling transaction aborts, which can influence overall performance and system consistency (Section~\ref{subsec:abort_handling}). These three dimensions provide \system the flexibility to adapt to different workload patterns and system states, securing an optimal trade-off between concurrency, system overhead, and data consistency. Table~\ref{tab:decisions} encapsulates the potential decisions in each dimension. Additionally, to direct these dynamic scheduling decisions, we propose a heuristic decision model. This model assesses current workload characteristics at runtime and guides the system to make appropriate scheduling decisions (Section~\ref{subsec:model}).
+
+% Figure environment removed
+
+\subcompact
+\subsection{Exploration Strategies}
+\label{subsec:explore}
+Threads traverse the \tpg to select operations for processing, employing either structured or unstructured exploration strategies.
+
+\label{symbol:se}
+In the structured approach (\se), threads adopt depth-first or breadth-first traversal patterns. As per Nikolov et al.'s work~\cite{nikolov2006graph}, \se involves partitioning vertices into subsets based on connected directed paths, with subsets assigned ranks that inform stratum placement. Two methods stem from this approach.
+
+\emph{A) BFS-like Exploration:} Threads concurrently explore operations of the same stratum, advancing to the next stratum only once all operations within the current one have been processed. This method relies heavily on barrier-based synchronization and its effectiveness can be compromised by uneven workload distribution among threads due to unpredictable operation completion times and potential aborts.
+\emph{B) DFS-like Exploration:} Here, threads are initially assigned an equal number of operations across strata. A thread can advance to the next stratum once the dependencies of its assigned operations in the current stratum are resolved. This method necessitates less synchronization overhead, as threads progress based on their assigned operations rather than waiting for all threads to complete a stratum. This, however, may increase memory access overhead due to repeated dependency resolution checks.
+
+\label{symbol:nse}
+Alternatively, in the non-structured approach (\nse), threads randomly select operations whose dependencies are resolved. Each thread maintains a signal holder that asynchronously manages dependency resolutions for remaining operations. Specifically, when an operation $O_i$ is successfully processed, the thread signals all other threads, which can then process operations dependent on $O_i$. Despite ensuring immediate resolution of operation dependencies and making more operations available for scheduling, \nse can lead to higher message-passing overhead due to the need for countdown latch signal transmission along all directed edges.
+
+% Figure environment removed
+
+\subcompact
+\subsection{Scheduling Unit Granularities}
+\label{subsec:granularity}
+\system offers flexibility in scheduling granularity, allowing either single-operation (Fine-grained Scheduling Unit or \fsu) or multi-operation (Coarse-grained Scheduling Unit or \csu) scheduling. 
+\label{symbol:fsu} In \fsu mode, a thread schedules single operations, as depicted in Figure~\ref{fig:granularity}(a). This approach optimizes system scalability by maximizing opportunities for parallelism and enabling immediate dependency resolution. 
+
+\label{symbol:csu}
+The drawback of \fsu
+is that it incurs significant context-switching overhead. Conversely, \csu mode schedules groups of operations, which helps reduce context-switching overhead at the potential expense of slowing dependency resolution and impacting scalability, as shown in Figure~\ref{fig:granularity}(b).
+
+Particularly noteworthy is the potential for circular dependencies to form between coarse-grained scheduling units, a phenomenon depicted in Figure~\ref{fig:granularity}. To tackle this, \system combines such dependencies into a single scheduling unit, first processing operations without dependencies. While this strategy successfully circumvents the issue of circularity, it may restrict parallelism. As such, the presence of cyclic dependencies is a key factor in \system's decision between utilizing \fsu or \csu.
+
+\subcompact
+\subsection{Abort Handling Mechanisms}
+\label{subsec:abort_handling}
+In \system, transaction aborts are handled in one of two ways: ``eager'' or ``lazy'' aborting.
+
+\label{subsubsec:eager}
+\label{symbol:ea}
+In the eager approach (\ea), threads abort transactions as soon as an operation fails, minimizing disruption to other ongoing operations. The implementation of \ea varies based on the exploration strategy employed. Under structured exploration, \ea operates in a layered fashion. When all operations within a stratum have been executed, threads start aborting processes should an operation fail. This includes aborting the failed operation and its logical dependents and updating affected operations by rolling back and restarting from the outermost stratum with aborted operations. In contrast, under non-structured exploration, \ea employs a coordinator-based mechanism. The first operation of each state transaction is designated as the ``head'', and the thread that processes it acts as the transaction's coordinator. Should a thread detect a failed operation, it notifies the coordinator, who subsequently aborts all operations in the transaction and instructs other threads to roll back and redo dependent operations.
+
+\label{symbol:la}
+Alternatively, in the lazy approach (\la), threads log failed operations without immediately processing them. Only once the entire \tpg has been fully explored do threads collaborate to abort failed operations and their logical dependents. Although this approach is straightforward to implement and reduces context-switching overhead, it may necessitate repeated checks for transaction aborts and repeated iterations, which can lead to significant computational waste compared to \ea.
+
+\label{subsec:rollback}
+To ensure a correct schedule, irrespective of the abort handling approach, states modified by aborted operations need to be rolled back. \system accomplishes this by generating a physical copy of each modified state, with each version timestamped based on the modifying operation. Upon an operation's abort, the associated state is rolled back to the version with the latest timestamp prior to the aborted operation. These physical copies can be discarded after the current transaction batch has been completely processed. This multi-versioning state storage approach also lends itself to supporting windowing queries within \system.
+
+\begin{table}[t]
+\centering
+\caption{Workload characteristics to \tpg Properties}
+\label{tab:properties}
+\resizebox{0.48\textwidth}{!}{
+\begin{tabular}{|c|l|l|}
+\hline
+\textbf{Type} & {\textbf{\tpg Prop.}} & \textbf{Workload Char.} \\ \hline
+\multirow{3}{*}{Vertex} & Computation Complexity & $C$ \\ \cline{2-3} 
+ & Vertex Degree Distribution & $\underset{\sim}{\propto} \theta$ \\ \cline{2-3}
+ & Ratio of Aborting Vertexes & $\underset{\sim}{\propto} \alpha$ \\ \hline
+\multirow{4}{*}{Edge} 
+ & Number of \lds & $\underset{\sim}{\propto} T*l$ \\ \cline{2-3} 
+ & Number of \tds & $\underset{\sim}{\propto} T*l$ \\ \cline{2-3} 
+ & Number of \pds & $\underset{\sim}{\propto} T*l*r$ \\ \cline{2-3} 
+ & Cyclic Dependency & Correlated to $\theta$, $T$, $l$, $r$ \\ \hline
+\end{tabular}
+}
+\end{table}
+
+% Figure environment removed
+
+\subcompact
+\subsection{Heuristics Decision Model}
+\label{subsec:model}
+Given the NP-complete nature of the original task graph scheduling problem and the added complexity of our context, our proposed solution is a lightweight, heuristic-based decision model. Informed by comprehensive microbenchmark studies and theoretical analysis (Table~\ref{tab:decisions}), it effectively guides the \system in making scheduling decisions.
+
+\textbf{Model Inputs.} The model operates on seven properties from the constructed \tpg (Table~\ref{tab:properties}), reflecting different workload characteristics. Vertex Computational Complexity corresponds to the complexity of the user-defined function in the associated state access operation ($C$). Vertex Degree Distribution reflects state access distribution of the operation ($\theta$), implying some states are more frequently accessed. The Ratio of Aborting Vertexes maps to the ratio of operations that need aborting ($a$), requiring profiling and estimation. The Number of \lds, \tds, \pds relates to the number of transactions arriving during the batch interval ($T$) and transaction length ($l$), with \pds also influenced by state accesses per operation ($r$). Lastly, Cyclic Dependency represents the presence of cycles when \csu is adopted, influenced by $\theta$, $T$, $l$, and $r$.
+
+\textbf{Decision Model.} As per Figure~\ref{fig:model}, the model operates on three parallel dimensions at runtime.
+\emph{I) Exploration Strategies:} \se is chosen when the dependency types are high in number and vertex degree distribution ensures thread-level workload balance. In other cases, \nse is chosen for more flexible dependency resolution.
+\emph{II) Scheduling Unit Granularities:} The model selects \csu when there are no cyclic dependencies among operations, \tds number is high, and \pds number is low. For other cases, \fsu is chosen for its better scalability.
+\emph{III) Abort Handling Mechanisms:} \la is chosen when computational complexity of vertices is low and the ratio of aborting vertices is high. Otherwise, \ea is chosen for its minimal impact on other operations' execution.

@@ -1,0 +1,71 @@
+% -------------------------------------------------------
+\subsection{One-to-many Data Forwarding} \label{connection-handle}
+% -------------------------------------------------------
+
+For the data-plane one-to-many data forwarding, \sys firstly reserves the optimal multicast forwarding, adopted by the previous in-fabric multicast solutions~\cite{crowcroft1988multicast, diab2022orca, shahbaz2019elmo}. Thus the sender only needs to send one copy of data, and the fabric makes multiple copies and forwards them to multiple receivers via the optimal paths. Therefore, there is no bandwidth wastage, and the communication distance and latency are minimized. 
+
+% Figure environment removed
+
+Secondly, departing from the previous works that only support layer-3 routing, \sys integrates layer-4 states into the fabric and further achieves a virtual one-to-many connection. Because of this, the single connected QP in the sender can simultaneously communicate with multiple QPs on multiple receivers. Therefore, \sys can fully leverage the advanced features of connected transport service, \ie, the one-sided \rdwrite operation and extended message size, as discussed in $\S$\ref{rdma}. Besides the more efficient bandwidth utilization, \sys outperforms the application-layer multicast with shorter communication distance and lower forwarding latency, as there is no additional \rdwqe and \rdcqe processing, and the intermediate nodes are not involved in forwarding data.
+
+\parab{Extended multicast forwarding table.} \sys elaborately extends the traditional multicast forwarding table structure by integrating layer-4 states. The extended table, illustrated in Fig.~\ref{fig:table}, is the foundation of \sys. The indexed key of the table is the \textit{multicast group IP address} (abbreviated as GroupIP). Many multicast groups can exist simultaneously, each with a unique GroupIP.
+
+% Figure environment removed
+
+The GroupIP indexes two types of states: the group-level states and the port-level states. The group-level states contain statistics of the multicast group, which are used for the many-to-one feedback aggregation. The port-level states are formatted into an array with at most $n$ ( \# of switch ports) entries, only containing ports included in the multicast tree. The entry with $port$ as $i$ represents states related to $port_i$. Each entry is assigned one of two types: $connected$ and $forwarded$, where $connected$ means that this port is directly connected to a receiver node, and $forwarded$ means that the next hop is a switch. The $connected$ entry contains the connected receiver's layer-3 and layer-4 states, as well as the ACK/NACK states, and the $forwarded$ entry only contains ACK/NACK states. $\S$\ref{ack-aggregation} introduces the usage of these ACK/NACK states. 
+
+The specific memory space used by one multicast table depends on the number of ports involved in the multicast group, which is at most $n$. We calculate that 1K multicast groups at most cost 0.92MB memory when each group contains the maximum entries. Moreover, the design goal of \sys is not to compress the switch-maintained states but to provide a general multicast protocol with prominent RDMA features. We can use many approaches to extend \sys to support more groups, and we'll talk about them in $\S$\ref{works}.
+
+\parab{Establishing QPs.} Each multicast member follows the common unicast-like steps to establish the RC QP but assigns a virtual destination to it. Specifically, the destination IP is set as a unique GroupIP, and the destination QPN can be assigned as any non-conflicting value (\eg, $0x1$). Commodity RNICs provide the application with the programming interface to specify the destination IP and QPN without modifying the RNIC circuit~\cite{qpmodi}. After QPs establishment, multicast members exchange their QPs information and register the above-described forwarding table to switches, as described in Appendix~\ref{apx:regis}. Once the registration finishes, the sender can start sending multicast data packets.
+%Once the master node receives all participants' affirm, the sender can start sending data packets.% and the fabric forwards them to multiple receivers based on the registered table.
+
+%Multicast receivers follow unicast's identical connection management logic to process multicast traffic. In particular, upon receiving a data packet, the $dest\_IP$ is first checked if it matches the node's IP. Further, the RDMA transport attempts to locate the associated QP based on the $dest\_QPN$ in the packet header. Then RNIC processes packets based on the associated QP's context (QPC), such as generating ACK, notifying the upper-layer application, \etc Therefore, the connection-related states in the packet header, including $dest\_IP$, $dest\_QPN$, \etc, have to be modified from GroupIP and $0x0$ to match each receiver, as discussed in $\S$\ref{key-chalge}.
+
+\parab{One-to-many data forwarding.} Switches involved in the multicast tree are responsible for forwarding data via the multicast tree and modifying packet headers to match different QPs. The switch follows Algorithm~\ref{alg:data-forward} to process data packets. Upon receiving a data packet ($p$), the switch uses the destination IP ($p.dest\_IP$) in the packet header to index the associated multicast forwarding table ($T$). Then switch iterates all entries (one entry corresponds to one port) in $T$ and actions as follows: (\romannumerber{1}) if the type is $forwarded$: creates a packet copy and forwards it through this port; (\romannumerber{2}) if the type is $connected$: creates a packet copy, modifies its connection-related states, and forwards it through this port.
+
+We take one path, $S_1$ to $L_2$ to $R_1$, of the multicast tree in Fig.~\ref{fig:overview} as an example to show the header change, which is illustrated in Fig.~\ref{fig:header-change}. Firstly, the destination IP and QPN are modified to match $R_1$'s QP identification, as described in $\S$\ref{key-chalge}. Besides, \sys changes the source IP from the sender's IP to GroupIP. As a result, when $R_1$ generates feedback, the feedback's destination IP will be the data packet's source IP, \ie, GroupIP. Thus feedback packets can also index the associated forwarding table by their destination IP. Besides, \sys switches replace the destination MAC address to avoid the receiver's MAC layer discarding the packet. 
+
+%The switch identifies multicast data packets through the specific header region, shown in Fig. \ref{fig:packet-format} and follows Algorithm \ref{alg:data-forward} to process data packets. 
+%if the type is $connected$: creates a packet copy, modifies its connection-related states in the header, and forwards the resulting packet through this port. 
+
+\begin{algorithm}[t]
+\caption{Forwarding Packets and Replacing Headers.}\label{alg:data-forward}
+\begin{algorithmic}[1]
+%\Function{Receive}{p}
+\State $p\gets $ data packet
+\State $j\gets$ port that $p$ enters
+\State $T\gets $ multicast forwarding table indexed by $p.dest\_IP$
+%\State $n\gets$ the number of switch ports
+%\State \textcolor{pink}{// loop over $T$ and copy/forward $p$}
+%\Comment{\textcolor{pink}{loop over $T$ and copy/forward $p$}}
+\For{$Entry \in T$}\Comment{\textcolor{gray}{loop over $T$ and copy/forward $p$}}
+	\If{$Entry.type = forwarded$ \& $Entry.port \neq j$}
+		\State $\overline{p}\gets$ a copy of $p$
+		\State send $\overline{p}$ out from $Entry.port$
+	\EndIf
+	\If{$Entry.type = connected$ \& $Entry.port \neq j$}
+		\State $\overline{p}\gets$ a copy of $p$
+		\State $\overline{p}.dest\_IP(QPN) =Entry.dest\_IP(QPN)$
+		%\State $\overline{p}.dest\_QPN=T[i].dest\_QPN$
+		\State $\overline{p}.(...)=Entry.(...)$
+		\State send $\overline{p}$ out from $Entry.port$
+	\EndIf
+\EndFor
+%\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\parab{Support for one-to-many \rdwrite.}
+\sys maintains connectivity between the sender and multiple receivers, which is sufficient for \rdsend/\rdreceive. However, \rdwrite requires more support. \rdwrite allows a node to write a memory slot on a remote node. The to-be-written MR info (including the remote VA and \rkey) is indicated in the first packet of the \rdwrite request. The \rdwrite responder's RNIC will check the MR info and execute the request only when they are correct. Otherwise, the packets will be discarded. To enable one-to-many \rdwrite, \sys needs to modify the MR states in the \rdwrite request header for different receivers. 
+
+Besides maintaining MR info for different receivers, the MR info needs to be updated for every \rdwrite request because the MR changes with different \rdwrite requests. We force the host application to invoke an extra \rdwrite message which contains the MR states of different receivers, before submitting the actual \rdwrite request. Then the leaf switch recognizes this special message, updates MR info to the table, and replaces the MR states for the subsequent real \rdwrite request. This per-request updating scheme introduces minimal extra bandwidth overhead as long as the extra \rdwrite message is small compared to the total volume of transmitted data. We evaluate the performance of one-to-many \rdwrite in $\S$\ref{eval:storage}. Moreover, we discuss a possible way to avoid this extra overhead in Appendix~\ref{apx:opwrite}. This alternative approach requires the RNIC's modification.
+
+%% Figure environment removed
+
+%The multicast forwarding of \sys is based on the forwarding table that installed on switches. We enrich the native IP multicast forwarding table by adding layer-4 information, including connection and ACK/NACK states, for connectivity and reliability supports. The enriched multicast forwarding table of \sys is illustrated in Fig. \ref{fig:table}. This table is indexed with GroupIP, and every GroupIP associates with an array with $n$ ( \# of switch ports) entries. $entry_i$ reprensets the action taken in $port_i$. Each entry has three types: $connected$, $forward$, and $excluded$, where $excluded$ means that this port isn't included in multicast tree. $Connected$ means that this port is directly connected to a multicast node, and $forward$ means that the downstream device is a switch. Each entry contains layer-3 IP address, layer-4 connection states, and ACK/NACK statistics. $\S$\ref{connection-handle} and $\S$\ref{ack-aggregation} introduce that how to support optimal distribution, connectivity and reliability, based on entry states.
+
+%\sys simultaneously achieves the optimal data distribution and the efficient one-to-many connection. Thus \sys combines the advantages of in-fabric and application-layer multicast solutions togather to support high application performance. The optimal data distribution enables the sender to sends only one copy of data. Then the network copy and forward multiple copies of data to multiple receivers through the registered multicast tree path, which significantly reduce bandwidth waste. Through the efficient one-to-many connection, multicast member can leverage the advanced RDMA features in connected transport, such as the comprehensive primitives and extended message size. Besides, each node only maintains one connection, and medium nodes aren't required to forward data, thus eliminating the scalability issue in RNIC and avoiding additional CPU overhead for medium data processing.  
+
+%Sender send packet with destination IP address out. Switch use specific header option to idendity multicast data packet and utilized the registed multicast forwarding tree to forward packets. The specific multicast data header is showed in Fig. \ref{fig:packet-header}. 
+
+%This is because, in Ethernet protocol, switch uses ARP protocol to find MAC address. ARP protocol use the IP address to find the associated MAC address in ARP table. As the GroupIP is a virtual IP address, ARP cannot find validated MAC address. So we need to manually assign it. 

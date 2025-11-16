@@ -1,0 +1,150 @@
+% =======================================================================
+% Figure environment removed
+% =======================================================================
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Preliminary: A review of FCGF}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Input data representation.}
+FCGF takes as input a quantised version of the original point cloud $\mathcal{X} \in \mathbb{R}^{V \times 3}$.
+The quantisation procedure splits the volume occupied by $\mathcal{X}$ into a grid of voxels of size $Q$ and assigns a single representative vertex $\textbf{x}_i \in \mathbb{R}^3$ to each voxel $i$.
+This reduction is typically computed with random sampling or by average pooling (barycenter)~\cite{minkowski}.
+The resulting sparse representation is obtained by discarding voxels corresponding to a portion of the empty space and is significantly more efficient in terms of memory utilisation.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Feature extractor.}
+The fully-convolutional feature extractor $\boldsymbol{\Phi}_\Theta$ is a parametric function with learnable parameters $\Theta$ designed as a UNet~\cite{UNet}.
+Given $\textbf{x}_i$, $\boldsymbol{\Phi}_\Theta$ produces a $F$-dimensional feature vector defined as $\boldsymbol{\Phi}_\Theta( \textbf{x}_i ) = \textbf{f}_i \in \mathbb{R}^F$.
+FCGF processes pairs of point clouds using a Siamese approach, i.e.~feature extractors with shared weights.
+% The weight sharing implicitly enforces symmetry in the metric learned by the model.
+FCGF is implemented in PyTorch using Minkowski engine~\cite{minkowski}.
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Hardest contrastive loss.}
+The hardest contrastive (HC) loss is defined as $\ell_\text{HC} = \lambda_P \ell_P + \lambda_N \ell_N$, where $\ell_P$ promotes similarity between features of positive samples, $\ell_N$ promotes dissimilarity between features of negative samples, and $\lambda_P, \lambda_N$ are hyperparameters. Given a pair of 3D scenes $( \mathcal{X}_1, \mathcal{X}_2 )$ as input, the set of positive pairs is defined as $\mathcal{P} = \{ (i, j): \textbf{x}_i \in \mathcal{X}_1, \textbf{x}_j \in \mathcal{X}_2, \phi(\textbf{x}_i) = \textbf{x}_j \}$, where $\phi \colon \mathcal{X}_1 \to \mathcal{X}_2$ is a correspondence mapping between $\mathcal{X}_1$ and $\mathcal{X}_2$ voxels.
+% Positive term
+$\ell_P$ is defined as
+%+++++++++++++++++++++++++++++++++++++++
+%\vspace{-1.5mm}
+\begin{equation}\label{eq:hcpos}
+\ell_P = \sum_{(i, j) \in \mathcal{P}} \frac{1}{\lvert \mathcal{P} \rvert} \left( \lVert \textbf{f}_i - \textbf{f}_j \rVert - \mu_P \right)^2_+,
+%\vspace{-3mm}
+\end{equation}
+%+++++++++++++++++++++++++++++++++++++++
+where $\lvert \mathcal{P} \rvert$ is the cardinality of $\mathcal{P}$, $\mu_P$ is a positive margin to overcome overfitting~\cite{lin2015deephash}, and $( \cdot )_+ = \max(0, \cdot)$.
+% Negative mining
+For each pair $(i, j) \in \mathcal{P}$, two sets of candidate negatives are defined as $\mathcal{N}_i = \{ k \text{ s.t. } \textbf{x}_k \in \mathcal{X}_1, k \ne i \}$, $\mathcal{N}_j = \{ k \text{ s.t. } \textbf{x}_k \in \mathcal{X}_2, k \ne j \}$.
+Computing $\mathcal{N}_i, \mathcal{N}_j$ scales quadratically with the minibatch size, therefore random subsets of $\mathcal{N}_i$ and $\mathcal{N}_j$ with fixed cardinalities are instead used in practice.
+% Negative term
+$\ell_N$ is defined as
+\begin{equation}\label{eq:hcneg}
+\begin{aligned}
+\vspace{-2mm}
+\ell_N = \sum_{(i, j) \in \mathcal{P}} & \frac{1}{2 \lvert \mathcal{P}_i \rvert} \left( \mu_N - \min_{k \in \mathcal{N}_i} \lVert \textbf{f}_i - \textbf{f}_k \rVert \right)^2_+ \\
+& \hspace{-4.5mm}+ \frac{1}{2 \lvert \mathcal{P}_j \rvert} \left( \mu_N - \min_{k \in \mathcal{N}_j} \lVert \textbf{f}_j - \textbf{f}_k \rVert \right)^2_+,
+\end{aligned}
+\end{equation}
+where $\lvert \mathcal{P}_i \rvert, \lvert \mathcal{P}_j \rvert$ are the numbers of valid negatives mined from the first and second term, respectively.
+Unlike metric learning losses that randomly mine a certain number of negatives from $\mathcal{N}_i, \mathcal{N}_j$~\cite{ContrastiveLoss, TripletLoss}, the HC loss mines the most similar features within a batch, i.e.~the hardest negatives.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Tailoring FCGF for 6D pose estimation}
+In this section, we describe how we modified FCGF. We focus on manipulating heterogeneous representations of input data, improving the HC loss, and modernising the training strategy. 
+Fig.~\ref{fig:pipeline} shows the block diagram of \ourmethod.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Input data}
+
+
+
+\noindent \textbf{Heterogeneous representations.}
+FCGF was designed for scene registration, where its input data is 3D scan pairs of the same scene captured from different viewpoints.
+Therefore, their input data belongs to the same distribution, i.e.~real-world data captured with the same LiDAR sensor.
+This is why authors in \cite{FCGF} use a Siamese approach.
+Unlike FCGF, our input data is heterogeneous, therefore we process it with two independent deep networks. Formally, given an object $O$ and a scene $S$, the input of our pipeline is the pair $(\mathcal{M}_O, \mathcal{I}_S)$, where $\mathcal{M}_O$ is a textured 3D model of $O$ and $\mathcal{I}_S$ is an RGBD capture of $S$ from a viewpoint.
+We transform $(\mathcal{M}_O, \mathcal{I}_S)$ into a pair of point clouds.
+For $O$, we produce a point cloud $\mathcal{X}_O \in \mathbb{R}^{V_O\times6}$ by sampling $V_O$ vertices on the triangular faces of $\mathcal{M}_O$ and extracting the corresponding RGB colours from its texture.
+For $S$, we use the intrinsic parameters of the RGBD sensor to map $\mathcal{I}_S$ into a coloured point cloud and sample $V_S$ points from it.
+Let $\mathcal{X}_S \in \mathbb{R}^{V_S\times6}$ be the point cloud of $S$.
+We quantise $\mathcal{X}_O$ and $\mathcal{X}_S$ by a factor $Q$ and process the pair with two networks implemented with Minkowski engine~\cite{minkowski}.
+$V_O$, $V_S$, and $Q$ are hyperparameters.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Processing geometric and photometric data.}
+Minkowski engine~\cite{minkowski} is designed to process optional input features in addition to the 3D coordinate of each point.
+However, authors in \cite{FCGF} show that, in the context of scene registration, adding the photometric information associated to each point leads to overfitting.
+We found instead that this addition significantly improves the performance. 
+Colour information helps in i) discriminating objects of different categories but with similar geometric shape (e.g. pudding box and gelatin box in YCBV~\cite{ycbv}), and ii) selecting the correct pose of symmetric objects among the set of geometrically-equivalent ones (i.e. the 6D pose of a box or a can cannot be uniquely defined unless we consider their texture patterns).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Loss function}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Positive mining.}
+We define $\mathcal{P}$ (Eq.~\ref{eq:hcpos}) as the set of valid correspondences between $\mathcal{X}_O$ and $\mathcal{X}_S$.
+Let $(\mathbf{R}_O, \mathbf{t}_O)$ be $O$ ground-truth 6D pose in $S$ and $\widetilde{\mathcal{X}}_O = \mathbf{R}_O \mathcal{X}_O + \mathbf{t}_O$ be the rigidly transformed version of $\mathcal{X}_O$ into the reference frame of $\mathcal{X}_S$.
+We compute all the correspondences by searching for each point of $\widetilde{\mathcal{X}}_O$ its nearest neighbouring point in $\mathcal{X}_S$.
+Due to occlusions with other objects and/or self-occlusions, some of the correspondences may be spurious, e.g.~associating points of different surfaces.
+Therefore, we consider a correspondence valid if the distance between $\tilde{\textbf{x}}_i \in \widetilde{\mathcal{X}}_O$ and $\textbf{x}_j \in \mathcal{X}_S$ is less than a threshold $\tau_P$ and if the other points on the scene are farther away, i.e. $(i, j) \in \mathcal{P} \Leftrightarrow \lVert \tilde{\textbf{x}}_i - \textbf{x}_j \rVert < \tau_P \text{ and } \lVert \tilde{\textbf{x}}_i - \textbf{x}_j \rVert < \lVert \tilde{\textbf{x}}_i - \textbf{x}_k \rVert $ for every $k = 1, \dots, V_S$.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Negative mining.}
+We experienced that mining the hardest negatives from the negative sets $\mathcal{N}_i$, $\mathcal{N}_j$ (Eq.~\ref{eq:hcneg}) can lead to loss instability and collapsing. % experimentally 
+This occurs because the hardest negative in $\mathcal{N}_i = \{ k : \textbf{x}_k \in \mathcal{X}_O, k \ne i \}$, i.e. the sample with the closest feature to $\mathbf{f}_i \in \mathbb{R}^F$, is likely to be a point spatially close to $\textbf{x}_i \in \mathcal{X}_O$, because their local geometric structure is nearly the same.
+Hence, Eq.~\ref{eq:hcneg} tries to enforce features corresponding to the same local geometric structure to be distant from each other.
+This problem can be mitigated by replacing $\mathcal{N}_i, \mathcal{N}_j$ in Eq.~\ref{eq:hcneg} with $\widetilde{\mathcal{N}}_i = \{ k : \textbf{x}_k \in \mathcal{X}_O, \lVert \textbf{x}_k - \textbf{x}_i \rVert > \tau_{NO} \}$ and $\widetilde{\mathcal{N}}_j = \{ k : \textbf{x}_k \in \mathcal{X}_S, \lVert \textbf{x}_k - \textbf{x}_j \rVert > \tau_{NO} \}$, where $\tau_{NO}$ is a safety threshold, i.e.~the radius of spheres on object and on scene where mining is forbidden.
+
+The choice of $\tau_{NO}$ is key because it determines which points on the point clouds can be used for negative mining.
+We found beneficial to choose $\tau_{NO}$ as a function of the dimension of the input object.
+Given $\mathcal{X}_O$, we define its diameter as $D_O$, and set $\tau_{NO}=t_{\text{scale}} D_O$. 
+In Fig.~\ref{fig:loss_detail}, we illustrate the safety thresholds.
+In this way, we can maintain a good quantity of negatives while avoiding the mining of spurious hardest negatives. 
+Using different thresholds for the object and the scene points clouds underperformed our final choice.
+Therefore, our loss is defined as
+%++++++++++++++++++++++++++++++++++
+\begin{equation*}
+    \ell_\text{HC} = \lambda_P \ell_P + \lambda_{NO} \ell_{NO} + \lambda_{NS} \ell_{NS},
+\end{equation*}
+%+++++++++++++++++++++++++++++++++++
+where $\lambda_{P}$, $\lambda_{NO}$ and $\lambda_{NS}$ are weight factors. $\tau_P$, $t_{\text{scale}}$, $\lambda_{P}$, $\lambda_{NO}$, and $\lambda_{NS}$ are hyperparameters.
+
+%===================================
+% Figure environment removed
+%===================================
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Training strategy}
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Data augmentation.}
+FCGF combines scaling and rotation augmentations to enhance feature robustness against variations in camera pose~\cite{FCGF}.
+These are effective in the context of point cloud registration, but in our specific scenario, the point cloud of the objects always belongs to a known set.
+Avoiding these augmentations helps the deep network in learning specialised features for each object. Our data augmentations consist of the following:
+
+(i) Point re-sampling of $O$ and $S$, i.e.~unlike FCGF, we randomly downsample point clouds at each epoch to mitigate overfitting. This allows the model to be more robust to depth acquisition noise; 
+(ii) Colour jittering on $O$, i.e.~we randomly perturb brightness, contrast, saturation, and hue of $O$;
+(iii) Random erasing on $S$, i.e.~unlike FCGF, we simulate occlusions at training time. For each point of $\widetilde{\mathcal{X}}_O$ we compute its nearest neighbour in $\mathcal{X}_S$ and randomly select a point on $\mathcal{X}_S$ within such correspondence set. We then erase all the points that fall within a distance threshold $\rho$ from it. This allows the model to be more robust to occlusions in the input scene.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\noindent \textbf{Optimisation techniques.} 
+FCGF uses an SGD optimiser with an initial learning rate $\text{lr}_{\text{init}}=10^{-1}$ decreased during training with an exponential scheduler with $\gamma = 0.99$.
+In our setting, these hyperaparameters do not lead to convergence.
+Instead, we set $\text{lr}_{\text{init}}=10^{-3}$.
+We experiment with Adam~\cite{adam} and AdamW~\cite{adamw}, and notice improvements in both cases.
+We also switch to a Cosine Annealing scheduler~\cite{cosine} that lowers the learning rate from $10^{-3}$ to $10^{-4}$ across the epochs.

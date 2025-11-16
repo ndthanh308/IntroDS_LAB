@@ -1,0 +1,507 @@
+\section{Implementation and Evaluation}\label{sec:evaluation}
+%\matt{todo: replace instances of Cataract with \name}
+In this section, we provide details on the implementation and evaluation of the \name attack. First, we describe the design of our neural-based approach to digital-to-physical mapping $T(\cdot)$, which we call \textit{TNet}. We then describe our prototype and experimental setup. Finally, we evaluate each component of \namenospace, including how the attack fares against existing defenses.
+%\luis{As discussed in the design section, the targeted, dynamic attacks will be domain-specific, and we will show the tradeoff between accuracy and robustness and time-to-generate pertubation. In both cases, we will be provided semantic information through some auxiliary sensor(s). In the case of the security camera, a second sensor could determine that a person will be entering the scene; however, the path is less deterministic; thus, we'd opt for a more robust AML attack (e.g., UAP). In the case of the self-driving car, the semantic information could be provided by knowledge of the map, the car's trajectory through some auxiliary sensors. Thus, if we know there will be some safety signs at a particular location, and we have access to GPS, we could deterministically generate a more accurate perturbation for safety signs. In particular, we want to make the attack stealthy such that we only trigger the perturbation in a safety-critical zone, e.g., we only want the perturbation to be active when we detect there's a stop sign.  }
+
+\begin{comment}
+Evaluation to-do list:
+\textbf{indoor attack performance}:
+\begin{itemize}
+    \item Average ASR over all 17 classes under 6 illuminance for all models
+    \item for yolo an interpolation operation needs to be added to change input size from 224 to 240
+    \item (optional) repeat the experiments without the backdrop
+\end{itemize}
+
+\textbf{outdoor attack performance}:
+\begin{itemize}
+    \item repeat the indoor experiments for a specific illuminance (which our attack will work)
+\end{itemize}
+
+\textbf{dynamic attack performance}:
+\begin{itemize}
+    \item one perturbation for each class vs one single perturbation for all
+\end{itemize}
+
+\textbf{transferability}:
+\begin{itemize}
+    \item ideally transferability across 4 different models, but could also be within each type of model.
+\end{itemize}
+
+against existing defending solutions:
+\begin{itemize}
+    \item adversarial learning with FSGM
+    \item implementation of input randomization
+    \item computing ASR for all defense solutions
+\end{itemize}
+\end{comment}
+
+% \begin{itemize}
+%     \item attack success rate at various angles and distances
+%     \item compare against static attacks
+%     \item attack performance against defense solutions (adversarial learning, input randomization and sentinet)
+%     \item attack transferbility across different models
+%     \item other results related to limitations, 
+% \end{itemize}
+
+\subsection{Digital-to-Physical Mapping via TNet}
+
+%We describe our realization of the digital-to-physical mapping $T(\cdot)$ here. 
+% Recall we split the mapping to two steps, $T_{D,C}(\cdot)$ and $T_E(\cdot)$. 
+%We employ a neural network model to approximate $T(\cdot)$. %\noindent\textbf{Model Architecture.} 
+%It is essential to choose the right architecture for the digital-to-physical mapping $T(\cdot)$. Since both the input and output of $T(\cdot)$ are images, it is intuitive to think of a fully convolutional neural network model. During our early investigation we tried a simple convolutional auto-encoder. However, this architecture cannot learn the digital-to-physical mapping well (outputing physical perturbations looks distinct from ground truth images). Increasing the size of the model didn't help. So we switched to a UNet architecture~\cite{ronneberger2015u}. The multiple skip connections in UNet enables the model to learn from the residuals between feature maps thus converges faster and has better accuracy. \yi{need rephrasing}
+To approximate the non-linear mapping between digital-to-physical perturbations, we design and train a feed-forward neural network model called TNet. Beyond boasting good performance accuracy, feed-forward neural networks are also differentiable. So a pre-trained TNet can be included as a component of the training procedure of \namenospace, where differentiation of the mapping function $T(\cdot)$ is essential to the back-propagation step (see Algorithm~\ref{algo:attack}).
+
+The inputs to TNet are RGB images representing digital perturbations, and the outputs are RGB images that illustrate how these digital perturbations will be perceived by the victim camera in the physical world. Two architectural backbones were initially selected for TNet: a fully-convolutional auto-encoder, and the UNet architecture~\cite{ronneberger2015u}. Empirically, we found that the UNet architecture's multiple skip connections enabled the model to converge faster and with better accuracy across a range of tested batch sizes.
+
+\noindent\textbf{Model Training.} To train the mapping, we randomly vary the center and the RGB vector of each dot and generate $10,000$ digital perturbations. We then collect their corresponding physical perturbations using the aforementioned hardware setup. During our initial investigation, we allowed other parameters of the alpha blending model to vary (e.g., $r$, $\alpha_{max}$, and $\gamma$).
+With too many free parameters and insufficient training data to cover the combinatorially growing space, TNet cannot learn a robust mapping. Additionally, if the training dataset is not large enough, TNet overfits the training data, and during the attack phase, resulting in a less-precise computed gradient. The optimization will deviate significantly from the correct direction, leading to an ineffective perturbation. Given the data collection bottleneck with a physical setup, we wanted to minimize the reliance on a large dataset. Thus, we fixed all the parameters except the center $c$ and the RGB vector $\gamma$ of each dot. We found that a dataset with $10,000$ pairs was sufficient to train TNet. %To determine the size of our dataset, we started from a very small number of $2,000$ pairs and gradually increased the number and find out $10000$ pairs is sufficient to train a good TNet for our attack.
+
+We used $80\%$ of the image pairs for training and $20\%$ for validation. As mentioned in Section~\ref{sec:design}, the number of dots affects the capacity of our attack: too few dots cannot perturb an image effectively, while effective perturbations with too many dots are difficult to train without a sufficiently large dataset. To show the effect of different number of dots, we consider $10$, $30$ and $50$ dots when training TNet. We set $\alpha$ in \autoref{eq:loss} to be $0.0004$.
+% According to \autoref{eq:loss}, we can control the weights of MSE and Perceptual loss by adjusting the $\alpha$. 
+We trained TNet for $1,000$ epochs with a batch size of 32 and a learning rate of $0.003$. We used Adam~\cite{kingma2014adam} as the optimizer.
+
+\noindent\textbf{Evaluating TNet.} Besides MSE and LPIPS~\cite{zhang2018perceptual}--which we used to train TNet--we also consider Peak Signal-to-Noise Ratio (PSNR) and the Structural Similarity Index (SSIM) \cite{hore2010image} to measure the accuracy of TNet. PSNR is derived from MSE, and takes into account the peak intensity of the input images to describe the similarity between two images. SSIM is designed based on luminance, contrast, and structure, so a higher SSIM indicates higher similarity in these factors. 
+
+We compared our UNet-based TNet (TNet-UNet) with two baseline models: a CNN Autoencoder-based model (TNet-CNN) and a multi-layer perceptron (MLP)-based model (TNet-MLP), since prior work~\cite{lovisotto2020slap} used an MLP-based approach. 
+%We also consider TNet-MLP because an MLP model is also used in prior work~\cite{lovisotto2020slap}.
+For both baseline models, we configure the architecture such that the overall number of weights is similar to TNet-UNet.
+%TNet-CNN was initially selected but suffered from poor attack accuracy.
+
+% As can be seen from the results, TNet can approximate digital-to-physical transformation very well.
+% We also show the comparison between some ground truth physical perturbation (collected) and TNet output in \autoref{fig:tnet_output}.
+
+\autoref{tab:tnet_accuracy} shows various metrics of the trained models on the test dataset. TNet-UNet achieves significantly better results in terms of the validation loss and the four metrics compared to the two baseline models, implying that the UNet architecture is the correct choice to approximate the digital-to-physical mapping with high accuracy. \autoref{fig:perturbations} depicts an example of different TNet models' output and the corresponding ground truth. %We also compare the output of TNet-UNet and its corresponding ground truth in \autoref{fig:perturbations}.
+%\yi{visual comparison of all 3 cases.}
+%As can be seen from the figures, TNet generates perturbations very close to the actual physical perturbation. 
+A more precise physical mapping guarantees more precise gradient values of the pattern generating function in the attack stage, increasing the probability of a successful adversarial perturbation. We select the TNet-UNet architecture for the rest of the paper and refer to it as TNet.  
+
+
+% \begin{table}[]
+% \centering
+% \begin{tabular}{|c|c|c|c|c|c|}
+% \hline
+% \multicolumn{1}{|l|}{\# dots} &
+%   \multicolumn{1}{l|}{Validation loss} &
+%   \multicolumn{1}{l|}{MSE} &
+%   \multicolumn{1}{l|}{LPIPS} &
+%   \multicolumn{1}{l|}{PSNR} &
+%   \multicolumn{1}{l|}{SSIM} \\ \hline
+%  10 & 6.457e-3  & 0.965e-3 & 5.393 & 30.8 & 0.887   \\ \hline
+%  30 & 9.086e-3 & 1.062e-3 & 8.043 & 29.74 & 0.853     \\ \hline
+%  50 & 10.670e-3 & 1.535e-3  & 9.134  & 28.14  & 0.815    \\ \hline
+% \end{tabular}
+% \caption{Accuracy of TNet. TNet is able to approximate the mapping... 
+% % \eric{Which percpetual loss? this doesn't make sense as written. a specicific perceptual loss algorithm should be named and cited. it's probably LPIPS.}
+% }
+% \label{tab:tnet_accuracy}
+% \end{table}
+
+\begin{table}[]
+\centering
+\caption{Accuracy of TNet models. The total loss of TNet-UNet on the validation set as well as four other image similarity metrics is significantly better than the other two baseline models. There are not fixed ranges for the metrics (of course they all need to be non-negative numbers) except that SSIM is between 0 and 1. However, a smaller MSE/LPIPS or a larger PSNR/SSIM value indicates better similarity between the predicted physical perturbation and the ground truth.}
+%\resizebox{\linewidth}{!}{%
+\begin{tabular}{cccccc}
+\toprule
+& Validation loss & MSE    & LPIPS & PSNR  & SSIM \\ \hline
+TNet-UNet & \textbf{2.26e-4}         & \textbf{1.95e-4} & \textbf{0.31}  & \textbf{37.17} & \textbf{0.92} \\
+TNet-CNN & 2.39e-3 & 1.42e-3 & 9.75 &  28.46 & 0.83  \\
+TNet-MLP & 0.01 & 8.74e-3 & 53.76 & 20.58 & 0.58  \\
+\bottomrule
+\vspace{-0.1in}
+\end{tabular}
+%}
+
+% \eric{Which percpetual loss? this doesn't make sense as written. a specicific perceptual loss algorithm should be named and cited. it's probably LPIPS.}
+% \yi{put results of simple CNN.}}
+\label{tab:tnet_accuracy}
+\end{table}
+
+
+
+\subsection{Prototype and Experimental Setup}
+\label{sec:prototype}
+
+\noindent\textbf{Implementation.} The entire adversarial perturbation generation pipeline is implemented in PyTorch~\cite{NEURIPS2019_9015}. We utilize an open-source UNet implementation\footnote{https://github.com/zhixuhao/unet} for the TNet architecture. All training and adversarial perturbation generation jobs are run on an Ubuntu 18.10 computer with $4$ NVIDIA RTX A5000 graphic cards and $132$GB memory. Note in the attack phase the adversary only needs to serve pre-generated perturbations.
+
+% \begin{itemize}
+%     \item Transparent Display Setup (include not on AR glasses)
+%     \item Dataset we used
+%     \item Computation/laptop/camera
+%     \item Include figure of setup
+%     \item Target models attacked
+% \end{itemize}
+
+% % Figure environment removed
+
+%TODO: note, this figure still has Cataract in it
+% Figure environment removed
+
+\noindent\textbf{Transparent Display Gadget.} 
+% \autoref{fig:setup-diagram} shows the construction of our transparent display gadget. 
+Borrowing the mechanism behind AR glasses and HUDs, we attach a $50:50$ ratio beam splitter to an Adafruit Mini PiTFT $1.3$" LED display (\ref{fig:trans-display}). We control the display using the Python ST7789 library\footnote{https://github.com/pimoroni/st7789-python}. The beam splitter partially reflects light emitted from the display into the victim camera lens. Light from the perceived object or scene can simultaneously reach the victim camera lens. The gadget is already very compact - slightly larger than an apple watch. Commercial transparent displays for AR can be even smaller (as small as a piece of len in a pair of glasses\footnote{https://www.lx-ar.com/\#/device/1?source\_inside=product}).
+% \yi{details of the hardware setup such as splitter.}
+
+\noindent\textbf{Victim Camera.} A Raspberry Pi Camera v2 was selected as the victim camera for all experiments. The camera is controlled by the PiCamera module\footnote{https://picamera.readthedocs.io/en/release-1.13/}. The camera's parameters (e.g., auto exposure, white balance) are fixed for all captured images.
+
+\noindent\textbf{Controlling the Light Conditions.} Indoor experiments were performed in a controlled laboratory environment. We measured the ambient light with a Urceri MT-912 lux meter. By adjusting the scene illumination, we were able to simulate different ambient environments, e.g., sunny versus cloudy conditions. The default environmental luminous flux was approximately $50$ lux. A $65$ Watt floodlight placed at varying distances was used to achieve different levels of illumination, with a maximum illuminance of approximately $3000$ lux. 
+% Measured illuminance of various ambient environments can be found in Appendix C.
+% \autoref{tab:light} shows the illuminance of various ambient environments as measured using the lux meter.
+% \eric{we should include the model of the lux meter used}
+
+% \begin{table}[]
+% \centering
+% \begin{tabular}{|l|c|}
+% \hline
+% Ambient environment              & Illuminance \\ \hline
+% Sunny afternoon                        &     35000        \\ \hline
+% Cloudy afternoon                       &             \\ \hline
+% Rainy afternoon                        &             \\ \hline
+% Sunrise or sunset on a sunny day &  460           \\ \hline
+% Indoor w/ ceiling light on       &  600           \\ \hline
+% \end{tabular}
+% \caption{Measured illuminance of various ambient environments. \eric{TODO: fill in missing values, include 2 new columns of binary values of where our attack is effective versus where SLAP is effective}
+% \luis{Add citation for luminance: ~\cite{eun2016bright}}}
+% \label{tab:light}
+% \vpsace{}
+% \end{table}
+
+% \begin{table}[]
+% \centering
+% \caption{The measured illuminance of various ambient environments~\cite{eun2016bright} as well as how \name and prior work were performed under each ambient light level. \Tdot~ indicates high ASR, \LEFTcircle~ indicates low to medium ASR, and \Twdot~ indicates not working at all. \name supports much stronger ambient light.}
+% \begin{tabular}{r|ccc}
+% \toprule
+% % \tabularnewline
+% Ambient Environment              & \multicolumn{1}{l}{Illuminance} & \name & SLAP \\ \hline
+% Indoor w/ Ceiling Lights       & 50 lux                          &    \Tdot      &   \Tdot   \\
+% Before Sunset & 120 lux                         &   \Tdot       &     \Tdot \\
+% Overcast Afternoon                      & 400-600 lux                                &    \Tdot      &   \LEFTcircle   \\
+% Midday, Overcast          & 1k-2k lux                   &    \Tdot      &   \Twdot   \\
+% Midday, Clear              &           40k-100k lux                      &    \LEFTcircle      &  \Twdot    \\ 
+% \bottomrule
+% \end{tabular}
+% \label{tab:light}
+% \end{table}
+
+% \noindent\textbf{Evaluation Protocol.} Here we talk about our evaluation setup and metrics.
+
+\noindent\textbf{}
+
+% % Figure environment removed
+
+% % Figure environment removed
+
+
+% % Figure environment removed
+
+% % Figure environment removed
+% % Figure environment removed
+
+% % Figure environment removed
+
+% % Figure environment removed
+
+% % Figure environment removed
+
+% Figure environment removed
+
+
+
+\subsection{Traffic Sign Recognition Results} 
+
+% In this use case, we assume the victim camera is mounted on an autonomous vehicle. Captured images are fed into a traffic sign recognition module. The goal of \name is to cause misclassifications by the model.
+
+In this experiment, the goal of \name is to cause misclassifications of traffic sign recognition modules.
+
+
+% % Figure environment removed
+
+% \begin{table}
+% \centering
+%     \begin{tabular}{|c|c|c|c|c|c|c|}
+%         \hline
+%          & School Zone & Stop Sign & Yield & Slow & ...  \\
+%          \hline
+%         ASR &  &  &  &  &   \\
+%         \hline
+%     \end{tabular}
+% \caption{ASR of the first use case.}
+% \label{table:case1_asr}
+% \end{table}
+
+\noindent\textbf{Recognition Modules.} We consider $3$ recognition modules: one classifier and two object detectors. For the classifier, we finetune a Resnet-50~\cite{he2016deep} using the combined dataset of the LISA traffic sign dataset~\cite{mogelmose2012vision} and $3400$ traffic sign images that we collected. The LISA traffic sign dataset is a well-known benchmark for traffic sign recognition applications.  Similar to the LisaCNN~\cite{eykholt2018robust} model, we use $17$ classes from the dataset. The total number of images in all $17$ classes is $6966$. The fine-tuned classifier achieves $99\%$ accuracy, which matches the results of LisaCNN. 
+For object detectors, we consider Faster R-CNN~\cite{ren2015faster} and YOLO v3~\cite{redmon2018yolov3}. For Faster R-CNN, we use ResNet-50 and a feature pyramid network~\cite{lin2017feature} as the backbone. For YOLO v3 we use Darknet-53 as the backbone~\cite{redmon2018yolov3}. Similar to~\cite{lovisotto2020slap}, we set the detection threshold of bounding boxes for Faster R-CNN and YOLO v3 to be $0.6$ and $0.4$ respectively. The input image size is set to be $240$x$240$ for Faster R-CNN and ResNet-50, and  $224$x$224$ for YOLO v3.
+Both of these two detectors are pretrained on the MS COCO dataset~\cite{lin2014microsoft}. For Faster R-CNN we obtained the pretrained checkpoint from PyTorch~\cite{NEURIPS2019_9015}. For Yolov3, we download the checkpoint from its official GitHub page\footnote{https://github.com/ultralytics/yolov3}. %\eric{How many images from MSCOCO?}\yi{it is not us who trained these detectors, we downloaded pretrained checkpoints} 
+Since the MS COCO dataset only contains stop signs but excludes all of the other traffic signs we otherwise consider, for the detectors, we present attack results only for stop signs.
+
+% Figure environment removed
+
+\noindent\textbf{Evaluation Protocol.} We created physical models of all $17$ classes of traffic signs that we used to train the recognition module for evaluating our attack. Each model traffic sign is approximately $3$cm x $3$cm. Since an actual traffic sign is much larger (an actual stop sign is about $76$cm x $76$cm), we scaled down the distance between the victim camera and the traffic sign accordingly. For instance, $47$cm in our setup corresponds to $12$m for an actual traffic sign. To collect data for evaluation, we placed a model traffic sign in front of the victim camera as shown in Section~\ref{fig:trans-display}. We recorded videos while moving the traffic sign to different distances and angles. Similar to~\cite{lovisotto2020slap}, we consider a maximum distance of $47$cm (which is equivalent to $12$m for a full-size traffic sign). For varying the angles, we keep the traffic sign within the field of view of the camera. Each video contains on average $500$ frames.
+% \eric{How many images/videos were collected?}
+
+\noindent\textbf{Generating Perturbations.} When generating a perturbation using the dot-based perturbation generating function (Section~\ref{sec:modeling}), we set the number of dots $n$ to be 100, the radius of the $k^{th}$ dot $r_k$ to be $1/10$ of the perturbation's height, the alpha blending value $\alpha_{\textnormal{max}}$ to be $1$, and the alpha dropoff $\beta$ to be $1$. We define the attack objective for the traffic sign classifier to minimize the reciprocal of the cross-entropy loss with respect to the true label. For detectors, the attack objective is to minimize the average class score of all the bounding boxes with respect to the class under attack. Our training dataset for generating the perturbations contains $1,000$ images for each type of traffic sign. We use a batch size of 16. The initial learning rate for the dot centers $c$ and color $\gamma$ are $1$ and $0.1$ respectively. Each batch is divided by 10 every $200$ epochs. We train each perturbation for $500$ epochs but we observe the optimization usually converges much earlier.
+
+\noindent\textbf{Indoor Results.} For indoor experiments, we evaluated the adversarial perturbations under various illuminance values (produced by moving the floodlight) ranging from $120$ lux to $3000$ lux. We define the attack success rate (ASR) to be the rate of misclassified frames across all recorded video frames with the target object. %out of all the frames of a video we recorded with a target object in the  tframe, how many of them are misclassified. 
+For the traffic sign classifier, this corresponds to the rate of misclassification into any other class. For the traffic sign detector, it corresponds to any missed detections. Figure~\ref{fig:indoor_asr} shows the results of our indoor experiments. For a given model, we report the average ASR over all the traffic signs across different illuminance values. As can be seen from the figures, our attack is effective in a wide range of environmental lighting conditions, including much stronger ambient light when compared to prior work. We attribute this success to our hardware and software co-designed attack approach, which enables a strong perturbation to be computed and precisely imposed on the victim camera. %The attack can survive much stronger ambient light when compared to prior work. 
+Because our attack is sensor-based, i.e., the adversarial perturbation is placed in close proximity to the victim camera, the ambient light has less of an impact on the perturbation performance. %Table~\ref{tab:light} to give the readers an idea of what different levels of illuminance mean. 
+Although we observe that the ASR for object detectors degrades in strong ambient light, we note that fooling an object detector is more difficult than fooling a classifier since the adversarial perturbation needs to account for both the bounding box and the class of the object in the bounding box. Specifically, only the pixel mutations inside and around the bounding box of the object can effectively alter the final prediction of the model. 
+% We also performed an ablation study on different components of \name. This can be found in Appendix A.
+% This is more obvious as the attack performance on Faster-RCNN is even slightly worse than YOLO v3. Faster-RCNN is a two-stage detector, only the pixels inside a bounding box will be used to make class predictions. 
+
+% \yi{we might also want to include a bar plot showing the performance of each class, just to give an idea of the effect of TNet on objects with different colors and shape.}
+
+% We first consider an untargeted attack scenario, i.e., for the classifier, it is causing misprediction (to any other classes) while for the detector, it is causing miss detection. 
+
+% We also present out targeted attack resunts
+
+% \documentclass[12pt,a4paper]{article}
+% \usepackage[T1]{fontenc}
+% \usepackage[utf8]{inputenc}
+% \usepackage[spanish]{babel}
+% \usepackage{graphicx}
+
+% \newcommand{\subf}[2]{%
+%   {\small\begin{tabular}[t]{@{}c@{}}
+%   #1\\#2
+%   \end{tabular}}%
+% }
+% % Figure environment removed
+
+% Finally, We compare our dynamic attack with a static attack approach. Here static attack means once the perturbation has been applied to the camera, it cannot be changed, such as in~\cite{li2019adversarial}. 
+
+% We compare the number of successfully attacked signs in \autoref{table:case1_compare}
+
+% \begin{table}
+% \centering
+%     \begin{tabular}{|c|c|c|c|c|c|c|}
+%         \hline
+%          & School Zone & Stop Sign & Yield & Slow & ...  \\
+%          \hline
+%         Static &  &  &  &  &   \\
+%         \hline
+%         Dynamic &  &  &  &  &   \\
+%         \hline
+%     \end{tabular}
+% \caption{Comparison to static approach.}
+% \label{table:case1_compare}
+% \end{table}
+
+% % Figure environment removed
+
+% \noindent\textbf{Ablation Study.} We perform an ablation study to investigate the contributions of \namenospace's components toward the final attack performance. We first consider the effect of removing TNet in \namenospace/d, i.e., when optimizing for an adversarial perturbation, we use $I_d$ directly as $I_p$ without passing it through TNet. We also consider the effectiveness of randomly generated perturbations in \namenospace/r. For \namenospace/r, we randomly generate 20 perturbations to attack the signs and select the perturbation with the highest ASR. Finally, we study the contribution from considering the variation of environmental factors. For this study, we fix all the factors, e.g., background, perspective, rotation, distance, and the light conditions, when preparing data to optimize a perturbation model using \namenospace/s. We report the results in Figure~\ref{fig:ablation}. For all three models, the comprehensive \name achieves significantly better results. Random perturbations perform the worst among all the variants except for ResNet-50. This can again be explained by the fact that classifiers are in general easier to attack when compared to object detectors~\cite{chen2018shapeshifter}. Some random guesses might fall inside vulnerable regions of the model's loss surface. However, the attack performance is still far from the performance of our approach. For \namenospace/s, not considering the environmental factors when crafting the perturbation results in highly sensitive perturbations with unstable attack performance. This is more obvious when the ambient light is stronger -- above 1500 lux the perturbations have no effect.
+
+% \noindent\textbf{Influence of Distance.} We investigate the influence of the distance between the victim camera and a traffic sign on the attack success rate. For this experiment, we divide the max distance of $47$cm in our setup into 10 intervals. We then slowly move a stop sign from $47$cm towards the camera. We group all the frames in an interval and report the ASR. The results are shown in 
+% As can be seen from the figure, 
+
+\noindent\textbf{Outdoor Results.} Outdoor experiments allow us to test our attack in a more realistic environment as well as in stronger natural light. To perform outdoor experiments, we transported the entire experimental setup to an outdoor road. We measured the illuminance using the same lux meter. %The outdoor experiments were conducted on a clear sunny day afternoon and evening in May.  
+% Since it is not safe and easy for us to collect results on open roads with various traffic signs, we again use our printed signs. It is not possible for us to control the outdoor illuminance precisely, we evenly sample multiple time slots in an afternoon (from 12pm to 6pm) and measure the environmental illuminance during these time slots. 
+Figure~\ref{fig:outdoor_asr} shows the outdoor attack results. For the classifier, \name is able to maintain a high ASR across all tested illuminance levels. For detectors, \name has nearly perfect attack performance up to 600 lux. This is equivalent to an overcast afternoon with some overhead cover. As illuminance increases, \name is still effective up to 3,000 lux, which is equivalent to noon on an overcast day. In general, \name can survive much stronger ambient light compared to prior light-based attacks~\cite{lovisotto2020slap}, which were tested to be effective only up to $120$ lux. To push the limit of \name in terms of illuminance, we exposed the setup to direct sunlight. In the most extreme case, we pointed the victim camera towards the sun. The measured illuminance was $60,000$ lux. To reduce the amount of light traveling into the camera lens, we utilized a neutral-density (ND) filter in front of the transparent display. The attack results are shown in Figure~\ref{fig:filter}. From the results with the ND filter, we found that \name can work under direct sunlight.
+% \yi{also put clean accuracy as a reference.}
+% \eric{unfinished}
+
+% Figure environment removed
+
+% Figure environment removed
+
+\noindent\textbf{Comparison to Static Approach.} As mentioned in Section~\ref{sec:design}, one major advantage of our attack approach compared to prior work is that our attack is dynamic. The adversary can change the displayed perturbation based on different situations. For example, the adversary can change the perturbations for different traffic signs based on the location of the victim vehicle to maximize the attack damage.
+% \eric{what situations? be more specific} 
+For static approaches, once a perturbation is attached to the victim camera, the attack cannot be changed or removed. To evaluate the efficacy of our approach, we compared the following two cases: 1) dynamic attack: an adversarial perturbation is crafted for each traffic sign and can be changed dynamically during the attack phase; and 2) static attack: an adversarial perturbation is crafted to maximize the misclassification rate of all types of traffic signs. To prepare such a perturbation, we perform the same optimization process with the same attack objective: maximize the loss with respect to the true label. However, instead of using images from a single class (e.g., the stop sign), we use images from all the classes. We randomly sample 1,000 routes from a traffic sign map\footnote{https://help.mapillary.com/hc/en-us/articles/360003021432-Exploring-traffic-signs}.  Each route contains approximately 100 traffic signs. We then test how effective the perturbations in each case are on these traffic signs. For the dynamic attack, the adversary is able to locate the vehicle through GPS and has access to a traffic sign map. For each encountered traffic sign, the perturbation specifically designed for it can be displayed accordingly. For the static attack, since there is only one single perturbation, it will be used for all the traffic signs. We report the average ASR over all the traffic signs in a route and all the routes for both cases in Figure~\ref{fig:compare_static}. Attempting to use one single perturbation for all the classes results in degraded attack performance because designing a single perturbation to accommodate too many cases is more challenging. \name has the ability to change the perturbation dynamically so each perturbation can focus on its own target class.
+
+\noindent\textbf{Transferability.} We also investigate the transferability of \name across different models--in addition to the $3$ models we already evaluated. We also consider Google Vision\footnote{https://cloud.google.com/vision}, a commercial pre-trained Image content recognizer. %\yi{this sounds like we are only evaluating Google Vision, in fact we are evaluating all 3 models.} 
+We queried the Google Vision API with our perturbed images. We define the ASR in this case as the percentage of queried images that do not return ``Stop Sign" in their top predictions. We report the cross-model ASR in Figure~\ref{tab:transferability}. According to the results, perturbations are more transferable between Faster R-CNN and YOLO v3, while not as transferable with ResNet-50. This is because Faster R-CNN and YOLO v3 are both object detectors and are both trained on the same dataset. This makes it easier for AEs to transfer between them. On the contrary, ResNet-50 is performing a different task (i.e., only classification) and trained on a different dataset. Finally, Google Vision is completely unable to defend against \namenospace. 
+Results are shown in \autoref{tab:transferability}.
+
+
+
+% Please add the following required packages to your document preamble:
+% \usepackage{multirow}
+\begin{table}[]
+\centering
+\caption{Transferability Results. We test generated perturbations across different model architectures. We additionally test transferability on the Google Vision Classifier API, achieving 100\% ASR in all cases. (*) indicates the usage of a neutral-density filter (approx. 90\% light reduction).}
+\vspace{-0.1in}
+\resizebox{.48\textwidth}{!}{%
+\begin{tabular}{cc|cccc}
+\hline
+\multicolumn{2}{c|}{}                 & \multicolumn{4}{c}{Target Model (ASR)}    \\ \hline
+lux                    & Source Model & ResNet-50 & YOLO v3  & Faster R-CNN & Google Vision \\ \hline
+\multirow{3}{*}{120}   & ResNet-50    & -         & 68.01\% & 98.32\% & 100\%     \\
+                       & YOLO v3       & 0\%       & -       & 100\%  & 100\%     \\
+                       & Faster R-CNN & 0\%       & 95.2\%  & -       & 100\%     \\ \hline
+\multirow{3}{*}{600}   & ResNet-50    & -         & 13.77\% & 33.33\% & 100\%     \\
+                       & YOLO v3       & 0\%       & -       & 86.61\%& 100\%     \\
+                       & Faster R-CNN & 0\%       & 32.23\% & -       & 100\%     \\ \hline
+\multirow{3}{*}{1400*}  & ResNet-50    & -         & 100\%   & 100\%  & 100\%     \\
+                       & YOLO v3       & 0\%       & -       & 100\%  & 100\%     \\
+                       & Faster R-CNN & 0\%       & 92.22\% & -       & 100\%     \\ \hline
+\multirow{3}{*}{5000*}  & ResNet-50    & -         & 100\%   & 100\%  & 100\%     \\
+                       & YOLO v3       & 0\%       & -       & 100\%  & 100\%     \\
+                       & Faster R-CNN & 0\%       & 100\%   & -       & 100\%     \\ \hline
+\multirow{3}{*}{40000*} & ResNet-50    & -         & 26.77\% & 45.07\%& 100\%     \\
+                       & YOLO v3       & 0\%       & -       & 63.31  & 100\%     \\
+                       & Faster R-CNN & 3.33\%    & 82.23\% & -       & 100\%     \\ \hline
+\end{tabular}
+}
+\vspace{-0.1in}
+\label{tab:transferability}
+\end{table}
+
+
+% % Figure environment removed
+
+% Please add the following required packages to your document preamble:
+% \usepackage{multirow}
+% \begin{table}[]
+% \centering
+% \begin{tabular}{lcccccc}
+% \hline
+% \multirow{2}{*}{}                   & \multicolumn{6}{c}{Illuminance}       \\
+%                                     & 120 & 300 & 600 & 1000 & 1500 & 2000 \\ \hline
+% \multicolumn{1}{c}{Cataract}        &     &     &     &      &      &      \\
+% \multicolumn{1}{c}{Static Approach} &     &     &     &      &      &      \\ \hline
+% \end{tabular}
+% \caption{Comparing to a static approach.}
+% \label{tab:compare_static}
+% \end{table}
+
+% Figure environment removed
+
+\begin{comment}
+
+\subsection{Face Recognition Results}
+
+We also evaluate our attack under a face recognition setup to show the generalizability of our approach. In this use case, we consider a face verification model to be the model under attack. The face verification model takes frames of faces as inputs, compares each frames
+
+predicts which individual each frame belongs to.
+% \eric{maybe remove ``in front of it''}
+For this evaluation, we consider an impersonation attack. In an impersonation attack the adversary tries to impersonate a registered user of a face recognition system. We assume  
+
+we record videos of 10 individuals in our research group and extract the frames to form a face dataset. When recording the video, we ask the individuals to turn their head slowly within $(-30^{\circ}, 30^{\circ})$ angle. At the end $500$ frames are extracted for each individual.
+We consider FaceNet~\cite{schroff2015facenet} to be the face recognition model. The FaceNet is pretrained on VGGFace2 ]\cite{cao2018vggface2}. We modify the last classification layer such that the output dimension matches with the number of individuals in our face dataset. We then finetune the model on our face dataset. We split our face dataset with a $0.8/0.2$ ratio for training/validation. The validation results shows that the model can classify the faces of these $10$ individuals with an accuracy of $99\%$.
+
+To attack such a face recognition model, We consider an impersonation attack where one 
+
+We train the human detection model with our own dataset. We asked 10 individuals to present in front of the camera in various gestures and record a video for 10 seconds. We then treat each frame of the video to be a image. We also record a video when no one is presented. We again trained the human recognition model based on the pre-trained YOLO v5. 
+
+face results will be shown in \autoref{fig:face}.
+\yi{During the face experiments, we found that we shouldn't assign too much weight to the original class loss term, otherwise the original class loss term might dominant the optimization and the predictions won't be driven towards the target class.}
+
+% % Figure environment removed
+
+% Figure environment removed
+
+% \yi{We might similarly show the average ASR under various light conditions. We can include detailed numbers of each pair of individuals in the appendix.}
+\eric{incomplete}
+\end{comment}
+
+
+% \begin{itemize}
+%     \item Security camera--Static sensor detecting objects; attack goal: targeted attack where we make a person be detected as a normal object; look into existing detectors; tentatively, make a human be detected as a box as they walk through a scene \luis{Come up with at least two targeted misclassifications (based on what these security cameras are using)}
+%     \item Self-driving car perception with moving objects (Yolo): targeted attack where any "safe" sign (schoolzone, stop sign, yield, "slow") is perceived as a 65 mph speed limit sign.
+% \end{itemize}
+
+% \subsection{Evaluating different attack parameters}
+% \begin{itemize}
+%     \item Coarsed-grained AML attacks (UAP) vs Fine-grained attacks (attacks on Yolo)
+%     \item Time-to-generate attack; depends on hardware used to attack; refresh rate
+%     \item Tradeoff between and time-to-generate perturbation (refresh rate)
+% \end{itemize}
+
+% \subsection{Compare to existing digital AML attacks}
+
+% In this section we show that directly applying digital AML attacks cannot achieve good results due to the gap being not filled. Our attack has better results.
+
+%\luis{Todo: add traffic dataset evaluation based on some ASR results. We will use Mapillary plus some open driving dataset}
+%\subsection{Compare to existing physical AML attacks}
+%Adversarial camera stickers is a UAP atack, we can compare by comparing the successful rate of a video of multiple frames between their UAP attack and our dynamic individual frame attack.
+
+% Please add the following required packages to your document preamble:
+% \usepackage{multirow}
+
+
+\begin{table}[]
+\footnotesize
+\centering
+\caption{ASR of our AEs evaluated against existing defense solutions under different light levels. We present averaged runs for Input Randomization, and only the best defensive result for Feature Squeezing (full results can be seen in Figure~\ref{fig:feature-sq}).}
+\vspace{-0.1in}
+\resizebox{1\linewidth}{!}{%
+\begin{tabular}{cc|cccccc}
+  \hline
+Model &
+  \begin{tabular}[c]{@{}c@{}}Ambient\\ Light (lux)\end{tabular} &
+  \begin{tabular}[c]{@{}c@{}}Baseline \\ ASR\end{tabular} &
+  \begin{tabular}[c]{@{}c@{}}Input \\ Randomization\end{tabular} &
+  \begin{tabular}[c]{@{}c@{}}SentiNet \end{tabular} &
+  \begin{tabular}[c]{@{}c@{}}Feature \\ Squeezing\end{tabular} &
+  %\begin{tabular}[c]{@{}c@{}}Adversarial \\ Training (AT)\end{tabular} &
+  \begin{tabular}[c]{@{}c@{}}Physical Adv. \\ Training \end{tabular}
+  \\ \hline
+\multirow{5}{*}{Resnet-50} & 120  & 100\%  & 98.5\% & 100\%  & 94.1\% &  100\% \\
+                           & 180  & 100\%  & 98.3\% & 100\%  & 59.2\% &  100\% \\
+                           & 300  & 100\%  & 90.5\% & 100\%  & 84.1\% &  100\% \\
+                           & 600  & 100\%  & 95.8\% & 100\%  & 89.9\% & 75.3\% \\
+                           & 1500 & 92.7\% & 92.2\% & 87.0\% & 28.3\% & 26.1\% \\
+                           %& 3000 & 78.3\% & 80.5\% & 67.5\% & 0\%    & 24.1\% \\
+                           & 3000 & 88.7\% & 91.4\% & 67.5\% & 86.8\%    & 34.3\% \\
+                           \hline
+\end{tabular}
+}
+\label{tab:defense}
+\vspace{-0.1in}
+\end{table}
+
+\subsection{Evaluation Against Existing Adversarial ML Defenses}
+
+In this section, we evaluate our physical adversarial perturbations against existing ML defenses. 
+% Many defenses focus on digital-domain attacks, where adversaries can precisely perform specific fine-grained modifications (e.g., pixel-level manipulations), whereas few defenses explicitly mention or seek to defend against physical-domain attacks. Therefore, 
+We consider two main criteria in choosing defenses to evaluate. The first criteria is non-specificity, as defenses targeting specific attack signatures or features are less likely to be successful against attacks they weren't designed for. The second defense criteria is low computational overhead, allowing it to be used in real-time applications. As such, we evaluate these defenses on traffic sign identification.
+Specifically, we test our adversarial perturbations against SentiNet~\cite{chou2020sentinet} -- a defense designed to detect physical AEs (e.g., physically-placed patches or stickers) -- as well as feature-squeezing~\cite{xu2017feature} and input randomization~\cite{xie2017mitigating}, two adversarial defenses which transform classifier inputs and meet the criteria of generality and low overhead. Additionally, we evaluate adversarial training~\cite{goodfellow2014explaining} as a general and preemptive defense simulating a knowledgeable or adaptive defender. A summary of these results can be found in Table~\ref{tab:defense}. In general, the trend of increasing brightness suppresses the effectiveness of \namenospace, resulting in decreased ASR as lux levels increase.
+
+\begin{comment}
+% Figure environment removed
+\end{comment}
+
+\begin{comment}
+% Figure environment removed
+\end{comment}
+
+% Figure environment removed
+
+\noindent\textbf{SentiNet.}
+SentiNet~\cite{lovisotto2020slap} detects adversarial attacks using a comparative saliency mechanism.
+Using Classifier Confidence and classifier Fool Rate (\%) to differentiate between benign and adversarial salient regions over several datasets, SentiNet can detect adversarial patches and perturbations.
+%Given a small set of known-clean reference images with known labels, an additional set of clean benign images, and a set of adversarial images,
+%SentiNet trains a polynomial threshold function over two metrics: Fool Percentage and Classifier Confidence.% Using a saliency function like GradCAM~\cite{selvaraju2017grad} or XRAI~\cite{kapishnikov2019xrai},
+%SentiNet isolates salient regions of benign and adversarial image sets, overlaying them onto reference images and noting any changes in network classification (Fool Percentage) and Classifier Confidence. After collecting this data, SentiNet fits a polynomial function separating benign and adversarial sample groups.
+%We evaluate SentiNet by first using a set of 200 benign images to fit SentiNet's attack detection classifier. We then evaluate 100 adversarial images using SentiNet's salience region testing. For finer granularity, we compute higher-resolution saliency regions using XRAI, following the implementation of~\cite{lovisotto2020slap}.
+Results in Figure \ref{fig:sentinet-asr} show a low detection rate, with the adversarial samples' distribution heavily overlapping and falling below the attack detection threshold polynomial fit by the behavior of the benign samples.% (Fig. 13b). %within the benign distribution for the two discriminatory features of SentiNet.
+We suspect that our adversarial perturbations are more difficult to detect using SentiNet because they are less centralized than the original patches studied. This is suggested by the low Fool Percentage of our AEs %(See Appendix B Figure~\ref{fig:feature-sq}) 
+-- individually, a single dot or localized dot cluster is not salient enough to produce adversarial behavior. % might be incorrect: Conversely, the slightly higher Average Confidence (evaluated with overlaid(?) salient regions replaced by low-salience Gaussian noise) of our adversarial samples indicate that our perturbations do not function exclusively by occluding the traffic sign. 
+
+% Figure environment removed
+
+\noindent\textbf{Feature-Squeezing.} Feature squeezing reduces the dimensionality of classifier inputs, restricting the space for AEs. This technique offers a simple and general strategy to attenuate both physical-domain and digital-domain attacks. We evaluate the effectiveness of bit-depth reduction on our adversarial perturbations. It can be seen that feature squeezing works only at low bit-depth. %We have some more detailed analysis on this defense solution in Appendix B.
+% by comparing its impact on classifier accuracy for benign and adversarial samples. 
+% Results are shown in Figure~\ref{fig:feature-sq}. 
+%As the input bit-depth decreases, the overall classifier accuracy is increasingly affected. This has a slight effect on adversarial samples, however classifier accuracy remains low.
+
+% As the input image bit depth decreases, both benign and adversarial classifier accuracy remains relatively stable until the bit depth drops below 2 bits/channel. At this point, we observe a general increase in adversarial accuracy.
+% We hypothesize that this is due to the dot perturbation's color robustness -- each dot maintains a constant color gradually fading outwards. As a result, decreasing the bit-depth only slightly attenuates the perturbation until the final step, in which each channel only has 2 possible values, more significantly affecting the perturbation.
+%Notably, feature-squeezing has a moderate effect even at high bit-depths and greater effectiveness at very low bit-depth. However, the steep accuracy-detection tradeoff reduces the practicality of low bit-depth.  %However, our adversarial perturbations robust enough that they are not attenuated until the bit-depth (and classifier accuracy) have been significantly reduced.
+
+
+
+\noindent\textbf{Input Randomization.} Input randomization modifies the classifier input during inference with a random re-scaling and padding in order to disrupt possible attacks which may rely on precise positioning. We rescale input images randomly between 224-240 pixels from their original size of 224, then randomly pad each edge to reach the final size of 240. We present averaged results over several runs with different random initializations, however, we note that the variance was less than 10\% among each group. We find that input randomization leads to only minor changes in the effectiveness of our adversarial perturbations.
+%We find that input randomization performs well, successfully increasing adversarial classification accuracy to 73.9\% (averaged over multiple runs).
+%However, this comes at the expense of clean classifier accuracy, which on average decreases 10\% from the baseline.
+
+
+
+\noindent\textbf{Adversarial Training.} 
+%Adversarial training incorporates adversarial examples into the training process in order to make classifiers more robust. However, this usually comes at the expense of clean accuracy and is tuned for digital-domain attacks.
+Wu \etal\cite{Wu2020Defending} propose an occlusion-based adversarial training process to increase classifier robustness against physically-realizable attacks. 
+This method of \textit{physical} adversarial training was designed to combat patch-based and sticker-based attacks~\cite{sharif2016accessorize, eykholt2018robust} with the idea that the characteristics of digital and physical attacks differ greatly, and therefore conventional adversarial training is not well-suited to physical attacks. We find physical adversarial training to be a promising method for partially mitigating our attack, especially at higher lux levels. We hypothesize that the higher effectiveness is hindered by the slight mismatch in threat models, as physical adversarial training focuses on ``occlusive" perturbations like stickers and patches, whereas light-based perturbations are additive and do not occlude.
+
+
+
+% \subsection{Trade off between accuracy and speed}
+
+

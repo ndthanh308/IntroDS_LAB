@@ -1,0 +1,107 @@
+\section{Methodology}
+\label{sec:experiment_methodology}
+
+In this section, we present our experiment methodology by introducing the infrastructure we base our experiments on, the implemented use cases, and the utilized evaluation metrics.
+
+\subsection{Infrastructure Setup}
+
+We select Apache Flink as a representative DSP system for our evaluation because it fulfills all previously defined assumptions like exactly-once semantics, fault
+tolerance, horizontal scalability, near to real-time event processing with processing one
+event at a time, and batch processing.
+Our complete infrastructure around Flink, illustrated in~\autoref{fig:infrastructure}, is deployed in a Kubernetes cluster to ensure high availability, fast scaling, and ease of management. 
+Apache Kafka is used as a messaging platform due to its high scalability, availability, and fault-tolerance. 
+The different partitions of Kafka are evenly distributed among the sub-tasks of Flink. 
+External data source enrichment is performed using Apache Cassandra, a column-based NoSQL database with high availability and fast read access. 
+Redis is deployed as a cache and is used as a popular in-memory key-value NoSQL database. 
+Prometheus, an open-source monitoring service with an integrated time series database, is deployed for a successful and meaningful evaluation. 
+Flink metrics can be easily scraped periodically and stored in Prometheus for later access.
+
+% Figure environment removed
+
+\begin{table}
+\centering
+\caption{Kubernetes Cluster Setup}
+\begin{tabular}[t]{lp{0.58\linewidth}}
+ \toprule
+ Resource & Details\\
+ \midrule
+ Node - Machine & c2-standard-8 (32GB memory, 8 vCPUs\\
+ & with 3.1GHz base frequency) \\ 
+ Node - Disk & 100GB, pd-standard (backed by HDD) \\ 
+ Software & Docker 20.10, Kubernetes 1.23, Java 11,\\
+ & Flink 1.14, Kafka 2.8, Redis 7.0,\\
+ & Cassandra 4.0, Prometheus 2.3, Python 3.7 \\
+ \bottomrule
+\end{tabular}
+\label{table:experimental_setup}
+\end{table}
+
+In general, the deployment of the infrastructure was parameterized with the aim of conducting the largest possible number of experiments within the available financial resources, with some chosen parameters proving appropriate even via an exploratory approach.
+The entire infrastructure was deployed in an 8-node Kubernetes cluster in a single data center of the Google Cloud Platform (GCP) using the Google Kubernetes Engine (GKE). 
+Flink was deployed with a parallelism of 8, which is also true for the keyed window operators used in our streaming jobs to be presented, and each \textit{TaskManager} having 2 task slots. 
+In contrast, Kafka was deployed with a cluster size of 3 and each topic with 8 partitions and a replication factor of 3. 
+The Cassandra instance was deployed with replication factor 1 and the SimpleStrategy replication strategy. 
+For monitoring the Flink metrics, a Prometheus instance was deployed on a single node.
+In order to accurately simulate a real use case, Flink was always deployed on different nodes than the Cassandra instances using node selectors, since in a real use case the database is often kept separate, and deploying them on the same nodes can result in latency advantages.
+Moreover, the event generation of the use cases was performed in a separate deployment in the Kubernetes cluster to simulate network overhead more realistically. 
+\autoref{table:experimental_setup} summarizes the Kubernetes cluster setup and the used software.
+
+\subsection{Use Case Implementations}
+
+We implement two representative use cases, one for fraud detection and another one for log analytics.
+
+For several reasons, \textbf{\underline{fraud detection}} is particularly well suited as a use case to evaluate different enrichment methods.
+Historical data for enrichment in fraud detection is usually enormous and may require complex queries to get efficient results. 
+The data structure can also be complex and outsourcing a subset or all of the data would be difficult. 
+Additionally, the constant addition and editing of historical data may impact the enrichment process. 
+The complexity of fraud detection highlights why different enrichment methods can be considered.
+\textbf{Event Structure.} For this use case, we are generating credit card transaction events and writing them to Kafka. 
+Each event contains three key pieces of information: transaction details, device information, and location information. 
+The device and location information each have a hash field, which allows for unique identification. 
+The transaction part can be identified by the account and receiver ID, and the transaction ID is unique across events. 
+Parameters can be used to control the probability of events containing known 
+information.\\
+\textbf{Historical Data.} We store historical data in the form of transactions in a Cassandra database to enrich transaction events. 
+Cassandra is a suitable choice because it can efficiently handle globally made transactions in a distributed setting, and its column-oriented schema is ideal for storing transaction events and querying them efficiently. Three separate tables were created to store device, location, and transaction information. 
+The partition key for the device and location tables is the account ID, and the hash value is the cluster key. 
+For the transaction table, the account ID is the partition key, and the receiver ID and transaction ID are both cluster keys.\\
+\textbf{Streaming Job.} The job, illustrated in~\autoref{fig:fraud_detection_streaming_job}, reads transaction events from Kafka and enriches them with historical data. 
+Depending on the enrichment method, either the external Cassandra instance is accessed or the events are enriched with outsourced data directly in Flink.
+Since join operations are not possible with Cassandra, three different queries would thus be necessary.
+The subsequent enrichment verifies if the recipient, device, or location has been used by the account before, and flags the event as suspicious if it has not. 
+A sliding window operation is performed on the enriched data stream to analyze the transaction volume of an account in a certain period of time.
+The resulting event includes the total transaction amount, the number of transactions in the window, and the suspicious flags. 
+The event is then serialized and written back to Kafka.\\
+\textbf{Enrichment Methods.} We applied various enrichment methods to the fraud detection use case in Flink. 
+For the datasource client, two types of enrichment methods have been implemented: synchronous and asynchronous. 
+The asynchronous method was implemented using the Async I/O API and the DataStax asynchronous client. 
+For caching, three different methods were used: local caching with a \texttt{LinkedHashMap}, local caching with custom partition using the Flink \texttt{partitionCustom} function, and external caching using Redis, where the cache was executed in combination with the asynchronous Cassandra client in the \texttt{RichAsyncFunction} operation.
+For embedded state, all historical data was stored in a Kafka topic as another source stream and joined with the latest transaction events. 
+
+% Figure environment removed
+
+In contrast, our second use case refers exclusively to enrichment of streaming data with ML models, specifically log data.
+\textbf{\underline{Log analytics}} is important for modern applications, as logs provide insight into user and system activity and can help identify errors and suspicious behavior. 
+Our evaluation of enrichment of streaming events by ML models focuses on the effects of varying model sizes and numbers, assuming that different models are required for analysis. 
+The models are executed embedded in Flink to avoid latency issues that could arise if the models were run externally in separate services. 
+Running multiple embedded models is possible but requires careful management of memory usage to avoid crashes.\\
+\textbf{Event Structure.} Log events are generated as input for the streaming job. 
+An event contains a key that represents a specific service from which the log message originates,
+another field for the content of the log message, and a timestamp.\\
+\textbf{Model Source.} We assume that ML models will be stored in an external storage due to their high memory usage. 
+This allows for efficient combination with other cloud-located services and easy access and updates of the models. 
+However, for our use case, the external data source only plays a minor role, as the models are only fetched from the external data source once during initialization and then executed locally.\\
+\textbf{Streaming Job.} A pre-trained ML model is used to make predictions within this job, as depicted in~\autoref{fig:log_analysis_streaming_job}. 
+The log events are read from Kafka, then a Keyed Stream is created and a tumbling window operation is performed. 
+The pre-trained model is loaded from Google Cloud Storage into Flink and processed with the ONNX Runtime, a high-performance engine for executing ML models that are compliant with the Open Neural Network Exchange (ONNX) format. 
+The model is loaded into a ML library-specific session object to run the model with an input. 
+The enrichment method loads the service-specific models once from the external data source and then stores them in the state backend for efficient access. 
+A single result is generated per window, containing the service key, predictions, and window timestamps.
+
+\subsection{Evaluation Metrics}
+
+The evaluation primarily requires measurement of latency, which is not recommended to be obtained from Flink's built-in end-to-end latency metric as it impacts the cluster's performance and, in the worst case scenario, only reflects the queue time for events traversing window operators. 
+Thus, a custom latency metric was created for the fraud detection use case, which considers the waiting time, only records the first occurrence of an event in a sliding window, and stores the final latency in a Flink metric histogram. 
+The metric can then be accessed in Prometheus along with other built-in Flink metrics.
+For the log analytics use case such custom solution is not necessary, which is why the latency metric is obtained using a regular histogram.
+In addition to latencies, we also consider the consumption rate as well as system load where feasible.

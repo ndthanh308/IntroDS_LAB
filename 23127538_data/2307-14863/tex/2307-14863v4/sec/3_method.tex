@@ -1,0 +1,140 @@
+\section{Proposed Method}
+In this section, we introduce our powerful IML-ViT paradigm, as shown in Figure \ref{fig:overall}, it consists of three main components: (1) a windowed ViT to balance the high-resolution inputs and the space complexity; (2) a \textit{simple feature pyramid network} (SFPN) to introduce multi-scale features; and (3) a lightweight MLP decoder head with additional edge supervision, which aids in focusing on artifact-related features and ensures stable convergence.
+
+\subsection{ViT Backbone}
+
+\textbf{High Resolution}
+The ViT Encoder aims to mine the detailed artifacts and explore the differences between the suspicious areas. Thus, it is essential to preserve the \textbf{original} resolution of each image to avoid downsampling that could potentially distort the artifacts. However, when training in parallel, all images within a batch must have the same resolution. To reconcile these demands, we adopt a novel approach that has not been applied to any IML method before. Rather than simply rescaling images to the same size, we pad images and ground truth masks with zeros and place the image on the top-left side to match a larger constant resolution. This strategy maintains crucial low-level visual information of each image, allowing the model to explore better features instead of depending on handcrafted prior knowledge. To implement this approach, we first adjust the embedding dimensions of the ViT encoder to a larger scale. 
+
+\textbf{Windowed Attention} To balance the computation cost from high resolution, we adopt a technique from previous works~\cite{MViTv2_2022, benchmark_ViT_2021}, which periodically replaces part of the global attention blocks in ViT with windowed attention blocks.  This method ensures global information propagation while reducing complexity. Differing from Swin~\cite{Swin_2021}, this windowed attention strategy is non-overlapping.
+
+\textbf{MAE Pre-train} We initialize the ViT with parameters pre-trained on ImageNet-1k~\cite{imagenet_2009} with Masked Auto Encoder (MAE)~\cite{MAE_2022}. This self-supervised method can alleviate the over-fitting problem and helps the model generalize, supported by Table \ref{tab:ablation}.
+
+
+More specifically, we represent input images as $X\in \mathbb{R}^{3\times h \times w }$, and ground truth masks as $M\in \mathbb{R}^{1\times h \times w }$, where $h$ and $w$ correspond to the height and width of the image, respectively. We then pad them to $X_p \in \mathbb{R}^{ 3 \times H \times W }$ and $M_p \in \mathbb{R}^{ 1 \times H \times W }$. Balance with computational cost and the resolution of datasets we employ in Table~\ref{tab:datasets}, we take $H=W=1024$ as constants in our implementation. Then $X_p$ is passed into the windowed ViT-Base encoder with 12 layers, with a complete global attention block retained every 3 layers. The above process can be formulated as follows:
+\begin{equation}
+G_e=\mathcal{V}(X_p) \in \mathbb{R}^{768 \times \frac{H}{16}\times \frac{W}{16} }
+\end{equation}
+where $\mathcal{V}$ denotes the ViT, and $G_e$ stands for encoded feature map. The number of channels, 768, is to keep the information density the same as the RGB image at the input, as $ 768 \times \frac{H}{16} \times  \frac{W}{16}  =  3 \times H \times W $.
+
+% The ViT Encoder aims to mine the detailed artifacts from these high-resolution images. In other word, we aiming at \textbf{preserve the original resolution of each image}, especially not to down-sample images that could destroy the artifacts. However, to parallelize the computation, all images within a batch must have an identical resolution.  To achieve these two goals, instead of simply re-scaling images to the same size, we top-left zero-pad all images to a larger constant resolution after applying common augmentations. This approach preserves more information about fresh artifacts for the model to learn on its own and no longer requires specific prior knowledge. We reset the embedding dimensions of ViT to fit this larger input.
+% Formally, we denote an input image as $X\in \mathbb{R}^{h \times w \times 3}$, where $h$ and $w$ are the height and width of the image, respectively. We then pad them to $X_p \in \mathbb{R}^{H \times W \times 3}$ before feeding them to the ViT encoder. In this article, $H=W=1024$, but it can be modified according to the actual datasets for training.
+
+% \textbf{MAE pre-trained ViT-B} We take ViT-B~\cite{ViT_2021} as basic backbone, and further initialize it with parameters pre-trained on ImageNet-1k~\cite{imagenet_2009} with Masked Auto Encoder(MAE)~\cite{MAE_2022}. This self-supervised method can greatly alleviate the over-fitting problem and helps the model generalize, supported with Table \ref{tab:ablation}.% which can considered as the \textit{cornerstone} for image manipulation localization method using ViT. 
+% Details are shown in Section \ref{lab:ablation}. 
+
+% \textbf{Windowed attention} As mentioned, input images have been padded to a high resolution, bringing huge memory usage. Following previous works~\cite{MViTv2_2022,benchmark_ViT_2021}, we apply non-overlapping and non-shifting windowed attention instead of global attention in ViT to reduce the  complexity. However, to ensure global information propagation, we keep the complete global attention block in the \textit{3rd}, \textit{6th}, \textit{9th}, and \textit{12th} blocks among all 12 blocks in ViT-B.
+% It should be noted that the MAE pre-training is done directly by taking the parameters provided on their Github, which means that the above modifications only occur during our fine-tuning process.
+
+
+\subsection{Simple Feature Pyramid Network}
+To introduce multi-scale supervision, we adopt the \textit{simple feature pyramid} network (SFPN) after the ViT encoder, which was suggested in ViTDet~\cite{ViTDet_2022}. 
+This method takes the single output feature map $G_e$ from ViT, and then uses a series of convolutional and deconvolutional layers to perform up-sampling and down-sampling to obtain multi-scale feature maps:
+\begin{equation}
+F_i = \mathcal{C}_i(G_e)  \in  \mathbb{R}^{ C_{S}\times \frac{H}{2^{i+2}}\times \frac{W}{2^{i+2}} } , i \in \{1,2,3,4\}
+\end{equation}
+Where $\mathcal{C}_i$ denotes the convolution series, and $C_S$ is the output channel dimension for each layer in SFPN. 
+% In our paradigm, as the default ViT output is a scale of $\frac{1}{16}$ compared to the original input size, then the resulting hierarchical scale of features from the Simple Feature Pyramid is $\{ \frac{1}{4}, \frac{1}{8}, \frac{1}{16}, \frac{1}{32}\}$.
+This multi-scale method does not change the base structure of ViT, which allowed us to easily introduce recently advanced algorithms to the backbone.
+
+
+
+\subsection{Light-weight Predict Head}
+For the final prediction, we aimed to design a model that is simple enough to reduce memory consumption while also demonstrating that the improvements come from the advanced design in the ViT Encoder and the multi-scale supervision. Based on these ideas, we adopted the decoder design from SegFormer~\cite{SegFormer_2021}, which outputs a smaller predicted mask $M_e$ with a resolution of $1 \times \frac{H}{4}\times \frac{W}{4}$. The lightweight all-MLP decoder first applies a linear layer to unify the channel dimension. It then up-samples all the features to the same resolution of $  C_D \times \frac{H}{4}\times \frac{W}{4}$ with bilinear interpolation, and concatenates all the features together.
+% , as shown in Figure \ref{fig:decoder}.
+Finally, a series of linear layers is applied to fuse all the layers and make the final prediction. We can formulate the prediction head as follows:
+\begin{equation}
+% P = \mathcal{D} (Concate(Linear(F_i))) \in \mathbb{R} ^{\frac{H}{4}\times \frac{W}{4} \times 1} ,  \forall i
+P = \, MLP\{ \odot_i (W_iF_i+b_i) \}  \in \mathbb{R} ^{\frac{H}{4}\times \frac{W}{4} \times 1} 
+\end{equation}
+Here, $P$ represents the predicted probability map for the manipulated area; $\odot$ denotes concatenation operation, and $MLP$ refers to an MLP module. Detailed structure and analysis are illustrated in Figure \ref{fig:decoder}.
+
+% Figure environment removed
+
+% where $P$ denotes the predict probability map for the manipulated area, and $\mathcal{D}$ is the MLP decoder. 
+
+\subsection{Edge Supervision Loss}
+% CHAT version
+To account for the fact that artifacts are typically more prevalent at the edges of tampered regions, where the differences between manipulated and authentic areas are most noticeable, we developed a strategy that places greater emphasis on the boundary region of the manipulated area. Specifically, we generate a binary edge mask $M^\star$ from the original mask image $M$ using mathematical morphology operations including dilation ($\oplus$) and erosion ($\ominus$) \cite{morphology_1983image}, followed by taking the absolute values of the result. The formula we use to generate the edge mask is:
+\begin{equation}
+M^\star = |(M \ominus B(k)) - (M \oplus B(k))|
+\end{equation}
+where, $B(x)$ generates a $(2x+1) \times (2x+1)$ \textit{cross} matrix, where only the $x^{th}$ column and $x^{th}$ row have a value of 1, while the rest of the matrix contains 0s. The integer value $x$ is selected to be approximately equal to the width of the white area in the boundary mask. Examples of the edge mask generated using this approach are shown in Figure \ref{fig:edge}.
+
+\textbf{Combined Loss}
+To compute the loss function, we first pad the ground-truth mask $M$ and the edge mask $M^\star$ to the size of $H \times W$, and refer to them as $M_p$ and $M^\star_p$, respectively. We then calculate the final loss using the following formula:
+\begin{equation}
+\mathcal{L} = \mathcal{L}{seg}(P, M_p) + \lambda \cdot \mathcal{L}{edge}(P * M^\star_p, M_p * M^\star_p)
+\end{equation}
+where $*$ denotes the point-wise product, which masks the original image. Both $\mathcal{L}{seg}$ and $\mathcal{L}{edge}$ are binary cross-entropy loss functions, and $\lambda$ is a hyper-parameter that controls the balance between the segmentation and edge detection losses. By default, we searched the optimal $\lambda = 20$ to guide the model to focus on the edge regions, which is supported by Figure \ref{fig:lambda}. We choose a larger value for $\lambda$ also for two reasons: (1) to emphasize the boundary region, and (2) to balance the significant number of zeros introduced by zero-padding.
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+While the proposed edge loss strategy is straightforward, as we will discuss in the Experiments section (Figure \ref{fig:edge_loss}), it remarkably accelerates model convergence, stabilizes the training process, and mitigates potential NaN issues. Therefore, we consider this strategy a powerful prior knowledge for IML problems, deserving attention in future research.
+
+
+
+
+
+% where the most significant differences between the manipulated and authentic regions are likely to occur. 
+
+% This strategy also mitigates the issue of highly imbalanced data in the IML problem, as the model would tend to output a mask of all zeros if most of the regions are zero-padded.
+
+
+% RAW version
+% To capture dissimilarities between tampered and authentic regions, many hand-crafted feature extractors, such as the BayarConv2D noise extractor and DCT High-frequency extractor~\cite{objectformer_2022}, have been proposed and widely used to exploit additional information from artifacts. However, while these artificial extractors may work, they are not optimal. Features may only be effective for one type of tampering; for example, noise is more sensitive to splicing from different images but less effective for copy-move from the same image. To address this, we have adopted a more generalized solution.
+% % edge loss 的直觉设计
+% Since artifacts are more commonly distributed at the edges of tampered regions and there is a more noticeable difference between the manipulated and authentic regions at the edges, we have developed a strategy to give more weight to the boundary region. This guides the model to focus on the edge regions. Our approach involves generating a binary edge mask $M^\star $ from the mask image $M$ using dilation $\oplus$ and erosion $\ominus$ operations in mathematical morphology~\cite{morphology_1983image}, and then taking the absolute values of it. More precisely, the way we generate the edge mask is based on this formula:
+% \begin{equation}
+%   M^\star  = |(M \ominus B(k)) - (M \oplus B(k))|
+% \end{equation}
+% where $B(x)$ takes an integer $x$ then generates a $(2x+1) \times (2x+1)$ "cross" matrix which has only the $x^{th}$ column and $x^{th}$ row as 1 and the rest as 0. $2x$ is approximately equal to the width of the white area of the boundary mask. Examples shown in Figure \ref{fig:edge}. 
+
+% \subsection{Loss functions}
+% We use bilinear interpolation to upsample the prediction $P$ to full size with $H \times W$ resolution.
+% For normal segmentation loss $\mathcal{L}_{seg}$ is compute between the padded mask $M$ and 
+
+
+% Then we use $M_e$ to mask the $P$ and $M$ separately with pointwise product and compute the edge loss:
+% \begin{align}
+%   l'_i &= -M_{ei} \times l_i \\
+%   \mathcal{L}_{edge} &=  \frac{\sum_{i}^{H\times W} l'_{i}}{H\times W}
+% \end{align}
+% where $M_{ei}\in\{0,1\}$.
+
+% \textbf{Predict Loss}
+
+% The meet the full size of input image, we simply bilinear up-sampled the prediction $M_e$  to $H \times W \times 1$. Then compute the pixel level BCE loss $\mathcal{L}_{seg}$ after remove the padding region.
+% % \begin{align}
+% %   l_{i}=-[M_{i} \cdot \log P_{i}& + (1-M_{i})\cdot \log(1-P_{i})] \\
+% %   \mathcal{L}_{seg} & = \frac{\sum_{i}^{H\times W} l_{i}}{H\times W}
+% % \end{align}
+% % \begin{equation}
+% %   \mathcal{L}_{seg}=-\sum_{i,j}[M_{i,j} \cdot \log P_{i,j} + (1-M_{i,j})\cdot \log(1-P_{i,j})]
+% % \end{equation}
+% \textbf{Edge loss}
+% % 可以丢，主要是阐释为什么特征提取器不好
+% To capture dissimilarities between tampered and authentic regions, many hand-crafted feature extractors, such as the BayarConv2D noise extractor and DCT High-frequency extractor~\cite{objectformer_2022}, have been proposed and widely used to exploit additional information from artifacts. However, while these artificial extractors may work, they are not optimal. Features may only be effective for one type of tampering; for example, noise is more sensitive to splicing from different images but less effective for copy-move from the same image. To address this, we have adopted a more generalized solution.
+% % edge loss 的直觉设计
+% Since artifacts are more commonly distributed at the edges of tampered regions and there is a more noticeable difference between the manipulated and authentic regions at the edges, we have developed a strategy to give more weight to the boundary region. This guides the model to focus on the edge regions. Our approach involves generating a binary edge mask $M_e$ from the mask image $M$ using dilation $\oplus$ and erosion $\ominus$ operations in mathematical morphology~\cite{morphology_1983image}, and then taking the absolute values of it. This can be summarized in the following equation:
+
+% \begin{equation}
+%   M_e = |(M \ominus B(k)) - (M \oplus B(k))|
+% \end{equation}
+% where $B(x)$ takes an integer $x$ then generates a $(2x+1) \times (2x+1)$ "cross" matrix which has only the $x^{th}$ column and $x^{th}$ row as 1 and the rest as 0. $2x$ is approximately equal to the width of the white area of the boundary mask. Examples shown in Figure \ref{fig:edge}. Then we use $M_e$ to mask the $P$ and $M$ separately with pointwise product and compute the edge loss:
+% \begin{align}
+%   l'_i &= -M_{ei} \times l_i \\
+%   \mathcal{L}_{edge} &=  \frac{\sum_{i}^{H\times W} l'_{i}}{H\times W}
+% \end{align}
+% where $M_{ei}\in\{0,1\}$.
+
+% \textbf{Combined loss}
+% Finally the combined loss can be expressed using the following formula:
+% \begin{equation}
+%   \mathcal{L} = \mathcal{L}_{seg} + \lambda \cdot \mathcal{L}_{edge}
+% \end{equation}
+% where $\lambda$ is weight for balance. In order to give more weight to the edge regions, we set $\lambda=20$ during training, which also alleviated the issue of highly imbalanced data in the IML problem. Otherwise, the model would tend to output a mask that is all zeros because most of the regions are zero-padded.
+

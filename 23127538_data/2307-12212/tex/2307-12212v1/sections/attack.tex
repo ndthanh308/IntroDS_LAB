@@ -1,0 +1,176 @@
+\vspacebeforesection
+\section{CID Censorship Attack}\label{sec:attack}
+
+We now proceed to detail our content censorship attack, targeting a specific victim CID.
+To describe and analyze this attack, we use a Sybil attack model with notations adapted from prior work~\cite{prunster2018holistic, total_eclipse} and summarized in \Cref{tab:notation}.
+%
+
+\vspacebeforesection
+\subsection{Attack process}
+\label{sec:attack-process}
+%
+
+\input{img/attack-illustration.tex}
+
+\para{Overview}
+In IPFS, \provider records for a target CID should be stored on the $k=20$ peers closest to that CID (\ie \resolvers).
+We generate $\numSybils \geq k$ Sybil identities that are closer to the target CID than to the closest honest peer. 
+As a result, those Sybil identities receive all new \provider records from \providers and resolution queries from \downloaders for that CID.
+\Cref{fig:attack-illustration} illustrates the position of Sybil peers.
+Sybils drop \provider records and do not respond to queries for that target CID.
+%
+
+\para{Details}
+The attack proceeds as follows.
+First, we use the IPFS API to retrieve the current $k=20$ closest peer IDs to the target CID, sort them by distance to the CID, and identify the closest one.
+%
+We then repeatedly generate random public/private key pairs and compute new peer IDs by hashing the public key. 
+If a generated peer ID is closer to the CID than to the currently closest peer ID, we keep the corresponding key pair, otherwise, we discard it. 
+We repeat the process until we obtain $\numSybils$ peer IDs that are closer to the target CID than any of the original 20 closest peer IDs.
+
+For each generated Sybil peer ID, we spawn a custom \texttt{libp2p} DHT node (server) that joins the IPFS network.
+%
+%
+These Sybil nodes drop received provider records for the target CID and respond with empty messages to received resolution queries for the target CID.
+The Sybil nodes behave normally for other CIDs, so that our experiments do not affect the rest of the network.
+The attacker continuously monitors the set of $\numSybils$ closest peers to the target CID to make sure it contains only the Sybil nodes. 
+If a new, honest node appears in the set, the attacker reacts by generating additional identifiers to maintain the desired number of Sybil nodes in the set.
+%
+%
+%
+
+%
+
+%
+%
+
+\vspacebeforesection
+\subsection{Attack analysis}
+\label{sec:attack-analysis}
+
+We analyze the attack in terms of cost and in terms of effectiveness, including its timing.
+
+\para{Initial costs}
+%
+The first cost for an attacker is that of generating Sybil identities.
+As the hash function is pre-image resistant, this process must use a brute force generation of private/public key pairs and associated IDs.
+The number of attempts it takes for generating $\numSybils$ Sybil identities that are closer to the target is denoted $s(\numSybils)$.
+This number naturally depends on $\numSybils$, but also on the distance of the closest honest peer from the target CID, which in turn depends on the number of peers in the network.
+%
+The closer the honest peer is to the target CID, the more keys the attacker needs to generate to obtain Sybil peer IDs closer to the CID.
+
+The number of attempts further translates into an operational cost which we quantify using public cloud resource costs.
+This cost $\cgen$ depends on $s(\numSybils)$ and the cost of generating one private/public key pair.
+IPFS and \texttt{libp2p} support both the RSA and Edwards-curve Digital Signature Algorithm (EdDSA) cryptosystems.
+The generation of keys for EdDSA is significantly faster than for RSA, and both are embarrassingly parallel; we evaluate these costs in \Cref{sec:evaluation}, and choose to target EdDSA in our implementation of the attack 
+%
+
+The effectiveness of the attack $\aeff$ varies with the number of Sybils $\numSybils$.
+Theoretically, the attack only requires $\numSybils = k = 20$ Sybil identities.
+However, different DHT nodes do not always discover the same set of $k=20$ closest peers (we provide experimental evidence in \Cref{sec:evaluation}, \Cref{fig:20closest}).
+As a result, the attack generally requires more than $20$ Sybil identities (as some further honest peers may be discovered).
+On the other hand, some of the discovered peers may not be online, so the attack may also succeed with fewer than $20$ Sybil identities.
+We empirically studied the effect of the number of Sybil identities on the rate of successfully censoring the target content, and observe that $\numSybils = 45$ Sybil identities can censor content with a $\aeff=99\%$ probability of success (\Cref{sec:evaluation}, \Cref{fig:attack_success_rate}).
+While $\numSybils(\aeff)$ depends on $k$, $\numSybils(\aeff)$ does not depend on 
+%
+whether the content was already provided before the Sybils were launched or not.
+
+\para{Timing}
+%
+The \emph{warmup time} $\twarmup$, \ie, the time before the content is effectively censored and becomes undiscoverable, depends on whether the Sybil peers are launched \emph{before} the \provider sends its \provider records to the network or the Sybil peers are launched \emph{after}.
+%
+
+%
+If Sybil peers are launched before the first \provider sends its \provider record to the network then, since the Sybil peers are the closest peers to the target CID, \providers will most likely send their \provider records to only Sybil peers.
+These Sybil peers simply drop the provider records.
+As a result, the content never becomes discoverable in the network.
+Therefore, if all Sybil nodes are launched before the first \provider advertised the content, the attack is effective immediately, i.e., $\twarmup = 0$.
+We note, however, that this best-case scenario is not likely in all contexts of use of IPFS, as it requires knowing the CID of the content to censor before mounting the attack.
+This CID depends, indeed, on the \emph{content} of the file which may be known only upon its publication.
+In certain cases, however, the attacker may know in advance that a specific file will be published and act to prevent its discoverability.
+
+%
+If the provider records were already stored on honest peers before the Sybil peers were launched, a \downloader may encounter an honest peer with relevant provider records \emph{before} reaching the Sybil peers, and be able to obtain the provider records this way.
+%
+By default, however, such provider records expire every 48 hours\footnote{24 hours in older versions of \texttt{go-libp2p}}, after which a \provider must call $\Call{Provide}{\cid}$ again.
+As a result, in the worst case, the last provider record on an honest \resolver will be removed $\twarmup = 48$h after launching the Sybil nodes, after which the content becomes censored.
+It is not desirable to get rid of this limited lifetime of provider records: an unlimited lifetime would result in a gradual overload of long-running peers and open new avenues for DoS attacks.
+
+%
+%
+%
+
+\para{Overall costs}
+%
+The overall costs of the attack $\catt$ include the initial costs $\cgen$ plus the operational costs of running the Sybil nodes at $\coper$ per unit time.
+The operational cost is incurred during the warmup time $\twarmup$ before the attack is effective and the time during which the attack must \emph{remain} effective $\teff$.
+Therefore, $\catt = \cgen  + (\twarmup + \teff) \times \coper$.
+
+%
+%
+%
+
+%
+
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%

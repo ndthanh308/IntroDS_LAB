@@ -1,0 +1,119 @@
+% Figure environment removed
+\vspace{-2mm}
+\section{Approach} \vspace{-2mm}
+
+We propose a new framework for robot learning that performs automatic data collection and policy learning from only a task description. Our design is grounded on four key observations:
+\vspace{-2mm}
+\begin{itemize}[leftmargin=3mm]
+   \item We recognize the importance of random exploration in reinforcement learning, but aim to not be constrained by its inefficiency for long-horizon, sparse reward tasks.
+   \item We acknowledge the usefulness of LLM's common-sense and zero-shot capabilities, but believe language \emph{is not by itself} the ideal representation for robust, rich, and precise robotic manipulation.
+   \item We are inspired by the effectiveness of robotic planning methods, e.g. TAMP,
+         but wish to be flexible to novel tasks and domains %
+         and non-reliant on ground truth state %
+         during policy inference.
+   \item We aim to achieve the simplicity and effectiveness of behavior cloning in distilling collected robot experience into a policy for real-world deployment, while side-stepping the requirement for costly human demonstrations or play data collection.
+         \vspace{-2mm}
+\end{itemize}
+Using no human demonstration or manually specified reward, our framework combines the strengths of these four areas into a unified framework for both efficient task-directed exploration and multi-task visuo-linguo-motor policy learning.
+
+\textbf{Method Overview.}
+In the data generation phase, we use an LLM to recursively decompose (\S\ref{sec:method:datagen:planning}) tasks into a hierachical plan (\ie task tree) for exploration and ground the plan into sampling-based robot utilities and motion primitives (\S\ref{sec:method:datagen:grounding}).
+Next, the LLM infers success-detection functions for each task in the plan (\S\ref{sec:method:datagen:verifying}), providing success-labeling.
+This autonomous data generation process outputs a replay buffer of task-directed exploration experience, labeled with language descriptions and success labels.
+In the training phase (\S \ref{sec:method:distill}), we filter this data for success according to the LLM inferred success condition and distill it into a multi-task vision-and-language-conditioned diffusion policy~\cite{chi2023diffusionpolicy}.
+
+
+% Figure environment removed
+\vspace{-2mm}
+
+\subsection{Simplify: Task Planning and Decomposition}\vspace{-2mm}
+\label{sec:method:datagen:planning}
+
+Given a task description, the first step is to generate a high-level task plan. To improve the flexibility to work with any tasks and 3D assets, we opted for an LLM-based planner to leverage their common-sense and zero-shot reasoning skills. Unlike classical TAMP planners, our framework does not require  domain-specific engineering and transition function design to work with new tasks. %
+
+Concretely,  our recursive LLM planner takes as input the task description, the simulation state, and outputs a plan in the form of a task tree (Fig.~\ref{fig:method:datagen}a).
+To do so, the LLM first checks whether the task description involves the robot interacting with multiple or only one object.
+For instance, ``move the package into the mailbox'' involves opening the mailbox before picking up the package and putting the mailbox in, and should be considered a multi-object task.
+Meanwhile, ``with the mailbox opened, move the package into the mailbox'' should be a single-object task.
+For the base case of single-object tasks, we prompt the LLM to which object part name to to interact.
+For the case of multi-object tasks, we prompt the LLM to decompose the task into subtasks, and recurse down each subtask.
+
+
+
+
+
+\vspace{-2mm}
+\subsection{Ground: Compiling a Plan into Robot Utilities}\vspace{-2mm}
+\label{sec:method:datagen:grounding}
+With the generated task tree \S \ref{sec:method:datagen:planning}, the next step is to ground the high-level plan into physical actions. Here, the choice of the \textit{low-level robot API} critically defines the system's capability and, therefore, becomes a key differentiating factor between different systems.
+In principle,  there are three desired properties we want to see in the action space design:
+\begin{itemize}[leftmargin=3mm]
+   \vspace{-2mm}
+   \item \textbf{Flexibility.} Planar actions~\cite{codeaspolicies2022,shridhar2021cliport} aren't flexible enough to manipulate prismatic and revolute joints.
+   \item  \textbf{Scalable.} Namely, actions should not require human demonstrations to acquire~\cite{jang22a,ahn2022can,lynch2020language,stepputtis2020language,shridhar2021cliport,shridhar2022peract,lynch2022interactive}.
+   \item \textbf{Language-friendly.} While joint sequences can encode any action, it is not language-friendly.
+         \vspace{-2mm}
+\end{itemize}
+
+
+We propose to ground the LLM's plan with API calls into a set of robot utility functions, which include a sampling-based motion planner, a geometry-based grasp and placement sampler, and motion primitives for articulated manipulation.
+We refer to these utilities as 6 DOF Exploration Primitives (Fig~\ref{fig:method:datagen}b) because, by virtue of being \emph{pseudo-random}, the sampling-based utilities generate \emph{diverse} robot trajectories, enabling effective exploration for rich 6 DoF manipulation settings.
+For instance, our grasp and placement samplers samples uniformly amongst all points in the object part's point cloud to find good grasps and placements poses, respectively, which are used as input into a rapidly-exploring random trees~\cite{lavalle1998rapidly} motion planner that samples uniformly in joint space.
+This results in diverse grasps, placements, and motion trajectories connecting grasps and placements.
+
+For each leaf node in the inferred task tree (\S~\ref{sec:method:datagen:planning}), the grounding process takes as input the node's task description (\eg ``open the mailbox''), its associated object part name (\eg ``mailbox lid''), and the simulation state, and outputs a sequence of 6 DoF Exploration Primitive API calls.
+Using the object part name, we can parse the object's kinematic structure from the simulation state and handle articulated and non-articulated (\ie rigid, deformable) objects separately.
+For non-articulated objects, the LLM is prompted to choose the pick \& place object names, used to sample grasp and placement pose candidates.
+For articulated objects (with either revolute or prismatic joints), the leaf node's associated object part name is used to sample a grasp candidate followed by a rotation or translation primitive conditioned on its joint parameters (i.e., joint type, axis, and origin).
+
+
+\textbf{Exploration Plan Rollout.}
+Each node in the exploration plan is grounded only when it is being executed, where the order of execution follows a pre-order tree traversal.
+By keeping track of the subtask's state, sub-segments of robot trajectory can be labelled with the subtask's description, thereby providing \textbf{dense and automatic text labels} for the trajectory.
+For instance, all actions taken during the inferred subtask ``open the mailbox'' can be labeled with both the subtask's description ``open the mailbox'' and the root task description ``move the package into the mailbox''.
+
+Since grounding happens only when a task node is visited, each node's grounding process is independent of the other leaf nodes, depending only on the simulation state when it is evaluated.
+While this simplifies planning significantly, it also means that failed execution can occur.
+For instance, a grasp candidate may render all placement candidates infeasible. %
+
+\vspace{-2mm}
+\subsection{Verify \& Retry: Robustifying the Data Collection Policy}\vspace{-2mm}
+\label{sec:method:datagen:verifying}
+
+Recall, the planning and grounding step can fail, especially when we consider long-horizon tasks.
+To address this, we propose a verify \& retry (Fig.~\ref{fig:method:datagen}c) scheme, which uses environment feedback to detect failed execution.
+
+\textbf{Verify.} For each task, the LLM infers \textbf{a success function code snippet} given the task description, simulation state, and API functions to for query simulation state (e.g., checking contact or joint values, etc).
+This amounts to prompting the LLM to complete a task success function definition that outputs a boolean value, indicating task success.
+For instance, given the task ``raise the mailbox flag'', the LLM's inferred code snippet should check whether the mailbox's flag hinge is raised (Fig.~\ref{fig:method:datagen}c, highlighted green).
+
+\textbf{Retry.} When a trajectory is labeled failed, the robot retries the same sequence of robot utilities with a different random seed (\ie for the sampling-based robotic utilities) without resetting the simulation state until the task succeeds.
+For instance, in the bus balance task (Fig.~\ref{fig:tasks_panel}, top left), the robot would repeatedly try different grasp and place candidates until the bus is balanced.
+In the tree traversal process \S~\ref{sec:method:datagen:grounding}, nodes only yield execution to its parent task when the node's inferred success condition returns true.
+This design not only leads to higher success rates in data generation but also provides useful demonstrations on \textbf{how to recover from failure}.
+In the output replay buffer, the only failed trajectories are ones which timed-out or led to invalid states (\eg object dropped on the floor).
+
+\begin{wrapfigure}{r}{0.5\textwidth}
+   \centering
+   \vspace{-12mm}
+   % Figure removed
+   \caption{ \footnotesize
+      \textbf{Language-Conditioned Policy Distillation}. The policy takes as input a task description, two RGB camera views, and gripper proprioception data, and outputs a sequence of gripper poses and closing command.
+   }
+   \label{fig:method:distillation}
+   \vspace{-4mm}
+\end{wrapfigure}
+
+\vspace{-2mm}
+
+\subsection{Language-conditioned Policy Distillation}
+\label{sec:method:distill}
+\vspace{-2mm}
+
+We extend diffusion policy~\cite{chi2023diffusionpolicy}, a state-of-the-art approach for single-task behavior cloning, to the multi-task domain by adding language-conditioning.
+This policy takes as input a task description CLIP~\cite{radford2021learning} feature, proprioception history, and visual observations, and outputs a sequence of end effector control commands.
+Following Robomimic~\cite{robomimic2021}'s findings, we use a wrist-mounted view in addition to a global (workspace) view to help with tasks requiring precise manipulation.
+We use their ResNet18-based~\cite{he2016deep} vision encoders, one for each view.
+We found that using only the latest visual observation along with the full observation horizon of proprioception maintains the policy's high performance while reducing training time.
+When used in conjunction with the DDIM~\cite{songdenoising} noise scheduler, we found that we could use a $10\times$ shorter diffusion process at inference (5 timesteps at inference, 50 timesteps at training) while retaining a comparable performance.
+Quantitatively, when using a 10 dimensional action space\footnote{3 for position, 6 for rotation using the upper rows of the rotation matrix, and a gripper close command}, our policy can be run at $\approx 35Hz$ on an NVIDIA RTX3080.

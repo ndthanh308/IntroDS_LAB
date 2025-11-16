@@ -1,0 +1,41 @@
+\vspace*{-1mm}
+
+\section{Background} \label{sec:background}
+
+In this section, we first introduce the architecture of a conventional GPU-centric cluster. Afterward, we document the predominant parallelization strategies for training LLMs to lay down the foundation of our system design and modeling. 
+
+\subsection{State-of-the-Art GPU cluster Design} \label{sec:gpu-centric-sota}
+
+The rise of network-heavy ML workloads led to the dominance of GPU-centric clusters, where \textit{individual} GPUs have dedicated NICs~\cite{swhwcodesign}.
+Figure~\ref{fig:rail-optimized} illustrates the network architecture of a typical GPU cluster. Each GPU has two communication interfaces: ($i$) A local interface to support high-bandwidth but short-range interconnection and ($ii$) a conventional RDMA-enabled NIC. The local interface connects $K$ GPUs to provide terabits of non-blocking any-to-any bandwidth in/out per GPU (900~GB/s or 7.2~Tbps for fourth-gen NVLink, for instance). This group of GPUs with fast interconnect forms a \textit{high-bandwidth domain (HB domain)}. Traditionally, HB domains were restricted to a single server (e.g., DGX servers with $K=8$ or 16 GPUs). Recently, Nvidia announced the GH200 supercomputer interconnecting $K=256$ Grace Hopper Superchips to form one HB domain across multiple racks~\cite{gh200}.   \looseness=-1
+
+
+% Figure environment removed 
+
+
+To scale training an LLM beyond a single HB domain, GPU cluster operators use RDMA-capable NICs to interconnect multiple HB domains together. The conventional network architecture to interconnect HB domains is called a \textit{rail-optimized} network~\cite{dgxh100archdoc}. 
+GPUs within an HB domain are labeled from 1 to $K$ as their \textit{rank} in these networks. A \textit{rail} is the set of GPUs with the same rank on different HB domains, interconnected with a rail switch. For instance, Figure~\ref{fig:rail-optimized} illustrates Rail 1 and Rail $K$ in red and yellow, respectively. These rail switches are connected to spine switches subsequently to form a full-bisection any-to-any \fattree network topology. This network ensures any pair of GPUs in different HB domains can communicate at the network line rate (hundreds of Gbps). For instance, traffic between \texttt{GPU 1, Domain 1} and \texttt{GPU 1, Domain 2} traverses through Rail Switch 1 only, while traffic between \texttt{GPU 1, Domain 1} and \texttt{GPU 2, Domain 2} goes through the respective rails and the spine switches. We refer to the connection across HB domains as the network domain in the rest of the paper. \looseness=-1
+
+\subsection{Parallelization Strategies for Training LLM}
+
+The parallelization strategies of LLMs impose a profound impact on their training performance. This section dives into LLMs' most popular parallelization strategies, from which we build our later analysis and arguments. Following prior work~\cite{shoeybi2020megatronlm,narayanan2021efficient,korthikanti2022reducing}, we focus on parallelizing the chain of transformers that contributes the most to the training time.
+% Figure environment removed 
+
+\para{Data Parallelism.}
+Data parallelism (DP) involves distributing batches of input data across multiple GPUs, allowing each to train a replica of the DNN model simultaneously, as shown in Figure~\ref{fig:llm-par}a. After a training iteration, the GPUs synchronize their optimizer states with an AllReduce operation, which can be overlapped with backpropagation to reduce the overhead. Scaling LLMs with DP presents a unique challenge: their model size often exceeds the memory capacity of an individual GPU, making it impossible to fit an entire model on a single processor. In this case, LLM designers employ tensor and pipeline parallelism, dividing the models across multiple GPUs to reduce the memory footprint.  \looseness=-1
+
+\para{Tensor Parallelism.}
+Instead of dividing input data, tensor parallelism (TP) splits the model's weight tensors (multidimensional data arrays) across multiple GPUs. Figure~\ref{fig:llm-par}b illustrates TP on LLMs, in which each GPU is responsible for a portion of the tensor computations for each transformer. In particular, Shoeybi et al.~\cite{shoeybi2020megatronlm}  proposed to split the model across the hidden dimension to allow parallel computation of non-linear activations. With this method of tensor spitting, a round of AllReduce is required for each attention and MLP layer for each forward and backward pass to collect the attention and gradient information, respectively. As a result, TP incurs a non-trivial amount of communication on the critical path of each tensor's computation and requires careful planning to operate efficiently. 
+
+\para{Pipeline Parallelism.}
+For LLMs, pipeline parallelism (PP) divides the layers of the transformer and puts different layers on different devices,  as illustrated in Figure~\ref{fig:llm-par}c. In this case, each set of devices forms a pipeline stage. In addition to splitting the model, PP breaks each batch of training data into micro-batches and pipelines them across the devices. Like TP, PP reduces the per-device memory footprint by decreasing each device's model parameters. However, PP incurs two types of overhead: the pipeline filling and draining phases (the ``pipeline bubble time") and the communication time from sending activation and gradients across pipeline stages. Most recent works on PP for LLMs use the ``1F1B" schedule introduced in PipeDream~\cite{harlap2018pipedream} to reduce the activation memory footprint. In MegatronLM, Narayanan et al. further improved this scheduling through an interleaving technique, which puts non-consecutive layers on each device and reduces the pipeline bubble time at extra communication cost~\cite{narayanan2021efficient}. 
+
+\para{Sequence Parallelism.}
+Figure~\ref{fig:llm-par}d shows yet another way to parallelize LLM training by splitting the training samples. Initially proposed by Li et al.~\cite{li2022sequence}, sequence parallelism exploits the structure of LLM datasets by dividing the training samples in the sequence rather than the batch dimension to enable long-sequence training. Korthikanti et al.~\cite{korthikanti2022reducing} revised this approach by combining it with TP, further reducing the activation memory footprint. In this approach, the parallelism alters between the tensor (for attention and linear layers) and the sequence (for dropout and layer normalization) within a transformer. An AllGather or ReduceScatter communication re-shards the activation each time the parallelization strategy changes between TP and sequence parallelism. However, the total final communication volume for a transformer stays the same as in the TP-only case. Combining TP and sequence parallelism also reduces the PP traffic across stages since it removes the redundancy across tensor-parallel ranks, removing the requirement of the scatter-gather optimization presented in MegatronLM~\cite{narayanan2021efficient}. In the rest of this paper, we use TP to refer to the combination of traditional TP and sequence parallelism. \looseness=-1
+
+\subsection{Combining the Above: PTD-P Parallelism}
+Training an LLM on a large GPU cluster efficiently requires a combination of the parallelization strategies above. 
+Narayanan et al. named such combination ``PTD-P" parallelism and thoroughly analyzed the interaction of different parallelization dimensions in MegatronLM. The paper provides empirical evaluations on different parameter combinations~\cite{narayanan2021efficient} and derived guidelines for choosing the parallelization strategy. 
+
+PTD-P parallelism represents the state-of-the-art LLM parallelization and is widely adapted in the industry~\cite{chowdhery2022palm, gpt3}. It equally distributes the computation of the model among all GPUs while attempting to minimize the pipeline and communication overhead. However, prior work does not comprehensively analyze LLMs' communication patterns. The following section examines the traffic pattern of training language models with PTD-P parallelism. We uncover a surprising fact: LLM training with PTD-P parallelism does not need full-bisection bandwidth connectivity in the network domain.
+ 

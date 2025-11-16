@@ -1,0 +1,157 @@
+\section{Proposed method}
+\label{sec:proposed_method}
+
+
+\input{sections/submission/figures/method-obs}
+\subsection{Preliminaries}
+\label{subsec:preliminaries}
+
+To reduce the heavy computations of convolutional layers in neural networks,
+the input feature (activation) and weight of each convolutional layer are quantized to low-bit values~\cite{cai2017deep,choi2018pact,jung2019learning,gholami2021survey}.
+In this work, as the features of SR network are more sensitive to quantization, we focus more on quantizing features.
+The input feature of the $i$-th convolutional layer $x_i\in\mathbb{R}^{B\times C\times H\times W}$, where $B, C, H,$ and $W$ denote the dimension of input batch, channel, height, and width, a quantization operator $Q(\cdot)$ quantizes the feature $x_i$ with bit-width $b$:
+\begin{equation}\label{eqn:method-quantmodule-pre}
+    Q(x_i) = \text{Int}({ \frac{\text{clip}(x_i, \alpha_l, \alpha_u) - \alpha_l}{s} }) \cdot s + \alpha_l,
+\end{equation} 
+where $ \text{clip}(\cdot, \alpha_l, \alpha_u)$ truncates the input into the range of $[\alpha_l, \alpha_u]$ and $s = \frac{\alpha_u - \alpha_l}{2^b-1}$.
+After truncation, the truncated feature is scaled to the integer range of bit-width $b$, $[0, 2^b-1]$.
+Then the scaled feature in the integer range is rounded to integer values with Int$(\cdot)$, and it is rescaled to range $[\alpha_l, \alpha_u]$.
+To obtain better quantization ranges for SR networks, 
+range parameters $\alpha_l, \alpha_u$ for each layer are generally learned through quantization-aware training~\cite{Li2020pams,zhong2022ddtb}.
+Since the rounding function is not differentiable, a straight-through estimator (STE)~\cite{bengio2013estimating} is used to train the range parameters in an end-to-end manner.
+We initialize $\alpha_u$ and $\alpha_l$ as the $j$-th and $100-j$-th percentile value of feature averaged among the training data.
+$j$ is set as 1 in our experiments to avoid outliers from corrupting the quantization range.
+Similarly, to quantize the weight of the $i$-th convolutional layer $w^i$, quantization operator $Q(\cdot)$ is used.
+However, instead of setting range parameters as learnable parameters, 
+$\alpha_l, \alpha_u$ for weights are fixed as the $j$-th and $100-j$-th percentile of weights.
+
+
+
+\subsection{Distribution mismatch in SR networks}
+\label{subsec:motivation}
+
+Quantization unfriendliness of SR networks is from the diverse feature (activation) distributions, as reported in previous studies~\cite{Li2020pams,hong2022daq,zhong2022ddtb}, mainly due to the absence of batch normalization layers in SR networks.
+Existing SR quantization methods address this issue by employing one~\cite{Li2020pams} or two~\cite{zhong2022ddtb} learnable quantization range parameters for each convolutional layer feature.
+However, despite that the quantization-aware training process aims to find the optimal range for each feature, it fails to account for the channel-wise and input-wise variance in distributions.
+As illustrated in Figure~\ref{fig:method-motiv}, where notable discrepancies exist between layer-wise and channel-wise distributions, quantization grids are needlessly allocated to regions with minimal feature density.
+This mismatch in inter-channel distributions leads to performance degradation when quantizing SR networks.
+In the following sections, we introduce a new quantization-aware training scheme to address the distribution mismatch problem.
+
+
+
+
+
+
+\subsection{Cooperative variance regularization}
+\label{subsec:var-reg}
+
+\input{sections/submission/figures/method-loss}
+Instead of focusing on finding a better quantization range parameter capable of accommodating the diverse feature distributions, our approach aims to regularize the distribution diversity beforehand.
+Obtaining an appropriate quantization range for a feature with low variance is an easier task compared to that of high variance.
+In this work, we define the overall mismatch of a feature distribution with the standard deviation, 
+\begin{equation}
+    M(x_i) \coloneqq \sigma(x_i),
+\label{eq:mismatch}
+\end{equation}
+where $\sigma(\cdot)$ calculates the standard deviation of the feature.
+Thus, variance regularization can be directly applied to the feature to be quantized $(x_i)$, which is formulated as follows:
+\begin{equation}
+    \mathcal{L}_{V}(x_i) = \lambda_V \cdot M(x_i),
+\label{eq:varianceloss}
+\end{equation}
+where 
+$\lambda_V$ is the hyperparameter that denotes the weight of regularization. 
+The overall $\mathcal{L}_{V} = \sum_{i}^{\# \;\text{layers}}{ \mathcal{L}_{V}(x_i)}$ is obtained by summing over all quantized convolutional layers. 
+The variance regularization loss can be used in line with the reconstruction loss, which is originally used in the general quantization-aware training process.
+The optimization of parameter $\theta^t$ is formulated as follows:
+\label{subsec:loss}
+\begin{equation}
+    {\theta}^{t+1} = \theta^{t} - \alpha^{t} (\nabla_\theta \mathcal{L}_R(\theta^t) + \nabla_\theta \mathcal{L}_V(\theta^t) ), 
+\end{equation}
+where $\nabla_\theta \mathcal{L}_R(\theta^t)$ the gradient from the original reconstruction loss and $\nabla_\theta \mathcal{L}_V(\theta^t)$ denotes the gradient from variance regularization loss and  $\alpha^t$ denotes the learning rate. 
+Updating the network to minimize the variance regularization loss will reduce the quantization error of each feature.
+
+However, then a question arises, \textit{does reducing the quantization error of each feature lead to improved reconstruction accuracy}?
+The answer is, according to our observation in Figure~\ref{fig:method-conflict}, not necessarily.
+During the training process, the variance regularization loss can collide with the original reconstruction loss.
+However, we want to avoid the conflict between two losses, in other words, minimize the variance as long as it does not hinder the reconstruction loss.
+Thus, we determine whether the two losses are cooperative or not by examining the sign of the gradients of each loss.
+If the signs of the gradients are equal, then the parameter is updated in the same direction by two losses. 
+By contrast, if the sign values are inverse, the two losses restrain each other, thus we only employ the reconstruction loss.
+In summary, we leverage variance regularization for parameters that the gradients have the same sign value as that from the reconstruction loss.
+Our optimization can be formulated as follows:
+\begin{equation}
+    \theta^{t+1} = 
+    \begin{cases}
+    \theta^{t} - \alpha^{t} (\nabla_\theta \mathcal{L}_R(\theta^t) + \nabla_\theta \mathcal{L}_V(\theta^t) ),  & \quad \nabla_\theta \mathcal{L}_R(\theta^t) \cdot \nabla_\theta \mathcal{L}_V(\theta^t)\geq0, 
+    \\
+    \theta^{t} - \alpha^{t} (\nabla_\theta \mathcal{L}_R(\theta^t) ), & \quad \nabla_\theta \mathcal{L}_R(\theta^t) \cdot \nabla_\theta \mathcal{L}_V(\theta^t)<0.
+    \end{cases}
+    \label{eq:cooperativeloss}    
+\end{equation} 
+This allows the network to reduce the quantization error cooperatively with the reconstruction error.
+
+
+\subsection{Distribution offsets}
+\label{subsec:offsets}
+\input{sections/submission/figures/method-motivation}
+
+The variance of the distribution can be reduced to a certain extent via variance regularization in Section~\ref{subsec:var-reg}.
+However, since regularization is applied only when it is cooperative with the SR reconstruction, the gap between distributions remains.
+In this section, we explore the remaining gap between distributions.
+First, as visualized in Figure~\ref{fig:method-motiv}, we observe that the distribution gap is larger (and more critical) in the channel dimension compared to the image dimension.
+
+
+Also, we find that this extent of the channel-wise gap in the distribution is different for each layer of the SR network, as shown in Figure~\ref{fig:method-offset}.
+Some layers (Figure~\ref{fig:method-offset-b}) exhibit a larger mismatch in the distribution deviation, while others (Figure~\ref{fig:method-offset-c}) show a larger mismatch in the distribution average.
+The quantization errors of the layer with a large mismatch in distribution mean can be decreased by shifting the channel-wise feature.
+On the other hand, the mismatch in layers with large divergence in distribution deviation can be reduced by scaling each channel-wise distribution for overall similar distributions.
+
+Since channel-wise shifting and scaling incur computational overhead and not all layers are in need of additional shifting and scaling (Figure~\ref{fig:method-offset-a}), we selectively apply offset scaling/shifting to layers that can maximally benefit from it.
+The standards for our selection are derived by feeding a patch of images to the 32-bit pre-trained network and calculating the mismatch in average/deviation of each layer.
+Given the $i$-th feature statistics $\hat{x}^i$ from the pre-trained network, the mismatch of $i$-th convolutional layer is formulated as follows:
+\begin{equation}
+\begin{aligned}
+    M_\mu^i \coloneqq \sigma(\mu_{c}(\hat{x}_i)) \quad \text{and} \quad M_\sigma^i \coloneqq \sigma(\sigma_{c}(\hat{x}_i)),
+\label{eq:indicators}
+\end{aligned}
+\end{equation}
+where $\mu_c(\cdot)$ and $\sigma_c(\cdot)$ respectively calculate the channel-wise mean and standard deviation of a feature and $\sigma(\cdot)$ calculates the standard deviation.
+After all $M_\mu^i$s and $M_\sigma^i$s  $(i=1,\cdots,\#\text{layers})$ are collected,
+we apply additional scaling offsets to top-p layers with high $M_\sigma^i$ value and shifting offsets to top-p layers with high $M_\mu^i$ value.
+The shifting and scaling process for feature $x^i$ of the $i$-th convolutional layer is formulated as follows:
+\begin{equation}
+\begin{aligned}
+    x_i^* = x_i + S_\mu, \quad \text{if} \; M_\mu^i \in \text{top-}p([M_\mu^1, \cdots, M_\mu^{\# \text{layers}}]),
+    \label{eq:offsets-b}
+\end{aligned}
+\end{equation}
+\begin{equation}
+    x_i^* = x_i \cdot S_\sigma, \quad \text{if} \; M_\sigma^i \in \text{top-}p([M_\sigma^1, \cdots, M_\sigma^{\# \text{layers}}]),
+\label{eq:offsets-w}
+\end{equation}
+where $S_\mu, S_\sigma \in \mathbb{R}^{C}$ are learnable parameters, top-$p(\cdot)$ constructs a set that contains values greater than the $100(1-p)$-percentile value of the given set.  
+$p$ is the hyperparameter that determines the ratio of layers to apply distribution offsets, which we set to $0.3$ in our experiments.
+Moreover, both offsets $S_\mu$ and $S_\sigma$ are quantized to low-bit, 4-bit in our experiments, to minimize the computational overhead.
+Consequently, the offsets additionally incur only $0.02\%$ overhead to the network storage size for EDSR.
+The offsets further relieve distribution mismatch with minimal overhead.
+
+
+\subsection{Overall training}
+\input{sections/submission/tables/alg}
+Algorithm~\ref{algo-odm} summarizes the overall pipeline for our framework, ODM.
+We follow the common practice~\cite{Li2020pams,zhong2022ddtb} to use $\mathcal{L}_1$ loss and $\mathcal{L}_\text{SKT}$ loss for the reconstruction loss as follows:
+\begin{equation}
+    \mathcal{L}_R = \mathcal{L}_1 + \lambda \mathcal{L}_{SKT}, 
+\label{eq:overallloss}
+\end{equation}
+where
+$\mathcal{L}_1$ loss indicates the $l_1$ distance between the reconstructed image and the ground-truth HR image, and $\mathcal{L}_\text{SKT}$ loss is the $l_2$ distance between the structural features of the quantized network and the 32-bit pre-trained network.
+The structural features are obtained from the last layer of the high-level feature extractor.
+The balancing weight $\lambda$ is set as $1000$ in our experiments.
+Also, the weight $\lambda_V$ to balance $\mathcal{L}_V$ and $\mathcal{L}_R$ in Eq.~\ref{eq:varianceloss} is set differently depending on the mismatch severeness of the SR architecture. 
+We provide detailed settings in the supplementary materials.
+
+
+
+

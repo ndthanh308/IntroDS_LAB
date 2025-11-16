@@ -1,0 +1,110 @@
+%\section{Smartpick Architecture and Implementation} 
+\section{Smartpick Implementation} 
+\label{sec:impl}
+\begin{table}
+	\centering
+	\caption{Smartpick Properties}
+	\label{tab:conf-em}
+	\scalebox{0.7} {\begin{tabular}{lc}
+			\hline
+			Key&Default Value\\
+			\hline
+			smartpick.cloud.\textit{compute.provider} & AWS \\
+			smartpick.cloud.\textit{compute.instanceFamily} & t3 \\
+			smartpick.cloud.\textit{compute.relay} & True \\
+			smartpick.cloud.\textit{compute.knob} & 0 \\
+			smartpick.train.\textit{max.batch} & 100\\
+			smartpick.train.\textit{pref.sameInstance} & False\\
+			smartpick.train.\textit{min.ram.gb} & 4\\
+			smartpick.train.\textit{errorDifference.trigger} & 50\\
+			\hline
+	\end{tabular}}
+	%\vspace{-2mm}
+\end{table}
+
+\label{sec:impl}
+Smartpick is implemented on top of Spark 2.2.1 \cite{sparkRef}. %, which is one of the de-facto distributed data processing frameworks. 
+Table \ref{tab:conf-em} shows Smartpick's properties that applications can easily set. 
+Spark applications can easily utilize Smartpick by setting these properties without any modification. 
+We will explain each property from the following explanation in detail.
+Most components in Smartpick are implemented in Python 3.0 \cite{python} %\textbf{KO: approximately how many lines?} 
+if not otherwise specified.  
+
+\noindent\textbf{Workload prediction module:}
+We designed and implemented the workload prediction module as a separate process (server) using Thrift RPC \cite{thrift}. 
+Thus, other SEDA systems can get benefits from Smartpick, i.e., workload prediction and the cost-performance tradeoff feature.
+We will show how two recent SEDA systems, 
+i.e., Cocoa and Smartpick, utilize Smartpick as an external prediction system in Section \ref{subsubsec:stateArtComp}.
+
+\noindent\textbf{Training prediction model:} To kick-start Smartpick, the first model training is invoked through a 
+CLI (Command Line Interface) script, tailor-made to initialize and create models from scratch. 
+When a prediction model needs to be trained either initially or in handling dynamics, 
+we devise a heuristic to vary each training sample in the range of $\pm$ 5\% and create a reasonable dataset comprising around 10x samples (x being the original size). 
+This task ensures that Smartpick can function quickly and effectively with as small as 100 representational workloads. 
+Finally, the data burst is preceded and succeeded by random shuffling so that eventually, when the entire dataset is split into training and test sets, 
+an unbiased selection is performed \cite{reshuffle}.
+
+\noindent\textbf{Optimal cloud configurations}:
+To determine the optimal cloud configuration with the prediction, \textit{compute.knob} can be set. 
+If the best performance is preferred regardless of cost, it can be set to 0. Or it can be set any greater number than 0 to explore the cost-performance tradeoff space discussed in Section \ref{subsec:tradeoff}. 
+Applications can set \textit{compute.instanceFamily} property to increase memory locality for further performance improvement, as discussed in Section \ref{sec:related}. 
+
+\noindent\textbf{Query similarity check:} To parse the alien queries, the similarity checker (SC) uses the 
+sql-metadata library \cite{sql-metadata}, which helps extract meaningful information such as the number of tables, columns and subqueries inferred in the request. 
+Next, a 4-dimensional list is computed having all of the features (along with the number of map tasks), followed by the determination of spatial cosine similarity with 
+respect to the known queries that helps filter out the best match. Thus, the closest query identifier is returned to the WP module, 
+which then uses it to deduce the request's resource-needs.
+
+\noindent\textbf{Prediction model updates:} Background re-training is necessary when the model is out of course and the predictions 
+deviate from actual values beyond a pre-defined threshold, i.e., \textit{errorDifference.trigger}. 
+An independent monitor thread in the MFE evaluates this condition and if required, creates a new model with \textit{warm\_start}, which is built as a pickle object for up-to-date reference. 
+On completion, the monitor replaces this model in the referred directory, and all new workload predictions point to this object.
+Smartpick allows users to select where the new model will be trained based on user's preferences, 
+i.e., \textit{pref.sameInstance} and \textit{min.ram.gb}. If the same instance re-training is configured (\textit{pref.sameInstance}) and minimum memory (\textit{min.ram.gb}) is available, Smartpick spawns a new sub-process for re-training. Otherwise, a new instance is started and used for this purpose.
+Smartpick also supports batch-based re-training (batch size given by the key \textit{max.batch}) that works independently to keep the model incrementally up-to-date.
+%In case of different instance re-training (i.e., when the key \textit{smartpick.train.pref.sameInstance} is false or when minimum RAM configured in \textit{smartpick.train.min.ram.gb} for same instance re-train is not available), the shell script makes CLI-based invocations for the starting and stopping of instances, and full RAM capacity is utilized for model re-training. 
+%Smartpick also supports batch based re-training (batch-size given by the key \textit{smartpick.train.max.batch}) that works independently for keeping the model incrementally up-to-date.
+
+\noindent\textbf{Metrics collection and history server:} 
+To capture the metrics outlined in Table \ref{tab:fea-wp}, 
+Spark's implementation of listener classes (along with the dependent modules) are modified 
+and monitoring data is stored in JSON format. 
+Once this model is in place, any subsequent request for data processing triggers asynchronous 
+system-level events that have no (little) overhead to the ongoing job. 
+The history server provides internal DNS (Domain Name System) as APIs for other components, e.g., MFE, to request and process the targeted metrics.
+
+\noindent\textbf{Managing compute instances:} Resource manager (RM) is implemented on JDK 8 \cite{java8} using SDK libraries of AWS \cite{awsSDK} and Google Cloud \cite{gcpSDK}. 
+Applications can point to the primary cloud provider by setting a Smartpick property - \textit{compute.provider}.
+RM communicates with the respective cloud interface and launches the determined numbers of VMs and SLs.
+Once these instances are up and running, it tracks their charging statuses for statistics on cost monitoring to be used later for performance/cost evaluation. 
+
+
+\noindent\textbf{Relay-instances mechanism:} 
+To make the relay-instance mechanism active, the property \textit{compute.relay}
+can be set to ``True''. SLs are terminated when relayed VM instances are ready to execute tasks.
+To this end, RM will use mapping between REQUEST ID (for SL) and INSTANCE ID (for VM) after 
+sending requests to cloud providers. 
+When a VM instance is ready to be used and connects to RM with its INSTANCE ID, 
+RM will find the corresponding target SL (REQUEST ID) using INSTANCE ID and let the task scheduler stop assigning tasks to it. 
+After checking that no task is running on the SL, RM sends a termination message to it. 
+%SLs may execute tasks until the query is done without using this mechanism, which incurs additional cost without or little performance improvement.
+
+\noindent\textbf{Cost estimation:} To estimate the cost for queries, we modified Spark workers to
+send instance information such as ID, cloud provider, region,
+type, storage type, and storage size to the RM when they
+connect to it. While most information is static, thus hard-coded 
+in the images, IDs are generated dynamically when
+Smartpick sends requests to cloud providers, e.g., REQUEST ID
+for SL and INSTANCE ID for VM. To identify each
+worker, a boot script for VM and a function code for SL
+acquire these IDs and set them as an environment variable. Using
+these IDs, Smartpick tracks instances’ execution time and calculates 
+overall compute resource cost for queries.
+Since VM instances are charged only when they are in the
+“Running” state, Smartpick uses a dedicated thread that checks
+their statuses. In our implementation, each VM instance uses 8
+GB (SSD) storage which is charged per second. While
+SL does not charge for its volatile storage (2048 MB),
+the external storage cost, e.g., AWS t3.xlarge or GCP e2-standard-4 for Redis, is added to the total cost if at least one SL instance
+is running for a query. Note, data transfer within a DC is free
+of charge in most cloud providers. 

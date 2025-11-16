@@ -1,0 +1,200 @@
+\FloatBarrier
+
+\section{Additional details and results for Automatic Speech Recognition (ASR)}
+\label{app:speech}
+In this section we provide additional details for the speech recognition experiments in both the supervised and semi-supervised case.
+
+
+\paragraph{Data} We use the \librispeech{} dataset~\citep{panayotov2015librispeech} which is a dataset of audio-transcription pairs. 
+For supervised Polyak-Ruppert averaging experiments, we use \tco{} as training data, and for semi-supervised pseudo-labeling experiments, we use \tco{} as the labeled and \tct{} and \tof{} as the unlabeled data.
+The standard \librispeech{} validation sets (\devclean{} and \devother{}) are used to tune all hyperparameters, as well as to select the best models. 
+Test sets (\testclean{} and \testother{}) are only used for reporting final model performance, measured in \gls{wer} without an external language model.
+We maintain the original 16kHz sampling rate, and compute log-mel filterbanks with 80 coefficients for a 25ms sliding window, strided by 10ms, later normalized to zero mean and unit variance for each input sequence.
+
+\paragraph{Acoustic model} 
+We employ a vanilla encoder-based only transformer model trained with the \gls{ctc} loss~\citep{graves2006connectionist}. 
+We use the training configuration from~\citet{likhomanenko2020slimipl}, which has three stages: 
+i) 1D convolutions to perform striding (kernel of 7 with stride of 3); 
+ii) a Transformer encoder with 36 layers, 
+post-LayerNorm, 
+four attention heads, 
+an embedding dimension of 768, 
+an MLP dimension of 3072, 
+a dropout frequency of 0.3,
+and a layer drop frequency of 0.3; and
+iii) a linear layer to map to the target vocabulary\footnote{The token set of this vocabulary consists of the 26 English alphabet letters augmented with the apostrophe and a word boundary token.}. 
+To reduce model training time by a factor of approximately $2-3\times$, and to reduce memory footprint, we use CAPE positional embeddings~\citep{likhomanenko2021cape} instead of relative positional embeddings~\citep{shaw2018self}: both models perform similarly.
+
+\begin{table}[t!]
+  \caption{Hyperparameters summary for speech recognition task for supervised (left) and semi-supervised pseudo-labeling (right) training with a vanilla transformer.
+  The $0.3\rightarrow 0.1$ in the dropout and layer drop rates indicates that a rate of 0.3 is used during pre-training, and a rate of 0.1 is used during pseudo-labeling.}
+  \label{tab:speech-transformer-hparams}
+  \centering
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    &  Supervised & Pseudo-Labeling \\
+    \midrule
+    Librispeech test-clean / test-other WER & 7.8/19.1 & 4.8/11.5 \\
+    \midrule
+    Optimizer & Adam & Adam \\    
+    Optimizer scaling rule & Adam & Adam \\
+    Base ($\beta_1, \beta_2$) & (0.995, 0.999) & (0.995, 0.999) \\
+    Base learning rate & $0.0001$ & $0.0001$  \\
+    Base learning rate warmup (steps) & 64k & 64k \\  
+    Learning rate schedule & Fixed (no decay) & Fixed (no decay) \\    
+    Learning rate minimum value & 0 & 0  \\    
+    Base training duration (steps) & 400k & 500k \\
+    Base batch size (dynamic) & $8\times 290s$ & $8\times 290s$  \\
+    Base teacher momentum & 0.99995 & 0.9999 \\    
+    Weight decay & None & None \\
+    Numerical precision & \texttt{bf16} & \texttt{bf16} \\
+    Augmentation stack & \texttt{SpecAug} & \texttt{SpecAug} \\   
+    Dropout & $0.3$ & $0.3\rightarrow 0.1$ \\
+    Layer drop & $0.3$ & $0.3\rightarrow 0.1$ \\
+    Gradient clipping & $1$ & $1$ \\
+    Labeled:unlabeled data ratio  & N/A & 1:3 \\
+    Base pre-training steps & N/A & 20k \\
+    Base start of EMA accumulation (steps) & N/A & 19k \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Training} 
+Here we discuss our training procedure for base batch size $B=8\times 290s$, which is adapted from~\citet{likhomanenko2020slimipl}, and is summarized in \Cref{tab:speech-transformer-hparams}.
+We use SpecAugment~\citep{park2019specaug} activated after 5k steps of training: two frequency masks with frequency mask parameter $F=30$, ten time masks with maximum time-mask ratio $p=0.1$ and time mask parameter $T=50$ are used; time warping is not used. 
+
+One difference in setup is we use the Adam optimizer, whereas \citet{likhomanenko2020slimipl} used Adagrad~\citep{DBLP:conf/colt/DuchiHS10}.
+Even though Adagrad can be viewed as a particular limit ($\beta_1=0$ and $\beta_2\to 1$) of Adam \citep{DBLP:journals/corr/KingmaB14}, we were unable to produce reasonable optimization in practice when applying the Adam Scaling Rule of \citet{DBLP:conf/nips/MalladiLPA22} in this limit.
+As a consequence, we chose to work with the Adam optimizer, where its scaling rule has been shown to work \citep{DBLP:conf/nips/MalladiLPA22}, and we take $\beta_1=0.995$, $\beta_2=0.999$, and $\eps=10^{-8}$.
+We obtained similar results for $\beta_1=0.99$.
+Finally, we use a linear learning rate warmup (64k steps) after which the learning rate is kept constant until convergence.
+This performance can be improved further by using a step decay schedule as shown in prior work. 
+We also apply gradient clipping of 1, and do not use weight decay. 
+
+\paragraph{Pseudo-Labeling}
+The pseudo-labeling process comprises of two stages:
+i) The pre-training phase, where we train model on labeled data for 20k steps with model EMA accumulation starting after 19k steps; and ii) the pseudo-labeling phase, where we involve unlabeled data by generating pseudo-labels from the model EMA (teacher) and provide them to the model (student) as if they were ground-truth labels. 
+Pseudo-labels are generated without any dropout applied to the teacher, and no data augmentation is applied for the corresponding inputs. 
+To produce the pseudo-label, we use \emph{hard transcription} (\Cref{def:hard-transcription})
+\begin{definition}[Hard Transcription] 
+For a sequence of frames, select the most probable token per frame, removing repetitions \emph{and} the CTC blank token. For example, ``h\#\#eelll\#\#ll\#\#\#oo'' is transformed into ``hello'', where ``\#'' is the CTC blank token.
+\label{def:hard-transcription}
+\end{definition}
+These hard transcriptions are then used as transcription for student optimization.
+We use a 1:3 proportion of labeled to unlabeled data as this was found to be optimal in~\citet{likhomanenko2020slimipl}, and we decrease model dropout and layer drop rates to 0.1 after pre-training phase.
+As we have access to the ground-truth labels on the data being treated as unlabeled, we can track pseudo-label quality by computing pseudo-labels on this data, and compute the \gls{wer} against their ground-truth. 
+Pseudo-label quality is the primary metric to evaluate progress on unlabeled data, as loss on pseudo-labeled data is unreliable when a teacher model and pseudo-labels are evolving with each time step.
+
+{\bf Scaling of batch size}~~~
+Sequential data is typically processed using dynamic batching as it is more computationally efficient than using a fixed number of sequences~\citep{ott2019fairseq}. 
+In our work, we use dynamic batching of $\sim$290s audio per GPU.
+Moreover, for \gls{ctc} we do not apply any additional sequence normalization.
+We experimented with fixed batching, but did not observe any significant differences in conclusions compared with the dynamic batching. 
+
+We note that dynamic batching is a more challenging setting for achieving systematic scaling, as the number of independent sequences in any given batch may change, and the \gls{iid} assumption does not hold at the frame level.
+Despite these violations of the assumptions of \Cref{subsec:ema-sdes},
+our results demonstrate that the Adam Scaling Rule (\Cref{def:adam-sr}, \cite{DBLP:conf/nips/MalladiLPA22}) holds in the case of dynamic batches, as does our \gls{ema} Scaling Rule (\Cref{def:ema-sr}).
+
+The base batch size is set to $B=8\times 290s$, and in our experiments we scale down to batch size of $B=2\times 290s$ and up to batch size of $B=128\times 290s$.
+The number of warmup and pre-training steps, steps before SpecAugment is turn on and model EMA is accumulated are scaled according to \Cref{sec:app-sde-perspective}.
+
+\ifthenelse{\equal{\anonymous}{0}}{{\bf Compute}~~~All experiments are done using A100 80GB 8GPU nodes with \texttt{bfloat16} precision training. While for supervised training evaluation of different EMA decay values is done in parallel during a single run, for pseudo-labeling every EMA decay value needs separate training. Final models training compute is detailed in~\Cref{tab:asr-sup-compute,tab:asr-pl-compute}. Total compute, including e.g. code development, runs with errors, and debugging, is {\bf 61k} GPUh.
+
+
+\begin{table}[ht]
+  \caption{
+  Compute usage for supervised model for speech recognition task in \Cref{fig:app-speech-polyak}. 
+  Values \emph{include} node allocation times (typically a small \% of corresponding total runtime), giving a practical   estimate of reproduction cost. 
+  All experiments conducted are using 80Gb A100s with fast interconnect.}
+  \label{tab:asr-sup-compute}
+  \centering
+  \small
+  \begin{tabular}{ccccccc}
+\toprule
+ Batch Size &  GPUs &  Time (h) &  Compute/Run (GPUh) &  Runs &  Compute (GPUh) \\
+\midrule
+       2 $\times$ 290s &      2 &     222      &       444         &       1 &    222       \\
+       4 $\times$ 290s &      4 &       108    &       432         &       1 &    432       \\
+       8 $\times$ 290s &      8 &     64      &         512       &       1 &      512     \\
+       16 $\times$ 290s &      16 &      54     &       864         &       1 &       896    \\
+       32 $\times$ 290s &      32 &      37     &       1,184         &       1 &     1,184      \\
+      \midrule 
+      \textbf{Total} &&&&& \textbf{3,436} \\
+\bottomrule
+  \end{tabular}
+\vspace{-0.5cm}
+\end{table}
+
+\begin{table}[ht]
+  \caption{
+  Compute usage for continuous pseudo-labeling for the speech recognition task in \Cref{fig:app-speech-pl-9999}. 
+  Values \emph{include} node allocation times (typically a small \% of corresponding total runtime), giving a practical estimate of reproduction cost. 
+  All experiments conducted are using 80Gb A100s with fast interconnect.}
+  \label{tab:asr-pl-compute}
+  \centering
+  \small
+  \begin{tabular}{ccccccc}
+\toprule
+ Batch Size &  GPUs &  Time (h) &  Compute/Run (GPUh) &  Runs &  Compute (GPUh) \\
+\midrule
+       2 $\times$ 290s &      2 &     225      &       550         &       2 &    1,110       \\
+       4 $\times$ 290s &      4 &       120    &       480         &       2 &    960       \\
+       8 $\times$ 290s &      8 &     72      &         576       &       1 &      576     \\
+       16 $\times$ 290s &      16 &      45     &       720         &       2 &       1,440    \\
+       32 $\times$ 290s &      32 &      33     &       1,056         &       4 &     4,224      \\
+       64 $\times$ 290s &      64 &      25     &       1,600         &       2 &     3,200      \\
+      \midrule 
+      \textbf{Total} &&&&& \textbf{11,510} \\
+\bottomrule
+  \end{tabular}
+\end{table}
+\vspace{-0.2cm}
+}{\compute}
+
+\ifthenelse{\equal{\anonymous}{0}}{}{\FloatBarrier}
+\FloatBarrier
+\subsection{Additional experimental settings and detailed metrics}
+\label{subsec:speech-detailed}
+
+We present detailed comparison between models trained with and without EMA Scaling Rule in~\Cref{fig:app-speech-polyak,fig:app-speech-polyak-noinf} for supervised training and in~\Cref{fig:app-speech-pl-9999,fig:app-speech-pl-999} for semi-supervised training.
+
+% Figure environment removed
+
+% Figure environment removed
+
+% Figure environment removed
+
+% Figure environment removed
+
+First, we observe that if the Adam Scaling Rule does not hold perfectly\footnote{See \citet{DBLP:conf/nips/MalladiLPA22} for a discussion on scenarios that lead to a breakdown of the Adam Scaling Rule.} (there is a mismatch between trajectories for the model before pseudo-labels are involved) the EMA Scaling Rule also gives discrepancies with the reference trajectory, however they are negligible compared to models trained without EMA Scaling Rule.
+For the semi-supervised training, to alleviate the difficulties with a breakdown of the Adam Scaling Rule for large $\kappa$ we postpone the pseudo-labeling process until the model reaches similar \gls{wer} as the baseline. 
+This allows us to align the initial model conditions for pseudo-labeling.
+In this scenario we are able to match the reference trajectory up to $\kappa=8$.
+
+We note that this result reveals that errors for the Adam Scaling Rule \emph{and} the EMA Scaling Rule are contributing, 
+although the way in which they contribute is different, and one can dominate the other.
+We observe in \Cref{fig:app-speech-pl-9999} that if the initial conditions of the models are similar (attained by using the same \gls{wer} as a condition to begin pseudo-labeling) then the error from the EMA Scaling Rule dominates over that of the Adam Scaling Rule, causing a divergence in training dynamics.
+
+Second, we observe in practice that the EMA Scaling Rule holds for both fixed batching (a sequence length in the batch can vary significantly) and for dynamic batching (when total number of frames in the batch is fixed, though padding still is accounted to the this amount). 
+This shows that EMA Scaling Rule is applicable to sequential data too.
+
+
+
+Third, we observe in \Cref{fig:app-speech-polyak-noinf,fig:app-speech-pl-999} that for smaller values of $\rho_B$, scaling with or without EMA Scaling Rule behave similarly, and reference trajectories match in the supervised and semi-supervised cases.
+However, if the momentum is too large, the \emph{teacher} moves slowly and is uninformative, whereas if the momentum is too low, the \emph{teacher} and the \emph{student} are effectively be the same model, implying: i) the student will self-predict with high confidence, removing any benefits of distillation\footnote{\citet{He2020Revisiting} alleviated the problem with the proper amount of noise during \textit{student} model training, whilst~\citet{xu2020iterative} used beam-search decoding with a language model.}; and ii) training instability or model divergence will happen in the low-resource settings \citep{likhomanenko2020slimipl,higuchi2022momentum}. 
+
+\FloatBarrier
+
+\subsection{Scaling to $\kappa=16$ with Progressive Scaling}\label{app:speech-progressive}
+Finally, we aim to scale semi-supervised pseudo-labeling further to $\kappa=16$. 
+In this case we observe that Adam Scaling Rule does not hold in the pre-training phase and there is no model convergence.
+To overcome this, we apply Progressive Scaling (\Cref{def:progressive-scaling}). 
+We pre-train models on supervised data with $\kappa=8$ for 29k of reference steps 
+(model EMA accumulation starts at 28k steps). We then scale to $\kappa=16$ and begin pseudo-labeling.
+We see in \Cref{fig:app-speech-pl-9999-progressive} that Progressive Scaling enables us to scale pseudo-labeling to $\kappa=16$ with (middle) and without (left) the EMA Scaling Rule.
+Second, models \emph{with} the \gls{ema} Scaling Rule track the baseline much closer than models without the \gls{ema} Scaling Rule, although a small gap is present.
+We further experimented with Progressive Scaling, postponed the transition condition to the $\kappa=16$ until 75k reference steps.
+In \Cref{fig:app-speech-pl-9999-progressive} (right), we see this scaled model tracks the reference trajectory, and so using a combination of the \gls{ema} Scaling Rule and Progressive Scaling, we are able to scale pseudo-labeling to $\kappa=16$, corresponding to a dynamic batch size of $128\times 290s$.
+
+% Figure environment removed

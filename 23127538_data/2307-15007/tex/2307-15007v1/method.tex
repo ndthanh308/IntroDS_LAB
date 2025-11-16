@@ -1,0 +1,64 @@
+\section{Verifiability Tuning}
+
+In the previous section we showed that given a $\Q$-verifiable model $f_v \in \mathcal{F}_v(\Q)$, we are able to apply QFA to recover the ground truth signal from the dataset. In this section, we shall discuss how to practically build such verifiable models that recover the optimal ground truth signal, $\X_\text{s}(\M, q) = \X \odot \M(\X) + q \odot (1 - \M(\X))$, given a pre-defined counterfactual distribution $q \sim \Q$ that determines feature replacement.
+
+\textbf{Relaxing QFA.} We note that QFA as defined in definition \ref{defn:QFA} is difficult to optimize in its current form due to its use of $\ell_0$ regularization and its constrained form. To alleviate this problem, we perform two relaxations: first, we relax the $\ell_0$ objective into an $\ell_1$ objective, and second, we convert the constrained objective to an unconstrained one by using a Lagrangian. The resulting objective function is given in equation \ref{l_explain}. Assuming the model $f_v$ is known to us, we can minimize this objective function to obtain ($\epsilon, \Q$)-feature attributions for each point $\X \in \mathcal{X}$.
+
+\vspace*{-0.6cm}
+\begin{align}
+    \mathcal{L}_\text{QFA}(\theta, \{\M(\X)\}_{\X \in \mathcal{X}}) = \E_{\X \in \mathcal{X}} \left[ \underbrace{\| \M(\X) \|_1}_\text{mask sparsity} 
+            + \lambda_1 \underbrace{\| f_v(\X; \theta) - f_v (\X_\text{s}(\M, q)); \theta) \|_1}_\text{data distillation} \right] \label{l_explain}
+\end{align}
+
+\textbf{Enforcing Model Verifiability via Distillation.} Assuming that the optimal masks denoting the signal-distractor decomposition are known w.r.t. every training data point (i.e., $\{\M(\X)\}_{\X \in \mathcal{X}}$), one can project any black-box model into a $\Q$-verifiable model via distillation. Specifically, we can use equation \ref{l_train} for this purpose, which contains (1) a data distillation term to enforce the $\epsilon$ constraint in QFA, and (2) a model distillation term to enforce that the resulting model and original model are approximately equal. Accordingly, the black-box model $f_b$ and our resulting model $f_v$ both have the same model architecture, and we initialize $f_v = f_b$. 
+
+\vspace*{-0.6cm}
+\begin{gather}
+\mathcal{L}_\text{train}(\theta, \{\M(\X)\}_{\X \in \mathcal{X}} ) = 
+            \E_{\X \in \mathcal{X}} \left[\underbrace{\| f_v(\X; \theta) - f_v (\X_\text{s}(\M(\X), q)); \theta) \|_1}_\text{data distillation}
+            + \lambda_2 \underbrace{\| f_b (\X) - f_v (\X; \theta) \|_1}_\text{model distillation} \right] 
+            \label{l_train}
+\end{gather}
+
+\vspace*{-0.2cm}
+\textbf{Alternating Minimization between $\theta$ and $\M$.} We are interested in both of the above objectives: we would like to recover the optimal masks from the dataset, as well as use those masks to enforce ($\epsilon, \Q$) constraints via distillation to yield our $\Q$-verifiable models. We can thus formulate the overall optimization problem as the sum of these terms, as shown in equation \ref{eqn:opt_prob}. Notice that both these objectives assume that either the optimal masks, or the verifiable model is known, and in practice we know neither. A common strategy in cases which involve optimizing over multiple sets of variables is to employ alternating minimization \cite{JainK17}, which involves repeatedly fixing one of the variables and optimizing the other. We handle the constrained objective on the mask variables via projection, i.e., using hard-thresholding / rounding to yield binary masks. 
+
+\vspace*{-0.5cm}
+\begin{gather}
+    \theta^*, \{\M^*(\X)\} = \arg \min_{\theta, \M} \left( \mathcal{L}_\text{train}(\theta, \{\M(\X)\}) + \mathcal{L}_\text{QFA}(\theta, \{\M(\X)\}) \right) \label{eqn:opt_prob}\\
+    \text{such that} \quad\quad \M(\X) \in \{0,1\}^d \quad \forall \X \in \mathcal{X} \nonumber
+\end{gather}
+
+\vspace*{-0.2cm}
+\textbf{Iterative Mask Rounding with Increasing Sparsity.} In practice, mask rounding makes gradient-based optimization unstable due to sudden jumps in the variables induced by rounding. This problem commonly arises when dealing with sparsity constraints. To alleviate this problem, use a heuristic that is common in the model pruning literature \cite{han2015learning} called iterative pruning, which involves introducing a rounding schedule, where the sparsity of the mask is gradually increased during optimization steps. Inspired from this choice, we employ a similar strategy over our masks variables.
+
+\textbf{Practical Details.} We implement these objectives as follows. First, we initialize the verifiable model to be the same as the original model, $f_v = f_b$, and the mask to be all ones, $D_s = m \odot D_d, m = 1$. 
+We then iteratively (1) simplify $D_s$ by optimizing $\mathcal{L}_{QFA}$ until $\M$ converges, (2) round $\M$ such that it is binary (i.e. $D_s$ is a subset a features in $D_d$ rather than a weighting of them), and (3) update $f_v$ by minimizing $\mathcal{L}_{train}$ such that $D_s$ is equally as informative as $D_d$ to $f_v$ and $f_v$ is functionally equivalent to $f_b$. As per Definition \ref{defn:QVIM}, we replace masked pixels in $D_s$ with a pre-determined counterfactual distribution $\Q$. This ensures that the given $\Q$ is the optimal counterfactual distribution for $f_v$, meaning $f_v$ comes from the $\Q$-verifiable model class $\mathcal{F}_v(\Q)$. Pseudocode is shown below.
+
+\begin{algorithm}
+\caption{Verifiability Tuning}\label{alg:cap}
+\begin{algorithmic}
+\State \textbf{Input:} Dataset $D_d := (x, y)$, model $f_b$, hyperparameter $k$ rounding steps 
+\State \textbf{Hyperparameters:} $k$ rounding steps, $u$ mask scaling factor
+
+\State $\{\M(\X)\}, ~~\text{s.t.}~~ \M(\X) \gets $ ones with shape $\R^{d/u}$ \Comment{Init mask $\M(\X)$ to ones}
+\State $f_v \gets f_b$ \Comment{Init verifiable model $f_v$ to $f_b$}
+
+\For{$k$ rounding steps}
+    \While{$\mathcal{L}_\text{QFA}$ not converged}
+        \State $\{\M(\X)\} \gets \{\M(\X)\} + \nabla_{\M} \mathcal{L}_\text{QFA}$
+    \EndWhile
+
+    \State $\M \gets$ round($\M$) ~~~$\forall~ \M \in \{ \M(\X) \}$
+
+    \While{$\mathcal{L}_\text{train}$ not converged}
+        \State $f_v \gets f_v + \nabla_{\theta} \mathcal{L}_\text{train}$
+    \EndWhile
+\EndFor
+\State \textbf{return} $\{\M(\X)\}, f_v$
+\end{algorithmic}
+\end{algorithm}
+
+
+
+\textbf{Mask Scale.} In order to encourage greater ``human interpretability,'' we explore different levels of mask granularity. We do this by downscaling the masks before optimization. Concretely, we initialize the masks to be of size $m_d = x_d / u$, where $x_d$ is the dimension of the image $\X$ and $u$ is the superpixel size we wish to consider. We then upsample the mask to be of dimension $x_d$ before applying it to $\X$. The more we downscale the mask by (i.e. the greater $u$ is), the larger the superpixels, or features, of $\X_s$ are, and the more interpretable and visually cohesive the distilled dataset $\X_s$ is. 

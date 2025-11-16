@@ -1,0 +1,258 @@
+\section{\tool{}}\label{sec:approach}
+
+Figure~\ref{fig:overview} shows the logical architecture of \tool.
+The input is a test case without stub code (\(\tau = \left\langle V,\varnothing, E, A\right\rangle \)) or with a broken one (\(\tau = \left\langle V,S_{bk}, E, A\right\rangle \)) and the corresponding CUT.
+The output is the test case with a synthesized stub code that makes the test pass.
+Specifically, \tool{} implements a population-based evolutionary algorithm that guides the search for stub code using a multi-objective fitness function, as discussed in Section~\ref{ssec:technical-challenges}.
+At each generation, \tool{} evolves a population of stub code candidates until it finds one that can pass the test or the budget runs out.
+Figure~\ref{fig:overview} shows the process of producing \(P_{i}\) the population at the \(i\)\textsuperscript{th} generation.
+First, \tool{} computes the fitness score for each candidate individual (stub code) \(S \in P_{i-1}\). Then, it performs selection, crossover, and mutation to obtain the new population $P_i$.
+In particular, the selection phase selects two parent individuals from \(P_{n-1}\). Individuals with higher fitness scores are more likely to be selected. The crossover phase combines the parents' genetic material (code elements in our case) to produce two offspring individuals. The mutation phase applies random mutations to the offspring individuals and adds them to $P_i$. These three phases repeat until $P_i$ is full.
+In the following, we present the fitness function and explain how we adapt the selection, crossover, and mutation phases for the problem of stub code generation and repair.
+
+% Figure environment removed
+
+\subsection{Fitness Function}
+In this paper, we formulate the synthesis of stub code as a multi-objective optimization problem (MOOP)~\cite{DBLP:journals/tse/PanichellaOPL15,DBLP:conf/icec/TamakiKK96} with three objectives.
+These objectives take into account the runtime behaviors of the Act and Assert phases of a test case.
+Each of them focuses on a particular aspect of the runtime behavior of the test case \(\tau\) with the candidate stub code \(S\).
+
+\paragraph{Stub Utilization (\(SU\)).}
+A given stub code \(S\) can have multiple stub calls to specify the behaviors of the mock objects.
+However, not necessarily all of the specified behaviors will be used during the Act phase.
+For example, the CUT might not invoke a stubbed method or the argument does not match.
+Such unused stub calls do not affect the behavior of the test, and mutating its return value has lower chances to make the test pass.
+Therefore, we define stub effectiveness (SU) of a stub code \(S\) based on the number of stub calls that are used by the CUT during the Act phase, denoted by
+\textit{used}$(S)$.
+\[
+	SU(S)=\tanh{\left(\frac{1}{C}{\textit{used}(S)} \right)}
+\]
+The hyperbolic tangent (\(\tanh\)) normalizes the value to \([0,1)\).
+Since the curve of \(\tanh \) is more steep in the interval \([0,1)\) than in \([1, \infty)\), we divide the integer counter by a constant \(C > 1\) to make use of the range \([0,1)\).
+In our experiment, we chose \(C=10\).
+
+\paragraph{Exercise Coverage (\(EC\)).}
+Apart from oracle assertion violations, a test case fails  when \(E\) invokes the CUT and the CUT throws an uncaught exception.
+Such uncaught exceptions are caused by the incorrect behaviors specified by the stub code.
+In general, a stub code that does not lead to uncaught exceptions when the test invokes the CUT is preferred, compared to one that does.
+As such, we define the exercise coverage (EC) of a stub code \(S\) as the ratio of the executed bytecode instructions in \(E\).
+\[
+	EC(S)=\frac{|\left\{e \in E, e \text{ is executed}\right\}|}{|E|}
+\]
+\(EC\) penalizes the individuals with an early failure of \(E\) due to incorrect behaviors specified in the stub code.
+
+\paragraph{Assertion Status (\(AS\)).}
+AS is derived from the runtime behavior in the Assert phase where the test executes the assertions in \(A\).
+It is computed from the score of each of the assertion oracles in \(A\) by taking their average.
+\vspace{2mm}
+\[
+	AS(S)=\frac{1}{|A|}\cdot\sum_{a\in A}{score(a)}
+\]
+The score of each assertion oracle is a number in the range of \([0, 1]\), indicating how likely the assertion oracle is satisfied.
+It is defined as the following.
+\[
+	score(a)=
+	\begin{cases}
+		1.0                                         & a \text{ is satisfied}                                     \\
+		1.0 - d(a.\text{expected}, a.\text{actual}) & a \text{ is \code{assertEquals} and } a \text{ is failing} \\
+		0.0                                         & \text{otherwise}                                           \\
+	\end{cases}
+\]
+Specifically, for \junit{} \code{assertEquals} assertions, we measure the distance between the expected and actual values to estimate how far it is from being satisfied, which is similar to the branching condition distance~\cite{DBLP:journals/infsof/WegenerBS01}.
+\[
+	d(x, y)=
+	\begin{cases}
+		\tanh{\left(\frac{|x - y|}{|x|}\right)}   & x, y \text{ are numeric types}   \\
+		\tanh{\left(\frac{Lev(x, y)}{|x|}\right)} & x, y \text{ are strings}         \\
+		d(str(x), str(y))                         & x, y \text{ are complex objects} \\
+	\end{cases}
+\]
+where \(Lev(x, y)\) is the Levenshtein distance~\cite{DBLP:journals/csur/Navarro01}.
+Such a distance function considers the actions of insertions, deletions, and substitutions, which is in line with our mutation operators.
+For complex objects, function \(str(x)\) serializes an object \(x\) into a string in a deep-copy manner~\cite{bloch2008effective}.
+Specifically, it recursively converts the fields of complex objects into string representations.
+This is because complex objects are often equated based on the values of its fields.
+Therefore, we chose such an strategy to approximate the distance between two complex objects.
+We implemented it using \code{ReflectionToStringBuilder} provided by the \textsc{Apache Commons} library~\cite{Tool:apachecommons}.
+We fall back the denominator to 1.0 if it is zero to avoid division-by-zero error and further normalized the result into the range of \([0,1)\) with the hyperbolic tangent.
+
+% Figure environment removed
+
+\(AS\) can provide additional guidance to generate values that can satisfy oracle assertions specified with \code{assertEquals}.
+For example, Listing~\ref{lst:benchmark-36} shows a code snippet adapted from a test in open-source project Spring Boot Admin~\cite{GitHub:spb/cfaftest}.
+It tests the creation of an \code{Application} object from a factory class \code{CFApplicationFactory} (Lines~\ref{code:b36-act}--\ref{code:b36-act-end}).
+The factory class sets up API end-points based on the information in an input \code{PathMappedEndPoints} that encapsulates a map from end-point names to their URLs.
+In Lines \ref{code:b36-cut}--\ref{code:b36-cut-end}, the factory sets the application's \code{HealthUrl} by concatenating the base URL with the health URL encapsulated in \code{endpoint} by invoking its \code{getPath} method.
+The oracle assertion of the test case verifies whether \code{HealthUrl} of the created application equals the string \code{"base\_url/actuator/health"} (Line~\ref{code:b36-assert}).
+To make this test pass, the \code{getPath} method should be stubbed to return \code{"/actuator/health"} when it is invoked with argument \code{"health"}.
+\(SU\), and \(EC\) cannot guide the generation of these specific values.
+For example, candidate stub code \(S_a\) stubbing \code{getPath} to return \code{"random"} (Lines~\ref{code:b36-sa}--\ref{code:b36-sa-end}) and \(S_b\) stubbing \code{getPath} to return \code{"/actuator/hea"} (Lines~\ref{code:b36-sb}--\ref{code:b36-sb-end}) will achieve the same fitness score with only \(SU\) and \(EC\).
+Both candidates can make the test execute to Line~\ref{code:b36-act-end} but violate the oracle assertion at Line~\ref{code:b36-assert}.
+However, returning \code{"/actuator/hea"} is much closer to passing the test as the returned string is much more similar to the expected value \code{"/actuator/health"}.
+This difference can be captured by \(AS\).
+
+\paragraph{Fitness Computation.}
+In this paper, we designed a dominance based fitness computation approach.
+This is because, in our scenario, the three objectives are of different importance.
+Based on the execution order of the arrange, act, and assert phases, there is a natural order of the three objectives: SU, EC, and AS.
+Our rationale is that individuals who perform better (the functions have higher values) in later phases are more likely to converge to the test passing-stub code because in a test case, a later phase depends on the outcome of the former phases.
+For example, the assert phase will be executed only when the arrange and act phases executed successfully.
+Therefore, we define the dominance relationship \(\succ\) between as follows.
+For two stub codes \(S_1\) and \(S_2\), \(S_1 \succ S_2\) if any of the following holds:
+\begin{itemize}
+	\item \(AS(S_1) > AS(S_2)\)
+	\item \(AS(S_1) = AS(S_2) \wedge EC(S_1) > EC(S_2)\)
+	\item \(AS(S_1) = AS(S_2) \wedge EC(S_1) = EC(S_2) \wedge SU(S_1) > SU(S_2)\)
+\end{itemize}
+During selection, for two individuals \ie{stub code} \(S_1\) and \(S_2\), we favor \(S_1\) if \(S_1 \succ S_2\).
+
+\subsection{Representation of Stub Code}\label{sec:representation}
+
+% Figure environment removed
+
+This section defines the possible stub code \(S\) that \tool{} is able to synthesize (the possible individuals of a population). It also describes how \tool{} represents an individual.
+Specifically, a candidate stub code can be constructed by any of the possible strings on the context-free grammar shown in Figure~\ref{fig:grammar}.
+Specifically, we represent \(S\) as a finite sequence of code elements, each of them can be either a \emph{variable definition} or a \emph{stub call}.
+A variable definition constructs a value and stores it in a variable.
+Then, a stub call can associate such variables with method calls on the mock objects.
+These code elements in the stub code work together to specify the behavior of the mock objects.
+By default, we set the length limit of \(S\) to 50, which is adequate for most of the stub code in practice (as shown in Table~\ref{tab:results}, the length of developer written stub code are less than 50).
+
+\paragraph{Variable Definition.}
+A variable definition \(v \leftarrow Expr\) defines a new variable \(v\) and initializes it with \(Expr\).
+The \(Expr\) can be a literal value in \textsc{Java}~\cite{jls11}, an array of previously defined variables~\footnote{The synthesized stub code is inserted before the first reference of the mock objects in the test case. All the variables defined before the stub code can be used in the synthesized stub code.}, or an API call.
+Specifically, an API call can be either a method call, a constructor call, or a field access, which also takes previously defined variables as arguments.
+In addition, \(Expr\) can be the creation of a mock object.
+This enables us to synthesize the mock objects that may be absent from the input~\eg{\code{user} in Listing~\ref{lst:stubbing-example}}.
+
+\paragraph{Stub Call.}
+A stub call specifies the reaction for a certain method call received by a mock object when the argument matcher matches all the arguments.
+The reaction can be either \textsf{Return}\((v)\), which returns the value referenced by the variable \(v\), or \textsf{Throw}\((v)\), which throws the exception referenced by the variable \(v\).
+There can be multiple stub calls matching the same method call on the same mock object.
+Their reactions will be executed in the order that they appear.
+
+Figure~\ref{fig:representation-example} illustrates our representation of the stub code in Listing~\ref{lst:stubbing-example}.
+There are four variable definitions and three stub calls.
+As specified by \(Stub_1\) and \(Stub_2\), \code{dao.findUser} will throw a \code{TimeoutException} for the first call and return \code{user} for the second call.
+The return value of \code{user.getPasswordHash} will be the SHA-1 digest of the string \code{"bar"} stored in \(v_3\).
+The arrows indicate the def-use dependencies among these code elements.
+
+The grammar in Figure~\ref{fig:grammar} is based on the APIs provided by the \mockito{}~\cite{Tool:mockito} framework, which is the most popular mocking framework for \java{}.
+It can be adapted to support the syntax of other object-oriented programming languages and mocking frameworks.
+Mocking frameworks tend to provide APIs with similar functionalities to aid the development.
+For example, a \(StubCall\) can be mapped to a \code{expect(...)} call in \easymock{}~\cite{Tool:easymock} or a \code{Mock<T>.Setup(...)} call in \moq{}~\cite{Tool:moq4}.
+\(\textsf{Return}(v)\) can be mapped to a \code{andReturn(...)} call in \easymock{} or a \code{MethodCall.Return(...)} call in \moq{}.
+In our experiment, we implemented \tool{} in \java{} using \mockito{}.
+
+% Figure environment removed
+
+\subsection{Evolutionary Algorithm}
+
+Algorithm~\ref{alg:workflow} details the key steps in the evolution of stub code.
+It takes a test case with a void or broken stub code \(\tau=\left\langle V,\varnothing, E,A\right\rangle\) or \(\left\langle V,S_{bk}, E,A\right\rangle \) as input, and outputs a stub code \(S\) such that the \(\testTuple \) is passing.
+The evolution process is controlled by the population size \(N\) and generation budget \(MAX\_GEN\).
+
+\paragraph{Symbol Pool.}
+One challenge in synthesizing the stub code is to properly construct the return values.
+However, it is less efficient to start searching from default values~\eg{0, \code{null}, an empty string} or random values.
+To address this challenge, we construct a symbol pool to provide heuristics for the search process.
+Specifically, the function \textsc{Construct-Symbol-Pool} in Algorithm~\ref{alg:workflow} extracts the literals and API calls from the \(\tau\) and the CUT.
+It also includes the symbols in the broken stub code \(S_{bk}\), if available.
+Such a constructed symbol pool contains useful values for synthesizing a test-passing stub code.
+After construction, the symbol pool \(B\) is passed to \textsc{Crossover-and-Mutation}.
+Mutation operators can take the literals and API calls in \(B\) to generate variable definitions.
+
+\paragraph{Initial Population.}
+\tool{} starts the synthesis process from an initial population.
+Specifically, the function \textsc{Create-Initial-Population} returns a population of \(N\) stub code where each of them contains randomly generated code elements for the mock objects in \(M\).
+
+\paragraph{Elitism Selection.}
+Before starting populating the new population, \tool{} retains the best individuals.
+At Line~\ref{alg:workflow:elitism} of Algorithm~\ref{alg:workflow}, the function \textsc{Elitism-Selection} selects the top 1\% of individuals with the highest fitness and brings them directly to the next generation.
+With elitism selection, \tool{} avoids losing the best individuals in the next generation.
+
+\paragraph{Parent Selection.}
+At Line~\ref{alg:workflow:sel-parents} of Algorithm~\ref{alg:workflow}, \tool{} selects two parent individuals to produce the offspring.
+In the function \textsc{Select-Parents}, we leverage tournament selection~\cite{DBLP:journals/compsys/MillerG95} to select the parents.
+Tournament selection is widely used in genetic programming~\cite{DBLP:conf/issta/FraserZ10,DBLP:journals/tse/GouesNFW12} because it has less stochastic noise compared with other selection methods~\cite{DBLP:journals/ec/BlickleT96}.
+Specifically, it randomly chooses \(K\) individuals and runs a tournament among them, after which the winner is chosen.
+In this paper, we choose \(K=2\) to mitigate premature convergence and the local optimum problem~\cite{DBLP:conf/cec/LeggHK04,DBLP:conf/smc/LavinasASL18}.
+Thus, we run two tournaments to get two parents \(\langle p_1, p_2\rangle\).
+
+\begin{algorithm}[t]
+	\SetFuncSty{textsc}
+	\SetKwFunction{ConstructSymbolPool}{Construct-Symbol-Pool}
+	\SetKwFunction{CreateInitialPop}{Create-Initial-Population}
+	\SetKwFunction{Select}{Select-Parents}
+	\SetKwFunction{CrossoverAndMutate}{Crossover-and-Mutate}
+	\SetKwFunction{SelectBest}{Select-Best}
+	\SetKwFunction{Elitism}{Elitism-Selection}
+	\SetKwFunction{Fitness}{Fitness-Computation}
+	\KwIn{Input test case \(\tau=\left\langle V,\varnothing, E,A\right\rangle \) or \(\left\langle V,S_{bk}, E,A\right\rangle \)}
+	\KwIn{Population size \(N\), generation budget \(MAX\_GEN\)}
+	\KwOut{Stub code \(S\)}
+
+	\(B \leftarrow \) \ConstructSymbolPool{\(\tau\)} \;
+	\(P \leftarrow \) \CreateInitialPop(\(N, B\)) \;
+	\(P \leftarrow \Fitness{P}\)\;
+	\(gen \leftarrow 1\) \;
+	\Repeat{\(\exists S \in P, \tau=\left\langle V,S,E,A\right\rangle \) passes \(\vee gen > MAX\_GEN\)\label{alg:workflow:stop}}{
+		\(P^\prime \leftarrow \Elitism{P} \) \label{alg:workflow:elitism}\;
+		\While{\(|P^\prime| < N\)}{
+			\(\langle p_1, p_2 \rangle \leftarrow \) \Select{\(P\)}\label{alg:workflow:sel-parents}\;
+			\(\langle o_1, o_2  \rangle \leftarrow \) \CrossoverAndMutate{\(p_1, p_2, B\)}\;
+			\(P^\prime \leftarrow P^\prime \cup \left\{ o_1, o_2 \right\} \) \;
+		}
+		\(P \leftarrow P^\prime\) \;
+		\(P \leftarrow \Fitness{P}\)\;
+		\(gen \leftarrow gen + 1\) \;
+
+	}
+	\Return{\(S\)}\;
+
+	\caption{Evolution of Stub Code in \tool{}}\label{alg:workflow}
+\end{algorithm}
+
+\paragraph{Crossover and Mutation.}
+The function \textsc{Crossover-and-Mutation} exchanges the genetic materials of two parents \(\langle p_1, p_2 \rangle \) and produces two offspring individuals \(\langle o_1, o_2 \rangle \), which are then mutated to introduce new genetic materials.
+
+First, we exchange the stub calls that stub a mock object in \(M\) because they directly contribute to the outcome of the test case.
+Specifically, we gather all such stub calls from \(p_1\) and \(p_2\), and copy each of them to \(o_1\) and \(o_2\) with probability 50\%.
+In the stub code, a stub call relies on other code elements to function~\eg{the variable definition for its return value}.
+Therefore, when copying a stub call, we perform a backward slicing~\cite{DBLP:journals/toplas/FerranteOW87} to obtain all its dependencies and copy all dependent code elements to the offspring.
+For example, in Figure~\ref{fig:representation-example}, when copying \(Stub_2\), we bring together \(Def_3\) and \(Def_2\) since they are required to define \(v_3\), which is the return value of \(Stub_2\).
+
+Next, the two offspring individuals \(o_1\) and \(o_2\) are mutated by one of the following mutation operators (randomly chosen with uniform probability).
+\begin{itemize}
+	\item \textit{\bfseries Inserting a Code Element.}
+	      We randomly generate a stub call and a variable definition, and insert it into the stub code.
+	      Variable definitions are generated by randomly choosing a literal or an API call from the symbol pool \(B\).
+	\item \textit{\bfseries Altering the Parameters.}
+	      Some code elements in the stub code take variables as their parameters.
+	      For example, in Figure~\ref{fig:representation-example}, stub call \(Stub_1\) takes \(v_1\) to be the exception and variable definition \(Def_3\) uses \(v_2\) to perform an API call.
+	      We randomly choose a parameter for such code elements and replace it with another variable of the same type in the stub code.
+	\item \textit{\bfseries Altering the Literals.}
+	      Some variable definitions in the stub code are numeric, string, or Boolean literals.
+	      For example, \(Def_2\) in Figure~\ref{fig:representation-example} defines \(v_2\) with a string literal.
+	      We apply a randomly chosen numeric or string operation \eg{add/subtract a random value, alter a character} to the literal.
+	      For a Boolean literal, we simply flip it.
+	\item \textit{\bfseries Swapping Two Code Elements.}
+	      We randomly choose two code elements and interchange them.
+	\item \textit{\bfseries Dropping a Code Element.}
+	      We randomly remove a stub call or an unused variable definition from the stub code.
+\end{itemize}
+
+\paragraph{Mocking Decisions.}
+The synthesized stub code can contain two types of mock objects.
+The mocking decision is made depending on how they are declared.
+\begin{itemize}
+	\item \textit{\bfseries Type I Mock Objects.}
+	      For the mock objects declared by developers in the test cases, we follow the original mocking decision by the developers.
+	\item \textit{\bfseries Type II Mock Objects.}
+	      During mutation, using a real object or a mock object is an alternative way of generating an object, and StubCoder will choose randomly between these alternative ways.
+	      For instance, when populating a variable of a complex type \(T\), the mutation operator will randomly choose between using a generator of \(T\) \eg{the constructors of \(T\), the fields of type \(T\), and the methods that return \(T\)}, and a mocked version of \(T\) \ie{\code{mock(T.class)}}.
+	      Since the goal of \tool{} is to synthesize a stub code to pass the test, the fitness function will then prioritize the stub code that is more likely to make the test pass.
+\end{itemize}
+
+\paragraph{Stopping Criterion.}
+As shown at Line~\ref{alg:workflow:stop} of Algorithm~\ref{alg:workflow}, we stop the algorithm if the best stub code makes the test pass or the maximum number of generations is reached.

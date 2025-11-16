@@ -1,0 +1,161 @@
+% Figure environment removed
+
+\section{Approach}
+
+
+The overview of an end-to-end multi-view 3D detection approach with DFA3D-based feature lifting is shown in Fig.~\ref{fig.pipeline}. In this section, we introduce how to construct the expanded 3D feature maps for DFA3D in Sec.~\ref{subsec.feature_expanding} and how DFA3D works to realize feature lifting in Sec.~\ref{subsec.3DDeformable}. In addition, we explain our efficient implementation of DFA3D in Sec.~\ref{sec.3D_attention_impl}. Finally, we provide a detailed analysis and comparison between our DFA3D-based feature lifting and the current mainstream feature lifting methods in Sec.~\ref{subsec.analysis}.
+
+\subsection{Feature Expanding}
+\label{subsec.feature_expanding}
+
+In the context of multi-view 3D detection, the depth information of input images is unavailable.  We follow~\cite{li2022bevdepth, wang2022sts, li2022bevstereo, huang2021bevdet} to introduce a monocular depth estimation to supplement depth information for 2D image features. Specifically, we 
+follow~\cite{li2022bevdepth} to adopt a DepthNet~\cite{fu2018deep} module, which takes as input the 2D image feature maps from the backbone and generates a discrete depth distribution for each 2D image feature. The DepthNet module can be trained by using LiDAR information~\cite{li2022bevdepth} or ground truth 3D bounding box information~\cite{chu2023oa} as supervision.
+
+We denote the multi-view 2D image feature maps as $\boldsymbol{X}\in \mathbb{R}^{V\times H\times W\times C}$, where $V$, $H$, $W$, and $C$ indicates the number of views, spatial height, spatial width, and the number of channels, respectively. We feed the multi-view 2D image feature maps into DepthNet to obtain the discrete depth distributions. The distributions have the same spatial shape as $\boldsymbol{X}$ and can be denoted as $\boldsymbol{D}\in \mathbb{R}^{V\times H\times W\times D}$, where $D$ indicates the number of pre-defined discretized depth bins.
+Here, for simplicity, we assume that $\boldsymbol{X}$ only has one feature scale. In the context of multi-scale, in order to maintain the consistency of depths across multiple scales, we select the feature maps of one scale to participate in the generation of depth distributions. The generated depth distributions are then interpolated to obtain the depth distributions for multi-scale feature maps.
+
+
+After obtaining the discrete depth distributions $\boldsymbol{D}$, we expand the dimension of $\boldsymbol{X}$ into 3D by conducting the outer product between $\boldsymbol{D}$ and $\boldsymbol{X}$, which is formulated as $\boldsymbol{F} = \boldsymbol{D} \otimes_{-1} \boldsymbol{X}$,
+where $\otimes_{-1}$ indicates the outer product conducted at the last dimension, and $\boldsymbol{F}\in \mathbb{R}^{V\times H\times W\times D\times C}$ denotes the multi-view expanded 3D feature maps. For more details about the expanded 3D feature maps, please refer to the further visualization in appendix.
+
+
+Directly expanding 2D image feature maps through outer products will lead to high memory consumption, especially when taking multi-scale into consideration. To address this issue, we develop a memory-efficient algorithm to solve this issue, which will be explained in Sec.~\ref{sec.3D_attention_impl}.
+
+
+\subsection{3D Deformable Attention and Feature Lifting}
+\label{subsec.3DDeformable}
+After obtaining the multi-view expanded 3D feature maps, DFA3D is utilized as the backend to transform them into a unified 3D space to obtain the lifted features. Specifically, in the context of feature lifting, DFA3D treats the predefined 3D anchors as 3D queries, the expanded 3D feature maps as 3D keys and values, and performs deformable attention in the 3D pixel coordinate system.
+
+To be more specific, for a 3D query located at $(x,y,z)$ in the ego coordinate system, its view reference point $\boldsymbol{R}_n=(u_n,v_n,d_n)$ in the 3D pixel coordinate system for the $n$-th view is calculated by\footnote{Since there is only a rigid transformation between the camera coordinate system of $n$-th view and the ego coordinate system, we assume the extrinsic matrix as identity matrix and drop it for notation simplicity.}
+\begin{equation}
+\begin{aligned}
+d_n
+\begin{bmatrix}
+u_n\\
+v_n\\
+1\\
+\end{bmatrix}
+&=
+\begin{bmatrix}
+f_n^x & 0 & u_n^0\\
+0 & f_n^y & v_n^0\\
+0 & 0     & 1
+\end{bmatrix} 
+\begin{bmatrix}
+x\\
+y\\
+z\\
+\end{bmatrix},
+\end{aligned}
+\label{equ.cam2img}
+\end{equation}
+where $f_n^x$, $f_n^y$, $u_n^0$, $v_n^0$ are the corresponding camera intrinsic parameters. By solving Eq.~\ref{equ.cam2img}, we can obtain
+
+\begin{equation}
+\begin{aligned}
+u_n = f_n^x\frac{x}{d_n} + u_n^0, v_n = f_n^y\frac{y}{d_n} + v_n^0, d_n = z
+\end{aligned}.
+\label{equ.sameuv}
+\end{equation}
+
+We denote the content feature of a 3D query as $\boldsymbol{q} \in \mathbb{R}^{C_q}$, where $C_q$ indicates the dimension of $\boldsymbol{q}$. The 3D deformable attention mechanism in the $n$-th view can be formulated by\footnote{Here we set the number of attention heads as 1 and the number of feature scales as 1, and drop their indices for notation simplicity.}
+\begin{equation}
+    \begin{aligned}
+        \Delta \boldsymbol{S} &= \boldsymbol{W}^{S}\boldsymbol{q}, \Delta \boldsymbol{S}_k = \Delta \boldsymbol{S}_{[3k:3(k+1)]}, \boldsymbol{A} = \boldsymbol{W}^{A}\boldsymbol{q},\\
+        \boldsymbol{q}_n &= \sum_{k=1}^{K}{\boldsymbol{A}_k\operatorname{Trili}\left(\boldsymbol{F}_n,
+% \begin{bmatrix}
+% u_n,v_n,d_n\\
+% \end{bmatrix}^{\scriptscriptstyle T}
+\boldsymbol{R}_n
++\Delta \boldsymbol{S}_k\right)},
+    \end{aligned}
+\label{equ.3ddef}
+\end{equation}
+where $\boldsymbol{q}_n$ is the querying result in the $n$-th view, $K$ denotes the number of sampling points, $\boldsymbol{W}^S \in \mathbb{R}^{3K\times C_q}$ and $\boldsymbol{W}^A \in \mathbb{R}^{K\times C_q}$ are learnable parameters, $\Delta \boldsymbol{S}$ and $\boldsymbol{A}$ represent the view sampling offsets in the 3D pixel coordinate system and their corresponding attention weights respectively. $\operatorname{Trili}(\cdot)$ indicates the trilinear interpolation used to sample features in the expanded 3D feature maps. The detailed implementation of $\operatorname{Trili}(\cdot)$ and our simplification will be explained in Sec.~\ref{sec.3D_attention_impl}.
+
+
+After obtaining the querying results through DFA3D in multiple views, the final lifted feature $\boldsymbol{q}'$ for the 3D query is obtained by  query result aggregation, 
+\begin{equation}
+\begin{aligned}
+    \boldsymbol{q}' = \sum_{n} \boldsymbol{V}_n \boldsymbol{q}_n
+\end{aligned},
+\label{equ.3ddef_mv}
+\end{equation}
+where $\boldsymbol{V}_n$ indicates the visibility of the 3D query in the $n$-th view. The lifted feature is used to update the content feature of the 3D query for feature refinement.
+
+\subsection{Efficient 3D Deformable Attention}\label{sec.3D_attention_impl}
+
+Although the 3D deformable attention has been formulated in Eq. \ref{equ.3ddef}, maintaining the multi-view expanded 3D feature maps $\boldsymbol{F}\in \mathbb{R}^{V\times H\times W\times D\times C}$ will lead to tremendous memory consumption, especially when taking multi-scale features into consideration. We prove that in the context of feature expanding through the outer product between 2D image feature maps and their discrete depth distributions, the trilinear interpolation can be transformed into a depth-weighted bilinear interpolation. Hence the 3D deformable attention can also be transformed into a depth-weighted 2D deformable attention accordingly. 
+
+
+% Figure environment removed
+
+
+As shown in Fig.~\ref{fig.conceptual_lift}, without loss of generality, for a specific view (the $n$-th view for example) with an expanded 3D image feature map $\boldsymbol{F}_n = \boldsymbol{D}_n \otimes_{-1} \boldsymbol{X}_n$, $\boldsymbol{F}_n \in \mathbb{R}^{H\times W\times D\times C}$, assume a sampling point $\boldsymbol{s}=(u_s,v_s,d_s)$ in the 3D pixel coordinate system falls in a cuboid formed by eight points: $\{(u_i, v_j, d_k)\}, i,j,k\in\left\{0,1\right\}$, which are the sampling point's eight nearest points in $\boldsymbol{F}_n$. The sampling point performs trilinear interpolation on the features of these eight points to obtain the sampling result. Since the eight points with the same $u,v$ coordinates share the same 2D image feature, their corresponding contributions in the interpolation process can be presented as 
+$\left\{\omega_{nijk} \boldsymbol{X}_{n,u_i,v_j}\right\}$, where $\omega_{nijk}$ denotes $\boldsymbol{D}_{n,u_i,v_j,d_k}$ for notation simplicity. $\omega_{nijk}$ indicates the depth confidence scores of point $(u_i, v_j, d_k)$ selected from the discrete depth distributions $\boldsymbol{D}_{n,u_i,v_j}$ that it belongs to, according to its depth values $d_k$.
+Therefore, the trilinear interpolation can be formulated as:
+\begin{equation}
+    \begin{aligned}
+        &t_u = \frac{u_s - \lfloor u_s\rfloor}{\lceil u_s\rceil-\lfloor u_s\rfloor}, t_v = \frac{v_s - \lfloor v_s\rfloor}{\lceil v_s \rceil-\lfloor v_s\rfloor}, \\
+        &t_d = \frac{d_s - \lfloor d_s/ d_{\Delta}\rfloor d_{\Delta}}{\lceil d_s/d_{\Delta}\rceil d_{\Delta} - \lfloor d_s/d_{\Delta}\rfloor d_{\Delta}}, \\
+        &Trili(\boldsymbol{F}_n, 
+\boldsymbol{s}) = \\
+            &\omega_{n000} \left(1-t_d\right)  \left(1-t_u\right) \left(1-t_v\right) \boldsymbol{X}_{n,u_0,v_0} + \\
+            &\omega_{n001} t_d      \left(1-t_u\right) \left(1-t_v\right) \boldsymbol{X}_{n,u_0,v_0} + \\
+            &\omega_{n100} \left(1-t_d\right)  t_u     \left(1-t_v\right) \boldsymbol{X}_{n,u_1,v_0} + \\
+            &\omega_{n101} t_d      t_u     \left(1-t_v\right) \boldsymbol{X}_{n,u_1,v_0} + \\
+            &\omega_{n010} \left(1-t_d\right) \left(1-t_u\right)  t_v     \boldsymbol{X}_{n,u_0,v_1} + \\
+            &\omega_{n001} t_d     \left(1-t_u\right)  t_v     \boldsymbol{X}_{n,u_0,v_1} + \\
+            &\omega_{n110} \left(1-t_d\right)  t_u     t_v     \boldsymbol{X}_{n,u_1,v_1} + \\
+            &\omega_{n111} t_d      t_u     t_v     \boldsymbol{X}_{n,u_1,v_1} ,
+    \end{aligned}
+    \label{equ.trilinear}
+\end{equation}
+where $d_\Delta$ indicates the depth interval between two adjacent depth bins. Eq. \ref{equ.trilinear} can be further re-formulated into
+\begin{equation}
+\begin{aligned}
+    &\mathcal{W}_{nij}=\omega_{nij0}(1-t_d) + \omega_{nij1}t_d, \\
+    &Trili(\boldsymbol{F}_n, 
+    \boldsymbol{s}) = \\
+            &\mathcal{W}_{n00} \left(1-t_u\right) \left(1-t_v\right) \boldsymbol{X}_{n,u_0,v_0} + \\
+            &\mathcal{W}_{n10} t_u     \left(1-t_v\right) \boldsymbol{X}_{n,u_1,v_0} + \\
+            &\mathcal{W}_{n01} \left(1-t_u\right) t_v     \boldsymbol{X}_{n,u_0,v_1} + \\
+            &\mathcal{W}_{n11} t_u t_v \boldsymbol{X}_{n,u_1,v_1}.
+\end{aligned}
+\label{equ.trilinear2}
+\end{equation}
+
+
+
+Comparing Eq.~\ref{equ.trilinear} and Eq.~\ref{equ.trilinear2}, we can find that the trilinear interpolation here can be actually split into two parts: 1) a simple linear interpolation of the estimated discrete depth distribution along the depth axis to obtain the depth scores 
+$\mathcal{W}_n=\left\{\mathcal{W}_{nij}\right\}$
+, and 2) a depth score-weighted bilinear interpolation in the 2D image feature maps. Compared with bilinear interpolation, the only extra computation we need is to sample depth scores $\mathcal{W}_n$ through linear interpolation. With such an optimization, we can calculate the 3D deformable attention on the fly rather than maintaining all the expanded features. Thus the entire attention mechanism can be implemented in a more efficient way. Moreover, such an optimization can reduce half of the multiplication operations and thus speedup the overall computation as well. 
+
+We conduct a simple experiment to compare the efficiency. The results are shown in Table~\ref{tab:source_consume}. For a fair comparison, we show the resource consumption of all steps in detail. 
+The results show that our efficient implementation only takes about 3\% time cost and 1\% memory consumption compared with the vanilla one.  
+
+\input{tab/source_consumption.tex}
+
+
+
+\subsection{Analysis}
+\label{subsec.analysis}
+\noindent\textbf{Comparison with Lift-Splat-based Feature Lifting.} Lift-Splat-based feature lifting follows the pipeline of LiDAR-based methods. To construct pseudo LiDAR features as if they are obtained from LiDAR data, it also utilizes depth estimation to supplement depth information. 
+It obtains the pseudo LiDAR features by constructing single-scale 3D expanded feature maps explicitly and transforming them from a 3D pixel coordinate system into the ego coordinate system according to the camera parameters. The pseudo LiDAR features are further assigned to their nearest 3D anchors to generate lifted features for downstream tasks. Since the locations of both 3D anchors and pseudo LiDAR features are constant, the assignment rule between them is fixed based on their geometrical relationship. 
+
+In DFA3D, the relationship between 3D queries and the expanded 3D features that are computed based on the estimated sampling locations can also be considered as an assignment rule. Instead of being fixed, DFA3D can progressively refine the assignment rule by updating the sampling locations layer by layer in a Transformer-like architecture.
+Besides, the efficient implementation of DFA3D enables the utilization of multi-scale 3D expanded features, which are more crucial to detecting small (faraway) objects.
+
+\noindent\textbf{Comparison with 2D Attention-based Feature Lifting.} Similar to DFA3D, 2D  attention-based feature lifting also transforms each 3D query into a pixel coordinate system. However, to satisfy the input of off-the-shelf 2D attention operators, a 3D query needs to be projected to a 2D one, where its depth information is discarded. It is a compromise to implementation and can cause multiple 3D queries to collapse into one 2D query. Hence multiple 3D queries can be entangled greatly. This can be proved easily according to the pin-hole camera model. In such a scenario, according to Eq.~\ref{equ.sameuv}, as long as a 3D query's coordinate $(x,y,z)$ in the ego coordinate system satisfies 
+
+\begin{equation}
+\begin{aligned}
+    \frac{x}{z} = \frac{u_n-u_n^0}{f_n^x}, \frac{y}{z} = \frac{v_n-v_n^0}{f_n^y}
+\end{aligned},
+\label{equ.view_ray}
+\end{equation}
+its reference point in the target 2D pixel coordinate system will be projected to the shared $(u_n, v_n)$ coordinate, resulting in poorly differentiated lifted features that will be used to update the 3D queries' content and downstream tasks. 
+
+
+
+

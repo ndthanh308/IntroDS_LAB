@@ -1,0 +1,162 @@
+
+% Figure environment removed
+
+\section{Methods}
+\label{sec:method}
+
+We provide a general description of our proposed framework in Section~\ref{subsec:overview}.
+We proceed to describe two use-cases:  anti-money laundering (AML) (Section~\ref{subsubsec:amlusecase}) and detection of injection attacks in recommendation systems (Section~\ref{subsubsec:rsusecase}).
+In Section~\ref{sec:theory}, we show theoretically, in a simplified setting, how our generator's loss function changes the learning dynamics compared to a typical GAN.
+
+\subsection{General description}
+\label{subsec:overview}
+
+Figure~\ref{fig:03_fulldiagram} depicts the general structure of our framework.
+It comprises a generator, a discriminator, an optimisation objective, and, optionally, an existing alert system. Each component is discussed in more detail below.
+
+
+\textbf{Generator.} As in the classical GAN architecture, the generator $G$ receives a random noise input vector and outputs an instance of data.
+However, unlike classical GANs, the loss of the generator  $\mathcal{L}(G)$ is a linear combination of three components: the optimisation objective for malicious activity $\mathcal{L}_{Obj}(G)$, the GAN loss $\mathcal{L}_{GAN}(G,D)$ that additionally depends on the discriminator $D$, and the loss from an existing detection system $A$, $\mathcal{L}_{Alert}(G,A)$:
+\begin{equation}
+    \mathcal{L}(G) = \alpha \mathcal{L}_{Obj}(G) + \beta \mathcal{L}_{GAN}(G,D) + \gamma\mathcal{L}_{Alert}(G,A)
+    \label{eq:generator_loss}
+\end{equation}
+where $\alpha$, $\beta$ and $\gamma$ are hyperparameters to tune the strength of each component. The last term is optional, and if no existing detection system is present we simply choose $\gamma = 0$.  Note also that one of the parameters is redundant and we tune only two parameters in our experiments (or one if $\gamma = 0$).
+
+We show in Section~\ref{sec:theory} that the stable point of convergence for the generator in our theoretical example moves away from the data distribution for any $\alpha > 0$. 
+
+\textbf{Discriminator.} The discriminator setup is the same as in a classical GAN. It receives an example and produces a score indicating the likelihood that the example is real or synthetic. Importantly, as explained in Section~\ref{sec:theory}, the generator subject to Equation~\ref{eq:generator_loss} will generate data increasingly out of distribution for larger $\alpha$. Therefore, we do not require the discriminator accuracy to fall to chance level at training convergence, as is usual with GANs. Instead, the discriminator may converge to perfect classification and may be used as a detection system for illicit activity. In our experiments, we use the Wasserstein loss \citep{arjovsky2017wasserstein} as our GAN loss.
+
+\textbf{Malicious optimisation objective.} The optimisation objective quantifies how well the synthetic example is fulfilling the goal of a malicious agent. It can be a mathematical formulation or a differentiable model of the goal. This objective allows the generator to find previously unseen strategies to meet malicious goals.
+
+\textbf{Alert system.} If an existing, differentiable alert system is present, we can add it to our framework to teach the generator to create examples that do not trigger detection (see Equation~\ref{eq:generator_loss}). In that scenario, it is then beneficial for the discriminator to focus on the undetected illicit activity. Whenever the existing system is not differentiable, training a differentiable proxy may be possible.
+
+\textbf{Generator vs. Discriminator views.} If required by the malicious optimisation objective, our generator can be adapted to generate samples which are only partially evaluated by the discriminator. For example, the layering stage of money laundering typically involves moving money through many financial institutions (FIs). However, each detection system operates within single institutions, limiting their view of the entire operation. Our method can be adapted to capture this situation, by generating samples containing various fictitious FIs, but only sending the partial samples corresponding to each FI to the discriminator. In recommender systems, the malicious objective can act on a group of synthetic illicit actors to generate coordinated attacks, while the detection of fraudulent users is typically performed on a single-user level.
+
+\textbf{Architecture optimisations.} In the next sections, we provide more details about the specific architectures used in the two experiments. We note that the architecture details (layer types, widths and number of layers) were first optimised using a vanilla GAN setup (i.e. setting $\alpha=0, \beta=1, \gamma=0$ in Equation~\ref{eq:generator_loss}). With the architecture fixed, the other hyperparameters were tuned as explained in the next sections.
+
+\textbf{Code availability.} The Pytorch code for both models can be found on GitHub
+(the link will be provided after double blind review).  
+%at https://github.com/feedzai/ganfather .
+
+
+\subsection{Anti-Money Laundering (AML)}
+\label{subsubsec:amlusecase}
+
+We tackle the layering stage of money laundering, in which criminals attempt to conceal the origin of the money by moving large amounts across financial institutions through what are known as ``mule accounts''. 
+
+\textbf{Representing dynamic graphs as tensors.} To represent the dynamic graph of transactions, we can use a 3D tensor as depicted in Figure~\ref{fig:03_amldatarepresentation}. We assume the nodes of the dynamic graph are accounts, and the edges are transactions.
+The first two dimensions correspond to the weighted adjacency matrix of the accounts and the third dimension is time.
+We discretise the events into time windows of fixed length and group events that belong to the same entry in the tensor by summing their amounts. In other words, each entry $A_{ijk}$ of the tensor corresponds to the cumulative amount sent between account $i$ and account $j$ on timestep $k$.
+Our representation covers any dynamic network with a 3D tensor whose size is fixed and pre-specified, which allows us to avoid using recurrent models.
+While this approach may limit the size of generated data, domain experts reported that up to 95\% of the money-laundering investigations involve cases containing up to 5 accounts.
+
+% Figure environment removed
+
+\textbf{Architecture.} We implement the generator using a set of dense layers, followed by a set of transposed convolutions. 
+Then, we create two branches: one to generate transaction amounts and the other to generate transaction probabilities.
+We use the probabilities to perform categorical sampling and generate sparse representations, similar to real transaction data. 
+After the sampling step, the two branches are combined by element-wise multiplication, resulting in a final output tensor with the dimensions described above. 
+%More details about the generator's architecture can be found on our GitHub repository.
+
+The discriminator receives two tensors with the same shape as inputs: one containing the total amount of money transferred per entry, and the other with the count information (mapping positive amounts to 1 and empty entries to 0). Each tensor passes through convolutional layers, followed by permutation-invariant operations over the internal and external accounts. Then, we concatenate both tensors. We reduce the dimensionality of the resulting vector to a classification outcome using dense layers.
+%More details about the discriminator's architecture can be found on our GitHub repository.
+
+We provide more details about both architectures on our GitHub repository.
+
+
+\textbf{Money Mule objective.} To characterise the money flow behaviour of layering, where money is moved in and out of accounts while leaving little behind, we define the objective function as the geometric mean of the total amount of incoming ($G(z)_{in}$) and outgoing ($G(z)_{out}$) money per generated account (Equation~\ref{eq:aml_reward}).
+
+\begin{equation}
+    \mathcal{L}_{Obj}(G) = -\int \sqrt{ G(z)_{in} \times G(z)_{out} } \cdot p(z) dz
+    \label{eq:aml_reward}
+\end{equation}
+Here $z$ represents random noise input to the generator $G$ and $p(z)$ is its probability distribution. This objective encourages the generator to increase the amount of money sent and received per account and keep these two quantities similar, as observed in mule accounts.
+
+\textbf{Existing Alert System.} In AML, it is common to have rule-based detection systems. In our case, the rules detection system contains five alert scenarios, capturing known suspicious patterns such as a sudden change in behaviour or rapid movements of funds. However, these rules are not differentiable, and our generator requires feedback in the form of a gradient. Hence, we construct a deep learning model as a proxy for the rules system. We hard-code a neural network mimicking the rules' logic operations by choosing the weights, biases and activation functions appropriately. This network gives the same feedback as the rules system would, but in a differentiable way.
+
+
+\subsection{Recommendation System}
+\label{subsubsec:rsusecase}
+
+In this work, we consider collaborative filtering recommender systems. However, our method is compatible with any other differentiable recommender systems.
+The system receives a matrix of ratings $R$ with shape $(N_u, N_i)$, where $N_u$ is the number of users and $N_i$ is the number of items.
+First, we compute cosine distances between users, resulting in the matrix $D$ of shape $(N_u,N_u)$. Then, we compute the predicted ratings $P$ as a matrix product between $D$ and $R$.
+We decided to not represent time since most classical recommender systems do not account for it. However, it is possible to include temporal information using a similar setup to what we described in the AML use case. We also note that, unlike in the AML scenario, we do not have an existing detection system in this setup.
+We provide details about the architectures of both the generator and the discriminator on our GitHub repository.
+
+
+\textbf{Injection Attack Objective.} We define the goal of malicious agents as increasing the frequency of recommendation of a specific item.
+The objective function in Equation~\ref{eq:rs_objective} incentivizes the generator to increase the rating of the target item $t$ for every user.
+
+\begin{equation}
+    \mathcal{L}_{Obj}(G) = \int \sum_{i}^{N_u}\sum_{j}^{N_i} (P_{ij}(z)-P_{it}(z))_+ \cdot p(z)dz
+    \label{eq:rs_objective}
+\end{equation}
+Here, the matrix of predicted ratings $P$ depends on the random inputs $z$ through the generator $G$ and $(\cdot)_+$ denotes a rectifier setting negative values to zero.
+
+
+\subsection{Theoretical justification}
+\label{sec:theory}
+In this section, we provide a theoretical justification to enlighten certain aspects of our setup, in a simplified setting. We will assume no existing detection system is available ($\gamma$ = 0 in Equation~\ref{eq:generator_loss}). In the case such a system would be available, we assume its effect is to limit how far the generated data distribution can be from the real data distribution. Furthermore, we assume that a malicious objective would promote a change in the distribution of at least one feature of the generated data compared to the real data. 
+
+In order to facilitate the analytical calculations, we make the following simplifying assumptions. Firstly, we assume that our data consists of only one feature, for which the regular (legitimate) activity is distributed following a normal distribution $p_{\text{data}}$ with mean $\mu_d$ and standard deviation $\sigma_d$:
+\begin{equation}
+    p_{\text{data}} = \mathcal{N}\left(\mu_d, \sigma_d\right)
+\end{equation}
+Secondly, we assume that we do not have any samples of malicious activity but that we know that it is characterised by larger values of this feature compared to the legitimate activity. Thirdly, we assume that the generated data follows a normal distribution $p_{\text{gen}}$ with mean $\mu_g$ and standard deviation $\sigma_g$. Using $\gamma =0$ and $\beta=1-\alpha$ in Equation~\ref{eq:generator_loss}, assuming $0\leq\alpha\leq1$, we can write the training criterion of the generator as:
+\begin{equation}
+    \mathcal{L}(G) = (1-\alpha) \cdot \left(2 \cdot \text{JSD}\left( p_{\text{data}} | p_{\text{gen}} \right) - \text{log}(4) \right) - \alpha \mu_g \label{eq_loss_gen}
+\end{equation}
+where the first term denotes the GAN loss \cite{goodfellow2014generative} and the second term denotes our \emph{malicious objective} rewarding the generator to produce samples with properties of the malicious data (i.e. increase the mean $\mu_g$ as much as possible).
+
+We can analytically solve the Jenson-Shannon Divergence (JSD) between the normal distributions, using $\sigma_m^2 = \sigma_d^2 + \sigma_g^2$,
+\begin{align}
+    \text{JSD}\left( p_{\text{data}} | p_{\text{gen}} \right)
+    & = \frac{1}{2} \text{KL}\left(p_{\text{data}} | 0.5*(p_{\text{data}} + p_{\text{gen}}) \right) \nonumber \\ & \qquad + \frac{1}{2} \text{KL}\left(p_{\text{gen}} | 0.5*(p_{\text{data}} + p_{\text{gen}}) \right) \nonumber \\
+    & = \frac{1}{2} \left[\log \frac{\sigma_m}{\sigma_d} + \frac{\sigma_d^2 + (\mu_d - 0.5(\mu_d + \mu_g))^2}{2\sigma_m^2} - \frac{1}{2} \right. \nonumber \\  & \left. \qquad + \log \frac{\sigma_m}{\sigma_g} + \frac{\sigma_g^2 + (\mu_g - 0.5(\mu_d + \mu_g))^2}{2\sigma_m^2} - \frac{1}{2} \right]
+\end{align}
+
+From this, we can calculate the gradient w.r.t. $\mu_g$:
+\begin{align}
+    \frac{\partial \text{JSD}(p_{\text{data}} | p_{\text{gen}})}{\partial \mu_g} &= \partial \left( \frac{1}{2} \left[\log \frac{\sigma_m}{\sigma_d} + \frac{\sigma_d^2 + (\mu_d - 0.5(\mu_d + \mu_g))^2}{2\sigma_m^2} - \frac{1}{2} \right. \right. \nonumber \\
+    & \left. \left. + \log \frac{\sigma_m}{\sigma_g} + \frac{\sigma_g^2 + (\mu_g - 0.5(\mu_d + \mu_g))^2}{2\sigma_m^2} - \frac{1}{2} \right] \right) / \partial \mu_g \nonumber \\
+    %& = \frac{1}{2} \partial \left( \frac{(0.5 \mu_d - 0.5 \mu_g)^2}{2\sigma_m^2} + \frac{(0.5 \mu_g - 0.5 \mu_d)^2}{2\sigma_m^2} \right) / \partial \mu_g \\
+    & = \frac{\mu_g - \mu_d}{4\sigma_g^2 + 4\sigma_d^2} \label{eq_grad_jsd}
+\end{align}
+
+Combining (\ref{eq_loss_gen}) and (\ref{eq_grad_jsd}), we find that the gradient of the training objective of the generator w.r.t. the mean of the generated distribution $\mu_g$ is
+\begin{align}
+    \frac{\partial \mathcal{L}(G)}{\partial \mu_g} &= \frac{(1-\alpha)}{2} \frac{\mu_g - \mu_d}{\sigma_g^2 + \sigma_d^2} - \alpha
+\end{align}
+
+Without loss of generality, we set $\sigma_g^2 + \sigma_{\text{data}}^2 = k/2$, such that
+\begin{align}
+    \frac{\partial \mathcal{L}(G)}{\partial \mu_g} &= (1-\alpha) \frac{\mu_g - \mu_d}{k} - \alpha
+\end{align}
+
+Denoting $\frac{\partial \mu_g}{\partial t}$ as the changes of $\mu_g$ over time (i.e. a continuous version of the discrete gradient updates) and $\eta$ as the learning rate, this leads to the following linear dynamical system which we can analyse in function of $\mu_g$, $\mu_{\text{d}}$ and the hyperparameter $\alpha$:
+\begin{align}
+    \frac{\partial \mu_g}{\partial t} &= - \eta \frac{\partial \mathcal{L}(G)}{\partial \mu_g} \nonumber \\
+    %\frac{\partial \mu_g}{\partial t} &= - \eta (1-\alpha) \frac{\mu_g - \mu_d}{k} + \eta \alpha \\
+    &= - \eta (1-\alpha) \frac{\mu_g - \mu_d}{k} + \eta \alpha \nonumber \\
+    %\frac{\partial \mu_g}{\partial t} &= -\eta d\mu_g + \eta d \mu_d+ \eta \alpha
+    &= -\eta d\mu_g + \eta d \mu_d+ \eta \alpha
+\end{align}
+where we defined $d = (1-\alpha)/k$. The stability of this linear system is defined by the sign of $-d$, which is always negative and hence the system has a stable fixed point.
+The stable fixed point for this dynamical system is easily found to be 
+\begin{align}
+    \mu_g^{\star} &= \mu_d + \frac{\alpha}{1-\alpha}k
+\end{align}
+We plot the phase diagram of the dynamical system in Figure \ref{fig:phase}, showing the fixed point in function of the parameter $\alpha$.
+
+% Figure environment removed
+
+\vspace{2.2cm}
+
+From these simplified setting calculations, we can conclude that:
+\begin{itemize}
+    \item For $\alpha>0$, our generated data will move away from the real data distribution and increasingly comply with the malicious objective.
+    \item Different values of $\alpha$ will result in varying levels of deviation from the real data. In the absence of ground truth to evaluate the system, hyperparameter tuning and empirical testing are necessary.
+    \item When generated data deviates from real data, the discriminator will increasingly achieve a perfect performance even at training completion. This is a major difference to standard GAN training.
+\end{itemize}

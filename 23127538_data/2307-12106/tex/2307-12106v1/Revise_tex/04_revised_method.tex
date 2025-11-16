@@ -1,0 +1,125 @@
+
+\section{Method}
+\label{sec:method}
+% 一句一行，然后换行，这样逻辑更加清楚
+% 整体介绍，注意英文的书写习惯是每句话别太长了，要精简
+% 第一句展示我们的pipeline, 我们的框架可以分成两个stage，
+
+% Figure environment removed
+
+% \subsection{Method Overview}
+
+% 首先是得到keypoints的热力图；另一方面是利用2D点以及3Drefinement算c2rp
+% 需要讲清楚我们的输入
+We will first introduce the problem statement in Section \ref{Problem Statement}.
+Then we will explain three modules, \textbf{Structure 
+ Prior Guided Feature Alignment}, \textbf{Temporal Cross Attention Enhanced Fusion}, and \textbf{Pose Refiner} in our approach.
+\textbf{Structure Prior Guided Feature Alignment} aims to align corresponding features between frames and is discussed in Section \ref{Robot Structure Prior}. \textbf{Temporal Cross Attention Enhanced Fusion} targets fusing temporal information and is discussed in Section \ref{Temporal CA}. Finally, we describe \textbf{Pose Refiner} in Section \ref{C2RP Refinement} to refine the predicted pose better. 
+
+\subsection{Problem Statement} \label{Problem Statement}
+Our problem is defined as follows: Given a live stream of RGB images $\{I_t\}_{t \geq 0}$ containing a manipulator along with its instant camera-to-robot pose $\{\mathcal{T}_t\}_{t \geq 0} = \{ (R_t, T_t) \}_{t \geq 0}$ $\in SE(3)$, the transformation from the camera space to the robot base space,  
+our objective is to track the camera-to-robot pose in an online manner. 
+In other words, at timestep $t$, provided images $I_{t-1}$ and $I_{t}$, predefined keypoints' 3D positions $\{P_t^{i}\}$ in robot space ($i$ denotes the index of each keypoint), camera intrinsics
+and the estimated pose $\hat{\mathcal{T}}_{t-1}$, we predict the rotation matrix $R_t$ and translation $T_t$ in $\hat{\mathcal{T}}_{t}$.
+
+
+\subsection{Structure Prior Guided Feature Alignment}\label{Robot Structure Prior}
+Inspired by the fact that the joints' states and pose of the robot change slightly between successive two frames, we believe the estimated previous pose $\hat{\mathcal{T}}_{t-1}$ will work as solid structure priors for guiding network learning. 
+In this way, our first step is to design a \textbf{Belief Map Generator} to produce a reprojection belief map. 
+Suppose we have acquired the previous estimated pose $\hat{\mathcal{T}}_{t-1}$, we reproject the instant keypoints' 3D positions $\{P_t^{i}\}$ into $\{\Tilde{p}_{t}^{i}\}$, and visualise them into a single-channel belief map $\Tilde{B}_{t} \in [0, 1]^{H \times W \times 1}$ (See in the left column of Figure \ref{pipeline}) . 
+Based on $\Tilde{B}_{t}$, the network cares more about the residuals of $\Tilde{B}_{t}$ to its ground truth.
+
+Similarly, we also prepare the previous belief map $B_{t-1}$ for guiding the network to align the previous frame's features.
+To be more specific, during the training process, $B_{t-1}$ is produced by augmenting ground truth 2D keypoints.
+While during inference, we utilise 2D keypoints $\{\hat{p}_{t-1}^{i}\}$ estimated from previous network output belief map $\hat{Y}_{t-1} \in \mathbb{R}^{\frac{H}{R} \times \frac{W}{R} \times c}$ and $\hat{O}_{t-1} \in \mathbb{R}^{\frac{H}{R} \times \frac{W}{R} \times 2}$ where $R$ and $c$ denotes the downsampling ratio and amounts of keypoints.
+
+% We select 2D keypoints' locations $\{\hat{p}_{t-1}^{i}\}$ with the highest confidence scores in the c-dimension of  $\hat{Y}_{t-1}$ and transform them into a whole belief map $B_{t-1}$.
+
+Then, we send the pairs $(I_{t-1}, B_{t-1})$ and $(I_t, \Tilde{B}_t)$ to a shared backbone and obtain two lists composed of 6 multi-scale features $L_{t-1}$ and $L_{t}$. We denote $L$ (for simplicity, we omit the subscript t) as $[f^1, \dots, f^6]$ where $f^j \in \mathbb{R}^{c_j \times h_j \times w_j}$ and $\frac{c_{j+1}}{c_j} = \frac{h_j}{h_{j+1}} = \frac{w_j}{w_{j+1}} = 2$. 
+$\{\hat{p}_{t-1}^{i}\}$ and $\{\Tilde{p}_{t}^{i}\}$ are rescaled to match the $f$'s size accordingly and treated as center proposals. 
+% Having measured the motion amplitude of the manipulator in finishing downstream tasks (e.g., Grasping), we confine the center proposal to a neighbourhood with window size $[13,7,3,1,1,1]$.
+Features extracted from the neighbourhoods of center proposals in $f_{t-1}$ and $f_t$ are regarded as aligned since they roughly entail the same keypoint's contextual information.
+The aligned features should be fused carefully, illustrated in the next section.
+
+
+\subsection{Temporal Cross Attention Enhanced Fusion}\label{Temporal CA}
+To carefully integrate the multi-scale aligned features in $L_{t-1}$ and $L_t$, we adopt different strategies considering the size of $f^j$ 
+For $f^m, m \in \{1,2,3\}$, they have much higher resolutions and fine-grained features, which are crucial for detecting small-sized keypoints.
+Therefore, we propose a temporal cross-attention module to fuse the features at the neighbourhood of center proposals.
+In comparison, for $f^n, n \in \{4,5,6\}$, they have lower resolutions and a broader receptive field, so each pixel-level feature contains more contextual and temporal information.
+We thus directly concatenate the features at the center proposals of $f_{t-1}^n$ and $f_{t}^n$ and process them into original sizes $\mathbb{R}^{c \times c_n}$ via a shallow Multilayer Perceptron (MLP). The newly processed features will instantly replace the counterpart in $f_{t}^n$.
+
+For the first three feature maps $\{f^m, m \in \{1,2,3\} \}$, 
+we treat $\{\hat{p}_{t-1}^{i}\}$ and $\{\Tilde{p}_{t}^{i}\}$ as center proposals respectively, and rescale them to match the size of $f^m$. 
+Having measured the motion amplitude of the manipulator in finishing downstream tasks (e.g., Grasping), we confine the center proposals to a square area with window size $d_m$.
+We take $f_{t-1}^m$ at the $d_m \times d_m$ window area around scaled $\{\hat{p}_{t-1}^{i}\}$ as query embeddings and $f_{t}^m$ at the same size of area around $\{\Tilde{p}_{t}^{i}\}$ as keys and values.
+After 3 vanilla Tranformer multi-head cross-attention layers  \cite{vaswani2017attention}, we concatenate the output features $Q_{t, d_m^2c}^m \in \mathbb{R}^{d_m^2c \times c_m}$ with $f_{t, d_m^2c}^m$ at the same $d_m^2c$ locations along the $c_m$-dimension, and send them through a shallow MLP to get $\hat{f}_{t, d_m^2c}^m$. 
+We directly replace  $f_{t, d_m^2c}^m$ with $\hat{f}_{t, d_m^2c}^m$ and pass all the six processed multi-scale features to the decoder layer and receive the output head.
+
+\subsection{Pose Refiner}\label{C2RP Refinement}
+% 3D refinement
+We design a pose refiner to mitigate the influence of outlier keypoints with significant reprojection errors when computing the camera-to-robot pose.
+Since the initial pose solved by \emph{Perspective-n-Point} (PnP) algorithms might be inaccurate sometimes due to outliers \cite{Ferraz2014VeryFS}, we correct such bias by solving reweighted PnP problems.
+Utilising predicted projections $\{\hat{p}_{t}^i\}$ and known $\{P_{t}^{i}\}$, we obtain an initial camera-to-robot pose $\hat{\mathcal{T}}_{t}^{init}$ via a PnP-RANSAC solver \cite{PNPRANSAC}.
+Next, we project $\{P_t^i\}$ via $\hat{\mathcal{T}}_{t}^{init}$ to 2D coordinates $\{p_t^{rep, i}\}$.
+We set the weights $\omega_t^i = \exp{(-5 \times \Vert \hat{p}_{t}^i -  p_t^{rep, i} \Vert^2 )}$ based on practical experience and optimise the following equation via an LM solver \cite{Pesaran2008ABL}.
+\begin{equation}
+\begin{aligned}
+\arg \min_{R_t,  T_t} \frac{1}{2}\sum_{i=1}^{c} \Vert \omega_t^i (\pi (R_t P_t^{i} + T_t ) - \hat{p}_t^{i}) \Vert ^2 \label{3D Rf}
+\end{aligned}
+\end{equation}
+where $\pi(\cdot)$ is the projection function, $R_t$ and $T_t$ is the rotation and translation in the camera-to-robot pose $\hat{\mathcal{T}}_{t}$ .The reweighted optimisation objective focuses more on the "influence" of comparatively precise predictions, thus mitigating the impact of keypoints with large reprojection errors. 
+
+\subsection{Implementation details} \label{Id}
+\noindent\textbf{Loss function}. 
+Our network output involves a predicted pixel-level belief map $\{\hat{Y}_t\} \in [0,1]^{\frac{H}{R} \times \frac{W}{R} \times c}$ and subpixel-level local offsets $\{\hat{O}_t\} \in [0,1]^{\frac{H}{R} \times \frac{W}{R} \times 2}$.
+We design two loss functions $L_B$ and $L_{off}$ for $\{\hat{Y}_t\}$ and $\{\hat{O}_t\}$ respectively. 
+For keypoints' ground truth 2D locations $\{p_t^i\}$, we scale them into a low-resolution equivalence $p_{low, t}^i= \lfloor \frac{P_t^i}{R} \rfloor$. We draw each keypoint in a single-channel feature map with a Gaussian Kernel $K(x, y) = \exp{(-\frac{(x - p_{low, t,x}^i)^2 + (y - p_{low, t, y}^i)^2}{8})}$ and shape the ground truth belief map $Y_t \in [0,1]^{\frac{W}{R} \times \frac{H}{R} \times c}$.
+The $L_B$ becomes: 
+\begin{equation} 
+    \begin{aligned}
+        L_B =  \Vert Y_t - \hat{Y}_t \Vert_{L_2}^2
+    \end{aligned}
+\end{equation}
+\label{L_B}
+where $R = 4$ in our network.
+We further follow \cite{CenterTrack} to correct the error induced by the output stride. The offsets$\{\hat{O}_t\}$ are trained via smooth $L_1$ loss and only supervised in locations $p_{low}^i$:
+\begin{equation}
+    \begin{aligned}
+        L_{off} = \Vert \hat{O}_{t}{}_{p_{low, t}^i} - (\frac{p_t^i}{R} - p_{low, t}^i) \Vert
+    \end{aligned}
+\end{equation}
+\label{L_off}
+The overall training objective is designed as follows:
+\begin{equation}
+    \begin{aligned}
+        L = \lambda_B L_B + \lambda_{off} L_{off}
+    \end{aligned}
+\end{equation}
+\label{Loss Function Equation}
+where $\lambda_B$ = 1.0 and $\lambda_{off} = 0.01$ in implementation.
+
+\vspace{3mm}
+\noindent\textbf{Training details.}
+During the training time, we pre-process the input image $I_{t-1}, I_t$ into the size of $\mathbb{R}^{480 \times 480 \times 3}$ via affine transformation and normalisation with mean $[0.5, 0.5, 0.5]$ and standard deviation $[0.5, 0.5, 0.5]$.
+To further improve our model's robustness, we apply $\mathcal{N}(0, 1.5I)$ noises as well as randomly drop with probability 0.2 to the ground truth keypoints in $B_{t-1}$.
+% 我们的backbone是基于DLA，使用adam优化，train了20个epoch，bs为16，使用了warm up，前3000个iteration的learning rate从0升到1.25e-4,从3000个iteration到结束，学习率以iteration为单位均匀下降到5.36e-5，train了20个epochs
+Our backbone is based on Deep Layer Aggregation \cite{Yu2018DeepLA} and trained for 20 epochs with batch size 16, Adam optimiser \cite{Kingma2015AdamAM} with momentum 0.9 and 180k synthetic training images.
+The learning rate warms up to 1.25e-4 from 0 during the first 3,000 iterations and drops to 0 during the rest of the iterations linearly.
+%
+
+\vspace{2mm}
+\noindent\textbf{Inference details.}
+During inference, we are given a long-horizon video split into consecutive frames.
+We use the first frame as $I_0$ and $I_1$, and blank images as the initial belief maps $B_0$ and $B_1$ to perform inference. 
+For each timestep $t > 1$, we select the keypoints' 2D locations $p_{low}^i$ with the largest confidence score  for each belief map in $\hat{Y}_{t-1} \in \mathbb{R}^{\frac{H}{R} \times \frac{W}{R} \times c}$.
+We then determine the accurate locations by adding $\hat{O}_{t}{}_{p_{low, t}^i}$ to $p_{low, t}^i$. 
+Finally, we rescale these low-resolution keypoints' locations to match the raw image's size via inverse affine transformation and obtain $\{\hat{p}_t^i\}$. 
+
+
+
+
+
+
+
+

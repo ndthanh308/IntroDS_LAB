@@ -1,0 +1,165 @@
+\appendix
+
+\input{subsections-language/forwarding.tex}
+
+\section{Detailed explanation of the benchmark} \label{sec:benchmark-details}
+
+In this section, we present the result of the verification of
+the benchmark \texttt{queue-2-SAT.ml} as an example.
+The following is the main part of the program of \texttt{queue-2-SAT.ml}:
+\begin{verbatim}
+let[@annot_MB "int list ->
+    (unit -> ({Get_next: s1, Add_to_queue: s2} |> int option / s => s)) ->
+    int option"]
+  queue initial (body :unit -> int option) =
+    match_with body () {
+      retc = (fun x -> (fun _ -> x));
+      exnc = raise;
+      effc = fun (type a) (e: a eff) -> match e with
+        | Get_next _ctx -> Some (fun (k: (a, _) continuation) ->
+            (fun queue -> match queue with
+              | [] -> continue k None []
+              | hd::tl -> continue k (Some hd) tl) )
+        | Add_to_queue v -> Some (fun (k: (a, _) continuation) ->
+            (fun queue -> continue k () (queue @ [v])) )
+    } initial
+
+let main init =
+  queue init (fun () ->
+    perform (Add_to_queue 42);
+    let _ = perform (Get_next 1(*dummy*)) in
+    perform (Get_next 2(*dummy*)) )
+\end{verbatim}
+This program uses two operations \texttt{Get\_next} and \texttt{Add\_to\_queue},
+which are used to dequeue and enqueue elements respectively.
+The function \texttt{queue} manages the queue.
+It receives an initial queue \texttt{initial} and the function \texttt{body},
+handling the operations performed in \texttt{body} in the state-passing manner
+to simulate the behavior of the queue.
+The first three lines of the program are the underlying simple type annotation,
+which tells the function \texttt{queue}
+that the argument \texttt{body} may perform the operations \texttt{Get\_next} and \texttt{Add\_to\_queue}
+and that its control effect is impure.
+This annotaion is necessary because our implementation does not support effect polymorphism
+as mentioned in Section~\ref{sec:impl}.
+The main function \texttt{main} first enqueue one element,
+and then try to dequeue twice
+(\texttt{Get\_next} returns \texttt{None} when the queue is empty).
+Note that we added a ghost parameter \texttt{\_ctx} to \texttt{Get\_next},
+which is used to distinguish its two occurrences.
+We give \texttt{1} to the first occurrence of \texttt{Get\_next},
+and \texttt{2} to the second.
+This ghost parameter is crucial for the precise verification of this program,
+described later in this section.
+
+\newcommand{\ilist}{\kwty{ilist}}
+% \newcommand{\ilist}{\kwty{int\ list}}
+\newcommand{\iopt}{\kwty{iopt}}
+% \newcommand{\iopt}{\kwty{int\ option}}
+\newcommand{\expNil}{\mathtt{[]}}
+\newcommand{\expNone}{\mathtt{None}}
+\newcommand{\isCons}{\mathrm{isCons}}
+\newcommand{\isSome}{\mathrm{isSome}}
+\newcommand{\tail}{\mathrm{tail}}
+
+We defined the following refinement type
+as the specification for the main function \texttt{main}
+(here after, we abbreviate the type $\kwty{int\ list}$ and $\kwty{int\ option}$
+as $\ilist$ and $\iopt$ respectively):
+\[
+  \tyrfn{z}{\ilist}{z \ne \expNil} \rarr \tyrfn{z}{\iopt}{z \ne \expNone}
+\]
+That is, if the queue is initially not empty,
+the last dequeue should return some value.
+
+By running the verification of the program with the specification,
+our implementation returns ``SAT'' as shown in Table~\ref{tab:eval},
+that is, the function \texttt{main} certainly has the type given as the specification.
+Let us investigate more detail by seeing the inferred type of the function \texttt{queue}:
+{\allowdisplaybreaks
+\begin{align}
+  &(init:\tyrfn{z}{\ilist}{z \ne \expNil}) \\
+  &\rarr (\tyunit \rarr \tycomp{\Sigma}{\iopt}{\tyctl{x}{
+    (\ilist \rarr \tyrfn{z}{\iopt}{\phi_1})
+  }{
+    (\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone})
+  }}) \!\!\! \\
+  &\rarr \tyrfn{z}{\iopt}{z \ne \expNone}
+\end{align}
+\[
+  \text{where} \begin{array}[t]{r@{}l}
+    \Sigma \defeq \{
+      &\mathtt{Add\_to\_queue}: \tyint \rarr (\tyunit \rarr \\
+        &\quad ((q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41}}))
+          \rarr (\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone}), \\
+      &\mathtt{Get\_next}: (ctx: \tyint) \rarr ((y: \iopt) \rarr \\
+        &\quad ((q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{31} \land \phi_{32}}))
+          \rarr ((q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41} \land \phi_{42}})
+    \}\end{array}
+\]
+\[\begin{array}[t]{r@{}l@{\quad}r@{}l}
+  \phi_1 &\defeq \isSome(x) \Rarr z \ne \expNone &
+  \phi_2 &\defeq init \ne \expNil \Rarr z \ne \expNil \\
+  \phi_{31} &\defeq \isCons(q) \land \isSome(y) \Rarr z \ne \expNone &
+  \phi_{32} &\defeq \isSome(y) \land ctx \ge 2 \Rarr z \ne \expNone \\
+  \phi_{41} &\defeq \isCons(q) \land \isCons(\tail(q)) \Rarr z \ne \expNone &
+  \phi_{42} &\defeq \isCons(q) \land ctx \ge 2 \Rarr z \ne \expNone
+\end{array}\]
+}
+where $\isSome(x)$ holds if $x = \mathtt{Some}~v$ for some $v$,
+$\isCons(x)$ holds if $x = v\mathtt{::}w$ for some $v$ and $w$,
+and $\tail(x)$ returns the tail of the list $x$.
+In the operation sigunature, we can find that
+\texttt{Add\_to\_queue} changes the answer type from
+$(q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41}}$
+to
+$\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone}$.
+Therefore, \verb|perform (Add_to_queue 42)| can be given the control effect
+\[
+  \tyctl{\_}{
+    ((q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41}})
+  }{
+    (\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone})
+  }~.
+\]
+Similarly, in the operation sigunature,
+\texttt{Get\_next} changes the answer type from
+$(q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{31} \land \phi_{32}}$
+to
+$(q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41} \land \phi_{42}}$~.
+Here, since the refinements of these answer types contain a condition on $ctx$,
+their truth depend on whether $ctx = 1\ (< 2)$ or $ctx = 2\ (\ge 2)$.
+This enables assigning different control effects (i.e., different ARM)
+to each occurrence of \texttt{Get\_next} depending on the context.
+Namely, \verb|perform (Get_next 1)| can be given the control effect
+\[
+  \tyctl{y}{
+    (q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{31}}
+  }{
+    (q:\ilist) \rarr \tyrfn{z}{\iopt}{\phi_{41}}
+  }
+\]
+since $ctx = 1$,
+while \verb|perform (Get_next 2)| can be given the control effect
+\[
+  \tyctl{y}{
+    \ilist \rarr \tyrfn{z}{\iopt}{\isSome(y) \Rarr z \ne \expNone}
+  }{
+    (q:\ilist) \rarr \tyrfn{z}{\iopt}{\isCons(q) \Rarr z \ne \expNone}
+  }
+\]
+since $ctx = 2$.
+Now, the control effect of the argument \texttt{body} can be obtained from
+the composition of these three control effects,
+which results in
+\[
+  \tyctl{x}{
+    (\ilist \rarr \tyrfn{z}{\iopt}{\phi_1})
+  }{
+    (\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone})
+  }~.
+\]
+Then, the handling construct is assigned the final answer type of \texttt{body},
+i.e., $\tyrfn{z}{\ilist}{\phi_2} \rarr \tyrfn{z}{\iopt}{z \ne \expNone}$,
+and finally applying the non-empty initial queue to the handling construct returns
+a value of type $\tyrfn{z}{\iopt}{z \ne \expNone}$ as expected.

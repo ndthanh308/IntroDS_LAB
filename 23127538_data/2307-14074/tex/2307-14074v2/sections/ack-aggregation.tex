@@ -1,0 +1,101 @@
+% -------------------------------------------------------
+\subsection{Many-to-one Feedback Aggregation} \label{ack-aggregation}
+% -------------------------------------------------------
+
+\begin{algorithm}[t]
+\caption{Many-to-one ACK/NACK Aggregation}\label{alg:ack-aggre}
+\begin{algorithmic}[1]
+%\Procedure{ProcessIncomingACK}{ }
+\State $p\gets $ ACK/NACK packet
+\State $T\gets $ forwarding table indexed by $p.dest\_IP$
+%\State $i\gets$ port that $p$ enters
+\State $Entry\gets$ entry in $T$ with $port$ $i$ that $p$ enters
+\State $min\_port\gets$ port with minimum $ack\_psn$ last time
+\State $last\_ack\_psn\gets$ last aggregated ACK's PSN
+\If{$p$ is $ACK$}
+\If{$p.psn \geq Entry.ack\_psn$}\Comment{\textcolor{gray}{update $Entry$}}
+		\State $Entry.ack\_psn = p.psn$
+		\State $Entry.(...) = p.(...)$
+	\EndIf
+%	\State \textcolor{gray}{// check for generation triggering condition}
+	\If{$i = min\_port$ \& $p.psn \geq last\_ack\_psn$}\label{line:trigger}
+		\State \Call{GenerateNewAck/Nack}{ }
+	\EndIf
+\Else \Comment{\textcolor{gray}{$p$ is a NACK packet}}
+	\If{$p.psn - 1 \geq Entry.ack\_psn$}
+		\State $Entry.ack\_psn = p.psn - 1$\Comment{\textcolor{gray}{update $Entry$}}
+	\EndIf
+%	\State \textcolor{gray}{// check for generation triggering condition}
+	\If{$p.psn \leq T.nack.ePSN$} \label{line:nackupdate}\Comment{\textcolor{gray}{update $T.nack$}}
+		\State $T.nack.ePSN = p.psn$
+		\State $T.nack.(...) = p.(...)$
+		\State \Call{GenerateNewAck/Nack}{ }
+	\EndIf
+\EndIf
+%\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+With the extended one-to-many data forwarding, \sys can optimally forward data replicas to multiple receivers, and different receivers' QPs can accept the packet. However, the second incompatibility impeding the leverage of RC is the existing reliability logic~\cite{zhu2015congestion, guo2016rdma}. The current reliability logic in commodity RNICs is designed to interpret a single feedback stream from a single receiver; thus, multiple feedback streams from multiple receivers can compromise reliability. 
+
+Feedback contains various types of packets, such as ACK, NACK, notification packets for congestion control (CC) (such as CNP~\cite{zhu2015congestion}), \etc We talk about ACK and NACK here, and the processing for CC-related feedback is described in $\S$\ref{other-design}. \sys performs the in-fabric many-to-one ACK aggregation and NACK filtering to deliver a unicast-like ACK/NACK stream to the sender. As a result, the sender can correctly interpret ACK and proceeds with data transmission. Besides, when the loss occurs, the sender can precisely detect and retransmit the lost packet.
+
+The basic principles of ACK-aggregation/NACK-filtering are that (\romannumerber{1}) the multicast source should receive an ACK only when \textit{\textbf{all}} receivers have received the corresponding packets; (\romannumerber{2}) the multicast source should receive a NACK when \textit{\textbf{any}} receiver loses a packet. Moreover, the aggregation needs to consider the processing rules of RDMA protocol, such as the go-back-N retransmission and ACK coalescing. 
+
+\begin{algorithm}[t]
+\caption{ACK/NACK Generation}\label{alg:generation}
+\begin{algorithmic}[1]
+\Function{GenerateNewAck/Nack}{ }
+\State $T\gets $ forwarding table indexed by $p.dest\_IP$
+%\State $n\gets$ the number of switch ports
+\State $ack\_out\_port\gets$ port that data packets enter
+\State $min\_psn\gets \infty$
+\State $min\_port\gets -1$
+\For{$Entry \in T$} \Comment{\textcolor{gray}{find the  minimized $ack\_psn$}}
+	% \If{$Entry.type = forwarded$ or $connected$}
+		\If{$min\_psn < Entry.ack\_psn$}
+			\State $min\_psn = Entry.ack\_psn$
+			\State $min\_port = i$
+		\EndIf
+	% \EndIf
+\EndFor
+\State \textcolor{gray}{// generate aggregated ACK}
+\State create ACK packet $p$ with ($psn = min\_psn$)
+\State send $p$ through $ack\_out\_port$ %\Comment{\textcolor{gray}{Generate ACK}}
+\State \textcolor{gray}{// check for generating NACK}
+\If{$min\_psn\ + 1 = T.nack.ePSN$} \label{line:nack}
+	\State create NACK packet $p$ %\Comment{\textcolor{gray}{Generate NACK}}
+	\State $p.psn$ = $T.nack.ePSN$
+	\State send $p$ through $ack\_out\_port$
+\EndIf
+\State update global $last\_ack\_psn$ with $min\_psn$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\sys maintains ACK/NACK-related information in the extended multicast forwarding table, illustrated in Fig.~\ref{fig:table}. Upon receiving an ACK/NACK packet, switches find the associated forwarding table by ACK/NACK packets' destination IP, \ie, GroupIP. We first present a working logic without packet loss and then describe how to handle NACK packets. 
+
+\parab{Handle ACK.} The ACK-related states includes (\romannumerber{1})~the group-level data, including the PSN of the last aggregated ACK ($last\_ack\_psn$), the port from which the ACK should be sent ($ack\_out\_port$), \etc; (\romannumerber{2})~the port-level data, including the largest acked PSN ($ack\_psn$) of each port. Switches process ACK packets, update the related states in the forwarding table, and generate the aggregated ACK packet, following Algorithm~\ref{alg:ack-aggre}. 
+
+Upon receiving an ACK packet, the switch firstly updates this port's $ack\_psn$ if the PSN of incoming ACK is larger than the old $ack\_psn$. Then, if the trigger condition (Line~\ref{line:trigger}) is satisfied, the \textsc{GenerateNewAck/Nack} function in Algorithm~\ref{alg:generation} is called to generate an aggregated ACK. The aggregated ACK contains the minimum $ack\_psn$ recorded by the switch, which is found by iterating all multicast forwarding table entries. As a result, each aggregated ACK forwarded by the switch confirms that all downstream receivers have received the corresponding data packets. 
+
+The port that owns the minimum $ack\_psn$ is recorded as $min\_port$. Each time an ACK with a larger PSN is received from $min\_port$ (Line~\ref{line:trigger}), the ACK generation is triggered. Thus not every ACK packet will trigger the generation, and the number of ACKs received by the source is reduced.
+
+%The switch maintains a triggering condition to generate the aggregated ACK, thus not every ACK packet will trigger the generation.
+%The insight behind this triggering condition is that \sys aims to guarantee that the multicast source won't receive many duplicate ACK packets. 
+%The switch records the port, called $min\_port$, that contains the minimum $ack\_psn$ of all ports in the last ACK generation procedure. Afterwards, as long as receiving a new ACK packet from $min\_port$ and its $ack\_psn$ got updated, the switch will generate ACK again. In ACK generation, switch firstly iterates all entries of multicast forwarding table, find the minimum $ack\_psn$ and the associated port. If the minimum $ack\_psn$ is larger than the PSN of last aggregated ACK ($last\_ack\_psn$), switch will generate a new ACK packet contains the new minimum $ack\_psn$, and update the group-level $min\_port$ and $last\_ack\_psn$.
+
+%Following the above algorithm, every time the multicast sender receives an aggregated ACK containing a PSN, the sender can recoginize that all receivers have received all packets before this PSN. As a result, the sender can interpret the aggregated ACK packets similar with unicast ACK stream.
+
+
+%In particular, the $group\_ack\_psn$ is the lowest $ack\_psn$ of all ports. The $input\_port$ is the port, through which aggregated ACK be forward. The $group\_nack\_psn$ is lowest $nack\_psn$ of all ports. And each $ack\_psn$ records the highest acked PSN for each receiver. Switch follows Algorithm \ref{alg:ack-aggre} to process ACK packet, update ACK/NACK related states in forwarding table and generate aggregated ACK packet and NACK packet. 
+
+\parab{Handle NACK.} When the loss occurs, the receiver generates NACK packet to notify the multicast sender. The NACK packet ($p$) contains the receiver's expected PSN ($p.psn$). Each NACK will acknowledge all data packets with PSN smaller than the expected PSN. This rule must be carefully handled in NACK generation. %towards compatibility with RNIC's retransmission logic.
+
+We illustrate an example in Fig.~\ref{fig:nack-delay}. There are two receivers and one switch. The switch generates two copies of data and forwards them to two receivers. There are two lost packet, $p1_{R1}$ and $p2_{R2}$, and two associated NACK packets, $nack_{p1}$ and $nack_{p2}$. The switch should forward the $nack_{p1}$ because it contains the minimum expected PSN. If the $nack_{p2}$ is forwarded to the sender first, the loss of $p1_{R1}$ will be covered because the sender will assume that all the packets before the expected PSN of $nack_{p2}$ (\ie, $p2$) have been received. Thus the sender won't retransmit $p1$ anymore, and the reliability is compromised.
+
+% Figure environment removed
+
+Therefore, the NACK packet should be forwarded only when all receivers have acknowledged all packets with PSN smaller than its expected PSN. We implement this judgement in Line~\ref{line:nack} of Algorithm~\ref{alg:generation}. If the condition is not satisfied, the switch keeps waiting, during which new ACK/NACK packets keep coming. If the switch receives a new NACK and its PSN is not great than the recorded $T.nack.ePSN$, the $T.nack.ePSN$ is updated, and the NACK generation condition is rechecked, as shown in Line~\ref{line:nackupdate} of Algorithm~\ref{alg:ack-aggre}.
+
+

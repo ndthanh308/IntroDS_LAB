@@ -1,0 +1,390 @@
+% \noindent{multimodal Diffusion Models:}
+% Figure environment removed
+
+\section{Method}
+Given the training dataset $D\!=\!\{\mathbf{X}_i,\mathbf{y}_i\}_{i=1}^N$ with the input data $\mathbf{X}\!=\!\{\mathbf{x}^v,\mathbf{x}^a\}$ 
+($\mathbf{x}^v$ represents the input video with continuous frames~\cite{zhou_AVSBench_ECCV_2022}, $\mathbf{x}^a$ is the audio of the current clip) 
+and ground-truth segmentation map $\mathbf{y}$, the goal of AVS is to segment the sound producer(s) from $\mathbf{x}^v$ with the guidance from $\mathbf{x}^a$.
+$i$ indexes the samples, which are omitted for clear presentation. 
+As discussed in Sec.~\ref{sec:intro}, AVS is unique in that audio serves as guidance to achieve guided binary segmentation, making it different from conventional multimodal learning~\cite{baltruvsaitis2018multimodal}, where each modality contributes nearly equally to the final output. 
+Given this distinction, we define AVS as a conditional generation task, where our objective is to maximize the likelihood of the conditional distribution $p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)$.
+
+
+
+
+% The overview of our proposed method can be seen in Fig.~\ref{fig:model_overview}.
+% (see Fig.~\ref{fig:model_overview} for an overview
+% % whole pipeline 
+% of our method).
+% Let $D=\{X_i,y_i\}_{i=1}^N$ to be the training dataset with $i$ as the index. $X=\{\{x^v_t\}_{t=1}^T,x^a\}$ denotes the input data, \ien~the visual $\{x^v_t\}_{t=1}^T$ for $T$ continuous frames, audio $x^a$ of the current clip. $y=\{y_t\}_{t=1}^T$ are the ground-truth segmentation map, \ien~the segmentation maps (we omit $t$ for clear presentation).
+% The whole pipeline of our method is illustrated in Fig.~\ref{fig:model_overview}.
+
+% We aim to segment objects that are producing the sound $x^a$ in a video $\{x^v_t\}_{t=1}^T$. 
+
+ 
+We resort to diffusion models for our AVS task (see Sec.~\ref{subsec_conditional_latent_diffusion}), aiming to model the distribution of $p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)$.
+Further, considering the constraint that the segmentation map should be well-aligned with the audio signal, we introduce contrastive learning (see Sec.~\ref{subsec_contrastive_learning}) as a constraint to our framework.
+We use the constraint to explicitly model the correspondence between visual and audio latent variables to guarantee the effectiveness of the conditional variables. 
+Finally, we present our pipeline and detailed implementation details of each module in Sec.~\ref{subsec_objective_function}.
+The overview of the proposed method is shown in Fig.~\ref{fig:model_overview}.
+
+% We present a latent diffusion model via contrastive learning to extensively explore the contribution of audio for effective audio-visual segmentation (see Fig.~\ref{fig:model_overview} for an overview of the proposed method).
+% Toward this goal, we model the latent code over the segmentation maps under the audio-visual pair as a condition using the latent diffusion model, then feed the learned latent distribution into the decoder to achieve the segmentation. 
+% Further, we perform contrastive learning under the positive latent code (encoded from the paired audio-visual data as the condition) and the negative latent code (encoded from the unpaired audio-visual data as the condition) to exploit the \enquote{paired information} between visual and audio inputs.
+
+% Our network is composed of five main modules:
+% 1) Latent Encoder that maps the ground-truth into a low dimensional latent code; 2) Latent Conditional Diffusion Model to learn a meaningful latent space; 3) Audio-Visual network to produce deterministic feature maps; 4) PredictionNet that employs stochastic features and deterministic features to produce the final segmentation results; 5) P/N pair construction and contrastive learning.
+% We will introduce each module as follows.
+
+
+\subsection{Conditional Latent Diffusion Model for AVS}
+\label{subsec_conditional_latent_diffusion}
+% With a conditional latent diffusion model, we model the conditional distribution $p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)$, where a latent diffusion model is learned to estimate the conditional ground-truth density function, achieving ground-truth aware inference.
+We model the conditional distribution $p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)$ using a conditional latent diffusion model. 
+Specifically, the latent diffusion model \Fix{learns} to estimate the conditional ground-truth density function, achieving ground-truth aware inference.
+
+
+% Our network is composed of five main modules:
+% 1) Latent Encoder that maps the ground-truth into a low dimensional latent code; 2) Latent Conditional Diffusion Model to learn a meaningful latent space; 3) Audio-Visual network to produce deterministic feature maps; 4) PredictionNet that employs stochastic features and deterministic features to produce the final segmentation results; 5) P/N pair construction and contrastive learning.
+% We will introduce each module as follows.
+
+\noindent\textbf{Latent Space Modeling.}
+We develop two encoders to encode the ground-truth segmentation map and the audio-visual input signal, respectively,
+% into a latent space, 
+where the former is designed to achieve ground-truth aware inference, and the latter is to achieve the projection from input space to feature space.
+
+We denote $E_{\varphi}$ as the ground-truth encoder to encode the ground-truth segmentation map, denoted by $\mathbf{z}_0$. 
+Specifically, we have $\mathbf{z}_0=E_{\varphi}(\mathbf{y})\in \mathbb{R}^{B\times D}$, where $B$ represents the batch size and $D$ corresponds to the latent space dimension. 
+It is worth mentioning that our approach for encoding the ground-truth is similar to the posterior computation strategy in ECMVAE~\cite{mao_iccv_2023_ecmvae}. 
+However, a key distinction lies in that we explicitly model the latent variable using a diffusion model, allowing it to follow any distribution. 
+In contrast, ECMVAE relies on assuming a Gaussian distribution for the latent variable utilizing the re-parameterization trick~\cite{kingma2013auto}.
+To construct the ground-truth latent encoder $E_{\varphi}$, we employ a structure comprising five convolutional layers, followed by leakyReLU and batch normalization. 
+The output channels for these layers are [16, 32, 64, 64, 64], respectively. 
+Subsequently, we utilize two fully connected layers to generate a latent code of size $D=24$.
+
+Moreover, we define the conditional input encoder as $E_{\psi}$, the encoder takes audio-visual pairs as input and outputs a conditional latent variable $\mathbf{c}$.
+Thus, we obtain $\mathbf{c}=E_{\psi}(\mathbf{x}^v, \mathbf{x}^a)$.
+In order to encode audio-visual signals simultaneously, $E_{\psi}$ is divided into two branches, namely the visual branch and the audio branch. 
+The visual branch consists of five convolutional layers and two fully connected layers, which share the same $E_{\varphi}$ structure. The audio branch involves two fully connected layers. Further, the visual and audio features are concatenated along the channel dimension, and another two fully connected layers are used to get the final conditional embedding $\mathbf{c}$.
+
+For ease of understanding, the more detailed structure of latent encoders $E_{\varphi},E_{\psi}$ is shown in Fig.~\ref{fig:latent_encoder}.
+It should be noted that our chosen latent encoders are lightweight enough and do not impose additional computational overhead. 
+In the experimental section, we will present a detailed analysis of the model's parameter complexity and computational efficiency.
+
+% Figure environment removed
+
+
+
+
+\noindent\textbf{Conditional Latent Diffusion Model.}
+Given the latent code $\mathbf{z_0}$, our conditional latent diffusion model aims to learn its distribution to restore the ground-truth information during testing. 
+Firstly, we review latent diffusion models~\cite{diffusion_model_raw,ho_ddpm_NIPS_2020,rombach_stable_diffusion_cvpr_2022}. 
+Then, we present our conditional diffusion model, which gradually diffuses $\mathbf{z}_0$ to $\mathbf{z}_K\sim\mathcal{N}(0,\mathbf{I})$, and restores $\mathbf{z}_0$ back from $\mathbf{z}_K$ under $\mathbf{c}$ as conditional.
+
+% with the audio-visual data as a conditional variable. 
+
+\noindent\textit{\textbf{Latent Diffusion model.}}
+The latent diffusion model is built upon a generative Markov chain, which converts a simple known distribution, (\eg~a Gaussian) into a target distribution. 
+The fundamental concept behind the diffusion model~\cite{diffusion_model_raw,ho_ddpm_NIPS_2020} involves the deliberate and gradual degradation of a latent code's structure through an iterative forward diffusion process. 
+Subsequently, the reverse diffusion process is employed to reconstitute structures within the sample.
+
+
+Following the standard diffusion procedure, the initial latent data representation $\mathbf{z}_0$ undergoes a gradual transformation into an analytically tractable distribution, denoted as $\pi(\mathbf{z})=\mathcal{N}(0,\mathbf{I})$. 
+This conversion occurs through iterative application of a Markov diffusion kernel $T_\pi(\mathbf{z}|\mathbf{z}';\beta)$, utilizing a diffusion rate parameter $\beta$, as expressed by:
+
+
+\begin{equation}
+    q(\mathbf{z}_k|\mathbf{z}_{k-1})=T_\pi(\mathbf{z}_k|\mathbf{z}_{k-1};\beta_k).
+\end{equation}
+% and the final analytically tractable distribution $\pi(z)$
+% % , \ie~$\mathcal{N}(0,\mathbf{I})$,
+% is defined as:
+% \begin{equation}
+%     \pi(z) = \int T_\mathcal{N}(\mathbf{z}|\mathbf{z}';\beta) \pi(\mathbf{z}') d\mathbf{z}'.
+% \end{equation}
+The forward trajectory of the diffusion model is thus:
+\begin{equation}
+q(\mathbf{z}_{0,...,K})=q(\mathbf{z}_0)\prod_{k=1}^K q(\mathbf{z}_k|\mathbf{z}_{k-1}),
+\end{equation}
+where the diffusion kernel $q(\mathbf{z}_k|\mathbf{z}_{k-1})$ is defined as Gaussian in~\cite{diffusion_model_raw,ho_ddpm_NIPS_2020}
+% either Gaussian diffusion 
+with an identity-covariance:
+\begin{equation}
+    q(\mathbf{z}_k|\mathbf{z}_{k-1}) = \mathcal{N}(\mathbf{z}_k;\sqrt{1-\beta_k}\mathbf{z}_{k-1},\beta_k\mathbf{I}).
+\end{equation}
+A notable property of the forward diffusion process is that it admits sampling $\mathbf{z}_k$ at arbitrary timestep $k$ in closed form:
+\begin{equation}
+\label{eq_diffusion_process}
+    q(\mathbf{z}_k|\mathbf{z}_0)=\mathcal{N}(\mathbf{z}_k;\sqrt{\bar{\alpha}_k}\,\mathbf{z}_0,(1-\bar{\alpha}_k)\mathbf{I}),
+\end{equation}
+where $\alpha_k=1-\beta_k$ and $\bar{\alpha}_k=\prod_{s=1}^k\alpha_s$. \equref{eq_diffusion_process} explains the stochastic diffusion process, where no learnable parameters are needed, and a pre-defined set of hyper-parameters $\{\beta\}_{k=1}^K$ will lead to a set of latent variables $\{\mathbf{z}\}_{k=1}^K$.
+
+The generative process or the denoising process is then to 
+% The generative distribution is trained to 
+% restore the data distribution \Mochu{restore the sample} 
+restore the sample via:
+\begin{equation}
+p_\theta(\mathbf{z}_{0,...,K})=p(\mathbf{z}_{K})\prod_{k=1}^K p_\theta(\mathbf{z}_{k-1}|\mathbf{z}_{k}),
+\end{equation}
+where $p(\mathbf{z}_{K})=\pi(\mathbf{z})=\mathcal{N}(0,\mathbf{I})$ in our case.
+For Gaussian diffusion, during learning, only the mean ($\mu$) and variance ($\Sigma$)
+% for a Gaussian diffusion kernel 
+are needed to be estimated, leading to:
+\begin{equation}
+    p_\theta(\mathbf{z}_{k-1}|\mathbf{z}_{k})=\mathcal{N}(\mathbf{z}_{k-1};\mu_\theta(\mathbf{z}_{k},k),\Sigma_\theta(\mathbf{z}_{k},k)),
+\end{equation}
+where $\theta$ represents model parameters. $\Sigma$ is set as hyper-parameters by~\cite{ho_ddpm_NIPS_2020}. Specifically, $\Sigma_\theta(\mathbf{z}_{k},k)=\beta_k\mathbf{I}$ is used for stable training, which means only $\mu_\theta(\mathbf{z}_{k},k)$ is learned.
+
+
+\noindent\textit{\textbf{Conditional diffusion model for AVS.}}
+For our AVS task, with the ground-truth latent encoder $\mathbf{z}_0=E_{\varphi}(\mathbf{y})$, \equref{eq_diffusion_process} provides the diffusion process by gradually destroying $\mathbf{z}_0$ to obtain $\mathbf{z}_K\sim\mathcal{N}(0,\mathbf{I})$. Our conditional generation process aims to restore $\mathbf{z}_0$ given the input conditional variable $\mathbf{c}=E_{\psi}(\mathbf{x}^v, \mathbf{x}^a)$, where $\mathbf{c}$ is the feature embedding of our audio-visual input, leading to the conditional generative process $p_\theta(\mathbf{z}_{k-1}|\mathbf{z}_{k},\mathbf{c})$.
+In our implementation, we concatenate the conditional variable $\mathbf{c}$ with the noisy ground-truth latent variable $\mathbf{z}_K$, to achieve conditional generation.
+It is important to note that since the binary ground truth lacks appearance information, we utilize the audio-visual fused feature $\mathbf{c}$ instead of the only audio feature to correlate the \enquote{visual} sound producer(s) with the audio data.
+% as no appearance information in encoded in the output feature $\mathbf{z}_0$. Our goal is to learn semantic rich latent space, where we aim to correlated \enquote{visual} sound producer(s) with audio, and the fused information in our case can provide \enquote{visual} guidance. 
+We thus sample from $p_\theta(\mathbf{z}_0|\mathbf{c})$ via:
+\begin{equation}
+\begin{aligned}
+    \label{eq_conditional_generation}
+    &p_\theta(\mathbf{z}_0|\mathbf{c})=\int p_\theta(\mathbf{z}_{0,...,K}|\mathbf{c}) \text{d}\mathbf{z}_{1,...,K},\\
+&p_\theta(\mathbf{z}_{0,...,K}|\mathbf{c})=p(\mathbf{z}_K)\prod_{k=1}^K p_\theta(\mathbf{z}_{k-1}|\mathbf{z}_k,\mathbf{c}).
+\end{aligned}
+\end{equation}
+
+Following the simplified diffusion model objective~\cite{ho_ddpm_NIPS_2020}, with the re-parameterization trick~\cite{kingma2013auto}, a noise estimator $\epsilon_\theta$ is designed to regress the actual noise $\epsilon$ added to $\mathbf{z}_k$ via:
+% Specifically, 
+% % To train the denoising UNet,
+% we adopt the simplified objective proposed by Ho \etal~\cite{ho_ddpm_NIPS_2020} to train our latent conditional diffusion model.
+% of  and an encoder $E_{\psi}$ to get the audio-visual embedding as a condition. The latent code and the condition can be represented as:
+% \begin{equation}
+%     \begin{aligned}
+%     \mathbf{z_0}=E_{\varphi}(\mathbf{y}), \quad\text{and}\quad \mathbf{c}=E_{\psi}(x^a,x^v)
+%     \end{aligned}
+% \end{equation}
+\begin{equation}
+    \begin{aligned}
+    \label{ddpm_loss}
+    \mathcal{L}_{\text{diffusion}}(\theta):=\mathbb{E}_{\mathbf{z},\mathbf{c}, \epsilon\sim \mathcal{N}(0,\mathbf{I}), k}\left[\left\|\epsilon-\epsilon_\theta\left(\mathbf{z}_k, \mathbf{c}, k\right)\right\|^2\right].
+    \end{aligned}
+\end{equation}
+
+The forward and reverse process of our proposed conditional latent diffusion model can be shown in Fig.~\ref{fig:model_overview}. 
+In the training phase, one-step denoising is completed through sampling with a randomly sampled timestep $t$.
+And the denoising objective is under the supervision of \equref{ddpm_loss}.
+At inference time, given the conditional latent variable $\mathbf{c}$ of the audio-visual pair and random noise $\mathbf{z}_K\!\sim\!\mathcal{N}(0,\mathbf{I})$, our model samples $p_\theta(\mathbf{z}_0|\mathbf{c})$ via \equref{eq_conditional_generation} by gradually performing denoising.
+% \MYX{describe how to perform condition here.}
+% SDFusion: Multimodal 3D Shape Completion, Reconstruction, and Generation
+
+\noindent\textit{\textbf{The structure of $\epsilon_\theta$.}}
+As described above, the noise estimator $\epsilon_\theta$ constitutes the central component within the diffusion model.
+Following the conventional practice in designing the diffusion models~\cite{ho_ddpm_NIPS_2020}, $\epsilon_\theta$ can be designed as a \enquote{encoder-decoder} structure.
+In our implementation, we design eight fully connected layers followed by leakyReLU activation to ensure lightweight. 
+The former four layers are \enquote{encoder}, and the latter four layers are \enquote{decoder}.
+
+
+% The effectiveness of $p_\theta(\mathbf{z}_0|\mathbf{c})$ depends on the representativeness of the conditional variable $\mathbf{c}$, which can be addressed by contrastive learning~\cite{chopra2005learning,dimension_reduction_lecun,Distance_Metric_Learning,large_scale_online_learning,facenet,npair_loss,chen2020simple,oord2018representation}.
+% Directly using the diffusion model with conditional variables with rich semantic information can be enough to achieve conditional maximum likelihood learning. However, g
+% Given the limited and less diverse training dataset~\cite{zhou_AVSBench_ECCV_2022} of our AVS task, it's difficult to guarantee the discriminativeness of the conditional variable.
+% An ideal $\mathbf{c}$ should be distinctive enough, serving as clear guidance.
+% % We want the conditional variable to be representative enough in feature space to distinguish the higher level visual semantic difference.
+% % can be less effective once the conditional variable itself is less informative. 
+% We thus resort to contrastive learning to learn informative feature representation~\cite{chopra2005learning,dimension_reduction_lecun,Distance_Metric_Learning,large_scale_online_learning,facenet,npair_loss,chen2020simple,oord2018representation}. 
+
+% The key challenge is then to obtain informative feature representation $\mathbf{c}$ for effective conditional generation $p_\theta(\mathbf{z}_0|\mathbf{c})$, which is achieved via contrastive learning~\cite{chopra2005learning,dimension_reduction_lecun,Distance_Metric_Learning,large_scale_online_learning,facenet,npair_loss,chen2020simple,oord2018representation}.
+
+% \noindent\textit{Technical details:} As the latent code and the condition embedding are vectors with size $B\times D$.
+% We use 8 MLP layers to construct the noise estimator $\epsilon_\theta$.
+
+% \Jing{structure of $\epsilon_\theta\left(\mathbf{z}_k, \mathbf{f}^f, k\right)$ }
+% conditions from audio-visual pairs, we sample $\mathbf{\hat{z}_0}$ by gradually denoising a noise variable sampled from the standard normal distribution $N(0,1)$.
+
+
+
+
+
+
+\subsection{Contrastive Representation Learning}\label{subsec_contrastive_learning}
+In the context of the conditional diffusion process described in \equref{eq_conditional_generation}, the efficacy of $p_\theta(\mathbf{z}_0|\mathbf{c})$ holds considerable significance.
+In our multimodal scenario, the proficiency of $p_\theta(\mathbf{z}_0|\mathbf{c})$ relies on the representational quality of the multimodal conditional variable $\mathbf{c}$, where the guidance of audio data facilitates the segmentation of visual data.
+% The uniqueness of AVS lies in the strong requirement for audio, as it provides guidance to achieve the so-called guided segmentation. 
+The distinctiveness of AVS stems from its significant reliance on audio, as it serves as a guiding force to accomplish guided segmentation.
+However, without extra constraint, the audio feature representation~\cite{hershey_VGGish_icassp_2017} could become dominated by the visual modality, leading to a less effective representation of audio, which is critical for AVS.
+
+\noindent\textbf{Density Ratio Modeling.} 
+We initiate the process by considering the conditional probability $p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)$ and proceed to derive the density ratio. 
+This ratio acts as a constraint, focusing on maximizing the contribution of the audio signal. 
+Employing Bayes' rule, we obtain:
+
+
+\begin{equation}
+    \begin{aligned}
+p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)=\frac{p(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)}{p(\mathbf{x}^v,\mathbf{x}^a)}=\frac{p(\mathbf{x}^v|\mathbf{y},\mathbf{x}^a)p(\mathbf{y}|\mathbf{x}^a)}{p(\mathbf{x}^v|\mathbf{x}^a)}.
+    \end{aligned}
+\end{equation}
+We define the density ratio $r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)$ as: 
+\begin{equation}
+\label{eq_likelihood_ratio}
+   % r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)=\frac{p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)}{p(\mathbf{y}|\mathbf{x}^a)}= \frac{p(\mathbf{x}^v|\mathbf{y},\mathbf{x}^a)}{p(\mathbf{x}^v|\mathbf{x}^a)}.
+   r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)= \frac{p(\mathbf{x}^v|\mathbf{y},\mathbf{x}^a)}{p(\mathbf{x}^v|\mathbf{x}^a)}=\frac{p(\mathbf{y}|\mathbf{x}^v,\mathbf{x}^a)}{p(\mathbf{y}|\mathbf{x}^a)}.
+\end{equation}
+To maximize the contribution of the audio data, our objective is to minimize the density ratio $r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)$, thereby avoiding poor alignment between the output $\mathbf{y}$ and the audio data $\mathbf{x}^a$.
+
+
+
+% Given the correlation between the density ratio with the objective function of contrastive learning, we claim that minimizing the density ratio can be achieved via contrastive learning.
+% Recall that contrastive learning~\cite{chopra2005learning} aims to maximize the distance of the given sample to its negative sample(s) and minimize its distance to the positive sample.
+% Considering the alignment requirement of $\mathbf{y}$ and $\mathbf{x}^a$, the goal of the optimization of $r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)$ is then to maximizing $p(\mathbf{y}|\mathbf{x}^a)$ for the paired $\mathbf{y}$ and $\mathbf{x}^a$, and minimizing it otherwise.
+
+Given the correlation between the density ratio and the objective function in contrastive learning~\cite{chopra2005learning,li2023mutual}, we claim that minimizing the density ratio can be attained through contrastive learning methods.
+Recall that contrastive learning aims to maximize the distance between a given sample and its negative samples, while simultaneously minimizing its distance to the positive samples.
+In light of the alignment requirement between $\mathbf{y}$ and $\mathbf{x}^a$, the primary objective in optimizing $r(\mathbf{y},\mathbf{x}^v,\mathbf{x}^a)$ is to maximize $p(\mathbf{y}|\mathbf{x}^a)$ for the matched pairs of $\mathbf{y}$ and $\mathbf{x}^a$, and minimize it otherwise.
+
+
+
+
+\noindent\textbf{Contrastive Learning to Optimize the Density Ratio.}
+As a conditional generative model, we argue that the representativeness of the conditional variable in the latent diffusion model plays an important role in the sample quality, especially for our specific multimodal task, where audio data serves as guidance for the visual data to achieve guided segmentation. 
+We will first introduce our conditional variable generation process, \ie~$\mathbf{c}=E_{\psi}(\mathbf{x}^v, \mathbf{x}^a)$, and then 
+% We want to have the conditional variable $\mathbf{c}$ to be discriminative enough to explain the alignment of audio and visual. We thus introduce contrastive representation learning to our framework. We will first introduce the conditional feature generation process
+% % encoding 
+% and then 
+present our positive/negative pairs construction for contrastive learning. Our objective is to learn an appropriate distance function, such that the paired audio-visual sound producer(s) data remains in close proximity in the latent space compared to the unpaired data.
+This can be achieved via maximizing $p(\mathbf{y}|\mathbf{x}^a)$ for paired samples and minimizing $p(\mathbf{y}|\mathbf{x}^a)$ for unpaired samples.
+% \Jing{I'm here!}
+
+
+
+% Besides the latent code $\mathbf{z}_0$, we have three variables involved in our framework, namely video $\mathbf{x}^v$, audio $\mathbf{x}^a$, and ground-truth segmentation map $\mathbf{y}$. We design a diffusion model to diffuse and restore the ground-truth information, thus we can sample from $p_\theta(\mathbf{z}_0|\mathbf{c})$ via \equref{eq_conditional_generation}. In that case, we claim that the conditional variable $\mathbf{c}$ should be discriminative enough to distinguish $\mathbf{z}_0$. 
+% In other words, given $\mathbf{c}$, the corresponding $\mathbf{z}_0$ should lead to a larger score than  $\mathbf{z}'_0$ of another sound producer(s).
+
+
+% Based on the above analysis, we present contrastive learning to investigate the contribution of the audio data. 
+
+
+We claim the conditional variable $\mathbf{c}$ should be discriminative enough to distinguish $\mathbf{z}_0$. 
+In other words, given $\mathbf{c}$, the corresponding $\mathbf{z}_0$ should lead to a larger score than  $\mathbf{z}'_0$ of another sound producer(s).
+% Specifically, with the audio-visual conditional feature $\mathbf{c}=E_{\psi}(\mathbf{x}^v_i, \mathbf{x}^a_i)$, we define its ground-truth encoding $\mathbf{z}_0=E_{\varphi}(\mathbf{y}_i)$ as its positive sample, and $\mathbf{y}'$ other than $\mathbf{y}_i$ in the mini-batch as the negative samples.
+More specifically, utilizing the audio-visual conditional feature $\mathbf{c}=E_{\psi}(\mathbf{x}^v_i, \mathbf{x}^a_i)$, we define its ground-truth encoding $\mathbf{z}_0=E_{\varphi}(\mathbf{y}_i)$ as the positive sample, while considering $\mathbf{y}'$ (distinct from $\mathbf{y}_i$) within the mini-batch as the negative samples.
+With the above positive/negative samples, we obtain our contrastive loss as:
+
+\begin{equation}
+    \begin{aligned}
+    \label{contrastive_loss}
+    \mathcal{L}_{\text{contrastive}}=-\mathbb{E}_\mathbf{\mathbf{z}_0}\left[\log \frac{f(\mathbf{z}_0,\mathbf{c})/\tau}{\sum_{\mathbf{z}_0'\in\{\mathcal{N},\mathbf{z}_0\}}f(\mathbf{z}'_0,\mathbf{c})/\tau}\right],
+    \end{aligned}
+\end{equation}
+where $\mathbf{z}_0$ is always paired with $\mathbf{c}$, and $\mathcal{N}$ represents the negative samples within the mini-batch, which includes all the samples except $\mathbf{z}_0$.
+$f(\mathbf{z}_0,\mathbf{c})=\exp(s(\mathbf{z}_0,\mathbf{c}))$ is the scoring function with $s(\cdot,\cdot)$ as the cosine similarity.
+$\tau$ is a temperature parameter and we set $\tau\!=\!1$ in all experiments.
+
+
+With the utilization of the contrastive loss described in \equref{contrastive_loss}, our objective is to maximize $f(\mathbf{z}_0,\mathbf{c})$. 
+This maximization aligns with the goal of enhancing the mutual information between $\mathbf{z}_0$ and $\mathbf{c}$, or equivalently, maximizing $p(\mathbf{y}|\mathbf{x}^a)$ as indicated in \equref{eq_likelihood_ratio} for the paired data.
+
+
+% Utilizing contrastive learning in our approach for AVS,
+% we aim to learn a suitable distance function, thus the paired audio/visual sound producer(s) data should stay closer
+% (maximizing $p(\mathbf{y}|\mathbf{x}^a)$ for paired samples) in latent space than the unpaired ones (minimizing $p(\mathbf{y}|\mathbf{x}^a)$ for unpaired samples).
+% % Besides the latent code $\mathbf{z}_0$, we have three variables involved in our framework, namely video $\mathbf{x}^v$, audio $\mathbf{x}^a$, and ground-truth segmentation map $\mathbf{y}$. We design a diffusion model to diffuse and restore the ground-truth information, thus we can sample from $p_\theta(\mathbf{z}_0|\mathbf{c})$ via \equref{eq_conditional_generation}. In that case, we claim that the conditional variable $\mathbf{c}$ should be discriminative enough to distinguish $\mathbf{z}_0$. 
+% % In other words, given $\mathbf{c}$, the corresponding $\mathbf{z}_0$ should lead to a larger score than  $\mathbf{z}'_0$ of another sound producer(s).
+% % We then define our positive and negative pair based on $\mathbf{z}_0$.
+% Specifically, with
+% % Given $\mathbf{z}_0$ of $\mathbf{y}_i$, we define its corresponding paired
+% audio-visual feature $\mathbf{c}=E_{\psi}(\mathbf{x}^v_i, \mathbf{x}^a_i)$, we define its ground-truth encoding $\mathbf{z}_0=E_{\varphi}(\mathbf{y}_i)$ as its positive sample, and $\mathbf{y}'$ other than $\mathbf{y}_i$ in the mini-batch as the negative samples.
+% % We construct unpaired audio-visual data, \ie~$(\mathbf{x}^v_i, \mathbf{x}^a_j)$ by reversing the ordering of the audio in the mini-batch, and obtain $\mathbf{c}'=E_{\psi}(\mathbf{x}^v_i, \mathbf{x}^a_j)$ as the negative sample of $\mathbf{z}_0$.
+% With the above positive/negative samples, we obtain our contrastive loss as:
+% % by reversing the ordering of the audio in the mini-batch, leading to the negative pairs.
+% % We then 
+% % Given the visual data $\mathbf{x}^v$, we define the paired audio $\mathbf{x}^a$ as its positive sample, leading to $c$.
+% % % For the negative samples, w
+% % We construct unpaired audio-visual data by reversing the ordering of the audio in the mini-batch, leading to the negative pairs.
+% % For the positive samples, we use paired audio-visual data to do the above process and obtain $\mathbf{z}_T$.
+% % For the negative samples, we construct unpaired audio-visual data by reversing the ordering of the audio in the batch. 
+% % Then feed the unpaired audio-visual data into the diffusion model and obtain $\mathbf{z}_T^\text{pos}$.\Jing{not sure about this, will come back.}
+% % We define the unpaired audio-visual data as the negative sample. 
+% % Thus, t
+% % The contrastive loss can be defined as:
+% \begin{equation}
+%     \begin{aligned}
+%     \label{contrastive_loss}
+%     \mathcal{L}_{\text{contrastive}}(\psi)=-\mathbb{E}_\mathbf{\mathbf{z}_0}\left[\log \frac{f(\mathbf{z}_0,\mathbf{c})/\tau}{\sum_{\mathbf{z}_0'\in\{\mathcal{N},\mathbf{z}_0\}}f(\mathbf{z}'_0,\mathbf{c})/\tau}\right],
+%     \end{aligned}
+% \end{equation}
+% % \Yunqiu{The $f(z_0,c)$ in the denominator is $f(z'_0,c)$? where is $z'_0$?} 
+% where $\mathbf{z}_0$ is always paired with $\mathbf{c}$, and $\mathcal{N}$ represents the negative samples within the mini-batch, which includes all the samples except $\mathbf{z}_0$, $f(\mathbf{z}_0,\mathbf{c})=\exp(s(\mathbf{z}_0,\mathbf{c}))$ is the scoring function with $s(\cdot,\cdot)$ as the cosine similarity.
+% % estimates the density ratio $\frac{p(\mathbf{z}_0|\mathbf{c})}{p(\mathbf{z}_0)}$. 
+% $\tau$ is a temperature parameter and we set $\tau\!=\!1$ in all experiments.
+
+
+%%%%%% delete the [Mutual Information Maximization Analysis] part %%%%%%%
+% \noindent\textbf{Mutual Information Maximization Analysis.} Mutual Information (MI) captures the nonlinear statistical dependencies between variables. Specifically, for random variables $\mathbf{z}_0$ and $\mathbf{c}$, their mutual information is defined as:
+% \begin{equation}
+% \begin{aligned}
+%     &I(\mathbf{z}_0;\mathbf{c})=\sum_{\mathbf{z}_0,\mathbf{c}}p(\mathbf{z}_0,\mathbf{c})\log\frac{p(\mathbf{z}_0,\mathbf{c})}{p(\mathbf{z}_0)p(\mathbf{c})}\\
+%     &=\sum_{\mathbf{z}_0,\mathbf{c}}p(\mathbf{z}_0,\mathbf{c})\log\frac{p(\mathbf{z}_0|\mathbf{c})}{p(\mathbf{z}_0)}\propto\sum_{\mathbf{z}_0,\mathbf{c}}p(\mathbf{z}_0,\mathbf{c})\log f(\mathbf{z}_0,\mathbf{c}).
+% \end{aligned}
+% \end{equation}
+
+% With the contrastive loss in \equref{contrastive_loss}, we aim to maximize the density ratio $f(\mathbf{z}_0,\mathbf{c})$, which in turn can be explained as achieving mutual information maximization between $\mathbf{z}_0$ and $\mathbf{c}$, thus our contrastive loss explicitly explores the contribution of $\mathbf{c}$ for the segmentation representation $\mathbf{z}_0$.
+%%%%%% delete the [Mutual Information Maximization Analysis] part %%%%%%%
+
+
+\subsection{Model Prediction Generation and Training}
+\label{subsec_objective_function}
+In Sec.~\ref{subsec_conditional_latent_diffusion}, we present our conditional latent diffusion model for learning a conditional distribution $p_\theta(\mathbf{z}_0|\mathbf{c})$ and restoring the ground truth information $\hat{\mathbf{z}}_0$ during inference. Moreover, as described in Sec.~\ref{subsec_contrastive_learning}, the discriminativeness of the conditional variable and its contribution to the final output is constrained via the contrastive learning pipeline. 
+As shown in Fig.~\ref{fig:model_overview}, the restored $\hat{\mathbf{z}}_0$ and the input data encoding are fed to the prediction decoder to generate our final prediction.
+
+% given the  
+% Our whole framework in Fig.~\ref{fig:model_overview} is composed of a fused feature extraction module for AVS, where TPAVI is used for cross-level multimodal fusion following~\cite{zhou_AVSBench_ECCV_2022}, a contrastive learning module for representative feature generation, a conditional diffusion module to explicitly model the conditional generation process $p(y|x^a,x^v)$, and a prediction decoder to generate our final segmentation map.
+
+
+
+\noindent\textbf{Input Data Encoding.}
+\Fix{We design a two-branch Audio-Visual network to produce multi-scale deterministic feature maps from the input audio-visual pairs, following the established paradigm of processing each modality through specialized encoders before fusion. 
+Similar to ECMVAE~\cite{mao_iccv_2023_ecmvae}, we encode the deterministic audio and visual features through separate branches to leverage modality-specific pre-trained models.
+For the audio branch, we preprocess the audio waveform into a spectrogram via short-time Fourier transform and feed it to a frozen VGGish~\cite{hershey_VGGish_icassp_2017} model, which is pre-trained on the large-scale AudioSet~\cite{gemmeke_audioset_icassp_2017} dataset. This specialized audio encoder yields rich audio representations $\mathbf{A}\in \mathbb{R}^{T\times d}$, where $d=128$ is the feature dimension.
+For the visual branch, given the video sequence $\mathbf{x}^v$, we extract visual features using either the ImageNet pre-trained ResNet50 backbone~\cite{he_resnet_cvpr_2016} or the PVTv2 backbone~\cite{wang_Pvtv2_CVM_2022}. These visual-specific encoders produce multi-scale visual features denoted as $\mathbf{F}_l\in \mathbb{R}^{T\times c_l\times h_l\times w_l}$, where $c_l$ represents the number of channels, and $(h_l,w_l)=(H,W)/2^{l+1}$. The spatial dimension of the input video is $(H,W)$, and the feature levels are $l\in [1,4]$.
+For the ResNet50 backbone, the channel sizes of the four stages are $c_{1:4}=[256, 512, 1024, 2048]$, while for the PVTv2 backbone, they are $c_{1:4}=[64, 128, 320, 512]$.
+We further process the visual features $\mathbf{F}_l$ using four convolutional neck modules to obtain $\mathbf{V}_l\in \mathbb{R}^{T\times c\times h_l\times w_l}$, where $c\!=\!128$.
+After obtaining the modality-specific representations, we perform multimodal fusion using the temporal pixel-wise audio-visual interaction module~\cite{zhou_AVSBench_ECCV_2022}. This cross-modality attention mechanism explores the correlation between audio features $\mathbf{A}$ and visual features $\mathbf{V}_l$, effectively integrating information from both modalities. Through this fusion process, we obtain the deterministic feature maps $\mathbf{G}_l\in \mathbb{R}^{T\times c\times h_l\times w_l}$ that encode rich audio-visual correlations, forming the foundation for our conditional generation approach to audio-visual segmentation.}
+
+\Fix{This separate encoding followed by fusion approach offers several key advantages. 
+First, it allows us to leverage powerful pre-trained models that have been optimized on large-scale datasets specific to each modality, extracting higher-quality modality-specific features. 
+Second, the specialized encoders preserve the unique statistical properties and information structures of the audio and visual data before integration. Third, this architecture facilitates more controlled and interpretable cross-modal interaction, as the fusion module can explicitly model how audio cues should guide visual segmentation. Finally, this design aligns well with our conditional generation framework, where audio serves as a guiding condition for the segmentation process, enabling a more precise modeling of the audio-visual relationship.}
+
+% \noindent\textbf{Input Data Encoding.}
+% We design an Audio-Visual network to produce a set of multi-scale deterministic feature maps from the input audio-visual pairs. 
+% Similar to ECMVAE~\cite{mao_iccv_2023_ecmvae}, we encode the deterministic audio and visual features from two branches.
+% For the audio branch, we preprocess the audio waveform to a spectrogram via the short-time Fourier transform and then fed it to the frozen VGGish~\cite{hershey_VGGish_icassp_2017} model, which is an audio classification network and per-trained on AudioSet~\cite{gemmeke_audioset_icassp_2017}. 
+% We represent the audio features as $\mathbf{A}\in \mathbb{R}^{T\times d}$, where $d=128$ is the feature dimension.
+% Given the video sequence $\mathbf{x}^v$, we extract visual features using the ImageNet pre-trained ResNet50 backbone~\cite{he_resnet_cvpr_2016} or the PVTv2 backbone~\cite{wang_Pvtv2_CVM_2022}. 
+% These visual features are encoded, resulting in multi-scale visual features denoted as $\mathbf{F}_l\in \mathbb{R}^{T\times c_l\times h_l\times w_l}$. Here, $c_l$ represents the number of channels, and $(h_l,w_l)=(H,W)/2^{l+1}$. The spatial size of the input video is denoted as $(H,W)$, and the feature levels are represented by $l\in [1,4]$.
+% For the ResNet50 backbone, the channel sizes of the four stages are $c_{1:4}=[256, 512, 1024, 2048]$. On the other hand, for the PVTv2 backbone, the channel sizes are $c_{1:4}=[64, 128, 320, 512]$.
+% Additionally, we use four convolutional layers as neck modules to further post-process the visual features $\mathbf{F}_l$ to $\mathbf{V}_l\in \mathbb{R}^{T\times c\times h_l\times w_l}$, where $c\!=\!128$.
+% Furthermore, given the audio-visual features, namely $\mathbf{A}$ and $\mathbf{V}_l$, we exploit the temporal pixel-wise audio-visual interaction module~\cite{zhou_AVSBench_ECCV_2022} to perform audio-visual fusion in the feature space, which is a cross-modality attention module to explore the audio-visual feature correlation.
+% Finally, we obtain the deterministic feature maps $\mathbf{G}_l\in \mathbb{R}^{T\times c\times h_l\times w_l}$, which contains audio-visual information.
+
+
+
+\noindent\textbf{Prediction Decoder.}
+Since the deterministic features $\mathbf{G}_l$ and stochastic representation $\mathbf{\hat{z}}_0$ are with different feature sizes, to fuse the two items, we perform a latent code expanding module $D_\tau$, which contains one $3\times 3$ convolutional layer, to achieve feature expanding of $\mathbf{\hat{z}}_0$. Specifically, we first expand $\mathbf{\hat{z}}_0$ to a 2D tensor and tile it to the same spatial size as $\mathbf{G}_4$. We define the new 2D feature map as $\mathbf{\hat{z}^\mathbf{e}}_0$. Given that the spatial size of $\mathbf{\hat{z}^\mathbf{e}}_0$ and $\mathbf{G}_4$ are the same, we perform cascaded channel-wise feature concatenation and one $3\times 3$ convolution to obtain $\mathbf{\hat{G}}_4$, which is the same size as $\mathbf{G}_4$.
+\Fix{Following the classic work in AVS~\cite{zhou_AVSBench_ECCV_2022}, we adopt Panoptic-FPN~\cite{kirillov_panopticfpn_cvpr_2019} as our decoder to process the mixed features  $\{\mathbf{G}_l \mid l = 1, 2, 3\} \cup \{\mathbf{\hat{G}}_4\}$. This architecture efficiently combines a bottom-up pathway with a top-down pathway featuring lateral connections, creating a feature pyramid that effectively preserves both visual spatial details and multimodal semantic information. The lightweight segmentation head then processes these multi-scale features to generate the final output $\mathbf{M}\in \mathbb{R}^{T\times 1\times H\times W}$. Since our task is binary segmentation (foreground vs. background), we apply the \texttt{sigmoid} activation function to the output, naturally mapping network predictions to probability values between 0 and 1, which is mathematically appropriate for our binary classification objective.}
+% Note that any valid decoder architecture could be used, we keep the same with AVSBench~\cite{zhou_AVSBench_ECCV_2022} 
+
+% to obtain a new tensor of channel dimension 
+% Specifically, we expand $\mathbf{\hat{z}}_0$ to the feature map of the same spatial size as $\mathbf{G}_4$ by defining $\varepsilon \in \mathcal{N}(0, \mathbf{I})$ as two-dimensional Gaussian noise map. Thus, we can obtain a $D$ (size of the latent space) channel stochastic feature $\mathbf{\hat{z}^\mathbf{e}}_0$ which is full of the segmentation ground-truth representation. Further, we mix $\mathbf{\hat{z}_0^\mathbf{e}}$ and $G_4$ channel-wise by concatenation, and obtain a fused $\hat{G}_4$ with $C+D$ channels.
+
+
+% \noindent\textbf{Technical details.}
+% Here we introduce the detailed structure of the involved modules. The $E_{\varphi}$ consists of five convolutional layers followed
+% by leakyReLU and batch norm, and the output channels are $[16, 32, 64, 64, 64]$. Then two fully connected layers are used to encode the feature into a latent space of size 24. The $E_{\psi}$ can be divided into two branches: the visual branch and the audio branch. The visual branch involves five convolutional layers and two fully connected layers, which keep the same as $E_{\varphi}$. The audio branch involves two fully connected layers. Further, the visual features and the audio features are concatenated channel-wisely and another two fully connected layers are used to get final conditional embedding. The $\epsilon_\theta$ consists of eight fully connected layers followed by leakyReLU activation, the former four layers are \enquote{encoder} and the latter four layers are \enquote{decoder}. The core role of the latent decoder $D_\tau$ is to perform feature expanding, and the implementation details are reported in the above subsection.
+% \Jing{introduce the structure of involved modules, $E_{\varphi}$, $\epsilon_\theta$, $D_\tau$, $E_{\phi}$. Especially, for the diffusion model, the step number, and how to achieve efficient sampling. Those details are needed}. 
+
+
+\noindent\textbf{Objective Function.} As a segmentation task, our model is trained with a cross-entropy loss with the ground-truth segmentation map as supervision. We also have a conditional latent diffusion module and a contrastive learning objective involved, leading to our final objective as:
+\begin{equation}
+    \label{eq_objective_function}
+    \mathcal{L}=\mathcal{L}_{\text{seg}}+\lambda_1 \mathcal{L}_{\text{diffusion}}+\lambda_2 \mathcal{L}_{\text{contrastive}},
+\end{equation}
+where $\lambda_1$ and $\lambda_2$ are used to balance the two objectives, which are set empirically as 1 and 0.1, respectively.
+All proposed modules can be completed through end-to-end training, eliminating the need for additional pre-training.
+% : $\{\lambda_1, \lambda_2\}=\{1, 0.1\}$.

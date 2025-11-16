@@ -1,0 +1,399 @@
+\documentclass{article}
+
+
+% if you need to pass options to natbib, use, e.g.:
+\PassOptionsToPackage{numbers, compress}{natbib}
+% before loading neurips_2023
+
+\usepackage[preprint]{neurips_2023}
+
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage[colorlinks]{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{graphicx}
+\usepackage{amssymb}
+\usepackage{todonotes}
+\input{math_commands.tex}
+\usepackage[capitalise]{cleveref}
+\usepackage{amsthm}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}[theorem]
+\DeclareMathOperator{\subsample}{select}
+
+% Better colors for hyperrefs. Reference: https://tex.stackexchange.com/a/525297
+\def\tmp#1#2#3{%
+  \definecolor{Hy#1color}{#2}{#3}%
+  \hypersetup{#1color=Hy#1color}}
+\tmp{link}{HTML}{800006}
+\tmp{cite}{HTML}{2E7E2A}
+\tmp{file}{HTML}{131877}
+\tmp{url} {HTML}{8A0087}
+\tmp{menu}{HTML}{727500}
+\tmp{run} {HTML}{137776}
+\def\tmp#1#2{%
+  \colorlet{Hy#1bordercolor}{Hy#1color#2}%
+  \hypersetup{#1bordercolor=Hy#1bordercolor}}
+\tmp{link}{!60!white}
+\tmp{cite}{!60!white}
+\tmp{file}{!60!white}
+\tmp{url} {!60!white}
+\tmp{menu}{!60!white}
+\tmp{run} {!60!white}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\def\method{Gen-neG}
+
+\title{Don't be so negative!  Score-based Generative Modeling with Oracle-assisted Guidance}
+
+
+% \author{%
+%   Saeid Naderiparizi \\
+%   Department of Computer Science\\
+%   University of British Columbia\\
+%   Vancouver, Canada \\
+%   \texttt{saeidnp@cs.ubc.ca} \\
+%   \And
+%   Xiaoxuan Liang \\
+%   Department of Computer Science\\
+%   University of British Columbia \\
+%   Vancouver, Canada \\
+%   \texttt{liang51@cs.ubc.ca} \\
+%   \AND
+%   Berend Zwartsenberg \\
+%   Inverted AI \\
+%   Vancouver, Canada \\
+%   \texttt{berend.zwartsenberg@inverted.ai} \\
+%   \And
+%   Frank Wood\thanks{Frank Wood is also affiliated with the Montr\'eal Institute for Learning Algorithms (Mila) and Inverted AI.} \\
+%   Department of Computer Science\\
+%   University of British Columbia \\
+%   Vancouver, Canada \\
+%   \texttt{fwood@cs.ubc.ca} \\
+% }
+\author{%
+  Saeid Naderiparizi \\
+  Department of Computer Science\\
+  University of British Columbia\\
+  \texttt{saeidnp@cs.ubc.ca} \\
+  \And
+  Xiaoxuan Liang \\
+  Department of Computer Science\\
+  University of British Columbia \\
+  \texttt{liang51@cs.ubc.ca} \\
+  \AND
+  Berend Zwartsenberg \\
+  Inverted AI \\
+  \texttt{berend.zwartsenberg@inverted.ai} \\
+  \And
+  Frank Wood\thanks{Frank Wood is also affiliated with the Montr\'eal Institute for Learning Algorithms (Mila) and Inverted AI.} \\
+  Department of Computer Science\\
+  University of British Columbia \\
+  \texttt{fwood@cs.ubc.ca} \\
+}
+
+
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+The maximum likelihood  principle advocates parameter estimation via optimization of the data likelihood function.  Models estimated in this way can exhibit a variety of generalization characteristics dictated by, e.g.~architecture, parameterization, and optimization bias.  This work addresses model learning in a setting where there further exists side-information in the form of an oracle that can label samples as being outside the support of the true data generating distribution. Specifically we develop a new denoising diffusion probabilistic modeling (DDPM) methodology, \method{}, that leverages this additional side-information.
+Our approach builds on generative adversarial networks (GANs) and discriminator guidance in diffusion models to guide the generation process  towards the positive support region indicated by the oracle.
+We empirically establish the utility of  \method{}   in applications including collision avoidance in self-driving simulators and  safety-guarded human motion generation.
+\end{abstract}
+
+
+\section{Introduction}
+
+What should we do when we train a generative model that produces samples that we know are ``bad'' or ``not allowed?''  Let's say we have, as is typical, a set of ``good'' training data samples and additionally an oracle that tells whether a sample is ``bad.''  We typically maximize the likelihood of ``good'' samples under our learned generative model. As most models only approximate the true data generating process, often when sampling from a fully trained, highly expressive model, some fraction of generated samples fall in the ``bad'' region as indicated by the oracle. Assuming the veracity of the oracle, this is a clear indication of model misspecification in the sense of incorrect generalization.
+
+The most natural thing to do with such a model is to deploy it in a rejection sampling loop in which the oracle is used to decide whether to reject a sample or not.  Depending on circumstances this may be an acceptable final ``generative model,'' but it may come at an unacceptable computational cost, particularly in terms of latency.  Consider the concrete example of realtime autonomous vehicle model predictive control and path planning \citep{janner2022planning}.  Selecting a control action conditioned on a joint sample of forward in time trajectories that do not produce collisions or other infractions is a supremely important task that requires low latency and extremely high success rates.  If a generative model fit on trajectories with no observed collisions or infractions produces infracting joint trajectories with probability $\epsilon$ (state of the art models \citep{lee2017desire, djuric2018short, gupta2018social, cui2019multimodal, ngiam2021scene, scibior2021imagining} can have high joint infraction rates),
+then in order to find at least one non-infracting sample with $1-\delta$ probability without looping the rejection sampler requires $\frac{\log \delta}{\log \epsilon}$  batched parallel samples.  Depending on the specific concrete value of $1-\delta$ required (e.g. 1 chance in a billion of having latency arising from rejection sampling looping imposed) and the baseline trajectory model rejection rate (e.g. 30-50\% is not atypical) this could require running many parallel samplers (in this concrete example around 30), a number that, depending on model size and available realtime edge computational capacity, is likely to be prohibitively large.  Other concrete examples of this nature arise in many control as inference problems \citep{levine2018reinforcement}.
+Minimizing $\epsilon$ directly, or restricting the generative model to only place mass on the positive support region indicated by the oracle, is the most natural thing to try to combat this problem.  Working towards this goal includes a body of work on amortized rejection sampling \citep{naderiparizi2022amortized,warrington2020coping} and the body of related work on generative adversarial networks (GAN)s \citep{goodfellow2014generative}.  Of course in the GAN setting the discriminator (which can be used in a rejection sampling loop for improved performance \citep{azadi2018discriminator, che2020your}) is learned rather than being fixed as in the case we consider. 
+
+% Figure environment removed
+
+Modern highly expressive deep generative models are sufficiently parameterized and easy to optimize so that they can effectively be trained to result in the de facto non-parametric optimal maximum likelihood solution of placing a mixture of Dirac measures directly on the training data.  Transformer-based \citep{vaswani2017attention} denoising diffusion process models \citep{sohl2015deep, ho2020denoising} are one-such model class.  Such models must be either trained on tremendously large amounts of data \citep{rombach2022high} or otherwise ``de-tuned'' (smaller architecture, fewer integration steps, etc.) to ensure that they generalize rather than memorize \citep{zhang2021understanding, arpit2017closer}.  In this paper we are agnostic to this point and assume that we are operating in a realistic modeling regime where the model generalizes.  Our work can be seen as a way to control the specific kind of generalization that the model exhibits.
+
+We focus specifically on diffusion models, which present several possible ways to solve this problem. While there are a multitude of options that could be considered for this problem, we only report one in this work. We mention but don't formally report these explorations in \cref{app:alternative-approaches} to combat the positive-results-only bias in our literature that leads to wasted duplicated research time and effort.
+
+
+What we discovered, and report in this work, is a \textit{simple rule for classifier guidance} that has been seemingly, to the best of our knowledge, surprisingly overlooked.  Drawing inspiration from results in the very recent work on discriminator guidance in diffusion processes \citep{kim2022refining} (the marriage of diffusion processes with GAN discriminator losses), we establish a new methodology for classifier guidance that learns and uses a sequence of differentiable classifiers fit to synthetic samples labelled by the oracle drawn from a sequence of classifier guided diffusion models.
+The resulting sequence of multiply classifier guided diffusion models (or the end of a sequence of distilled models; details to follow) monotonically decreases the rejection rate while empirically maintaining a competitive probability mass assigned to validation samples.
+The key insight and technical contribution boils down to a carefully choosing the ratio of ``good'' and ``bad'' synthetic samples to use when training each of the sequence of guidance classifiers.  
+
+We demonstrate our methodology, which we call \textbf{Gen}erative modeling with \textbf{neG}ative examples (\method{}) on several problems, including modeling motion capture sequence data in a way that eliminates ground plane violations and static traffic scene vehicle arrangements that avoid collisions and off-road placements. We empirically demonstrate that \method{} can drive the ratio of samples that violate the constraint set monotonically towards zero, while maintaining or even increasing (as one would expect from renormalizing a probability distribution from shifting mass away from the no-support region specified by the oracle) the probability assigned to held out validation samples.
+
+\section{Background}
+
+\subsection{Score-based Diffusion Models}\label{background:score-based}
+Score-based diffusion models \citep{sohl2015deep, song2019generative, ho2020denoising, song2021scorebased}, also referred to as diffusion models (DMs) are a class of generative models that are defined through a stochastic process which gradually adds noise to samples from a data distribution $q_0(\rvx_0)$, such that when simulated forward from $t=0$ the marginal distribution at time $T$ is $q_T(\rvx_T) \approx \pi(\rvx_T)$ for some known $\pi(\rvx_T)$ typically equal to $\gN(\vzero, \mI)$. This is known as the ``forward process'' and is formulated as an SDE
+\begin{equation}
+    d\rvx_t = f(\rvx_t, t) dt + g(t) d \rvw, \quad \rvx_0 \sim q_0(\rvx_0)
+    \label{eq:forward-process}
+\end{equation}
+where $f$ and $g$ are predefined drift and diffusion coefficients of $\rvx_t$ and $\rvw$ is the standard Wiener process. DMs generate data by learning the inverse of this process, which is known as the ``reverse process'' and defined as
+\begin{equation}
+    d \rvx_t = [f(\rvx_t, t) - g(t)^2 s_\theta(\rvx_t; t)] d\bar{t} + g(t) d\bar{\rvw}, \quad \rvx_T \sim \pi(\rvx_T),
+    \label{eq:reverse-process}
+\end{equation}
+where $\bar{t}$ and $\bar{\rvw}$ are the infinitesimal reverse time and reverse Wiener process, respectively. If $s_\theta$ approximates the score function of the marginals of the forward process, the terminal distribution of the reverse process coincides with $q_0(\rvx_0)$~\citep{anderson1982reverse}.
+Formally, when
+\begin{equation}
+    s_\theta(\rvx_t; t) = \nabla_{\rvx_t} \log q_t(\rvx_t) 
+\end{equation}
+we have
+\begin{equation}
+    p_\theta(\rvx_0; 0) = q_0(\rvx_0),
+\end{equation}
+where $p_\theta(\rvx_t; t)$ is the marginal distribution of the approximate reverse process.
+
+In order to approximate the score function $\nabla_{\rvx_t} \log q_t(\rvx_t)$, DMs minimize the following score matching objective function~\citep{hyvarinen2005estimation,vincent2011connection,song2019generative}:
+\begin{equation}
+    \mathcal{L}^{\text{DM}}_\theta = \meanp{t,\rvx_0,\rvx_t} {\gamma_t \norm{s_\theta(\rvx_t; t) - \nabla_{\rvx_t} \log q(\rvx_t | \rvx_0)}^2},
+    \label{eq:score-matching}
+\end{equation}
+where $\rvx_0 \sim q(\rvx_0)$, $\rvx_t \sim q(\rvx_t | \rvx_0)$, $t$ is sampled from a distribution over $[0, T]$, and $\gamma_t$ is a positive weighting term. Importantly, the Wiener process in \cref{eq:forward-process} allows direct sampling from the marginals of the forward distributions~\citep{song2021scorebased}, i.e. $q(\rvx_t | \rvx_0) = \gN(\alpha_t \rvx_0, \sigma_t)$, with $\alpha_t$ and $\sigma_t$ determined by the drift and diffusion coefficients in \cref{eq:forward-process}. This formulation moreover allows the evaluation of the score function ($\nabla_{\rvx_t} \log q(\rvx_t | \rvx_0)$) in closed form.
+
+Many of the DMs reported in the literature operate on discrete time steps~\citep{ho2020denoising,song2020denoising,nichol2021improved}, and can be considered as particular discretizations of the presented framework. Various parameterizations of the score function have been also explored in the literature.
+
+In the remainder of this paper we use $q$ to denote the forward process, $s_\theta$ for the score function of the reverse process and $p_\theta$ is the distribution generated by running \cref{eq:reverse-process} backward in time. This applies to the marginals, conditionals, and posteriors as well. Furthermore, to avoid unnecessary notation clutter throughout the rest of the paper, we omit the explicit mention of $\theta$ and $\phi$ and $t$ when their meaning is evident from the context.
+
+\def\cls{\ensuremath{C}}
+\subsection{Classifier Guidance}
+
+A distinctive and remarkable property of DMs is the ability to train an unconditional version and sample from its class-conditional distributions at inference time without requiring re-training or fine-tuning \citep{Dhariwal2021diffusion,song2021scorebased}. However, it requires a time-dependent classifier $q(y | \rvx_t) = \int q(y | \rvx_0) q(\rvx_0 | \rvx_t)$. Here, $q(y|\rvx_0)$ is a traditional classifier, that predicts the class probabilities for each $y$ given a datum $\rvx_0$ from the dataset. While $q(y | \rvx_t)$ classifies a noisy datum $\rvx_t$ sampled from $q_t(\rvx_t) = \int q(\rvx_t | \rvx_0) q(\rvx_0) \,d\rvx_0$.
+
+Classifier guidance follows from the identity $\nabla_{\rvx_t}\log q(\rvx_t | y) = \nabla_{\rvx_t}\log q(\rvx_t) + \nabla_{\rvx_t}\log q(y | \rvx_t)$. If $s_\theta(\rvx_t; t)$ is the score function of the DM, then the score function of the class-conditional DM is
+\begin{equation}
+    s_\theta(\rvx_t | y; t) = s_\theta(\rvx_t; t) + \nabla_{\rvx_t}\log q(y | \rvx_t).
+\end{equation}
+
+\paragraph{Binary classification}
+A special case of the above classifier guidance that we use in this paper is when there are only two classes. We provide here a brief overview of such a binary classification task and the notation associated with it.
+Let $q(\rvx | y=1)$ and $q(\rvx | y=0)$ be the distribution of positive and negative examples. Let $\alpha$ and $1 - \alpha$ be the prior probabilities $q(y)$ of positive and negative examples. We then have $q(\rvx) = q(y=1) q(\rvx | y=1) + q(y=0) q(\rvx_t | y=0) = \alpha q(\rvx_t | y=1) + (1 - \alpha) q(\rvx_t | y=0)$. A binary classifier $C_\phi: \gX, [0, T] \rightarrow  [0, 1]$, can then be trained to approximate $q(y=1|\rvx_t)$ by minimizing the expected cross-entropy loss
+\begin{equation}
+    \gL_{\phi}^{\text{CE}} = -\meanp{t}{\meanp{q(\rvx_t)}{q(y=1|\rvx_t) \log \cls_\phi(\rvx_t; t) + q(y=0|\rvx_t) \log (1 - \cls_\phi(\rvx_t; t))}}.
+    \label{eq:cls-cross-entropy}
+\end{equation}
+Minimizing the cross-entropy loss between the classifier output and the true label is equivalent to minimizing the KL divergence between the classifier output and the Bayes optimal classifier (see \cref{app:bayes-optimal-kl}).
+The minimizer of this loss is then
+\begin{equation}
+    \cls_{\phi^*}(\rvx_t; t) = \frac{\alpha q(\rvx_t | y=1)}{\alpha q(\rvx_t | y=1) + (1 - \alpha) q(\rvx_t | y=0)}.
+    \label{eq:cls-optimal}
+\end{equation}
+
+\def \infr{\ensuremath{\alpha}}
+\def\synth{\ensuremath{{\gD}}}
+\section{Methodology}
+
+In this section, we describe \textbf{Gen}erative modelling with \textbf{neG}ative examples (\method{}).
+\method{} makes use of an oracle that can distinguish samples that are outside of the support for the problem. In a nutshell, \method{} consists of first training a DM on given training data as usual, (we refer to the resulting DM as the ``baseline DM'' throughout).  Then we draw samples from this baseline DM, label them using the oracle, then train a classifier (for guidance) using those samples, critically, as we will demonstrate, ensuring that the correct ratio of positive and negative examples are used in training.  We then combine this classifier and the baseline model in the typical classifier guidance way.  \method{} establishes this classifier guided DM as a new baseline DM (either fixing and ultimately ``stacking'' classifiers or optionally distilling the classifier guided DM into a DM with a single score function estimator) and then repeats this process of generating samples from this new baseline, labelling them with the oracle, training a classifier with the carefully chosen label ratio, employing classifier guidance, stacking or distilling, then repeating.  Throughout we will refer to the resulting DM as stacked or distilled depending on whether or not distillation into a unified score function is employed.
+
+\def\oracle{\ensuremath{\gO}}
+
+\subsection{Problem formulation and notation} \label{sec:method:notation}
+
+Let $\gD = \{\rvx^{i}\}_{i=1}^N \sim q(\rvx)$ be a dataset of i.i.d. samples from an unknown data distribution $q$. Furthermore, let $\oracle: \gX \rightarrow \{0, 1\}$ be an oracle function that assigns each point in the data space $\gX$ a binary label. In other words, this oracle partitions the data space into two disjoint sets $\gX = \Omega \cup \Omega^\complement$ such that $\oracle(\rvx) = \1_{\Omega}(\rvx)$.
+Our objective is to learn a score-based diffusion model that (1) maximizes the likelihood of $\gD$ and (2) avoids allocating probability to $\Omega^\complement$.
+
+
+In the first stage of \method{} we train a DM, $p_\theta(\rvx)$, following standard DM training procedures (e.g. \cref{background:score-based}) without utilizing the oracle. In the second stage, we leverage the oracle to train a binary classifier that guides the generation process of DM to avoid $\Omega^\complement$. We explain this second stage in the rest of this section.
+
+
+\subsection{Bayes Optimal Classifier Guidance for Diffusion models} \label{sec:method:classifier}
+The core component of \method{} is a classifier that discriminates between positive and negative samples respectively in $\Omega$ and $\Omega^\complement$, which is used to guide the baseline DM. There are two main insights required for \method{} that our work provides, the first of which is how to obtain the correct distribution of training data for such a classifier and the second is how to train a classifier which does not shift the sampling distribution.
+
+\paragraph{Oracle-assisted classifier guidance} Classifier guidance in score-based models is typically used to generate samples from a specific pre-defined class on the training dataset. For instance, a classifier trained on an image classification dataset can be utilized to guide an unconditional diffusion model that has been trained on the same dataset.
+Unlike traditional approaches that rely on explicit, predefined, labelled datasets, our framework operates based on the oracle function $\oracle(\rvx)$, which determines the validity of samples.
+
+\method{} instead builds a binary classification task using the fully-synthetic data generated by the baseline DM i.e. the data is distributed as $p_\theta(\rvx)$ and the labels are $y = \oracle(\rvx)$. A time-dependent binary classifier $\cls_{\phi}$ is then trained on this dataset. Finally the classifier is incorporated into the baseline DM by
+\begin{equation}
+    s_{\theta, \phi}(\rvx_t; t) = s_\theta(\rvx_t; t) + \nabla_{\rvx_t} \log C_\phi(\rvx_t; t).
+    \label{eq:gen-neg-score}
+\end{equation}
+Equivalently, we denote the marginal distributions generated by the oracle-assisted DM as $\tilde{p}_{\theta,\phi}(\rvx_t; t)$.
+In the rest of this section we show why the classifier guidance in $\tilde{s}_{\theta, \phi}$ helps to enhance the model and reduce the amount of mass on $\Omega^\complement$, i.e. $\int_{\rvx\in\Omega^\complement} p_{\theta, \phi^*}(\rvx)$.
+
+
+\input{algorithm.tex}
+
+\begin{theorem}
+    \label{thm:method:cls-guidance}
+    Let $p_\theta(\rvx)$ be the distribution learned by a baseline DM with marginal distributions denoted by $p_\theta(\rvx_t; t)$ and let $p_\theta(y=1 | \rvx_0)= \oracle(\rvx_0)$. Further, let $\cls_{\phi^*}: \gX, [0, T] \rightarrow [0, 1]$ be the Bayes-optimal time-dependent binary classifier arising from perfectly optimizing the following cross-entropy objective
+    \begin{equation}
+        \gL_\phi^{\text{CE}}= -\meanp{t}{\meanp{p_\theta(\rvx_0, \rvx_t)}{\oracle(\rvx_0) \log \cls_\phi(\rvx_t; t) + (1 - \oracle(\rvx_0)) \log (1 - \cls_\phi(\rvx_t; t))}}
+        \label{eq:cls-time-cross-entropy}
+    \end{equation}
+    then
+    \begin{equation}
+        \nabla_{\rvx_t} \log p_\theta(\rvx_t; t) + \nabla_{\rvx_t} \log \cls_{\phi^*}(\rvx_t; t) = \nabla_{\rvx_t} \log p_\theta(\rvx_t | y=1 ; t).
+    \end{equation}
+\end{theorem}
+In other words, by using a Bayes-optimal binary classifier for guidance, we target exactly the score function of positive (oracle-approved) examples.
+\begin{corollary}
+    \label{thm:method:improved-model}
+    For an optimal classifier $\cls_{\phi^*}$, 
+    \begin{enumerate}
+        \item $p_{\theta, \phi^*}(\rvx) = p_{\theta}(\rvx | y=1)$,
+        \item There is no mass on $\Omega^\complement$, i.e.  $\int_{\rvx\in\Omega^\complement} p_{\theta, \phi^*} (\rvx) = 0$,
+        \item For any dataset $\gD \subseteq \Omega$, $p_{\theta, \phi^*}(\gD) \geq p_{\theta}(\gD)$.
+    \end{enumerate}
+\end{corollary}
+\cref{thm:method:improved-model} suggests the guidance our \method{} methodology can improve the baseline DM in terms of both infraction rate and test dataset likelihood.
+
+See the proofs for the \cref{thm:method:cls-guidance,thm:method:improved-model} in \cref{app:proof-thm,app:proof-corr}.
+
+
+\paragraph{Training the classifier}
+Training the classifier in our approach presents a noteworthy challenge due to the major label imbalance within the synthetic dataset $\synth$ generated by the model. This imbalance emerges because the baseline is already close to the target distribution, resulting in a scarcity of negative examples. 
+However, these negative examples play a crucial role in guiding the model at the boundary between positive and negative examples, where the model requires the most guidance.
+
+\method{} addresses this challenge by sampling a balanced dataset $\synth$ from the model, ensuring the same number of positive and negative examples. However, \method{} crucially employs importance sampling in the classifier's training objective to rectify the  bias introduced by having to balance the dataset to achieve high  classifier accuracy in training.  \cref{thm:method:cls-guidance} suggests that a classifier trained on dataset whose marginal distribution over labels  differs from the true marginal distribution over labels will target the wrong cross-entropy and arrive at a classifier guided DM that does not necessarily target the distribution of interest.  We show evidence of this happening in \cref{fig:exp-checkerboard-samples}.
+
+Finally, in order to avoid the computational cost of sampling from the baseline DM to compute the classifier objective in \cref{eq:cls-time-cross-entropy}, we approximate the $p(\rvx_0, \rvx_t) = p(\rvx_0) p(\rvx_t | \rvx_0) \approx p(\rvx_0) q(\rvx_t | \rvx_0)$. This is similar to the approximation in \citet{kim2022refining}.
+In particular, the classifier's objective in \method{} is
+\begin{align}
+    \gL_{\phi}^{\text{cls}}(\alpha) := &\alpha \meanp{p_\theta(\rvx_0|y=1)}{\meanp{q(\rvx_t|\rvx_0)}{- \log \cls_\phi(\rvx_t; t)}}\nonumber\\
+    + &(1 - \alpha) \meanp{p_\theta(\rvx_0 | y=0)}{\meanp{q(\rvx_t|\rvx_0)}{- \log (1 - \cls_\phi(\rvx_t; t))}}.
+    \label{eq:true-objective}
+\end{align}
+
+Given the balanced dataset $\synth = \synth^+ \cup \synth^-$ where $\synth^+ \sim p(\rvx_0 | y=1)$, $\synth^- \sim p(\rvx_0 | y=0)$, and $N = |\synth^+| = |\synth^-|$,
+\begin{align}
+    \label{eq: classifier loss}
+    \hat{\gL}_{\phi}^{\text{cls}}(\alpha, \synth^+, \synth^-) := &\frac{1}{N} \sum_{\rvx_0 \in \synth^+} \alpha \meanp{q(\rvx_t|\rvx_0)}{- \log \cls_\phi(\rvx_t; t)}\nonumber\\
+    + &\frac{1}{N} \sum_{\rvx_0 \in \synth^-} (1 - \alpha) \meanp{q(\rvx_t|\rvx_0)}{- \log (1 - \cls_\phi(\rvx_t; t))},
+\end{align}
+is an importance sampling estimator of the objective function in \cref{eq:true-objective}; proof in \cref{app:objective-is}.
+
+
+\paragraph{Iterative Training by Stacking Classifiers} If the classifier is perfect, we know that the DM with score function $s_{\theta,\phi}$ will have improved likelihood and zero infraction (see \cref{thm:method:improved-model}). However, in practice the trained classifier is only an estimate and infractions may not be entirely eliminated.
+
+To alleviate this problem, we note that once the classifier is trained the guided score function $s_{\theta,\phi}(\rvx)$ itself defines a new diffusion model.
+Consequently, we can employ a similar procedure to train a new classifier on $s_{\theta,\phi}$, aiming to further lower its infraction rate. This iterative approach involves training successive classifiers and incorporating them into the model, progressively enhancing its performance and reducing the infraction rate.
+
+
+\paragraph{Distillation}
+Adding a stack of classifiers to the model linearly increases its computational cost, since each new classifier requires a forward and backward pass each time the score function is evaluated. To avoid this, we propose to distill the classifiers into the baseline model.
+
+Let $s_{\theta, \mPhi}$ be a ``teacher model'' consisting of a baseline model $s_{\theta}$ and a stack of classifiers $\{\cls_\phi\}_{\phi \in \mPhi}$. We distill $s_{\theta, \mPhi}$ into a new ``student model'' $s_{\psi}^{\text{dtl}}$, possibly with the same architecture as the baseline model, by minimizing the following distillation loss
+\begin{equation}
+\label{eq: distillation}
+    \mathcal{L}_\psi^{\text{dtl}} = \meanp{\mathbf{x}_0\sim q(\mathbf{x}_0), t} {\gamma_t \norm{s_{\theta, \mPhi}(\mathbf{x}_t; t) - s_\psi^{\text{dtl}}(\mathbf{x}_t; t)}^2},
+\end{equation}
+where $\gamma_t$ is the weight term, similar to the training objective of diffusion models. Here, $\mathcal{L}^{\text{dtl}}$ makes the outputs of the student model match that of the teacher.
+Algorithm~\ref{alg: iterative training} summarises \method{}.
+
+
+\section{Experiments}
+We demonstrate \method{} on three datasets: a 2D checkerboard, collision avoidance in traffic scenario generation for and safety-guarded human motion generation.
+In each experiment we report a likelihood-based metric on a held out dataset to measure distributional shifts and a kind of infraction metric to measure faithfulness to the oracle.
+
+\subsection{Toy Experiment}
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+
+We first demonstrate Gen-neG on a simple dataset of 2D points uniformly distributed on a checkerboard grid as shown in \cref{fig:exp-checkerboard-samples}.
+We apply EDM \citep{karras2022elucidating}, a continuous-time DM, to this problem. A baseline DM trained for long enough on this dataset can easily achieve negligible infraction rate. However, because our dataset (see the first panel of \cref{fig:exp-checkerboard-samples}) only contains 1000 points the model is prone to over-fitting (see \cref{app:overfitting} for overfitting results). We therefore stop training of the baseline DM before it starts overfitting measured by the evidence lower bound (ELBO) on a held-out validation set. The second panel of \cref{fig:exp-checkerboard-samples} shows samples drawn from the baseline DM and the third panel shows the improved results after one iteration of \method{}. We further report in \cref{fig:exp-checkerboard-scores} the rate of oracle violation $\int_{\rvx\in\Omega^\complement} p_{\theta, \phi^*}$, which we will refer to as the infraction rate, and an ELBO estimate by the trained model after each iteration for up to 5 iterations. It demonstrates each iteration of \method{}, improves the infraction rate with a comparable ELBO, at least for the first few iterations. \cref{fig:exp-checkerboard-scores} also shows that distillation does not lead to a significant drop in performance.
+
+We also report results for an experiment of one iteration of classifier guidance without the application of proper importance sampling (IS) weights. In this case, the classifier is trained on a synthetic dataset with a uniform class distribution. The last panel of \cref{fig:exp-checkerboard-samples} visualizes samples from this model. While method produces an excellent infraction rate of about $0.03\%$, the classifier severely modifies the shape of the distribution, an undesirable side effect. In particular, we can see the areas close to the boundary have strongly reduced density. In quantitative terms, we find that the ELBO of this imbalanced classifier approach is $-1.42$, a significantly worse result.
+
+\subsection{Infractions in Traffic Scene Generation}
+We consider the task of traffic scene generation, where vehicles of variable size, are placed on a two dimensional map with according orientations. Traditionally implemented by as rule based systems~\citep{yang1996microscopic, lopez2018microscopic}, this task has recently been approached using generative modelling techniques~\citep{tan2021scenegen, zwartsenberg2023conditional}. The approach taken in both these bodies of prior art is to reject any infracting samples, which in this case means a vehicle is off the driving area (``offroad''), or overlaps with another (``collision''). While rejecting such samples is generally effective, it is computationally wasteful, especially when the rate of infractions is high. We therefore apply \method{} to this task, in order to improve performance.
+The specific task we consider is to generate $N$ vehicles in a given scene, conditioned on a rendered representation of the drivable area. For each vehicle, the position, length, width, orientation and velocity are predicted for a total of $7$ dimensions per vehicle. Vehicles are sampled \emph{jointly}, meaning that the overall distribution $p_\theta(\mathbf{x})$ $\mathbf{x}\in\mathbb{R}^{N\times 7}$. 
+We train the baseline employing the formalism in DDPM~\citep{ho2020denoising} with a transformer-based denoising  network~\citep{vaswani2017attention} on a private dataset. Our architecture consists of self-attention layers and map-conditional cross-attention layers in an alternating order. We use relative positional encodings (RPEs)~\citep{shaw2018self, wu2021rethinking}, which makes use of the vehicles relative positions. Relevant samples (including infracting, and non-infracting ones) and road geometry can be seen in \cref{fig:banner}.
+For our experiments, the oracle function either assigns each scene a collective label, or for each vehicle an individual label. This label is based on the occurrence of collisions or offroad infractions. We then use these results to construct ``by-scene'' and ``by-agent'' classifiers. 
+
+
+\begin{table}[!t]
+  \caption{Results for traffic scene generation, in terms of collision, offroad, and overall infractions as well as ELBO. Two varieties (``by-scene'' and ``by-agent'') for the classifier are presented, as well as results with (\method{}) and without importance sampling. The final two rows provide the results of distilling the models labelled with $\dagger$ and *.}
+  \centering
+  \label{tab: 2nd experiment}
+  \begin{tabular}{lllll}
+    \toprule
+    Method     & Collision ($\%$) $\downarrow$  & Offroad ($\%$) $\downarrow$ & Infraction ($\%$) $\downarrow$ & r-ELBO ($\times 10^2$) $\uparrow$  \\
+    \midrule
+    baseline DM & $28.3\pm 0.70$  & $1.3\pm 0.14$ & $29.3\pm 0.64$ &  $-27.5\pm0.01$   \\
+        \midrule
+    by-scene w/o IS & $20.5\pm 1.21$ & $0.9\pm 0.17$ & $21.9\pm 1.14$ & $-27.7\pm0.01$\\
+    by-scene & $23.3\pm 0.7$ & $1.0\pm 0.28$ & $24.1\pm 0.67$ & $-27.6\pm 0.01$\\
+        \midrule
+    by-agent w/o IS & $14.6\pm 0.49$ & $0.8\pm 0.13$ & $15.2\pm 0.50$ & $-28.0\pm 0.01$  \\
+    by-agent$^\dagger$    & $16.4\pm 0.5$ &  $0.9\pm 0.12$ & $17.2\pm 0.44$ & $-27.7\pm 0.01$ \\
+    by-agent stacked$^*$  & $11.6\pm 0.65$ & $0.6\pm 0.10$ & $12.2\pm 0.60$ & $-28.0\pm 0.01$\\
+        \midrule
+    Distillation of ($\dagger$) &$12.2\pm0.42 $ & $0.8\pm0.06$ &$12.9\pm0.36$ & $-26.8\pm 0.01$ \\
+    Distillation of (*) & $5.1\pm 0.24$ & $0.5\pm 0.0.09$ & $5.6\pm 0.20$ & $-27.0\pm 0.01$\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
+\cref{tab: 2nd experiment} presents the results of our experiments. We provide results for both the ``by-agent'' and ``by-scene'' experiments, both showing significant improvement over the baseline result. We moreover show ablations for both settings, where we drop the importance sampling (``w/o IS''), which results in improved infraction rates, but a decreased ELBO. We also provide results for a multi-round approach in the ``by-agent'' setting, which shows even better results. Finally, we demonstrate that our approach of distilling the resulting models back into a single one works well here too, albeit at a slight drop in performance on ELBO. Overall we find that \method{} works as expected, and provides a competitive infraction rate boost over our baseline model, without sacrificing likelihood performance.
+
+\subsection{Motion Diffusion}
+Our final experiment is a text-conditional motion generation task on the HumanML3D dataset \citep{guo2022generating}. The dataset contains 14,616 human motions annotated by 44,970 textual descriptions. It includes motions between 2 and 10 seconds in length and their total length amounts to 28.59 hours.
+For our baseline DM, we use the pre-trained checkpoints provided by Human Motion Diffusion (MDM) \citep{tevet2023human}. MDM employs DDPM to learn a transformer-based architecture \citep{vaswani2017attention} with a pre-trained CLIP embedding module \citep{radford2021learning} to facilitate conditioning on the descriptions.
+It has been shown that, despite its high quality generated motion, under more detailed inspection, MDM and other DMs often lack physical plausibility \citep{yuan2022physdiff}.
+For example, ground penetration often exists in the generated examples.
+Such imperfections can cause issues if the model were to be used in downstream applications.
+To address this issue, we implement an oracle that labels motions with ground penetration at any point in their duration as negative.
+We then train our classifier with an architecture that matches that of the original diffusion model with the CLIP encoder removed, because the classifier is not conditioned on the text. We evaluate performance in terms of infraction rate, and the reweighted ELBO, the reweighting referring to a uniform schedule of $\gamma_t$ in \cref{eq:score-matching}.
+
+\cref{tab:mdm} summarizes our results of one iteration of \method{} on this dataset. \method{} improves both the per-step and overall infraction rate with a small drop in the reweighted ELBO and FID. While guiding using a classifier trained without IS weighting produces lower infraction rates, the reweighted ELBO and FID in that case drops even further. Hence, \method{} provides a significant improvement of the infraction rates, with a lower cost in terms of model likelihood or sample quality.
+
+\begin{table}[!t]
+  \centering
+  \caption{Results of the Motion Diffusion experiment. ``Inf. per step'' is the average rate of generated motion frames with infraction while ``infraction'' is the average rate of generated motions that at least including one infracting frame. r-ELBO is a reweighted ELBO with the same weighting as in diffusion loss.}
+  \label{tab:mdm}
+  \begin{tabular}{lllll}
+    \toprule
+    Method     & Infraction ($\%$) $\downarrow$ & Inf. per step ($\%$) $\downarrow$ & r-ELBO ($\times 10^2$) $\uparrow$  & FID $\downarrow$\\
+    \midrule
+    MDM & $18.92 \pm 0.58$  & $4.55 \pm 0.03$ & $-6.03 \pm 0.04$ & $0.783$\\
+    MDM + classifier & $15.35 \pm 0.53$ & $3.15 \pm 0.02$ & $-7.25 \pm 0.11$ & $0.822$ \\
+    MDM + classifier w/o IS  & $13.38 \pm 0.50$ & $2.40 \pm 0.02$ & $-9.19 \pm 0.30$ & $1.040$\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
+\section{Related Work}
+ \citet{liu2023learning} employs diffusion bridges to define a family of diffusion models that are guaranteed to be bound to a constrained set $\Omega$ by construction. Their approach, however, is limited to constraints that admit tractable expectations, rendering it impractical for any but the simplest constraints such as product of intervals in $\R^d$. The second one is \citet{kong2023data} which refers to the problem as ``data redaction.'' They consider multiple setting, one of which, validity-based approach is mostly related to our oracle-assisted guidance, but in the GAN literature. They implicitly perform data redaction by incorporating them into the discriminator and fine-tune the generator. Last, \citet{kim2022refining} incorporates a binary classifier in the form of GAN discriminators to refine the the learned distribution of DMs, further improving its sample quality. While they utilize a set of tools similar to ours, the problems we tackle different problems.
+
+
+\section{Conclusion}
+We have proposed a framework to incorporate constraints into diffusion models. These constraints are defined through an oracle function that categorizes samples as either \emph{good} or \emph{bad}. Importantly, such a flexibility allows for simple integration with human feedback. We have demonstrated our model on different modalities demonstrating how it can benefit safety constraints.
+
+Possible future directions for this work are (1) incorporating the true training dataset into the later iterations of the method, as the training dataset only affects the baseline DM. The next stages solely use synthetic data. Although we show theoretically that our guidance only improves the model, this lack of revisiting the true dataset in presence of practical errors and approximations poses challenges for large-scale adoption of our method. Our preliminary experiments of visiting the true dataset at the distillation time have not been successful yet. (2) Avoiding stacking of classifiers, instead directly learning an artifact that can replace the previous classifier in our method, similar to \citep{de2021diffusion}, is vital to the computational  complexity of the method as the current computational cost scales linearly with the number of classifiers. (3) Bridging the gap the diffusion bridge-based approaches and our work which is practically applicable to a larger set of applications is another avenue for future developments.
+
+\section*{Acknowledgements}
+
+We acknowledge the support of the Natural Sciences and Engineering Research Council of Canada (NSERC), the Canada CIFAR AI Chairs Program, and the Intel Parallel Computing Centers program, and the Mitacs Accelerate program in partnership with Inverted AI. Additional support was provided by UBC's Composites Research Network (CRN), and Data Science Institute (DSI). This research was enabled in part by technical support and computational resources provided by WestGrid (www.westgrid.ca), Compute Canada (www.computecanada.ca), and Advanced Research Computing at the University of British Columbia (arc.ubc.ca). We thank Setareh Cohan for helping us with the motion diffusion experiments.
+
+
+%\section*{References}
+\bibliographystyle{plainnat}
+\bibliography{bib}
+
+\newpage
+\appendix
+\input{appendix.tex}
+
+
+
+\end{document}

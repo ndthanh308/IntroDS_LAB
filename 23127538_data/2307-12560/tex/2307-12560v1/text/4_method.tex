@@ -1,0 +1,53 @@
+\vspace{-3pt}
+\section{Real Image Interpolation}
+% Let $x^0, x^N$ be two real images that we want to interpolate with $N-1$ intermediate images.
+
+
+\input{figs/2_pipeline}
+
+\subsection{Latent interpolation}\label{sec:latent_interp}
+Our general strategy for generating sequences of interpolations is to iteratively interpolate pairs of images, starting with the two given input images. 
+For each pair of parent images, we add shared noise to their latent vectors, interpolate them, then denoise the result to generate an intermediate image. The amount of noise to add to the parent latent vectors should be small if the parents are close to each other in the sequence, to encourage smooth interpolations. If the parents are far apart, the amount of noise should be larger to allow the LDM to explore nearby trajectories in latent space that have higher probability and better match other conditioning information.
+
+Concretely, we specify a sequence of increasing timesteps $\mathcal{T}=(t_1,\dots,t_K)$, and assign parent images using the following branching structure: images $0$ and $N$ (the input images) are diffused to timestep $t_K$ and averaged to generate image $\frac{N}{2}$, images $0$ and $\frac{N}{2}$ are diffused to timestep $t_{K-1}$ generate image $\frac{N}{4}$, images $\frac{N}{2}$ and $N$ are also diffused to timestep $t_{K-1}$ to generate image $\frac{3N}{4}$, and so on. By adding noise separately to each pair of parent images, this scheme encourages images to be close to their parents, but disentangles sibling images.  %images $kN/2^j$ and $(k+2)N/2^j$ generate image $(2k+1)N/2^{j+1}$ for all $j=$
+
+\paragraph{Interpolation type}
+We use spherical linear interpolations (\textit{slerp}) for latent space and text embedding interpolations, and linear interpolations for pose interpolations. Empirically, the difference between \textit{slerp} and linear interpolation appears to be fairly mild.
+
+\paragraph{Noise schedule}
+We perform DDIM sampling \cite{ddim}, and find that the LDM's quality is more consistent when the diffusion process is partitioned into at least 200 timesteps, and noticeably degrades at coarser schedules. Empirically, latent vectors denoised with less than 25\% of the schedule often resemble an alpha composite of their parent images, while images generated with more than 65\% of the schedule can deviate significantly from their parent images. For each interpolation we choose a linear noise schedule within this range, depending on the amount of variation desired in the output. Our approach is compatible with various stochastic samplers \cite{karras2022elucidating} which seem to yield comparable results.
+% Written out explicitly, we create sequences of corresponding noisy latents $\{z_t^0\}_{t \in \mathcal{T}}, \{z_t^N\}_{t \in \mathcal{T}}$, such that:
+% \begin{gather}
+% z_t^i = \alpha_t z_{t-1}^i + \beta_t \eps_t,
+% \end{gather}
+% where $\eps_t \sim \normal(0,I)$ is shared for both images.% and $z_0^0, z_0^N$ are obtained as before.
+% Each intermediate image is assigned a particular timestep $t := \texttt{image_schedule}(i)$ to generate its interpolated latent code:
+% $z_t^i := \texttt{slerp}(z_t^0, z_t^N, i/N)$
+% We then perform denoising with the LDM: $z_0^i := \mu_\theta(z_t^i, t)$ and use the decoder to produce the image.
+
+% $z_0^0 := \gE(x^0)$, $z_0^N := \gE(x^N)$, and all images are generated $z_0^i = \texttt{slerp}(z_0^0, z_0^N, i/N)$, $x^i := \mathcal{D}(z_0^i)$
+% We examine three different strategies for latent interpolation, which differ in how they combine diffusion with interpolation to create interpolated images.
+
+% \paragraph{Denoise-renoise-interpolate}
+% Rather than partially denoise each latent, we can fully denoise the latent, then add new noise back to the appropriate level before interpolating it. This strategy permits a much wider range of latent space to be traversed, by decoupling images $N/4$ from $3N/4$, etc., while still forcing adjacent images to be similar.
+% \footnote{The interpolation of two latent vectors at a particular noise level may not remain at the same noise level due to correlations introduced during the denoising process. However, we observe empirically that the independent noise assumption.}
+
+\subsection{Textual inversion}\label{sec:text_inversion}
+Pre-trained latent diffusion models are heavily dependent on text conditioning to yield high quality outputs of a particular style. Given an initial text prompt describing the overall content and/or style of each image, we can adapt its embedding more specifically to the image by applying textual inversion. In particular, we encode the text prompt as usual, then fine-tune the prompt embedding to minimize the error of the LDM on denoising the latent vector at random noise levels when conditioned on this embedding. Specifically, we perform 100-500 iterations of gradient descent with the loss $\loss(c_{\rm{text}}) = \norm{\hat{\eps}_\theta(\alpha_t z_0 + \sigma_t \eps; t, c_{\rm{text}}) - \eps}$ and a learning rate of $10^{-4}$. The number of iterations can be increased for images with complicated layouts or styles which are harder to represent with a text prompt.
+
+In this paper we specify the same initial prompt for both input images, although one can also substitute a captioning model for a fully automated approach. Both positive and negative text prompts are used and optimized, and we share the negative prompt for each pair of images. Since our task does not require a custom token, we choose to optimize the entire text embedding.
+% We also want to interpolate the prompt between the input images so that the style and content can transition smoothly. We can either specify prompts for each of the images, or perform single-image textual inversion on the images. In our experience, the best approach is to choose an initial shared positive and negative prompt for the images, then .
+
+\subsection{Pose guidance}\label{sec:pose_guidance}
+\input{figs/4_pose_conditioning}
+If the subject's pose differs significantly between the two images, image interpolation is challenging and often results in anatomical errors such as multiple limbs and faces. We obtain more plausible transitions between subjects in different poses by incorporating pose conditioning information in the LDM. We obtain poses of the input images using OpenPose \cite{openpose}, with the assistance of style transfer for cartoons or non-human subjects (see Fig. \ref{fig:openpose}). We then linearly interpolate all shared keypoint positions from the two images to obtain intermediate poses for each image. The resulting pose is provided to the LDM using ControlNet \cite{controlnet}, a powerful method for conditioning on arbitrary image-like inputs. Interestingly, we observe that \textit{even when the wrong pose is predicted} for input images, conditioning on pose still yields superior interpolations as it prevents abrupt pose changes (see Fig. \ref{fig:pose}). %Additionally, we find it helpful to increase the strength of the pose conditioning for images towards the middle of the sequence.
+% If the modality of the input images is unsuitable for obtaining accurate pose information (e.g. stylized cartoons), we can first perform style transfer to a photorealistic image using the LDM, which will be more suitable as input to OpenPose even if the image quality is poor .
+\input{figs/c_openpose}
+
+
+\vspace{-3pt}
+\subsection{CLIP ranking}\label{sec:clip_ranking}
+\vspace{-3pt}
+LDMs can yield outputs of widely varying quality and characteristics with different random seeds. This problem is compounded in real image interpolation since a single bad generated image compromises the quality of all other images derived from it.
+Thus when quality is more important than speed, multiple candidates can be generated with different random seeds, then ranked with CLIP \cite{clip}. We repeat each forward diffusion step with different noise vectors, denoise each of the interpolated latent vectors, then measure the CLIP similarity of the decoded image with specified positive and negative prompts (e.g., positive: ``high quality, detailed, 2D'', negative: ``blurry, distorted, 3D render''). The image with the highest value of positive similarity minus negative similarity is kept. %We generate more candidates for images at higher noise levels since these images have more freedom to deviate from the desired style.
+In applications requiring an even higher degree of control and quality, this pipeline can be changed into an interactive mode where users can manually select desired interpolations or even specify a new prompt or pose for a particular image.

@@ -1,0 +1,129 @@
+\section{The \ripple{} Benchmark}
+\label{sec:rippledit}
+
+In this section, we first describe a data collection pipeline (\S\ref{sec:datacollection}) for factual edit requests and test queries for evaluating their ripple effects.
+Then in \S\ref{sec:datastats}, we apply this data generation process to create \ripple{}, a new benchmark for comprehensive KE evaluation.
+
+
+% Figure environment removed
+
+\subsection{Data Generation Pipeline}
+\label{sec:datacollection}
+
+We describe our four-step data generation process, which is illustrated in Fig.~\ref{figure:pipeline}.
+This process creates KE evaluation examples, each consisting of a factual edit request and a set of test queries (following our evaluation criteria). Since some steps in the pipeline involve manual writing of templates and logical rules, we restrict the edits and test queries to a fixed set of $N_{rel}$ basic relations.\footnote{The full list of relations is available in our codebase, example relations are shown in Fig.~\ref{figure:top_relation_stats}.}
+
+\paragraph{Step 1: Factual triplets collection}
+The first stage of the pipeline (Fig.~\ref{figure:pipeline}A) is to collect facts, for creating injection and edit requests. 
+To this end, we use \wikidata{}, a relational knowledge base consisting of facts that are expressed as triplets $(e, r, o)$, where $e$ is a subject entity, $r$ is a relation,
+and $o$ is the object entity. We collect triplets of the following three types:
+
+\begin{itemize}
+[leftmargin=*,topsep=2pt,parsep=1pt]
+    \item \textbf{\recentlyemerged{}}: To create ``real'' plausible edit requests, we collect triplets that were recently inserted to \wikidata{}. Such triplets represent facts that changed only recently. Therefore, they can be used to create injection edit requests for models that were trained before these facts were introduced, to simulate cases of an out-of-date model that requires factual updates.
+    We collect such facts by randomly sampling triplets that have been modified during a range of 250 days after July 2022.
+
+\item \textbf{\fakefacts{}}:
+We collect triplets corresponding to random facts, for which we will later generate modification edits (similarly to \citet{meng2022locating}).
+Concretely, we divide the entities in \wikidata{} into 10 groups, based on the amount of triplets associated with each entity. Intuitively, this could be viewed as a popularity measure. Then, we sample $N_{ent}$ random entities from each group and randomly collect one triplet about each entity, which we will later convert to a factual edit request.
+These edits simulate factual edits that are meant to fix incorrect model predictions (e.g., when a model predicts that the capital of Germany is Frankfurt).
+
+\item \textbf{\topviews{}}:
+The two previous triplet types rely on random sampling from the entire knowledge-graph, and so many of them are likely to represent facts about tail entities. Tail entities are often not captured by models \cite{mallen-etal-2023-trust}, and therefore are not suitable for testing modification edits.
+To address this, we collect triplets about \emph{popular entities}, where the subject corresponds to one of the top-viewed pages in Wikipedia.\footnote{
+We extracted the entities whose corresponding Wikipedia page was included in the top-1000 most viewed pages in at least one month during 2020-2022.}
+For a given triplet with a popular subject, we then sample \wikidata{} triplets associated with them (the facts which on of those entities is the subject of).
+Importantly, this type of triplets enables to control for the ripple effect severity (\S\ref{sec:rethinking}), i.e., how models handle the ripple effects of popular entities versus tail entities. 
+
+\end{itemize} 
+
+\paragraph{Step 2: Edits generation}
+Once we obtain factual triplets, we turn to generate edit requests for them (Fig.~\ref{figure:pipeline}B).
+For \recentlyemerged{}, triplets represent new facts that are meant to be injected to the model, assuming that it was trained before these facts were introduced to the world. 
+Hence, for \recentlyemerged{}, the target triplet for injection is the triplet itself. 
+For \fakefacts{} and \topviews{} triplets, we create an edit by generating a target triplet as follows. First, given a certain relation $r$, we create a set of candidate object entities $O_r$ by sampling $N_{cand}$ triplets involving $r$ and extracting their object. Then, for every triplet $(e,r,o)$ in \fakefacts{} and \topviews{}, we sample a target object $o' \neq o$ from $O_r$. The fact that the target object is sampled from triplets with the same relation, makes the edit request technically consistent with the original triplet -- the target object is of the same ``type'' as the original object (for example, a triplet with the relation \texttt{Capital} will get a new object of type \texttt{City}).
+
+\paragraph{Step 3: Evaluation tests generation}
+The next step in the generation process (Fig.~\ref{figure:pipeline}C) is to create ripple effect evaluations for the factual edits we collected.
+To this end, we generate test queries for each of the evaluation criteria introduced in \S\ref{subsec:criteria}. Each test query corresponds to a factual triplet that is expected to be true post-editing.
+
+\begin{enumerate}
+[leftmargin=*,topsep=2pt,parsep=1pt]
+    
+\item \logicalgeneralization{}:
+\label{item:logical_generalization}
+For every relation $r$, we define a set $D_r$ of relations that semantically depend on it -- changing $r$'s target object for a given subject is expected to change the target objects for the relations $D_r$ of the subject.
+For instance, for the relation $r =$ \texttt{Mother}, the set $D_r$ includes the relations \texttt{Sibling}, \texttt{Sister}, \texttt{Brother}, \texttt{Aunt}, and \texttt{Uncle}, among others. 
+Then, for every relation $r \in D_r$, we craft a logical rule for obtaining the new target for that relation post-editing.
+Given an edit $(e, r ,o) \rightarrow (e, r, o^*)$, we apply the logical rule corresponding to each relation $r' \in D_r$ to obtain a set of test queries $(e, r', z')$ about the subject $e$.
+
+\item \compositionality{}:
+Let $\mathcal{S}(e)$ be the set of \wikidata{} triplets in which $e$ is the subject. Given an edit $(e, r, o) \rightarrow (e, r, o^*)$, we iterate through $\mathcal{S}(o^*)$ and for each triplet $(o^*,r', z) \in \mathcal{S}(o^*)$, we construct a two-hop query about $e$, with $z$ as the answer.
+
+\item \forwardcompositionality{}:
+Let $\mathcal{T}(e)$ be the set of \wikidata{} triplets in which the entity $e$ is the object. Given an edit $(e, r, o) \rightarrow (e, r, o^*)$, we iterate through $\mathcal{T}(e)$ and for each triplet $(z ,r', e) \in \mathcal{T}(e)$, we construct a two-hop query about $z$ with $o^*$ as the answer.
+
+\item \aliasing{}:
+\wikidata{} maintains a set $\mathcal{A}(e)$ of aliases for every entity $e$.
+Given an edit, $(e, r, o) \rightarrow (e, r, o^*)$, we use this information to create a test query $(e', r, o^*)$ for every $e' \in \mathcal{A}(e)$.
+
+\item \forgetfulness{}:
+We focus on counterfactual edits (\fakefacts{} and \topviews{}) with one-to-many relations. To test whether the model retains the original objects $\{o_1, ..., o_n\}$, in addition to the new edited object $o^*$, we use the triplets $(e, r, o_1), ..., (e, r, o_n)$ as test queries.  
+For example, see Fig.\ref{figure:examples}E.
+
+
+\item \relationspecificity{}:
+Given an edit $(e, r, o) \rightarrow (e, r, o^*)$, we test whether facts about $e$ that are semantically not influenced by the edit are retained after the edit. Concretely, we use as a test query every triplet in $\mathcal{S}(e)$ (the set of triplets about $e$) with a relation that is in $D_r$ (the set of relations that semantically depend on $r$).
+
+\end{enumerate}
+
+
+\begin{table}[t]
+\setlength\tabcolsep{3pt}
+% \setlength{\belowcaptionskip}{-8pt}
+\footnotesize
+\centering
+        \begin{tabular}{llrr} \\ 
+        % \toprule
+        & \recentlyemerged{} & \fakefacts{} & \topviews{} \\ \midrule
+        \# of factual edits & 2,000 & 1,000 & 1,000 \\ 
+        \# of tests per edit & $26.2$ & $18.7$ & $25.3$ \\
+        \# of queries per test & $5.24$ & $3.1$ & $4.2$ \\ \midrule
+        \# of LG queries &$2.5$ &$3.6$ &$2.6$ \\
+        \# of CI queries &$11.7$  &$4.7$ &$6.1$ \\ 
+        \# of CII queries &$5.1$ &$5.1$ &$3.9$ \\
+        \# of SA queries &$1.8$ &$1.3$ &$4.7$ \\
+        \# of FN queries &$0$ &$0.3$ &$0.2$ \\ 
+        \# of RS queries &$5.1$ &$3.7$ &$7.8$ \\ \midrule
+        Subject triplets count & $31.7$ & $13.3$ & $115.2$ \\
+        Subject page back-links & $278.1$ & $121.6$ & $3934.5$ \\
+        Subject page views & $189.6$ & $67.91$ & $7376.5$ \\ \midrule
+        Object triplets count & $192.4$ & $46.4$ & $39.5$ \\
+        Object page back-links & $18634.2$ & $3065.0$ & $2136.0$ \\
+        Object page views & $2852.4$ & $1379.7$ & $1176.7$ \\ 
+        \bottomrule
+        \end{tabular} 
+\caption{Statistics on the three subsets of \ripple{} showing the average of different metrics. For a given subject/object entity, triplets count is the number of \wikidata{} facts it is associated with, page back-links is the number of Wikipedia pages with a link to the entity's page, and page views is the average daily view count of the entity's Wikipedia page over the week \ripple{} was created.}
+\label{tab:datset_stats} 
+\end{table}
+
+% Figure environment removed
+
+\paragraph{Step 4: Phrasing in natural language}
+\label{paragraph:phrasing_in_nl}
+At this point (Fig.~\ref{figure:pipeline}D), we have factual edit requests and their corresponding test queries. To use them as inputs to LMs, we convert them from triplet-form to natural language (NL). 
+To this end, we manually craft a template NL phrase per relation in the data (this is feasible since we use a fixed set of relations), and use it to convert all the triplets with this relation.
+For instance, we use the template \texttt{``The date of birth of <$e$> is''} to obtain prompts for triplets with the relation $r=$ \texttt{Date of Birth} and a subject entity $e$.
+
+For the \forgetfulness{} test triplets generated for an edit $(e, r, o) \rightarrow (e, r, o^*)$ (where $o$ is one of possibly multiple objects for the subject-relation pair), we form a single NL query that asks about other objects than the edited one, for example, 
+\texttt{``The award received by <$e$> which is not <$o^*$> is''}.
+
+\subsection{Data Statistics}
+\label{sec:datastats}
+
+We used our data generation pipeline to collect edits for 2,000 \recentlyemerged{} facts, 1,000 \fakefacts{} facts, and 1,000 \topviews{} facts. Specifically, to obtain the \recentlyemerged{} subset, we set $N_{ent}=200$ to sample 200 facts from each entity group in \wikidata{}. For target triplets generation of \fakefacts{} and \topviews{}, we set $N_{cand}=100,000$.
+Last, we manually craft NL templates and logical rules for $N_{rel}=54$ basic relations.
+We call our diagnosis benchmark \ripple{}, and publicly release it to the research community.
+
+Statistics on \ripple{} are presented in Tab.~\ref{tab:datset_stats}, showing that our generation process resulted in multiple (18-26) test queries per edit, with one test query of each type on average. Moreover, \topviews{} edits contain more popular subjects (as intended), while \recentlyemerged{} edits have the least poplar objects.
+Fig.~\ref{figure:top_relation_stats} shows the top relations and their frequency in each subset of \ripple{}, demonstrating the diversity of the generated facts.

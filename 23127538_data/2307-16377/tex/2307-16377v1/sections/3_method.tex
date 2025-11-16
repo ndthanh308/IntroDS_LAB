@@ -1,0 +1,178 @@
+% Figure environment removed
+
+
+\section{Method}
+
+\noindent\textbf{Human Body Model.} 
+SMPL~\cite{SMPL} represents a 3D human mesh by 3 low-dimensional vectors (\ie, pose $\mathbf{\theta} \in \mathbb{R}^{72}$, shape $\mathbf{\beta} \in \mathbb{R}^{10}$ and camera parameters $\mathbf{\pi}  \in \mathbb{R}^{3}$).
+Following previous methods~\cite{3dCrwodNet,ROMP,SPIN,HMR,PARE}, we use the gender-neutral shape model. 
+The SMPL model generates a 3D mesh $\mathcal{M}(\theta,\beta) \in \mathbb{R}^{6890 \times 3}$ through a differentiable function.
+By applying a pretrained linear regressor $W \in \mathbb{R}^{N\times6890}$,  we obtain the 3D joint coordinates $J_\mathit{3D}=W \mathcal{M} \in \mathbb{R}^{N\times3}$, where $N=17$, conveniently.
+Additionally, we obtain the 2D joints $J_{2D} = \boldsymbol{\Pi}(J_{3D}, \pi) \in \mathbb{R}^{N \times 2}$  by projection.
+
+
+\noindent\textbf{Overview.} 
+We propose a method called \methodname, which utilizes transformers to fuse 2D and 3D features for 2D$\&$3D alignment and a novel contrastive learning strategy to globally supervise the 3D space for target humans.
+Our pipeline is depicted in~\cref{fig:method_overview}{\color{red}a} and explained in~\cref{sec:fuse_2d_3d}, where JOTR regresses SMPL parameters by fusing 2D and 3D features obtained from a cropped image patch.
+The proposed 3D joint contrastive learning is illustrated in~\cref{fig:contrast} and explained in~\cref{sec:joint_contrastive_learning}, including two contrastive losses: joint-to-non-joint contrast and joint-to-joint contrast.
+
+
+
+\subsection{Fusing 2D and 3D Features with Transformers}
+\label{sec:fuse_2d_3d}
+As analyzed in~\cref{sec:introduction}, relying solely on 2D features for achieving 2D alignment to reconstruct the human mesh in occluded scenarios may result in suboptimal performance. To overcome this limitation, we propose integrating both 2D and 3D features with transformers in the reconstruction process. Drawing inspiration from the success of transformer models in multi-modality fusion~\cite{kamath2021mdetr,lei2021detecting}, we propose an  encoder-decoder transformer architecture that enables the mutual complementation of 2D and 3D features for 2D$\&$3D alignment.
+
+
+\noindent\textbf{Lifting Module.} 
+\label{sec:lifting_2d_to_3d}
+Unlike previous method~\cite{3dCrwodNet} that lifts 2D features to 3D features via MLPs without integrating inductive bias or prior knowledge, we draw inspiration from bird's eye view representations~\cite{reiher2020sim2real, yang2021projecting, chitta2021neat, wang2022detr3d, li2022bevformer, BEV} in 3D space. 
+As analyzed in BEV~\cite{BEV}, the farther a voxel is from the camera, the less information it carries. To put this hypothesis into practice, BEV employs pre-defined 3D camera anchor maps to impact the 3D feature.
+Similar to BEV, we design learnable Rescaled Relative 3D Coordinates (RRC) $C_{3D} \in \mathbb{R}^{D \times H \times W \times 3}$ in range $(0, 1)$ to provide 3D spatial prior knowledge.
+In this representation, $C_{ijk} \in \mathbb{R}^{3}$  represents the relative location of voxel
+$(x_{k}, y_{j}, z_{i})$ and  the $x$ and $y$ coordinates are uniformly distributed with equal intervals. 
+For $Z$ axis, we utilize a monotonically increasing convex function $\psi$ to rescale $z$ coordinates unevenly as $z' = \psi (z)$.
+In practice, we employ $\psi(z) = z^{\lambda}, \lambda > 1$ as rescaling function and $\lambda$ is a learnable parameter with initial value of $3.0$. 
+The whole pipeline can be written as:
+\vspace{-2pt}
+{
+    \small
+    \begin{align*}
+        \small
+        \label{eq:lifting_2d_to_3d}
+        \hat{F_\mathit{3D}} &= MLP(F_{2D}) , \\
+        \tilde{F_{3D}} &=   CNN(Concat(\hat{F_\mathit{3D}}, C_{3D})) , \\
+        H_{3D} &= TransformerEncoder(\tilde{F_{3D}}).
+    \vspace{-2pt}
+    \end{align*}
+}
+\methodname first lifts pose-guided 2D feature $F_{2D} \in \mathbb{R}^{H \times W \times C}$ which is obtained from image and joint heatmap through CNN encoder to coarse 3D feature $\hat{F_\mathit{3D}} \in \mathbb{R}^{ D\times H\times W \times C}$ via MLPs without any inductive bias or prior knowledge. 
+Then, \methodname concatenates $\hat{F_\mathit{3D}}$ and $C_{3D}$ in channel dimension.
+Following CoordConv~\cite{liu2018coordconv}, we apply a convolutional block to refine the concatenated feature to achieve space-aware 3D feature $\tilde{F_\mathit{3D}} \in \mathbb{R}^{ D\times H\times W \times C }$. 
+Finally, we utilize a transformer encoder (\ie, 3D transformer encoder in~\cref{fig:method_overview}{\color{red}a}) to enhance the global interaction of 3D space via self-attention mechanism, 
+\vspace{-4pt}
+\begin{equation}
+    \small
+    \label{eq:attention}
+    Attention(Q, K, V)=softmax\left(\frac{Q K}{\sqrt{C}}\right) V,
+\vspace{-2pt}
+\end{equation}
+achieving the hidden state $H_{3D} \in \mathbb{R}^{ D \times H \times W \times C }$.
+For the sake of simplicity, we omit the positional encoding and rearrangement of tensor in~\cref{eq:attention}.
+
+\noindent\textbf{Fusion Transformer.}
+In contrast to prior 2D alignment technologies such as spatial averaging and 2D joint feature sampling, we propose the use of attention mechanisms to selectively focus on semantically distinct areas (\ie, visible human parts).
+Moreover, to estimate hidden information for achieving 3D alignment, we extend 2D features with 3D joint feature sampling. 
+Drawing inspiration from the successful fusion of image and text representations in MDETR~\cite{kamath2021mdetr} and Moment-DETR~\cite{lei2021detecting}, we design a transformer decoder-based fusion transformer to integrate 2D and 3D features and regress SMPL parameters in a coarse-to-fine manner leading to 2D $\&$ 3D alignment.
+
+\noindent\textbf{SMPL/Joint Query.}
+Instead of concatenating or pooling on 2D and 3D features, \methodname decouples the SMPL parameters and 2D/3D joint features  into separate query tokens, $Query \in \mathbb{R}^{N_q \times C}$,  comprising two distinct parts.
+The $N_s$ tokens belong to SMPL token, where $N_s = 3$, and are responsible for regressing pose, shape and camera parameters $ \{ \theta, \beta, \pi \}$ respectively.
+The remaining  $N_j = N_q - N_s$ tokens are responsible for locating 3D joints of the human and extracting corresponding 3D joint features, which refine the SMPL parameters and provide auxiliary supervision for the 3D space.
+
+\noindent\textbf{2D-Based Initial Regression.}
+As shown in~\cref{fig:method_overview}{\color{red}c}, we initially have no prior knowledge about the 3D joint locations. We regress the SMPL parameters and initial 3D joints with a transformer decoder reasoning in 2D hidden state $H_{2D} \in \mathbb{R}^{H \times W \times C} $ which is obtained by a transformer encoder (\ie, 2D transformer encoder in~\cref{fig:method_overview}{\color{red}a}) working on $F_{2D}$. 
+$H_{2D}$ is set as $K$ and $V$, and $Query$ tokens are treated as $Q$ in~\cref{eq:attention}. 
+Subsequently, we obtain initial predictions for pose, shape, camera parameters, and 3D joint coordinates via MLPs working on the output of transformer decoder.  
+
+\noindent\textbf{Refining with 3D Features.}
+To conserve computing resources, we avoid directly concatenating the hidden states (\ie, $H_{2D}$ and $H_{3D}$).  
+Instead, we use the initial prediction of 3D joints $J_{3D}' \in \mathbb{R}^{N_j \times 3}$ as reference points to sample \enquote{local} 3D joint features $H_{J_{3D}}=\mathcal{F}\left(H_{3D}, J_{3D}'\right) \in \mathbb{R}^{N_j \times C}$ like~\cite{ddetr} in~\cref{fig:method_overview}{\color{red}d}, where $\mathcal{F}(\cdot)$ denotes feature sampling and trilinear interpolation. 
+We then concatenate $H_{2D}$ with $H_{J_{3D}}$ and feed them into another transformer decoder (\ie, a stack of refining layers in~\cref{fig:method_overview}{\color{red}c}) as $K$ and $V$ in~\cref{eq:attention}.
+Note that $Z$ axis is not uniform in our 3D space.
+When sampling \enquote{local} 3D joint features, we also apply $\psi$ to rescale $z$ in $J_{3D}'$ as mentioned earlier. 
+Since the refining process consists of several identical transformer decoder layers, we naturally consider utilizing the outputs of each layer $H_{d} \in \mathbb{R}^{L \times N \times C}$  as a cascade refinement,
+\vspace{-2mm}
+\begin{equation}
+    \small
+    \label{cascade_refine}
+        \theta^{l+1}=\theta^{l}+MLP\left(\theta^{l}, H_{d}^{l}\right),
+\vspace{-2mm}
+\end{equation}
+where $l$ denotes the $l$-th refining layer and $MLP\left(\theta^{l}, H_{d}^{l}\right)$ is responsible for learning the residual for correcting parameters via MLPs. Besides, we also regress $\beta$ and $J_{3D}'$ with cascaded refinement as  shown above. 
+
+% Figure environment removed
+
+\subsection{3D Joint Contrastive Learning} 
+\label{sec:joint_contrastive_learning}
+As analyzed in~\cref{sec:introduction}, due to the lack of explicit \enquote{global} supervision for 3D representations, the \enquote{local} 3D joint coordinates may not provide accurate enough supervision for the 3D features.
+Especially  when the target person is obstructed by other individuals, similarities in their semantic appearances could result in confusion.
+To address this challenge, we propose a 3D joint contrastive learning strategy inspired by the success of pixel contrastive learning in semantic segmentation~\cite{wang2021exploring}.
+This approach enhances the representation of the target person while distinguishing them from other objects (\eg, other people, occlusions, and background).
+
+\noindent\textbf{Vanilla Contrastive Learning.} 
+In computer vision, contrastive learning was originally applied for unsupervised representation learning, where the goal is to minimize the distance between similar images (\ie, an image with its augmented version) while maximizing the distance between dissimilar images (\ie, an image with another image in training set) in an embedding space. 
+Usually, InfoNCE~\cite{gutmann2010noise,oord2018representation} is used as the loss function for contrastive learning,
+\vspace{-4pt}
+\begin{equation}\small\label{eq:NCE}
+\!\!\!\!\mathcal{L}^{\text{NCE}}_I\!=\!-\log\frac{\exp(\bm{i}\!\cdot\!\bm{i}^+/\tau)}{\exp(\bm{i}\!\cdot\!\bm{i}^+/\tau)
+\!+\!\sum_{\bm{i}^-\in \mathcal{N}_I}\exp(\bm{i}\!\cdot\!\bm{i}^-/\tau)},\!\!
+\vspace{-3pt}
+\end{equation}
+where $I$ is the anchor image, $\bm{i} \in \mathbb{R}^{C}$ is the representation embedding of $I$,  $\bm{i}^+$ is an embedding of a positive for $I$, $\mathcal{N}_I$ contains embeddings of negatives, `$\cdot$' denotes the inner (dot) product, and $\tau\!>\!0$ is a temperature hyper-parameter. Note that all the embeddings in the loss function are $\ell_2$-normalized.
+
+
+\noindent\textbf{Joint-to-Non-Joint Contrast.} 
+As shown in \cref{fig:contrast}{\color{red}a}, to better distinguish occlusion cases, we consider \textit{joint-to-non-joint contrast} between the $n$-th round predicted joints (in~\cref{fig:method_overview}{\color{red}c}) and the entire 3D space, as there are many voxels outside the joints.
+We augment~\cref{eq:NCE} in our joint-to-non-joint contrast setting.
+Since we employ trilinear interpolation to acquire the joint embedding from $H_{3D}$, the joint embedding is a weighted sum of the 8 voxel embeddings in the 3D space.
+As a result, for an anchor joint $j$, the positive samples are other predicted joints (not restricted to belonging to the same class), and the negative samples are the voxels that have no contribution to any joint embeddings. 
+The joint-to-non-joint contrastive loss is defined as:
+\begin{equation}
+    \small
+    \label{eq:j2v_NCE}
+    \!\!\!\!\mathcal{L}^{\text{NCE}}_{j2n}\!=\!\frac{1}{|\mathcal{P}_j|}\!\!\sum_{\bm{j}^+\in\mathcal{P}_j\!\!}\!\!\!-_{\!}\log\frac{\exp(\bm{j}\!\cdot\!\bm{j}^{+\!\!}/\tau)}{\exp(\bm{j}\!\cdot\!\bm{j}^{+\!\!}/\tau)
+    +\!\sum\nolimits_{\bm{n}^{-\!}\in\mathcal{N}_n\!}\!\exp(\bm{j}\!\cdot\!\bm{n}^{-\!\!}/\tau)},\!\!
+    % \vspace{-2pt}
+\end{equation}
+where $\mathcal{P}_j$ is  joint embedding collections of positive samples and $\mathcal{N}_n$ denote non-joint voxel embedding collections of negative samples, for joint $j$.
+
+\noindent\textbf{Joint-to-Joint Contrast.} 
+As shown in \cref{fig:contrast}{\color{red}b}, to strengthen the internal connections among joints of the same category, we consider \textit{joint-to-joint contrast} among human joints.
+We extend~\cref{eq:NCE} for applying to our joint-to-joint contrast setting.
+Essentially, the data samples in our contrastive loss computation are the  $n$-th round predicted joints  (in~\cref{fig:method_overview}{\color{red}c}) and ground truth 3D joints.
+For an anchor joint $j$ from predicted joints with its corresponding semantic label $\bar{c}$ (\eg, head, right hand, and neck), the positive samples are ground truth joints that also belong to the class $\bar{c}$, and the negative samples are the $n$-th round predicted joints belonging to the other classes $\mathcal{C}\setminus\{c_j\}$.
+As a result, the joint-to-joint contrastive loss is defined as:
+% \vspace{-2pt}
+\begin{equation}
+    \small
+    \label{eq:j2j_NCE}
+    \!\!\!\!\mathcal{L}^{\text{NCE}}_{j2j}\!=\!\frac{1}{|\mathcal{P}_j|}\!\!\sum_{\bm{j}^+\in\mathcal{P}_j\!\!}\!\!\!-_{\!}\log\frac{\exp(\bm{j}\!\cdot\!\bm{j}^{+\!\!}/\tau)}{\exp(\bm{j}\!\cdot\!\bm{j}^{+\!\!}/\tau)
+    +\!\sum\nolimits_{\bm{j}^{-\!}\in\mathcal{N}_j\!}\!\exp(\bm{j}\!\cdot\!\bm{j}^{-\!\!}/\tau)},\!\!
+    % \vspace{-2pt}
+\end{equation}
+where $\mathcal{P}_j$ and $\mathcal{N}_j$ denote joint embedding collections of the positive and negative samples, respectively, for joint $j$. 
+
+Note that the positive and negative samples, as well as the anchor joint $j$ in both \textit{joint-to-non-joint} and \textit{joint-to-joint} contrast are not necessarily limited to the same 3D space. 
+The joint-to-non-joint contrastive loss in~\cref{eq:j2v_NCE} and joint-to-joint contrastive loss in~\cref{eq:j2j_NCE} are complementary to each other; the former enables the network to learn discriminative joint features that are distinctly different from those of other non-joint voxels (\eg, occlusions), 
+while the latter helps to regularize the joint embedding space by improving intra-class compactness and inter-class separability.
+
+
+
+\subsection{Loss Function.}
+Finally, we obtain refined SMPL parameters $\{ \theta, \beta, \pi \}$. 
+We can achieve mesh vertices $M=\mathcal{M}(\theta,\beta) \in \mathbb{R}^{6890 \times 3}$ and 3D joints from mesh $J_\mathit{3D}=W \mathcal{M} \in \mathbb{R}^{N\times3}$ accordingly. 
+We follow common practices~\cite{HMR,SPIN,3dCrwodNet} to project 3D joints on 2D space  $J_{2D} = \boldsymbol{\Pi}(J_{3D}, \pi) \in \mathbb{R}^{N \times 2}$ and  add supervisions with 2D keypoints.
+Meanwhile, when 3D annotations are available, we also add 3D supervision on SMPL parameters and 3D joint coordinates. 
+Overall, the loss function can be written as follows:
+\vspace{-2pt}
+\begin{equation}
+    \small
+    \label{eq:loss}
+    \begin{aligned}
+        \mathcal{L} = &\lambda_{3 D} \mathcal{L}_{3 D}+\lambda_{2 D} \mathcal{L}_{2 D}+\lambda_{SMPL} \mathcal{L}_{S M P L} \\
+                    &+ \lambda_{j2n} \sum\nolimits_j \mathcal{L}^{\text{NCE}}_{j2n} + \lambda_{j2j} \sum\nolimits_j \mathcal{L}^{\text{NCE}}_{j2j},
+    \end{aligned}
+\end{equation}
+where $j$ is the sampled anchor joints and the first three is calculated as:
+\vspace{-2pt}
+{
+    \small
+    \begin{align*}
+        \mathcal{L}_{\mathit{3D}} & =  \| J_{3D} \; - \; \hat{J_{3D}}\| , \\
+        \mathcal{L}_{\mathit{2D}} &=  \| J_{2D} \; - \; \hat{J_{2D}} \| , \\
+        \mathcal{L}_{\mathit{SMPL}} &= \| \theta \; - \; \hat{\theta} \| + \|\beta \; - \; \hat{\beta}\|,
+    \vspace{-4pt}
+    \end{align*}
+}
+where $\| \cdot \|$ denotes L1 norm. $\hat{J_{2D}}$, $\hat{J_{3D}}$, $\hat{\theta}$, and $\hat{\beta}$ denote the
+ground truth 2D keypoints, 3D joints, pose parameters and shape parameters, respectively. 

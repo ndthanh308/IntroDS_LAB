@@ -1,0 +1,156 @@
+%\paragraph{Task} 
+
+To test the equivariant regression architecture described in \secref{architecture} we chose a task where the aim is to reconstruct (or \textit{predict}) the full 4-momentum of the $W$-boson within the Lorentz-boosted top-quark decay products. Specifically, we consider the same hadronic top-quark decay process that constitutes the signal in the top-tagging dataset, which uses the $t\to bW\to bqq$ two-step decay, followed by hadronization, showering, and detection. Our aim is to reconstruct the true 4-momentum of the $W$-boson given the full set of observed final state particles of the top-quark decay, as represented by the jet constituents. The work most closely related to this task is the transformer-based reconstruction of the top quark momentum in ref.~\cite{CPT}, and we employ similar evaluation criteria for our task.
+
+%------------------------
+% DATASET
+%------------------------
+\subsection{Regression dataset}
+
+The dataset used for the regression task consists of 1.5M $t\bar{t}$ events simulated with \PythiaEight, via the HEPData4ML package~\cite{Offermann_HEPData4ML}, consisting of 700k events for training, 200k events for validation, and 500k events for testing (with an additional 100k events set aside in a second testing set). From each event, we cluster anti-$k_T$ jets with $R=0.8$ using \Fastjet and we select the jet nearest to the truth-level top quark in $\left( \eta,\phi \right)$, requiring the distance between the top quark and the jet to satisfy $\Delta R \left(\mathrm{top\, quark},\mathrm{jet} \right) < 0.8$. This jet clustering is done both at truth-level, and using calorimeter tower objects produced by running the event through \Delphes fast detector simulation using the ATLAS detector card. Thus, each \textit{event} in the dataset corresponds to a single jet, and includes information for truth-level particles such as the truth-level top quark -- we may therefore use the terms \textit{jet} and \textit{event} interchangeably below with the understanding that each ``event'' in this dataset has one and only one jet recorded.
+%
+This dataset is fully reproducible since it contains the full set of parameters used for its own generation via the HEPData4ML package. It is publicly available via Zenodo~\cite{btW6}, where a full description of the various data fields is provided. Here we provide only an overview of some key features:
+%===========================================
+\begin{enumerate}
+    \item There are two versions of the dataset, corresponding with truth- and reconstruction-level (\Delphes) jets. The events are the same between versions, so the two can be compared event-by-event to study the effects of detector reconstruction on network training and performance.
+    \item The input data for the network are the 4-momenta of the $200$ leading jet constituents. For use as possible regression targets and for defining jet containment (explained below), each event contains
+    \begin{enumerate}
+        \item the truth-level top quark that initiated the jet,
+        \item the bottom quark from top-quark decay,
+        \item the $W$-boson from top-quark decay,
+        \item the two quarks from subsequent $W$-boson decay ($W\rightarrow q q'$),
+    \end{enumerate}
+    In addition, the event contains the stable $W$-boson daughter particles. These are the truth-level, final state particles that are traced back to the $W$-boson by \Pythia.
+    \item Each jet is tagged with the Johns Hopkins top tagger~\cite{Kaplan:2008ie} (JH), as implemented in \Fastjet. This allows us to define a subpopulation of JH-tagged events, which we shall sometimes refer to as \textit{JH events}. For jets that it tags as top-quark jets, JH reconstructs a $W$-boson candidate from subjets.
+    \item Each jet is also tagged as whether or not it is \textit{fully-contained} (FC). We define FC events as those where the $b$-quark, as well as the two quarks from $W\rightarrow q q'$ decay, are within $\Delta R < 0.8$ of the jet centroid (i.e.~within the jet radius). In such cases almost all of the $W$-daughters are contained within the jet and we can expect a good reconstruction of the $W$ momentum. FC events comprise $75\%$ of the dataset.
+\end{enumerate}
+%===========================================
+
+%------------------------
+% TRAINING PROCEDURE
+%------------------------
+\subsection{Regression training procedure}
+
+Our model has 4 equivariant $\mathrm{Eq}_{2\to 2}$ blocks. Each messaging layer takes in 132 channels and outputs 78 channels. Conversely, each equivariant aggregation layer has 78 input channels and outputs 132 channels. The $\mathrm{Eq}_{2\to 1}$ block has the same shape, and the final fully-connected layer has the shape $1\times 132$. There are 210k parameters in total. Assuming $N$ non-zero input jet constituents, this produces $N$ scalar coefficients $c_i$ with zero-padding, which are the Lorentz invariants as described by \equref{equiv}. The reconstructed 4-momentum is then computed via 
+\[
+    p_{\mathrm{reco}}=\sum_i c_i p_i \label{def pelican weights}.
+\]
+The training regimen for this task is essentially identical to the one for top-tagging: \textsc{AdamW} optimizer with weight decay of $0.01$, 35 epochs in total with 4 epochs of warm-up and exponential learning rate decay for the last 3 epochs. All matching hyperparameters were copied from the top-tagging model with no extra optimization. The main difference is in the choice of the loss function $L(p_{\mathrm{reco}},p_{\mathrm{target}})$. Spacetime geometry allows for many choices of this function, which in turn will affect the shape of the landscape near $p_{\mathrm{target}}$ and in turn the precision of various reconstructed features of the vector, such as the mass, energy, spatial momentum, transverse momentum, and direction. It is even possible to construct Lorentz-invariant loss functions to make the training process itself equivariant. Nevertheless, for the purpose of simultaneous reconstruction of the direction and the mass $m_W$ of the $W$-boson, we found 
+%------------------------
+\begin{equation}
+    \text{Loss}(p_{\text{reco}},p_{\text{target}})=0.01\Vert\boldsymbol{p}_{\mathrm{reco}}-\boldsymbol{p}_{\mathrm{target}}\rVert+0.05|m_{\mathrm{reco}}-m_{\mathrm{target}}| \label{loss-regression}
+\end{equation}
+to be very effective. It uses all 4 components of the target vector and strikes a good balance between the precision of the reconstructed mass and spatial momentum. The coefficients are chosen such that each term in the loss function is order unity for our datasets.
+%------------------------
+
+Aside from the loss function, another rarely discussed feature of this task is the choice of the target vector $p_{\mathrm{target}}$. Even though our ultimate inference target is the true $W$ momentum $p^W_{\mathrm{true}}$, it is not necessarily the best training target given the nature of the dataset. Detection and jet clustering include multiple energy, momentum, and spatial cuts that exclude some decay products from the final jet. For instance, one of the three quarks in $t\to bqq$ might fall outside of the $R=0.8$ radius of the jet clustering algorithm, in which case most of the decay products of that quark are likely to be absent from the event record. If many of the decay products of the $W$-boson are missing, then we lack the information necessary to make an accurate estimate of its true momentum, or even to identify which of the jet constituents belong to the $W$-boson. This effect is often referred to as an \textit{acceptance} issue due to the finite purview of the final state reconstruction. %This is best seen from the mass spectrum of this target, shown in \figref{targetm}.
+
+%===========================================
+% Figure environment removed
+%===========================================
+
+To alleviate this issue and provide better control over the inference stage, we propose an alternative target 4-vector that we call the \textit{contained true $W$ momentum} $p^W_{\mathrm{cont}}$, equal to the total 4-momentum of the \textit{truth-level $W$ decay products} that fall within the radius of the final reconstructed top jet. In the truth-level dataset, this is simply $p^W_{\mathrm{cont}}=\sum_k p_{i_k}$ where $i_k$ are the indices of the constituents whose parent is the $W$-boson and not the $b$-quark. In the \Delphes dataset, however, there is no simple analytic relationship between $p^W_{\mathrm{cont}}$ and the jet constituents $p_i$. That is to say that the mapping of the truth-level information to the detector-level reconstruction is highly nonlinear. Nonetheless, in either dataset this vector more accurately reflects the available information about the $W$-boson and allows us to make inferences not only about the $W$-boson itself, but also about the containment qualities of the event. This will be discussed further in \secref{disc-Wreco} below.
+%
+For reference, the true mass spectra of both $p^W_{\mathrm{true}}$ and $p^W_{\mathrm{cont}}$ are shown in \figref{targetm}. For fully-contained (FC) events, the mass spectra are similar between the true and the contained $W$ mass as expected. Non-FC events are mostly confined to a clear second peak at 13 GeV corresponding to $qb$ and $q$ jets (where one of the quarks from $W\to qq$ fell outside the jet), and a minor peak at $m^W_{\mathrm{cont}}=0$ corresponding to $b$ jets.
+
+Given the above observations, we prepared two PELICAN models, one trained to reconstruct $p^W_{\mathrm{true}}$, and another trained to reconstruct $p^W_{\mathrm{cont}}$. Otherwise the two models are identical and are trained in the same way and with the same loss function. We then compare the outputs of each model to $p^W_{\mathrm{true}}$ and analyze the benefits of the two choices of the target.
+
+%------------------------
+% RESULTS
+%------------------------
+\subsection{Regression results for $p^W_{\mathrm{true}}$ reconstruction}
+
+\renewcommand{\arraystretch}{1.05} % to get the vertical text to not collide with dividers, we slightly stretch the table vertically
+%===========================================
+\begin{table}[t]
+    % \vspace{-1\intextsep}
+    \centering
+    \begin{small}
+        \begin{tabular}{ccS[table-format=3.2]<{\%}S[table-format=3.2]<{\%}S[table-format=3.3]}
+        \toprule
+        & Method &  \multicolumn{1}{c}{$\sigma_{p_T}$ (\%)} & \multicolumn{1}{c}{$\sigma_{m}$ (\%)} & \multicolumn{1}{c}{$\sigma_{\Delta R}$ (centirad)}\\
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{\parbox{1.3cm}{\centering Without\\ \Delphes}}} 
+        & JH               & 0.66    & 1.26     & 0.216   \\
+        & PELICAN$\mid$JH  & 0.26    & 0.57     & 0.113   \\
+        & PELICAN$\mid$FC  & 0.30    & 0.71     & 0.139   \\
+        & PELICAN          & 0.79    & 1.12     & 0.473   \\
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{\parbox{1.3cm}{\centering With\\ \Delphes}}} 
+        & JH               & 9.8   & 8.3   & 9.6      \\
+        & PELICAN$\mid$JH  & 3.5    & 2.6   & 2.8      \\
+        & PELICAN$\mid$FC  & 4.0    & 2.9   & 3.1      \\
+        & PELICAN          & 5.1    & 3.0   & 4.7      \\
+        \bottomrule
+        \end{tabular}
+    \caption{Momentum reconstruction results for JH and PELICAN trained to reconstruct $p^W_{\mathrm{true}}$. We report the relative $p_T$ and mass resolutions, and the interquantile range for the angle $\Delta R$ between predicted and true momenta. "PELICAN$\mid$JH" refers to PELICAN evaluated only on JH-tagged jets, and "PELICAN$\mid$FC" to PELICAN evaluated only on FC events. PELICAN uncertainties are within the last significant digit.\label{btW6_W_table}}
+
+    % Momentum reconstruction results for the Johns Hopkins (JH) tagger and PELICAN for relative $p_T$ resolution ($\sigma_{p_T}$) and relative mass resolution ($\sigma_{m}$). Uncertainties are given by the central 68th interquantile range (IQR), except for $\psi$ where it is the lower 68th IQR. $\psi$ is in radians.}
+    \end{small}
+    \vspace{-0.5\intextsep}
+\end{table}
+%===========================================
+
+The results are summarized in \tabref{btW6_W_table}. We quantify the precision of the reconstruction using the resolution of transverse momentum \pT\footnote{$\pt=\sqrt{p_x^2+p_y^2}$.} and mass as a metric, given by half of the central $68^\text{th}$ interquantile range of $(x_{\mathrm{predict}}-x_{\mathrm{true}})/x_{\mathrm{true}}$, where $x$ is $m$ or $p_T$. In addition we report the lower $68^\text{th}$ interquantile range for $\Delta R$, the $z$-boost-invariant spatial angle between predicted and true momenta\footnote{$\Delta R=\sqrt{(\Delta \phi)^2+(\Delta \ln \tan \theta/2)^2}$.}. 
+
+Since there are no pre-existing ML-based methods for this task, we use the $W$-boson identification of JH for the baseline comparison. JH has a $36\%$ efficiency on the truth-level dataset and $31\%$ on the \Delphes one. It can only identify $W$-boson candidates for jets it tags, so we report PELICAN results both on the JH-tagged jets only (PELICAN$\mid$JH) and on the full dataset (PELICAN). Moreover, we evaluate PELICAN on the population of FC events (PELICAN$\mid$FC). More than $99.9\%$ of JH-tagged events contain all three true quarks $bqq$ within the jet radius, so this population represents an especially restricted and ``ideal'' type of event. The results were evaluated over 5 training runs initialized with different random seeds, and the resolutions reported in \tabref{btW6_W_table} are consistent across the runs.
+
+
+There are significant differences in PELICAN's performance on the different sub-populations of events. In the direct comparison with the JH tagger, PELICAN$|$JH is 2-4 times more precise. However, even on the much larger class of FC events, PELICAN produces predictions with almost the same precision. The highest loss of precision happens on non-FC events where many of the $W$ decay products are missing from the jet, leading to lower average precision on the entire dataset. As discussed in \secref{Wmass}, this result can be \textit{explained} by interrogating the PELICAN weights and kinematic information directly.
+
+%===========================================
+% Figure environment removed
+%===========================================
+In \figref{btW6WW_res_m} we show the relative reconstructed $W$ masses for two of the models, one trained on truth data, and one on \Delphes data. The results also include the curve for the JH tagger's reconstruction, as well as PELICAN$\mid$JH and PELICAN$\mid$FC. The $68^\text{th}$ interquantile ranges of these curves match the numbers in the $\sigma_m$ column of \tabref{btW6_W_table}. See \secref{Weights} for further details on the causes of performance degradation in the \Delphes case. For the complete set of results see \appref{appendix_plots}.
+
+%===========================================
+% Figure environment removed
+%===========================================
+
+%------------------------
+% RESULTS
+%------------------------
+\subsection{Regression results for $p^W_{\mathrm{cont}}$ reconstruction}
+
+Now we train new models with the target vector set to the contained true $W$ momentum $p^W_{\mathrm{cont}}$, evaluate their precision by comparing the outputs to the true $W$ momentum $p^W_{\mathrm{true}}$, and compare the results to \tabref{btW6_W_table}. As shown in \tabref{btW6_D_table}, the resolutions for these models on JH-tagged and FC events are slightly worse than the first set of models, in the \Delphes case by 5-15\%. The largest change is in non-FC events, leading to poor average resolutions on the whole dataset. Despite this, as we will now show, these models can in fact be better suited for real-world applications.
+
+%===========================================
+\begin{table}[t]
+    % \vspace{-1\intextsep}
+    \centering
+    \begin{small}
+        \begin{tabular}{ccS[table-format=3.2]<{\%}S[table-format=3.2]<{\%}S[table-format=3.3]}
+        \toprule
+        & Method &  \multicolumn{1}{c}{$\sigma_{p_T}$ (\%)} & \multicolumn{1}{c}{$\sigma_{m}$ (\%)} & \multicolumn{1}{c}{$\sigma_{\Delta R}$ (centirad)}\\
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{\parbox{1.3cm}{\centering Without\\ \Delphes}}} 
+        & JH               & 0.66    & 1.26     & 0.216   \\
+        & PELICAN$\mid$JH  & 0.27    & 0.62     & 0.113   \\
+        & PELICAN$\mid$FC  & 0.34    & 0.86     & 0.142   \\
+        & PELICAN          & 2.37    & 38.93    & 0.681   \\
+        \midrule
+        \multirow{3}{*}{\rotatebox[origin=c]{90}{\parbox{1.3cm}{\centering With\\ \Delphes}}} 
+        & JH               & 9.8    & 8.3   & 9.6      \\
+        & PELICAN$\mid$JH  & 3.6   & 2.8  & 3.1      \\
+        & PELICAN$\mid$FC  & 4.2    & 3.6   & 3.4      \\
+        & PELICAN          & 6.2    & 39.6   & 5.6      \\
+        \bottomrule
+        \end{tabular}
+    \end{small}
+    \caption{PELICAN resolutions for models trained to reconstruct $p^W_{\mathrm{cont}}$. Resolutions are still obtained by comparing the model predictions to $p^W_{\mathrm{true}}$.\label{btW6_D_table}}
+    \vspace{-0.5\intextsep}
+\end{table}
+%===========================================
+
+%------------------------
+% DISCUSSION
+%------------------------
+\subsection{Discussion \label{disc-Wreco}}
+
+To see the main benefit of this model, we present the behavior of the relative reconstructed mass shown in \figref{btW6DW_res_m}. PELICAN-reconstructed masses within the range of true $W$ masses are almost as precise on the full dataset as they are on FC events (see \figref{btW6DW_res_m} near the peak at 1). The most prominent feature obvious from these results is that, despite the slightly lower accuracies on FC events (at fixed width and depth of the network), the model trained to reconstruct $p^W_{\mathrm{cont}}$ accurately reproduces the mass spectrum of $m^W_{\mathrm{cont}}$ in \figref{targetm} and therefore discriminates between FC and non-FC events, allowing us to perform post-inference event selections. 
+
+For instance, in the \Delphes case, choosing a 55 GeV cutoff, $97\%$ of all FC events have $m_{\mathrm{reco}}>55 \text{ GeV}$, and vice versa, $97\%$ of all events with $m_{\mathrm{reco}}>55\text{ GeV}$ are FC. In this manner we can significantly improve the accuracy of the reconstruction without accessing truth-level information that is needed to identify FC events. Notably, this so called ``parton labeling'' via neural networks was recently studied in ref.~\cite{CPT23}. This filtering of events comes at the cost of a modest reduction in signal efficiency -- from the ostensible $100\%$ down to $75\%$. Note that in the \Delphes case, the set of FC events is contaminated with a small number of events with significant losses of $W$ decay products due to detector effects, but it can be refined by reducing the jet radius used in the definition of full containment. Consequently, we propose the following simple routine for real-world applications of these models. First, use the model trained targeting $p^W_{\mathrm{cont}}$ as an FC-tagger to refine the data. Then, apply the model targeting $p^W_{\mathrm{true}}$ to reconstruct the $W$-boson.
+
+We conclude that $p^W_{\mathrm{cont}}$ is the better target for many common reconstruction tasks where one is willing to sacrifice some signal efficiency -- or to only fully measure the 4-momentum on a sub-sample of the identified events -- to gain improved accuracy. In the following sections we will not present models trained on both targets, however a complete set of metrics and figures can be found in \appref{appendix_plots}.
+
+% % Figure environment removed

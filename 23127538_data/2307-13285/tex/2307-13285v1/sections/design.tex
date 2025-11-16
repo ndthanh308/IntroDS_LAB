@@ -1,0 +1,340 @@
+\section{\sys Design \label{design}}
+\subsection{\sys Architecture}
+As illustrated in Figure~\ref{fig:overview}, the \sys architecture consists of the switch data plane, clients, and servers.
+
+% Figure environment removed
+
+\textbf{Switch data plane.}
+The core of the \sys architecture is the switch data plane.
+We design three custom modules, which are triggered only for \sys packets.
+The request cloning module decides whether to replicate requests based on server states.
+The response filtering module blocks redundant slower responses using request fingerprints.
+The state tracking module updates the server states upon receiving responses to track the latest state information.
+Meanwhile, our switch data plane can perform packet forwarding with the traditional L2/L3 routing module.
+
+\textbf{Clients and servers.}
+To support \sys, we need modifications on clients and servers to insert metadata (e.g., server state) into the \sys header, which resides between the L4 header and the application payload.
+%\sys does not require modification for the header structure of existing applications.
+Note that integrating \sys with existing RPC frameworks needs careful investigation because it may cause interference between request cloning and existing functionality in the framework.
+
+% Figure environment removed
+
+\subsection{Packet Format}
+Figure~\ref{fig:header} shows the packet format of \sys.
+The \sys header is encapsulated as a L4 payload.
+We reserve an L4 port number for \sys so that the switch can apply different packet processing logic for \sys packets and normal packets.
+Since both \sys packets and normal packets are forwarded using traditional L3 routing, \sys is compatible with existing network functions.
+The \sys header consists of 7 fields as follows.
+
+\begin{itemize}[noitemsep]
+\item{
+\texttt{TYPE}: the message type, which can be \texttt{REQ} (a request) and \texttt{RESP} (a response).
+}
+%\vspace{-10pt}
+\item{
+\texttt{REQ\_ID}: the request ID, which is a unique sequence number assigned by the switch.
+}
+\item{
+\texttt{GRP}: the group ID that specifies a pair of candidate servers.
+}
+\item{
+\texttt{SID}: the server ID that sent a response.
+This field is used as the index for the server state table.
+}
+\item{
+\texttt{STATE}: the server state, which can be busy or idle.
+}
+\item{
+\texttt{CLO}: the field to clarify whether the request is cloned or not. 0 means the non-cloned request; 1 means the cloned original request; 2 means cloned request.
+}
+\item{
+\texttt{IDX}: the index for hash tables to filter redundant responses. 
+Note that this is the table index, not the slot index of a table.
+}
+\end{itemize}
+
+\begin{algorithm}[t!]
+\small
+\caption{Packet Processing in Data Plane \label{alg1}} 
+\begin{algorithmic}[1] 
+\StateX $-$ $pkt$: Packet to be processed
+\StateX $-$ $SEQ$: Global sequence number for request IDs.
+\StateX $-$ $GrpT$: Match-action table to get a server pair
+\StateX $-$ $AddrT$: Match-action table to get IP address
+\StateX $-$ $StateT$: Register array to track server states 
+\StateX $-$ $ShadowT$: The copy of the state table
+\StateX $-$ $FilterT$: Register arrays to filter redundant responses
+\If{$pkt.type$ == \texttt{REQ} \textbf{and} NotCloned} %\Comment{Original}
+    \State $SEQ \gets SEQ + 1$
+    \State $pkt.req\_id \gets SEQ$ %\Comment{Assign seq. number}
+    \State $Srv1,Srv2 \gets GrpT.read(pkt.grp)$ \Comment{Get server IDs}
+    \State $pkt.dst \gets AddrT[Srv1]$ \Comment{Get IP addr.}
+    \If{$StateT[Srv1] == IDLE$ \textbf{and} $ShadowT[Srv2] == IDLE$} %\Comment{Both servers are idle}
+
+        \State $pkt.clo \gets 1$ \Comment{Mark as cloned original packet}
+        \State $pkt.sid \gets Srv2$ \Comment{Will be used for forwarding clone}
+        \State Clone($pkt$) \Comment{Forward $pkt$ and recirculate clone} %\Comment{Forward original and recirculate clone}
+    \EndIf
+\ElsIf{$pkt.type$ == \texttt{REQ} \textbf{and} Cloned} %\Comment{Cloned}
+        \State $pkt.clo \gets 2$ \Comment{Mark as cloned packet}
+        \State $pkt.dst \gets AddrT[pkt.sid]$ \Comment{Get IP addr.}
+\ElsIf{$pkt.type$ == \texttt{REP}} %\Comment{Response}
+    \State $StateT[pkt.sid] \gets pkt.state$ %\Comment{update state table}
+    \State $ShadowT[pkt.sid] \gets pkt.state$ %\Comment{update shadow table}
+    \If{$pkt.clo > 0$} %\Comment{Cloned?}
+        \State $Hidx \gets Hash(pkt.req\_id)$ \Comment{Get hash index}
+        \If{$FilterT[pkt.idx][HIdx] == pkt.req\_id$}
+            \State $FilterT[pkt.idx][HIdx] \gets 0$ %\Comment{Clear hash slot}
+            \State Drop($pkt$) %\Comment{Block redundant response}
+        \Else %\Comment{Do fingerprinting}
+            \State $FilterT[pkt.idx][HIdx] \gets pkt.req\_id$ 
+        \EndIf
+    \EndIf
+
+\EndIf
+\State Forward($pkt$) %\Comment{Forward packet with L2/L3 routing}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Request Packet Processing}
+In this subsection, we describe how the switch processes request and response packets.
+Algorithm~\ref{alg1} describes the high-level pseudocode of request processing in the switch data plane.
+Figure~\ref{fig:pro} shows how \sys handles requests.
+
+
+% Figure environment removed
+
+\textbf{Request packets.}
+Clients do not have to know server information since the switch determines the destination server.
+Clients use a group ID to determine a pair of candidate servers.
+The group ID is randomly chosen by the client.
+Each group ID matches two candidate servers, which are predefined by the operator.
+The number of groups is $2\binom{n}{2}$ as we choose two servers between $n$ servers.
+Multiplying by two is to sustain the randomness of server selection because the switch forwards the request to the first candidate server if cloning conditions are not satisfied.
+For example, assume that we have only two servers.
+In this case, we have two groups, and each group specifies \{Srv1,Srv2\} and \{Srv2,Srv1\}.
+If we specify only one group (e.g., \{Srv1,Srv2\}) for this case, all non-cloned requests are forwarded to Srv1. 
+
+
+We use several tables to process requests as follows.
+The group table $GrpT$ is a match-action table that maps from the group ID to the IDs of candidate servers.
+Since clients do not specify the destination server initially, we also use the address table $AddrT$, a match-action table that assigns a destination IP address to the packet.
+To track server states, we use two tables, which are the state table $StateT$ and the shadow state table $ShadowT$, a copy of $StateT$.
+The tables contain the state of servers, and the switch performs cloning decisions based on the information.
+
+The switch has different processing logic for original requests and cloned requests.
+Upon receiving a normal request, the switch assigns a request ID to the request after increasing the sequence number by one (lines 1-3).
+Next, the switch gets the ID of candidate servers (i.e., $Srv1$ and $Srv2$) by accessing $GrpT$ (line 4).
+After that, the destination IP address is updated using the ID of server 1 as the index for $AddrT$ (line 5).
+The switch now checks whether the tracked server states are both idle or not.
+This is done by accessing $StateT$ and $ShadowT$ for server 1 and server 2, respectively (line 6).
+If positive, the request is marked as cloned but original (line 7).
+In addition, since we should forward the clone to server 2 as well, we put the ID of server 2 into the \texttt{SID} field (line 8).
+The switch finally clones the request by forwarding the original request to server 1 and recirculating the cloned request into the ingress pipeline (line 9).
+For recirculated cloned requests, the switch marks the request as cloned by updating the \texttt{CLO} field to 2 (lines 11-12).
+After that, the IP address of server 2 is assigned to the request packet (line 13).
+Figure~\ref{fig:pro} (a) outlines the process.
+
+\textbf{Response packets.}
+When a server sends back a response, the server updates the \texttt{SID} and \texttt{STATE} fields with its server ID and the current server state.
+To handle responses, we use three tables: $StateT$, $ShadowT$, and $FilterT$.
+Between them, $FilterT$ is the filter table to block slower responses, which is implemented as a register array.
+The switch has slightly different logic for the faster response of a request and the slower response of the request, as shown in Figure~\ref{fig:pro} (b) and (c).
+Upon receiving a response, the switch first updates the state information of the server in $StateT$ and $ShadowT$ (lines 14-16).
+After that, the switch checks whether the response is of a cloned request by lookup the \texttt{CLO} field.
+If positive, the switch data plane gets the hash slot index using the \texttt{REQ\_ID} field (lines 17-18).
+If the hash slot of the matched filter table contains the same request ID (i.e., the slower response), the switch clears the slot and drops the packet (lines 19-21).
+This is because the faster response is already forwarded to the client.
+Otherwise, for the faster response, the switch puts the value of \texttt{REQ\_ID} field into the hash slot as a fingerprint to block the slower response (lines 22-23).
+
+
+% Figure environment removed
+
+% Figure environment removed
+
+\subsection{Dynamic Request Cloning}
+\textbf{State tracking.}
+\sota~\cite{laedge} dynamically replicates requests only if the candidate servers are idle, which is guaranteed by queueing requests in the coordinator and dispatching only one request at once.
+However, this cannot be directly implemented in the current generation of programmable switches, as they have limited memory to buffer millions of requests and cannot store complex data structures.
+
+Instead, we track server states and clone requests only if the servers are \textit{considered idle}.
+We observe that, in general, the request queue in a server is empty if the number of incoming requests is not enough to make the server overloaded.
+Therefore, if the queue is empty, we can consider the server as idle and is affordable to a cloned request as well.
+We avoid non-empty queues because the existence of queued requests indicates that the server is too busy to handle incoming requests instantly, leading to performance degradation due to the reverse effect.
+To deliver the server state to the switch, we make servers piggyback their state in response packets.
+Upon receiving responses, the switch always updates the state table so that the latest state information can be maintained.
+
+One issue is that the actual server state is not idle when a cloned request visits the server, because there is a time gap between the tracked state and the actual state.
+Therefore, to avoid this, we make the server drop the packet request if the queue is not empty when receiving a cloned request.
+It is important to note that only cloned requests (\texttt{CLO}=2) are dropped, while the original request (\texttt{CLO}=1) is processed normally.
+Another possible solution is to track the server-side throughput and only clone requests when it is below a certain threshold.
+However, this requires complex performance profiling to determine the threshold.
+
+\textbf{Shadow state table}
+To decide whether to clone, we must check the state of both candidate servers.
+This requires the read of the state table twice, but it is not possible with the current switch ASIC using the PISA architecture~\cite{bosshart13}.
+This is because, in the architecture, the switch data plane consists of multiple match-action stages and the memory space of the table is statically allocated to a single stage at compile time.
+A packet passes through the match-action stages in the data plane to preserve a line-rate, which means that a packet can visit the table only once.
+To overcome this limitation, we put a shadow table, a copy of the state table.
+This allows the switch to check server states twice indirectly.
+The consistency between the state table and the shadow table can be preserved since the switch always updates the tables at the same time upon receiving a response.
+
+
+
+\textbf{Cloning in the switch.}
+The commodity programmable switch provides two options to clone packets.
+One is port mirroring and the other is multicasting.
+Both of them generate a copy of the original packet and send the clone to a specific output port.
+\sys utilizes multicasting since it is simpler in terms of switch configuration.
+A challenge here is that we cannot assign the destination IP to the clone because the switch currently processes the original request at the time that replicates the request.
+Therefore, we make the cloned request visit the ingress pipeline again using recirculation.
+The recirculation is implemented by forwarding the clone to the port in loopback mode.
+When the clone is recirculated, the switch assigns the destination IP address and forwards it to the corresponding output port.
+
+\textbf{Example.} Figure~\ref{fig:cloning} shows an example of request cloning.
+%The original state table and the shadow table are allocated in stage 1 and stage 2, respectively.
+%The address table to assign the destination IP is in stage 3.
+In this example, the switch confirms that the servers $Srv1$ and $Srv2$ are idle by accessing the state table and the shadow table.
+The switch then assigns 10.0.1.103 to the request for the destination IP and forwards the request.
+At the same time, the switch generates the cloned request for $Srv2$ and recirculates it.
+When recirculated, the address table assigns 10.0.1.101 to the clone.
+After that, the switch finishes the process by forwarding the clone.
+
+
+
+\subsection{Response Filtering with Fingerprinting}
+For the client, it is redundant to process the slower response of a request, since the client already received the faster response.
+This overhead degrades the performance gain~\cite{vulimiri13}.
+Our switch data plane filters redundant responses using request fingerprinting.
+The idea is simple as follows.
+We assign a monotonically-increasing sequence number for the request ID to each request, which is shared by the original and the clone.
+The faster response puts the request ID in the filter table as a fingerprint to let the slower response know that the faster one is already processed.
+The switch drops the slower response if the table contains the same request ID.
+Note that the filter table is a register array, not a match-action table.
+
+\textbf{Minimizing memory usage.}
+A challenge here is how to minimize the memory footprint for response filtering because switch memory is a scarce resource.
+However, the current switch ASIC does not allow dynamic memory allocation, and the memory space must be allocated at compile time~\cite{bosshart13,chole17}.
+Reserving memory space as many as possible is not feasible because the sequence number for request IDs (i.e., the number of requests) can be over billions.
+
+To reserve space for filtering while minimizing the memory footprint, we make the filter table use the hash index.
+Our insight behind the idea is that the request ID only exists until the slower response arrives, which is a few microseconds in common.
+Therefore, each hash slot can be reused for multiple request IDs.
+We also allow responses to overwrite the existing request ID in a slot.
+This is to handle hash collisions and packet drops.
+If we prohibit the overwrite, responses can be dropped even if the response is the fastest one.
+In a similar vein, if the slower response of a request is dropped or missed before visiting the switch, the hash slot becomes unavailable permanently.
+Meanwhile, the overwrite may cause the failure to block the slower response, but it is not often since hash collisions and packet drops are rare because of microsecond-scale latency.
+
+To further minimize hash collisions, we arrange multiple filter tables in the switch data plane.
+We randomly assign a table index in the \texttt{IDX} field at the client side.
+Since the \texttt{IDX} field remains consistent for a request and its responses, all related packets access the same table.
+It is important to note that the index refers to the table index, not the hash slot index.
+As a result, responses of two different requests with the same hash index can be processed concurrently without collisions, unless they have the same assigned table index.
+
+\textbf{Example.}
+Figure~\ref{fig:hash} shows examples of our filter table when we have three tables.
+Let us consider a request with the request ID $req\_id=7$ and the table index $idx=1$.
+As shown in Figure~\ref{fig:hash} (a), the faster response of the request inserts 7 to the empty hash slot in the second filter table.
+When the slower response arrives at the switch, the switch resets the hash slot to empty and drops the response as illustrated in Figure~\ref{fig:hash} (b).
+We now consider when a hash collision occurs in Figure~\ref{fig:hash} (c).
+Although the hash index of the request with $req\_id=8$ collides with the request with $req\_id=7$, we can avoid the overwrite thanks to the different table index.
+
+\subsection{Failure Handling}
+In this section, we describe how \sys handles failures.
+
+\textbf{Dropped messages.}
+The loss of requests does not cause a problem as \sys simply concerns request cloning.
+Meanwhile, the drop of responses may cause issues.
+As mentioned in a previous subsection, if the slower response of a request is dropped, the filter table slot will be permanently occupied and unavailable.
+However, our design allows responses to overwrite the hash slot with a different request ID, thus avoiding this problem.
+
+\textbf{Server failures.}
+In the event of a server failure, the overall performance will be degraded until the server is either recovered or removed.
+The switch control plane can quickly remove the failed server from the list of potential destination servers by updating relevant tables (e.g., the group table and the address table) in the switch data plane and the number of groups on the client side.
+
+\textbf{Switch failures.}
+\sys does not cause any permanent misbehavior during switch failures as it stores only soft states, such as server states, the global sequence number for request IDs, and the filter table entries.
+Once the switch is recovered, the server states can be updated through the following responses.
+The loss of table entries does not lead to any serious consequence, although there may exist temporary overhead on the client side as slower responses can be forwarded.
+Additionally, while the sequence number restarts from 0, this does not result in any fatal outcome, as most requests with earlier sequence numbers have already been completed.
+
+
+
+\subsection{Handling Practical Requirements}
+We now describe how \sys can support a variety of practical requirements.
+
+\textbf{Integration with RackSched.}
+RackSched~\cite{racksched} is an in-network request scheduler for microsecond-scale workloads.
+It performs the Join-the-Shortest-Queue (JSQ) load balancing~\cite{randomloadbalancing} by utilizing the power of two choices~\cite{poweroftwochoices} in the switch data plane.
+\sys can integrate RackSched into its design to make synergy as follows.
+First, we change the state table to the load table and store the queue length of request queues in servers instead of binary states.
+\sys still can make a cloning decision since we consider the server with the empty queue as idle.
+If all candidate servers have empty queues, we replicate requests as usual.
+Otherwise, we fall back to RackSched.
+The switch compares the queue lengths of the servers and chooses the one with the shortest queue as the destination server.
+When integrating the two solutions, we address several challenges caused by the computational limits of the switch ASIC, but we omit the detail due to space constraints.
+
+\textbf{Multi-rack deployment.}
+\sys generally targets a single-rack model like rack-scale computers, but it is possible to deploy for a multi-rack model like cloud-scale data centers.
+This is because \sys leverages the existing forwarding function to route both normal and cloned requests.
+In multi-rack deployment, aggregation switches do not have to be aware of request cloning and only ToR switches need to use \sys logic.
+However, the ToR switch of servers may apply the \sys logic to packets even if the \sys processing should be done only in the ToR switch of the client.
+Therefore, we add a switch ID field to the \sys header, with an initial value of zero that is set to the pre-defined switch ID when the packet passes through the ToR switch of the client.
+ToR switches then apply the \sys logic only to packets with a switch ID field of zero or matching their own ID.
+
+
+\textbf{Multiple pipelines and scalability.}
+Modern programmable switches consist of multiple pipelines and each pipeline is connected to a number of ports.
+For example, for a 64-port switch with 4 pipelines, 16 ports are assigned to each pipeline.
+Each pipeline basically does not share its table entries, metadata, and registers.
+Therefore, the solution has limited scalability with a limited number of ports (i.e., the number of servers) if it supports a single pipeline only.
+\sys can work with multiple pipelines.
+For example, \sys can work between the client with pipeline 0 and the server with pipeline 1.
+This is because the \sys mechanism only requires soft states like server states and request IDs to be maintained in a pipeline connected to the client.
+The entry of match-action tables of all pipelines can be updated by the switch control plane at the same time.
+In a similar vein, \sys does not limit the number of supported servers compared to the vanilla switch even with multi-rack environments.
+Our soft states are updated in the switch data plane at line-rate and do not rely on the switch control plane, which has a limited update throughput.
+
+
+\textbf{Multi-packet messages.}
+A microsecond-scale RPC message is generally small and consists of a single packet.
+For example, DeathStarBench~\cite{deathstarbench} states that 75\% of RPC requests are less than 512 bytes in size, while over 90\% of RPC responses are smaller than 64 bytes.
+Therefore, the current \sys design does not consider multi-packet requests and responses by default.
+For multi-packet requests, since we assign the group ID at the client, the request affinity is naturally preserved.
+However, we need a cloned request table that stores the ID of cloned but unfinished requests since every packet of a cloned request should be cloned regardless of system load.
+To filter multi-packet responses, we can use multiple ordered filter tables and make the server assign a unique table index to each packet of a multi-packet response.
+The switch then uses the corresponding ordered filter table index to perform the filtering logic.
+For example, for a 4-packet response, the server could assign table indices from 0 to 3, and the switch would filter each packet using the matching filter table index.
+
+\textbf{Protocol support.}
+Our design basically considers UDP for the L4 protocol since our focus is on microsecond-scale RPCs, which usually consist of a single packet~\cite{alto,deathstarbench,racksched}.
+However, some RPC applications may choose to use TCP.
+To support TCP without any unexpected behavior, the request ID assignment logic should be revised.
+This is because the switch will assign a different request ID for retransmitted requests, which can lead to misbehavior for multi-packet requests.
+To address this, we use a tuple of the client ID and a local sequence number generated by the client for request IDs like Lamport clocks~\cite{lamportclock,hermes}.
+Additionally, we also append the \sys header to the TCP handshake packet for applying the \sys logic though they do not contain a payload.
+
+
+\textbf{Integration with RPC frameworks.}
+We clarify that integrating \sys with existing RPC frameworks like eRPC~\cite{erpc} may require a considerable amount of engineering effort because the framework provides various functions and diverse packet transport logic like RDMA, which can cause a functional collision with \sys.
+For example, some RPC frameworks can generate multiple packets for a single request even if the request size is small.
+In this case, \sys may clone only partial packets of a multi-packet request when the server state information is updated.
+This does not provide as much performance improvement as full cloning.
+However, this still provides a degree of improvement since cloned packets of the request see the performance gain.
+The retransmission of a request is a similar case since the tracked server state is continuously changed.
+However, it is intentional that original packets and retransmitted packets may differ in copying or not because we should clone packets by considering the state of servers.
+Furthermore, RPC frameworks should have a redundancy filtering mechanism or redundancy-aware response handling mechanism because a redundant response may not be filtered by the switch.
+Without such a mechanism, RPC frameworks may not work correctly.
+To support RDMA-based RPC frameworks, we need to revise the switch data plane partially for parsing the RDMA header and should address potential issues.
+Note that it is possible to parse and craft RDMA packets in the switch data plane~\cite{kim20tea}.
+
+\subsection{Generality}
+A high-level takeaway from our work is that switches are an attractive high-performance vantage point to perform various functions in the era of microseconds.
+Therefore, we believe that the design choice of \sys can inspire the emergence of other in-network computing systems for microsecond-scale applications.
+Furthermore, the proposed techniques can be applied to various in-network computing systems.
+For example, we leverage recirculation to assign the IP address to the cloned packet.
+This can be applied to other systems that replicate packets in the programmable switch, which include data replication, consensus, and multi-path routing.
+Request filtering using request fingerprints in the data plane can also be applied to other systems.
+For example, an admission control mechanism that requires frequent and quick rule updates can utilize this.
+This is because the rule update by the switch control plane is slow and has limited update throughput whereas the register update in the switch data plane is fast and offers line-rate throughput.

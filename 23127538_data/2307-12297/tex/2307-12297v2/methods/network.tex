@@ -1,0 +1,54 @@
+% Figure environment removed
+% Figure environment removed
+\noindent In \cref{eq:multiframe:setOfFrames} we show that different views of the same object have usable redundant information.
+To exploit the redundancy, these different perspectives require accurate mapping of the frames to pivot frame $\mathcal{I}$.
+Na\"ively, a temperature map $\Hat{X}$ can be estimated from \cref{eq:multiframe:setOfFrames} by:
+\begin{equation}\label{eq:methods:naiveSolution}
+    \begin{split}
+        \Hat{X}_{naive}^{u,v} &= \frac{1}{\nFrames}\sum_{i=1}^\nFrames\left[\frac{1}{g^{u-x_i,v-y_i}}\Tilde{I}^{u,v}_i - \frac{d^{u-x_i,v-y_i}}{g^{u-x_i,v-y_i}}\right]\longrightarrow\\
+        \Hat{X}_{naive}^{u,v} &= \frac{1}{\nFrames}\sum_{i=1}^\nFrames\left[G^{u-x_i,v-y_i}\Tilde{I}^{u,v}_i + D^{u-x_i,v-y_i}\right]
+    \end{split}
+\end{equation} where 2D coefficient maps $G$ and $D$.
+The na\"ive approach requires exact registration between frames.
+The information must be located on the exact same coordinates across all frames.
+Inaccurate registration leads to artifacts or ghosting, as well as inexact temperature estimation.
+Even with a robust registration framework there is always some degree of misalignment between frames, so the na\"ive approach is unsuitable for practical use.
+
+The method for temperature estimation proposed in this work is robust to misalignment between frames.
+The frames are registered toward $\mathcal{I}$ using any off-the-shelf registration method, then fed into a NN that predicts a kernel for each pixel in every frame of the burst.
+The kernels are then applied on overlapping patches around each pixel by an inner product between the patch and kernel.
+Our method is based on the KPN proposed by De~Brabandere et al.~\cite{DeBrabandere16}.
+\cref{fig:methods:kernels} shows kernels predicted by the network. The kernels compensate for misalignment between frames by spatially shifting their center to compensate for the shifts.
+% Our method is based on kernel prediction networks (KPN) proposed by De~Brabandere et al.~\cite{DeBrabandere16} for predicting correspondence between frames. Recently, KPN was applied to various tasks such as deblurring~\cite{Dahary2020}, spatial super resolution in videos~\cite{Younghyun18} and denoising~\cite{mildenhall2018kpn}.
+% KPN enables the use of different samples of the same scene, even samples with blur or noise. The predicted kernels handles the degradation, be it noise, blur or nonuniformity, and the merged results are sharp.
+
+The architecture of the temperature estimation network is based on UNET~\cite{unet}, with the kernel prediction block attached to the rear end of the decoder. The encoder and decoder are composed of three $3\times 3$ convolution layers with activations and normalizations, and are described in \cref{table:nn_architecture} in the supplementary material.
+The kernel prediction block is composed of three $1\times 1$ convolution layers with activations, and is described in \cref{table:kpnBlock} in the supplementary material.
+The entire network architecture is detailed in the supplementary material.
+
+Although the KPN corrects nonuniformity, its temperature estimation is inaccurate.
+To improve the latter to match radiometric cameras, we used the ambient temperature as prior information to calibrate the output of the network.
+The offset between the gray-level frames and the temperatures was modeled as a polynomial of the mean of the gray-level frames and the ambient temperature:
+\begin{equation}\label{eq:methods:temperature_encoding}
+    \Tilde{d}\left(\Tilde{I},\tamb\right) = \frac{1}{N}\sum^N_{n=1}\underbrace{\left[\sum_{i,j=0}^\nu\delta_{i,j}\cdot \text{Mean}\left({\Tilde{I}_n}\right)^i \cdot \tamb^j\right]}_{\Tilde{d}_n}
+\end{equation} where $\Tilde{d}_n$ is the offset for frame $n$, $\text{Mean}\left({\Tilde{I}_n}\right)$ is the spatial mean of the $n$th gray-level frame, $\tamb$ is the ambient temperature, $\delta_{i,j}$ are the coefficients of the polynomial, and $\nu$ is the degree of the polynomial.
+
+% Figure environment removed
+
+The offset block was jointly trained with the network, allowing the entire network to train end-to-end.
+Namely, the coefficients $\delta_{i,j}$ of $\Tilde{d}_n$ were realized by a set of $N\times(\nu+1)$ weights organized in a matrix, such that a single matrix multiplication and summation is required to calculate the offset for all frames.
+We found that a polynomial of degree $\nu=4$ offers sufficient improvement in the accuracy of the temperature estimation, and that training the offset block separately from the network does not offer significant improvement.
+\cref{fig:methods:temperature_encoding} shows the results of the offset block. The error between the temperature estimation of the offset block and the ground truth (GT) temperature is shown. The error is sub-degree Celsius, and the offset is accurate enough to calibrate the output of the network.
+
+The following equation describes the temperature estimation by applying a KPN to the image-acquisition model.
+To combine the information from multiple frames, the gain term in \cref{eq:multiframe:setOfFrames} is generalized as a KPN, and the information from all frames is used.
+The kernels applied to each pixel handle the nonuniformity and noise, and the offset term in \cref{eq:methods:temperature_encoding} handles the thermal calibration, resulting in the temperature estimation $\temperatureEstimationPerPixel$:
+\begin{equation}\label{eq:methods:KPN}
+    \temperatureEstimationPerPixel = \sum_{n=1}^\nFrames\left<\kernels^p_n,S^p\left(\Tilde{I}^p_n\right)\right> + \Tilde{d}\left(\Tilde{I},\tamb\right)
+\end{equation} where $\nFrames$ is the number of frames in a burst, $\kernels$ is the kernel of size $K\times K$ produced by the kernel prediction block, and $S(\cdot)$ is a function that crops a $K\times K$ patch around a pixel $p$ in the support of the frames.
+
+The scheme of the model is shown in \cref{fig:methods:network}. The registered burst of frames is fed into the network, which outputs a kernel for each pixel in each frame.
+These kernels $\kernels$ serve as the \textit{gain} in \cref{eq:methods:KPN}.
+The registered frames are also fed to the offset block along with the ambient temperature, which outputs the \textit{offset} term in \cref{eq:methods:KPN}.
+The gain is applied to the frames and the results are summed depth-wise.
+The scene temperature estimation $\temperatureEstimation$ is obtained by adding the offset term to the result of the depth-wise summation.

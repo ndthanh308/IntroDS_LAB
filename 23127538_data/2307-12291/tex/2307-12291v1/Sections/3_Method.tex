@@ -1,0 +1,175 @@
+%&latex
+\section{Method}
+
+
+\noindent \textbf{Overview.} The task of generalizable neural human rendering targets on learning conditional NeRF across multi-view videos of different subjects, which can generalize to unseen subjects in a single feed-forward pass given sparse reference views. At the core of the task is to get a high-quality condition feature that contains accurate subject information for each query point sampled on rays. To this end, we propose a novel framework named TransHuman which shows superior generalization ability. As shown in Fig.~\ref{fig_overview}, TransHuman is mainly composed of three aspects: Transformer-based Human Encoding (TransHE), Deformable Partial Radiance Fields (DPaRF), and Fine-grained Detail Integration (FDI). \S~\ref{Sec_TransHE} introduces the TransHE which builds a pipeline for capturing the global relationships between human parts via transformers under the canonical space. \S~\ref{Sec_DPaRF} demonstrates the DPaRF which deforms the processed SMPL back to the observation space and fetch a robust human representation. \S~\ref{Sec_FDI} presents the FDI module that further gathers the fine-grained information directly from the observation space with the guidance of human representation. After that, we introduce the volume rendering  in \S~\ref{Sec_rendering}, and the training and inference pipelines in \S~\ref{sec_losses}.
+
+\subsection{Transformer-based Human Encoding}
+\vspace{-2mm}
+% TODO: clarify the coordinate system 
+\label{Sec_TransHE}
+% \noindent\textbf{Motivation.} For capturing the global relationships around the surface of SMPL model. 
+For simplicity, we start by introducing the process of a single reference image that is applicable for all other views, and the multi-view aggregation will be detailed in \S~\ref{Sec_FDI}.
+Given a reference images $I$ for a certain time step and its corresponding pre-fitted SMPL model $V^o \in \mathbb{R}^{6890\times3}$ under the observation pose~\footnote{We use the SMPL coordinate system unless otherwise specified.}, we first project the $d_1$-dimensional deep features of $I$ extracted by CNN to the vertices of $V^o$ based on the camera information, and get the painted SMPL $F \in \mathbb{R}^{6890\times d_1}$. 
+% TODO: More detailed.  XXXX
+Previous methods~\cite{kwon2021nhp,chen2022gpnerf} have mainly employed the SPC~\cite{liu2015sparse} to diffuse the painted SMPL to nearby space (Fig.~\ref{fig_idea}). However, they optimize under the varying observation space which leads to the pose misalignment between training and inference stages, and the limited receptive fields of 3D convolution blocks make it sensitive to the incomplete painted SMPL input caused by the heavy self-occlusions of human bodies. Tackling these issues, we present a pipeline named Transformer-based Human Encoding (TransHE) that captures the global relationships between human parts under the canonical space. The key of TranHE includes a canonical body grouping strategy for avoiding the semantic ambiguity and a canonical learning scheme to ease the optimization and improve the generalization ability.  
+
+\noindent \textbf{Canonical Body Grouping.}  Directly taking all the vertex features of $F$ as input tokens of transformers is neither effective considering the misalignment between fitted SMPL and the ground truth body, nor efficient due to the large vertex number, \ie, $6890$. A possible solution is to directly perform the grid voxelization~\cite{mao2021votr} on $F$ under the observation pose. However, due to the complex human poses, this will lead to the semantic ambiguity issue. 
+More concretely, the gathered vertices in each voxel are highly different as the pose changes (\ie, temporal semantic variance), and a voxel might include vertices from dispersed semantic parts (\ie, spatial semantic entanglement), as illustrated in Fig. \ref{fig_semantic_ambiguity}.
+% More concretely, the gathered points in each voxel is highly different as the pose changes, and the voxel might includes points from disperse semantic parts, \eg, when a hand is close to a leg, the points from these two parts might be split into a same voxel, which is misleading for capturing the global relationship between semantic parts. 
+
+To tackle this issue, we propose that grouping the vertices under the canonical space and then applying this canonical grouping to all the observation poses is a better choice. Compared with the varying observation poses, the canonical pose is both \textit{static} and more \textit{stretched}, which can largely relieve the semantic ambiguity issue via the consistent split among different poses (\ie, temporal semantic consistency) and more disentangled semantics in each voxel (\ie, spatial semantic disentanglement), as shown by the right part of Fig.~\ref{fig_semantic_ambiguity}. 
+
+%%%%%%%%%%%%%%%%%%%%
+ \input{./Figures/Semantic_Ambiguity}
+
+
+Formally, we first process the canonically posed (T-posed) SMPL  $V^{c} \in \mathbb{R}^{6890\times3} $ with a clustering algorithm (\eg, k-means~\cite{ahmed2020k}) based on the 3D coordinates, and get a grouping dictionary $\mathcal{D}^{c}$ caching the indexes of the SMPL vertices that belong to the same cluster, as illustrated in Fig.~\ref{fig_overview}. Notice that we only need to calculate $\mathcal{D}^{c}$ once before training. 
+% \eg, $\mathcal{D}^{c} = \{1:1,2; \;\; 2:3\}$ when cluster $1$ contains vertex $1$ and $2$, while cluster $2$ contains vertex $3$. 
+Then, for each iteration, the features from the same cluster are aggregated via average pooling: 
+\begin{equation}
+    \widehat{F} = \mathcal{G}_{\mathcal{D}^{c}}(F), \;\;\; \widehat{F} \in \mathbb{R}^{N_t \times d_1},
+\end{equation}
+where $N_t$ is the number of clusters (tokens), and $\mathcal{G}_{\mathcal{D}^{c}}(\cdot)$ indicates indexing based on $\mathcal{D}^{c}$ and then performing average pooling in each cluster. 
+% TODO: explain the choice of clustering instead of grid voxelization here. 
+
+% The function of canonical body grouping is similar as the linear projection in Vision Transformers (ViT)~\cite{dosovitskiy2020ViT} that projects the flattened high-resolution image patches into high-dimensional tokens, yet differs mainly in that we perform on the 3D surface of canonical SMPL with a clustering algorithm and aggregate in a non-parametric manner. 
+
+\noindent \textbf{Canonical Learning.} 
+After grouping, we now have a decent number of input tokens, and the next question is about the choice of position embedding for each token. 
+Since we need the condition feature of a query point under the observation space, a possible choice is to directly learn under the observation space (same as SPC-based methods~\cite{kwon2021nhp,chen2022gpnerf}) and use the 3D coordinates of each token under the observation pose as the position information, \ie, $\widehat{V}^o = \mathcal{G}_{\mathcal{D}^{c}}(V^o) \in \mathbb{R}^{N_t \times 3}$. However, except for the pose misalignment issue mentioned previously, 
+% this strategy suffers mainly from two aspects: First, the varying poses under the observation space leads to the pose misalignment between training and inference stages, therefore harming the generalization ability. Second,
+$\widehat{V}^o$ is also varying for different time steps, which leads to the unfixed patterns of position embeddings that make it harder to capture the global relationships between human parts. 
+
+Hence, to address these issues, we propose to learn the global relationships under the static canonical space for removing the pose-misalignment and easing the learning of global relationships: 
+\begin{equation}
+    \widehat{F}^{'} = \mathcal{T}(\widehat{F}, \gamma_1(\widehat{V}^c)),
+\end{equation}
+where $\widehat{V}^c = \mathcal{G}_{\mathcal{D}^{c}}(V^c)$ is the token positions under the canonical space, $\gamma_1(\cdot): \mathbb{R}^{3 \rightarrow d_1}$ represents the positional encoding used in the original NeRF~\cite{mildenhall2021nerf}, $\mathcal{T}(\cdot): \mathbb{R}^{d_1 \rightarrow d_1}$ indicates the transformers, and $\widehat{F}^{'} \in \mathbb{R}^{N_t \times d_1}$ is the output tokens with learned global relationships between each other.  
+
+% Different from the SPC-based methods~\cite{kwon2021nhp,chen2022gpnerf} that learn under the volatile observation poses, our TransHE applies a canonical learning scheme that removes the pose misalignment between training and inference stages, therefore leads to the better generalization ability. 
+
+% TODO: merge this to the previous paragraph 
+
+
+% TODO: Partial radiance fields 
+\subsection{Deformable Partial Radiance Fields}
+\vspace{-2mm}
+\label{Sec_DPaRF}
+% In the SPC-based representation~\cite{kwon2021nhp,chen2022gpnerf}, a trilinear sampling scheme is employed to fetch the final human representation from the discrete 3D feature volume. 
+% However, such scheme limits the information into the discrete volume. 
+% For a more continuous representation, 
+For deforming the processed SMPL back to the observation space and get a robust human representation, we present the Deformable Partial Radiance Fields (DPaRF). The main idea of DPaRF is to bind each output token of TransHE with a conditional partial radiance field for a certain semantic part whose coordinate system deforms as the pose changes under the observation space, and the query points from rays are encoded as the coordinates under the deformed coordinate system, as shown in Fig.~\ref{fig_overview}. 
+
+\noindent \textbf{Coordinate System Deformation.} 
+Given the $i$-th token $\widehat{F}^{'}_{i} \in \mathbb{R}^{d_1}$ from the TransHE output, a coordinate system $W^c_i \in \mathbb{R}^{3 \times 3 }$ is initialized under the canonical space which takes $\widehat{V}^c_{i} \in \mathbb{R}^{3}$ as the origin~\footnote{Without loss of generality, we set  $W_i$ as the identity matrix for all the tokens for simplicity.}. Then, as the pose changes under the observation space, we rotate  $W^c_i$ with the rotation matrix $\widehat{R}_i \in \mathbb{R}^{3 \times 3 } $ of token $i$:
+\begin{equation}
+    W_i^o = \widehat{R}_i W_i^c,
+\end{equation}
+where $\widehat{R}_i$ is the  averaged rotation matrix for vertices belonging to the $i$-th token, \ie, $ \widehat{R} = \mathcal{G}_{\mathcal{D}^c}(R) \in \mathbb{R}^{N_t \times 3 \times 3 } $, and $R \in \mathbb{R}^{6890 \times 3 \times 3 }$ can be calculated via blending the rotation matrices of $24$ joints with the blend weights provided by SMPL~\cite{loper2015smpl}. 
+
+% the provided blend weights from SMPL~\cite{loper2015smpl} and the target poses. 
+
+\noindent\textbf{Coordinate Encoding.}
+After that, for a query point $\mathbf{p}$ sampled from the rays under the observation space, we get its coordinate   $\overline{\mathbf{p}}_i$ under the DPaRF of the $i$-th token with:
+    \begin{equation}
+          \overline{\mathbf{p}}_i =  W_i^o (\mathbf{p} - \widehat{V}_i^o).
+    \end{equation}
+And the final fetched human representation from the DPaRF of the $i$-th token is:
+\begin{equation}
+\label{eq_humanrepresentation}
+    \mathbf{h}_i = [\widehat{F}^{'}_{i}; \gamma_2(\overline{\mathbf{p}}_i)],   \;\;\; \mathbf{h}_i \in \mathbb{R}^{d_2}, 
+\end{equation}
+where $[;]$ indicates the concatenation, and $\widehat{F}^{'}_{i}$ is the condition feature for the $i$-th DPaRF. 
+
+% Compared with the trilinear sampling of discrete 3D volumes in SPC-based representation, DPaRF directly uses the more continuous 
+ % local coordinates. 
+
+%TODO: 
+    \noindent \textbf{K-nearest Fields Aggregation.}
+Finally, for a more robust representation, we assign a query point $\mathbf{p}$  to its $N_k$ nearest DPaRFs, and aggregate them based on the distances:
+\begin{equation}
+\mathbf{h} = \sum_{i=1}^{N_k} softmax(- \frac{\| \mathbf{p} - \widehat{V}_i^o \| _2}{ \sum_i \| \mathbf{p} - \widehat{V}_i^o\|_2 }) \mathbf{h}_i,
+\;\;\; \mathbf{h} \in \mathbb{R}^{d_2}.
+\end{equation}
+% where $\sigma(\cdot)$ is the softmax normalization function. 
+% summary & discussion
+
+\subsection{Fine-grained Detail Integration}
+\label{Sec_FDI}
+\vspace{-2mm}
+
+With TransHE and DPaRF, for a query point $\mathbf{p}$, we can actually achieve a set of human representations from $N_v$ reference views $ \mathbf{h}^{1:N_v} = \{ \mathbf{h}^j \}_{j=1}^{N_v} \in \mathbb{R}^{N_v \times d_2} $ 
+ following the same procedure.  $\mathbf{h}^{1:N_v}$ contains coarse information with human priors (\eg,  geometry constraints and certain color information) yet lacks the fine-grained information (\eg, lighting, textures) for high-fidelity novel view synthesis. Therefore, inspired by~\cite{kwon2021nhp}, we further integrate the fine-grained information from the pixel-aligned appearance feature $\mathbf{a}^{1:N_v} = \{ \mathbf{a}^j\}_{j=1}^{N_v} \in \mathbb{R}^{Nv \times d_2} $ at the guidance of human representation $\mathbf{h}^{1:N_v}$. 
+
+ \noindent\textbf{Fine-grained Appearance Features.}
+ For the appearance features, instead of directly using projected deep features from CNN, \ie, the one used when painting SMPL, we additionally concatenate the projected  RGB-level information from the raw images and then fuse them with a fully connected layer $FC(\cdot): \mathbb{R}^{3+d_1 \rightarrow d_2}$. 
+ % \begin{equation}
+ % \label{eq_RGB}
+ %    \mathbf{a}^j  = FC([\Gamma(I^j); \Gamma(CNN(I^j))]), \;\;\;  \mathbf{a}^j \in \mathbb{R}^{d_2},
+ % \end{equation}
+ % TODO: Wherether to introduce this trick on method or experiment. 
+ % where $\Gamma(\cdot)$ is the projection operation. 
+ The projected RGB features can complement the misaligned and lost details caused by the down-sample operation in CNN. 
+
+% TODO: Coarse-t
+ \noindent\textbf{Coarse-to-fine Integration.}
+Then, we employ a cross-attention module which takes the human representation $\mathbf{h}^{1:N_v}$ as the query, and the appearance feature $\mathbf{a}^{1:N_v}$ as the key and value, and get the integrated feature $\mathbf{f}^{1:N_v} \in \mathbb{R}^{N_v \times d_2}$. The final condition feature  $\mathbf{f} \in \mathbb{R}^{d_2}$ of query point $\mathbf{p}$ is achieved via the average pooling on the view dimension: $\mathbf{f} = \sum_{j=1}^{N_c} \frac{1}{N_c}\mathbf{f}^{j}$. 
+% \begin{equation}
+% \small
+%     \begin{aligned}
+%     & att = softmax(\frac{1}{d_2}Q(\mathbf{h}^{1:N_v})\cdot K(\mathbf{a}^{1:N_v})^{T}), \;\;\; att \in \mathbb{R}^{N_v \times N_v}, \\
+%     & \mathbf{f}^{1:N_v} = att \cdot V(\mathbf{a}^{1:N_v}) + \mathbf{h}^{1:N_v}, \;\;\; \mathbf{f}^{1:N} \in \mathbb{R}^{N_v \times d_2},
+% \end{aligned}
+% \end{equation}
+% \begin{equation}
+% \small
+%     \mathbf{f}^{1:N_v} = CA(Q(\mathbf{h}^{1:N_v}), K(\mathbf{a}^{1:N_v})),   V(\mathbf{a}^{1:N_v})),  
+% \end{equation}
+% where $Q(\cdot)$, $K(\cdot)$, $V(\cdot):\mathbb{R}^{d_2 \rightarrow d_2}$ are learnable query, key, and value embedding functions,  $CA(\cdot)$ indicates the cross attention module, and $\mathbf{f}^{1:N} \in \mathbb{R}^{N_v \times d_2}$ is the . 
+
+% The final condition feature $\mathbf{f} \in \mathcal{R}^{d_2}$ of query point $\mathbf{p}$ is achieved via the average pooling on the view dimension: $\mathbf{f} = \sum_{j=1}^{N_c} \frac{1}{N_c}\mathbf{f}^{j}$. 
+
+% \noindent \textbf{Desnity \& Color Prediction.}
+
+\subsection{Volume Rendering}
+ \label{Sec_rendering}
+ \vspace{-2mm}
+ \noindent \textbf{Desnity \& Color Prediction.}
+ The final density $\sigma(\mathbf{p}) \in \mathbb{R}^1$ and color $\mathbf{c}(\mathbf{p}) \in \mathbb{R}^3$ are predicted as: 
+\begin{equation}
+\begin{aligned}
+    & \sigma(\mathbf{p}) = MLP_{\sigma}(\mathbf{f}), \\
+    & \mathbf{c}(\mathbf{p}) = MPL_{\mathbf{c}}(\mathbf{f},\gamma_3( \mathbf{d})),
+\end{aligned}
+\end{equation}
+where $MLP_{\sigma}$ and $ MLP_{\mathbf{c}}$ are NeRF MLPs for density and color predictions, respectively, and $\mathbf{d}$ is the unit view direction of the ray. 
+
+\noindent \textbf{Differentiable Rendering.}
+ Then, for a marched ray $\textbf{r}(z) = \textbf{o} + z \textbf{d}$, where $\textbf{o} \in  \mathbb{R}^3$ represents the camera center, and $z \in  \mathbb{R}^1$ is the depth between a pre-defined bounds $[z_n, z_f]$, its color $\textbf{C}(\textbf{r})$ is calculated via the differentiable volume rendering~\cite{mildenhall2021nerf}:
+\begin{equation}
+    \label{accumulate}
+    \textbf{C}(\textbf{r}) = \int_{z_n}^{z_f} T(z) \sigma (z) \textbf{c}(z) dz,
+\end{equation}
+where $T(z) = exp (- \int_{z_n}^z \sigma(s) ds )$ represents the probability that the ray travels from $z$ to $z_n$. 
+
+\subsection{Training \& Inference}
+\label{sec_losses}
+\vspace{-1mm}
+\noindent\textbf{Training Losses.} We compare the rendered pixel colors with the ground truth ones for supervision. Similar to \cite{weng2022humannerf}, we employ the MSE loss for pixel-wise and perceptual loss~\cite{zhang2018unreasonable} for patch-wise supervision, which is more robust to misalignments. The random patch sampling~\cite{weng2022humannerf} is employed for supporting perceptual loss training.  The overall loss is:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{MSE} + \lambda \mathcal{L}_{PER},
+\end{equation}
+where we set $\lambda=0.1$ by default.
+
+
+\noindent\textbf{Inference.} During the inference stage, for each time step, $N_v$ reference views are provided and the rendered target views are compared with the ground truth ones for calculating the metrics. 
+Notably, GP-NeRF~\cite{chen2022gpnerf} has proposed a fast rendering scheme that leverages the coarse geometry prior from the 3D feature volume to filter out useless points. Similarly, our framework also supports such strategy by simply using the SMPL template as the geometry prior instead (detailed in the appendix). 
+
+% \subsection{Overall Losses}
+% \label{Sec_losses}
+% Given a target view, we compare the rendered color with the ground truth color for supervision. Similar as \cite{weng2022humannerf}, we employ the MSE loss for pixel-wise and perceptual loss~\cite{zhang2018unreasonable} for patch-wise supervision, which is more robust to misalignments. The random patch sampling~\cite{weng2022humannerf} is employed for supporting the perceptual loss training.  The overall loss is:
+% \begin{equation}
+%     \mathcal{L} = \mathcal{L}_{MSE} + \lambda \mathcal{L}_{PER},
+% \end{equation}
+% where we set $\lambda=0.1$ by default.

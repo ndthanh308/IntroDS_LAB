@@ -1,0 +1,160 @@
+\section{motivation}\label{sec:motivation}
+
+%\todo{Revise:
+%需要更新motivation为
+%%在GPU上执行效率低
+%%%1）性能指标表支持利用效率低
+%%%2）Bound图支撑Stage和语义图之间的并行性挖掘
+%%%3）DRAM访存图支撑语义图之间的数据复用性挖掘
+%%为什么需要设计新的加速器
+%%%1）无法实现全流程加速
+%%%2）缺乏定制优化挖掘新的并行性和数据复用性
+%%%%逻辑结构
+
+%%Execution Bound 
+%%Acceleration Challenges: Compute bound and memory bound (Table and Execution bound Figure)
+%%Acceleration Opportunities: Parallelism and Data Reusability
+%%Ineffieciencies of existing architectures 
+%}
+
+%In this section, we quantitatively characterize and identify the execution patterns in processing HGNNs. Based on this, we explain the motivation behind our design.
+
+This section explains the motivation to design the accelerator for HGNNs via characterization. 
+
+\subsection{Characterization of HGNNs on GPU} \label{sec:characterization}
+We conduct a quantitative characterization for HGNNs on an NVIDIA GPU T4 using two prevalent HGNN models. We focus on the last three stages for the inference acceleration on transductive learning and omit SGB stage since it is executed in CPU in the training phase. The experimental setup is shown in Section~\ref{sec:evaluation_methodology}. Note that the processing of total vertices is batched into a coarse-grained matrix operation for efficient execution on GPUs.
+%\revise{Due to the SGB stage is executed in CPU and completed during training phase, the characterization focuses on the other stages.}  %在background中描述，
+
+\textbf{Execution Time Breakdown.} 
+Fig.~\ref{fig:execution_breakdown} shows the breakdown of the execution time of the inference phase. 
+The FP, NA, and SF stages take 24\%, 71.5\%, and 4.5\% execution time averaging across different models and datasets, respectively.
+From above, the NA stage dominates the execution time of HGNNs. The reason is that, for each semantic graph, neighboring feature vectors of each vertex in the corresponding semantic graph need to be aggregated, which is time-consuming.
+
+%\todo{
+%根据表2和Roofline图，描述每个stage调用的kernel，以及他们的瓶颈，并举例说明一个NA中最重要kernel的时间占比、带宽利用率和峰值性能，并总结得出每个stage的execution bound。
+%}
+
+\textbf{Execution Bound.}
+Different stages exhibit different execution bounds, leading to low utilization of various hardware components, as demonstrated in Fig.~\ref{fig:roofline} and Table~\ref{tab:kernel_profiling_details}. 
+
+$\bullet$  \textit{The FP stage is dominated by the execution of dense-dense matrix multiplication, primarily facing compute bound.} The CUDA kernels in the FP stage generally exhibit compute bound due to their high compute-to-memory-access ratios, such as the sgemm (dense-dense matrix multiplication) kernel. 
+%Table~\ref{tab:kernel_profiling_details} shows that the sgemm kernel consumes the most execution time of the NA stage, exhibiting high performance and a high degree of data locality.
+For example, the sgemm kernel in the HAN model on the DBLP dataset costs over 97.4\% execution time of the FP stage. 
+The arithmetic intensity of this kernel is 26.8 FLOP/Byte and larger than the one in the ridge of Roofline (see Fig.~\ref{fig:roofline}), which reveals that the FP stage faces compute bound.
+In addition, this kernel achieves 95.9\% peak performance due to the intensive computation. 
+However, this kernel only reaches 33.6\% DRAM bandwidth utilization due to the high reuse ratio of data, leaving plenty of DRAM bandwidth underutilized.
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+$\bullet$  \textit{The NA stage is dominated by the execution of graph-topology-dependent operations, primarily exhibiting memory bound and irregular memory access pattern.} 
+The CUDA kernels in the NA stage perform compute operations dependent on the irregular topology of graphs, generally showing memory bound caused by the irregular memory accesses to neighboring feature vectors, such as the SpMMCsr (SpMM, sparse-dense matrix multiplication). 
+Taking the HAN model on the DBLP dataset as an example, the SpMMCsr kernel aggregates neighboring feature vectors into a single vector for each vertex according to the irregular neighbor connection. 
+This kernel achieves high DRAM bandwidth utilization (74.3\%) with a low L2 Cache hit rate (31.4\%) due to the intensive irregular memory accesses. 
+In addition, this kernel exhibits low arithmetic intensity (0.49 FLOP/Byte) and low achieved peak performance (3.9\%). This reveals that many computing resources in the NA stage are underutilized.
+
+$\bullet$  \textit{The SF stage is dominated by the execution of dense-dense matrix multiplication, element-wise operation, and data rearrangement operation, primarily facing compute bound first and then memory bound.}
+%
+In this stage, the sgemm kernel first calculates attention weights for each resulting feature vector of each semantic graph from the NA stage, and then the uEleWise (unrolled\_elementwise\_kernel), Concat (CatArrayBatchedCope) and Reduce kernels aggregate these feature vectors into single one for each vertex with attention weights. 
+The sgemm kernel still exhibits compute-bound.
+On the contrary, the uEleWise, Reduce, and Concat kernels show memory bound.
+As a result, the SF stage faces low DRAM bandwidth utilization first and then low compute utilization. 
+%\candelete{Note that R-GCN, the early-stage HGNN model, directly performs Reduce kernel, using sum operation to aggregate the resulting feature vectors without attention weights, so that its SF stage only exhibits memory bound. But attention-based aggregation is prevalent recently because it helps achieve better accuracy~\cite{HAN}.}
+
+
+
+\begin{table}[!t]
+   % \vspace{-10pt}
+    \caption{Profiling results of major CUDA kernels on HAN model with DBLP dataset.} \label{tab:kernel_profiling_details}
+    %\vspace{-10pt}
+    \centering
+    \setlength\tabcolsep{3pt}%	
+	\renewcommand\arraystretch{0.8}
+    \resizebox{0.49\textwidth}{!}{
+\centering
+
+\begin{tabular}{ccccc}
+\toprule
+  \begin{tabular}[c]{@{}c@{}} \textbf{Kernel} \\ \textbf{Name}  \end{tabular}  & 
+  \begin{tabular}[c]{@{}c@{}} \textbf{Time}   \\ \textbf{(\%)} \end{tabular}     & 
+  \begin{tabular}[c]{@{}c@{}} \textbf{Achieved Peak} \\ \textbf{Performance (\%)} \end{tabular} & 
+  \begin{tabular}[c]{@{}c@{}} \textbf{DRAM Bandwidth} \\ \textbf{Utilization (\%)} \end{tabular}  &
+\begin{tabular}[c]{@{}c@{}} \textbf{L2 Cache} \\ \textbf{Hit  Rate (\%)} \end{tabular} \\ \midrule \midrule
+ \multicolumn{5}{c}{\blackcircledempty{2} Feature Projection (Compute Bound)}    \\ \midrule 
+    sgemm    & 97.4\% & 95.9\% & \textbf{33.6\%} &  82.7\%   \\ \midrule \midrule
+\multicolumn{5}{c}{\blackcircledempty{3} Neighbor Aggregation (Memory Bound)}       \\ \midrule 
+    SpMMCsr  & 85.9\% & \textbf{3.9\%}  & 74.3\%  & \textbf{31.4\%} \\
+    \midrule \midrule
+    \multicolumn{5}{c}{\blackcircledempty{4} Semantic Fusion (Compute Bound $\rightarrow$ Memory Bound)}        \\ \midrule  
+    sgemm   & 47.8\% & 84.2\% & \textbf{42.4\%} & 83.3\% \\
+   uEleWise  & 20\%   & \textbf{0.9\%}  & 82.4\% & \textbf{50.0\%} \\
+    Reduce   & 11\%   & \textbf{3.1\%}  & 88.3\%  & \textbf{25.2\%}\\  
+    Concat   & 17.5\% & \textbf{0\%}    & 81.6\% & \textbf{50.0\%} \\
+    \bottomrule
+\end{tabular}
+    }
+    
+   % {\scriptsize `Bandwidth' and `Performance' are respectively abbreviated to BW and Perf. The unit of arithmetic intensity is FLOP/Byte. `Peak Performance (\%)' represents the percentage of achieved performance to peak performance (FLOPS).}
+  	\vspace{-5pt}
+\end{table}
+
+
+%\todo{
+%如下的比较参考一下基金本子的写法，要体现并行性和数据局部性，对应下面的design requirements
+%}
+
+\textbf{Differences between GNNs and HGNNs.} 
+%GNNs usually consist of two stages: the Aggregation stage which aggregates the neighboring feature vectors for each vertex; the Combination stage which updates the feature vectors of each vertex using the aggregated results. 
+The major differences between GNNs and HGNNs on execution are:
+
+$\bullet$  \textit{Joint Feature Projection vs. Separate Feature Projection.} The raw feature vector of each vertex in HomoGs is in the same vector space with the same dimension. Thus, the feature projection of vertices in GNNs can be performed jointly. However, the raw feature vectors of vertices of different types in HetGs are not in the same vector space and have different dimensions, requiring different feature projection parameters. Generally, HGNNs utilize a specific feature projection matrix for each vertex type or in each semantic graph.
+
+$\bullet$  \textit{Aggregation vs. Aggregation+Fusion.} GNNs only aggregate once for the neighbor aggregation on a single type of relation. HGNNs aggregate features from neighbors in each semantic graph generated according to corresponding semantics (relations or metapaths), and then fuse intermediate results of each semantic graph for each vertex. 
+
+
+% These differences indicate that traditional GNN accelerators cannot be straight applied in HGNNs, %这个是inefficiency of previous work， 后面章节才写
+
+\textbf{These differences introduce high-degree inter-semantic-graph parallelism and data reusability, exposing opportunities for HGNN acceleration.}
+The inter-semantic-graph parallelism in the NA stage points to that different semantic graphs can be processed in parallel. The inter-semantic-graph data reusability derives from that the intermediate results of the FP stage can be reused across the processing of different semantic graphs. Furthermore, more semantic graphs can capture more semantics in deep, which helps improve the prediction accuracy of HGNNs~\cite{SeHGNN}. It follows that these parallelism and data reusability becomes higher degree as the number of metapaths increases. 
+
+\subsection{The Need for an HGNN Accelerator}
+
+%HGNNs are showing great potential in various tasks. Many companies, such as Alibaba~\cite{liu2018heterogeneous, Alibaba_Bid_Keyword_Matching,niu2020dual} and Didi~\cite{didi_real-time_event_prediction}, have implemented HGNN in data centers, which reflects the increasing importance and scope of the upcoming applications. An efficient architecture is timely to achieve high performance and stimulate HGNN development. Therefore, given the above characterizations, we explain the motivation to design an HGNN accelerator.
+
+Given the above characterizations, we explain the motivation to design an HGNN accelerator.
+
+\textbf{Limitations of GNN Accelerators.} 
+GNN accelerators tailored to GNNs gain significant speedup and energy savings compared to GPUs~\cite{HyGCN,awbgcn,ReGNN}. Whereas, they lack the HGNN-oriented design and optimization to accelerate HGNNs. 
+First, they have proposed stage-fusion optimizations to accelerate GNNs, but they are ill-suited to HGNNs. This is because the execution semantics and execution patterns of the sequential stages in HGNNs differ from those in GNNs, resulting in different fusion methodologies of compute, memory access, and dataflow.
+Second, they miss elaborate optimizations to exploit the high-degree inter-semantic-graph parallelism and data reusability in the processing of HGNNs.
+Third, GNNs and HGNNs have great differences in execution patterns. GNN accelerators lack the control unit to schedule the whole execution for HGNNs. 
+
+
+%GNN accelerators tailored to GNNs gain significant speedup and energy savings compared to GPUs~\cite{HyGCN,awbgcn}. 
+%However, they are unable to effectively handle the execution of HGNNs. On one hand, the accelerators designed for  graph convolutional network (GCN)~\cite{GCN} and GCN variants (e.g., GraphSage \cite{GraphSage}) target to the simple workflow of GCNs, failing to perform the attention mechanism~\cite{HyGCN,awbgcn,ReGNN} widely used by HGNNs. In addition, they lack the efficient scheduling of the execution flow and dataflow to handle the execution semantics and patterns of HGNNs. 
+%
+%On the other hand, existing graph attention network (GAT)~\cite{GAT} accelerators~\cite{NTGAT,FTW-GAT,FPGAN} employ model quantization and dynamic pruning operations to reduce the number of computations, which sacrifices model accuracy for performance improvement. Due to the multi-level aggregation in HGNNs, the model's accuracy loss can be amplified. Meanwhile,  they lack the ability to fully exploit abundant inter-semantic-graph-level parallelism in heterogeneous graphs and opportunities for data reuse during the execution process. 
+
+
+%\todo{
+%利用上面的分析数据只说GPU的不好，以及无法挖掘新的并行性和数据复用
+%}
+
+\textbf{Inefficiencies of GPUs.}
+GPUs are inherently tailored to compute-intensive workloads such as dense-dense matrix multiplication~\cite{gpu_drawback}. GPUs cannot efficiently handle irregular memory accesses caused by the graph-topology-dependent execution pattern in the NA stage~\cite{HyGCN,Graphicionado,Tesseract,GraphR,GraphDynS,understand_GCN,understand_HGNN}, suffering from low efficiency. For example, the SpMMCsr kernel in the NA stage exhibits high DRAM bandwidth utilization with a low L2 Cache hit rate (see Section \ref{sec:characterization}). This reveals that frequent replacements of feature vectors have occurred, which introduce many redundant DRAM accesses. 
+In addition, existing software frameworks usually execute stages with different execution bounds in serial to leverage hardware-optimized coarse-grained operations on GPUs~\cite{PyG,DGL} (e.g., SpMM), causing low compute utilization and DRAM bandwidth utilization.
+
+\textbf{Design Requirements.}  
+%\todo{add challenges for each requirements
+%我把design requirement 挪下来了，每一点requirements后面简单描述一下每个技术点的design challenge啦，并描述一下我们怎么解决这个design challenge。详细描述可以在设计章节。}
+Given the characteristics of HGNNs, we present the architecture design requirements to perform HGNNs with high performance.
+First, to improve the utilization of various hardware components, a novel stage-fusion methodology is required to fuse stages that exhibit different execution bounds.
+We propose a stage-fusion programming model along with a customized hardware datapath to enable seamless pipelined execution without any stalls.
+%
+Second, the high-degree inter-semantic-graph parallelism and data reusability can be exploited to improve performance and efficiency. It is necessary to design specific computing, memory access, and control units to exploit them. 
+Meanwhile, workload-aware scheduling is proposed to ensure workload balance among pipelines without increasing the latency, and similarity-aware execution scheduling is employed to remove the redundancy compute.
+
+% \add{However, these requirements also give rise to some design challenges. One primary issue is how to separate the stages with explicit execution bounds and how to avoid data conflicts during the fusion process(Section~4.1).
+% Moreover, to utilize the high-degree inter-semantic-graph parallelism and data reusability effectively, ensuring workload balance among pipelines becomes a significant concern(Section~4.2).}

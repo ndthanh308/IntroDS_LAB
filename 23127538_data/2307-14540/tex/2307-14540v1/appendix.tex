@@ -1,0 +1,190 @@
+% \section*{Appendix}
+
+% Figure environment removed
+
+% \subsection{Detailed \ld{} Design and Implementation Choices} \label{app:design_impl}
+\subsection{Converting LD outputs to lateral deviations} \label{app:design_impl}
+
+% The \ld{} is designed to be generally applicable for high-level AD systems. Specifically, we implement \ld{} on two popular open-source high-level AD systems, Baidu Apollo~\cite{apollo} and Autoware~\cite{autoware}, following the system diagram in Fig.~\ref{fig:design_overview}. 
+% In this section, we describe the implementation details in \ld{}.
+
+% \textbf{Converting LD outputs to lateral deviations.}
+% For high-level AD systems, although they do not use LD for localization purpose as mentioned in \S\ref{sec:opportunity}, they often still perform LD in the perception module for camera calibration~\cite{apollo}. Specifically, 
+The LD output consists of the detected left and right lane lines, which are represented as polynomial functions in the bird's eye view~\cite{apollo, openpilot}. An example of the polynomial functions is shown in Fig.~\ref{fig:ld_polys}. For these polynomial functions, the absolute values at $x=0$ represent the vehicle's distances to the lane lines, $d_{\text{left}}$ and $d_{\text{right}}$. 
+Therefore, we can calculate the lateral deviation to the lane centerline by
+\vspace{-0.07in}
+\begin{equation}
+\small
+\begin{aligned}
+lw/2 - d_{\text{left}}\ \ \text{or}\ \  d_{\text{right}} - lw/2,
+\end{aligned}
+\label{eqt:lateral_dev_calc}
+\vspace{-0.07in}
+\end{equation}
+where $lw$ is the lane width. 
+We calculate the lateral deviation as a \textit{signed} number to differentiate the deviations to the left (positive) and to the right (negative). 
+%\alfred{why not use absolute} \junjie{re-wrote the equation and explained why we use a signed lateral deviation.}
+
+
+Although we can also obtain the lane width from the lane line polynomials (i.e., $lw_{\text{poly}} = d_{\text{left}} + d_{\text{right}}$), as mentioned in \S\ref{sec:design_detection}, it is not uncommon that one of the lane lines is missing or incorrectly detected in real world driving, e.g., when the current lane splits into a through lane and a left or right turn lane.
+In such cases, directly using the distances from the polynomial functions would result into a wrong lateral deviation. To address this, we include two optimizations in the lateral deviation calculation: (1) instead of estimating the lane width from the polynomial functions, we query the current lane width from the semantic map (line 4 in Alg.~\ref{alg:attack_detection}), and (2) prioritize the lane line with a smaller distance to the vehicle by using it to calculate the lateral deviation in Eq.~\ref{eqt:lateral_dev_calc} (line 4, 6 in Alg.~\ref{alg:ld_dev_calc}).
+%\alfred{how to ``prioritize''? the equation above needs input from both left and right lane line poly.}\junjie{how about the current version?} 
+This is because for the lane splitting scenario mentioned above, the incorrectly-detected lane line often has a much larger distance compared to the correctly-detected one.
+A special handling is that when both lane lines are incorrectly detected, which is very rare in SCNN~\cite{pan2018spatial} and never occur in OpenPilot LD model~\cite{openpilot}, we will reuse the previously calculated lateral deviation. 
+% Note that this is different from the cases where both lane lines are naturally unavailable, e.g., in intersections, where we disable the attack detection since they are out of the applicable domain for lane detection (\S\ref{sec:design_detection}).
+
+
+\begin{algorithm}[tbp]
+\footnotesize
+\caption{Calculation of LD deviation to lane centerline}
+\label{alg:ld_dev_calc}
+\textbf{Notations:} $lw_{\text{map}}$: lane width from map; $poly(\cdot)$: polynomial function fitted on detected lane line; $d$: distance to lane line; $D$: deviation to lane centerline
+\begin{algorithmic}[1]
+\Function{\text{L\textsc{d}}\text{D\textsc{ev}}}{$LD$, $lw_{\text{map}}$}
+    \State $d_{\text{left}} \gets \lvert LD.poly_{\text{left}}(0) \rvert$ \textbf{if} $LD.poly_{\text{left}}$ \textbf{else} $\infty$ \Comment{dist. to left line}
+    \State $d_{\text{right}} \gets \lvert LD.poly_{\text{right}}(0) \rvert$ \textbf{if} $LD.poly_{\text{right}}$ \textbf{else} $\infty$ \Comment{dist. to right line}
+    \If{$LD.poly_{\text{left}}$ \textbf{and} $d_{\text{left}} < d_{\text{right}}$}  \Comment{left line is correct}
+        \State $D$ $\gets$ $lw_{\text{map}}/2 - d_{\text{left}}$ \Comment{dev. to centerline; $+$: left, $-$: right}
+    \ElsIf{$LD.poly_{\text{right}}$ \textbf{and} $d_{\text{right}} < d_{\text{left}}$} \Comment{right line is correct}
+        \State $D$ $\gets$ $d_{\text{right}} - lw_{\text{map}}/2$
+    \Else \Comment{if none of the lane lines are correctly detected}
+        \State $D$ $\gets$ last calculated $D$ \Comment{re-use last dev. to centerline}
+    \EndIf
+    \State \textbf{return} $D$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+
+% \textbf{Safe deceleration in attack response.}
+% Generally, a deceleration $<$4.6 $\mathrm{m/s^2}$ is considered as safe for maintaining steady control~\cite{deceleration}. Thus, to calculate the speed profile of the AR trajectory (\S\ref{sec:design_ar}), we apply 4 $\mathrm{m/s^2}$ as the deceleration, which is also defined in Baidu Apollo as the maximum allowed deceleration to ensure safety~\cite{apollo}. 
+
+
+
+% \vspace{-0.1in}
+\subsection{Evaluation of LiDAR Localization Dependency on Lane Line Markings}  \label{app:lidar_lane_line_dependency}
+% \vspace{-0.1in}
+
+\textbf{Evaluation methodology.} 
+To evaluate the dependency of LiDAR localization on lane line markings, we first create two traces of modified LiDAR data: one without lane line markings (denote as \textit{no-marking}) and another with incorrect lane line markings (denote as \textit{wrong-marking}). Next, we execute the LiDAR locators on the original LiDAR trace as well as on the two modified traces. \textit{If a LiDAR locator does not rely on the lane line markings, we should observe a high similarity between the original and the modified executions.}
+
+Specifically, LiDARs scan the surrounding environment and output Point Cloud Data (PCD), which stores the 3D positions and intensities of the reflected laser points. Since the lane line markings will exhibit distinctively higher intensities than the other road surface due to their color differences, we create the \textit{no-marking} PCDs by changing their intensities to the same as other road surface area. 
+To do that, we first apply the commonly-used RANSAC plane segmentation~\cite{schnabel2007efficient} on the PCDs to find all points that belong to the ground plane, i.e., the road surface, and then set the intensities of these ground points to their median value. This thus effectively makes the lane line markings indistinguishable from the other road surface.
+The creation of \textit{wrong-marking} PCDs is slightly more complicated. After recognizing all ground points, we identify the lane line marking points depending on whether their intensities are above a certain threshold. For each lane line marking point, we search a corresponding ground point that is \textit{laterally offset by half-lane-width} and set their intensities the same as the original lane line marking points. Finally, we clear the original lane line marking points by setting their intensities to the median ground point intensities. Since the lane line markings are moved by half-lane-width, the \textit{wrong-marking} PCDs should have the largest lateral LiDAR localization impact if the lane line markings have any effect on the LiDAR locator.
+Fig.~\ref{fig:laneline_removal_example} shows such an example of the original PCD and the one with \textit{no-marking} and \textit{wrong-marking}. 
+% Note that the LiDAR map used in the LiDAR locator still have the complete lane line markings.
+
+\textbf{Experimental setup.} 
+We evaluate on 2 LiDAR locators, one from Baidu Apollo (BA-LiDAR locator)~\cite{wan2018robust} and another from Autoware (AW-LiDAR locator)~\cite{autoware}. Details of the LiDAR locators can be found in Appendix~\ref{app:lidar_locators}. Since MSF localization takes not only position measurements but also position uncertainties from LiDAR locator as inputs, we calculate both the \textit{position accuracies} and \textit{uncertainty correlation} with the original and no/wrong-marking PCDs to show the similarity.
+% with and without lane line markings removal to show the similarity.
+We evaluated on the same 5 local road and highway traces in \fr{}~\cite{fusionripper} from two datasets. For each trace, we exclude intersections since they do not have lane line markings. Among them, since \textit{ba-local} does not provide ground truth positions, we calculate the position accuracy based on the LiDAR locator with the original lane line markings.
+
+\textbf{Results.}
+Table~\ref{tbl:correlation} shows the experiment results. For the position accuracy, we report the Root Mean Squared Error (RMSE) between the LiDAR locator positions and the ground truth positions or the ones with the original lane line markings. For the correlation, we use the commonly-used Pearson's correlation, and a correlation coefficient $>$0.5 is considered strongly correlated~\cite{cohen2013statistical}. As shown, for both LiDAR locators, the uncertainty correlation coefficients between the original and modified PCDs are all well above the threshold for strong correlation, and their position accuracies are also all at centimeter-level. Particularly, since AW-LiDAR locator does not use lane line markings at the design level (Appendix~\ref{app:lidar_locators}), the traces consequently show perfect correlations and identical position accuracies no matter how we modify the lane line markings. Such a result suggests that the existing LiDAR locators used in high-level AD systems are indeed largely ignore the lane line marking information when localizing the vehicle on the map, which might because global localization focuses more on the unique features on the road, such as buildings, roadside layouts, and traffic signs. 
+As a result, this indicates that lane line markings are largely independent of the ones that are already used in high-level AD localization and thus pose a great potential for defense purposes.
+
+
+
+\begin{table*}[tbp]
+\footnotesize
+\begin{minipage}{0.23\linewidth}
+	\centering
+    % Figure removed
+    % \vspace{-0.05in}
+    \captionof{figure}{PCDs with the original, removed, and incorrect lane line markings.}
+    \label{fig:laneline_removal_example}
+\end{minipage}\hfill
+\begin{minipage}{0.76\linewidth}
+    \centering
+    \caption{The uncertainty correlation coefficients ($r$) and position accuracies (RMSE) of LiDAR locators using the original, lane line markings removed (denote as \textit{no-marking}), and incorrect lane line markings PCDs (denote as \textit{wrong-marking}). Results with statistically strong correlation are highlighted in \textbf{bold}; we omit the $p$-values as they are all statistically significant. The numbers are averaged across all sensor traces used in \fr{}~\cite{fusionripper}.}
+    \label{tbl:correlation}
+    % \vspace{-0.1in}
+    % \setlength{\tabcolsep}{5.5pt}
+    \begin{tabular}{@{}c|cc|ccc@{}}
+    \toprule
+     & \multicolumn{2}{c|}{Uncertainty Correlation ($r$)} & \multicolumn{3}{c}{Position Accuracy (RMSE)} \\ \cmidrule(l){2-6} 
+     & \begin{tabular}[c]{@{}c@{}}Original vs\\ No-marking\end{tabular} & \begin{tabular}[c]{@{}c@{}}Original vs\\ Wrong-marking\end{tabular} & Original & No-marking & Wrong-marking \\ \midrule
+    BA-LiDAR Locator & \textbf{0.89} & \textbf{0.64} & 0.064 m & 0.065 m & 0.063 m \\
+    AW-LiDAR Locator & \textbf{1.0} & \textbf{1.0} & 0.076 m & 0.076 m & 0.076 m \\ \bottomrule
+    \end{tabular}
+
+    % \vspace{-0.1in}
+    \caption{Semantic map APIs required for \ld{}.}
+    \label{tbl:map_apis}
+    % \vspace{-0.1in}
+    % \setlength{\tabcolsep}{3pt}
+    \begin{tabular}{@{}ll@{}}
+    \toprule
+    Map API & Description \\ \midrule
+    \texttt{MapLaneDev(pose)} & Query the deviation from \texttt{pose} to the closest lane centerline \\
+    \texttt{MapLaneWidth(pose)} & Query the width of the closest lane to \texttt{pose} \\
+    \texttt{MapLanePoint(pose)} & Query the closest point and lane heading on the closest lane centerline to \texttt{pose} \\
+    \texttt{MapIsIntersection(pose)} & Query if \texttt{pose} is located in an intersection\\ \bottomrule
+    \end{tabular}
+\end{minipage}
+\end{table*}
+
+
+\subsection{Details of the LiDAR Locators} \label{app:lidar_locators}
+
+At design level, Baidu Apollo LiDAR locator (BA-LiDAR locator)~\cite{wan2018robust} considers point cloud intensities in its position calculation. Thus, the modifications of lane line intensities do have the potential to affect the BA-LiDAR locator performance. On the other hand, Autoware LiDAR locator (AW-LiDAR locator)~\cite{autoware} only uses the position data in the PCD and completely ignores the intensities. This means that AW-LiDAR locator does not consider lane line markings at the design level.
+% Nevertheless, we still include AW-LiDAR locator in our evaluation.
+% When used in AD localization, the MSF takes not only the position measurement but also the position uncertainty from LiDAR locator as inputs. Thus, we report the \textit{position accuracies} and \textit{uncertainty correlation} with and without lane line markings removal to show the similarity. 
+Since AW-LiDAR locator implements the Normal Distributions Transform (NDT) algorithm~\cite{ndt}, which does not output position uncertainty by default, thus we follow a common adaptation for NDT to use the point cloud matching fitness score as the uncertainty~\cite{merten2008three}.
+
+
+% We evaluated on the same 5 local road and highway traces in \fr{}~\cite{fusionripper} from two datasets. For each trace, we exclude the road segments that do not have lane line markings, e.g., intersections, since they are out of the applicable domain for lane boundaries. Among them, since \textit{ba-local} does not provide ground truth positions, we calculate the position accuracy based on the LiDAR locator with the complete lane line markings instead of the ground truth positions.
+
+\subsection{SAVIOR Evaluation Setup} \label{app:savior_setup}
+
+To evaluate SAVIOR, we follow the similar methodology as the ground rover evaluation in the SAVIOR paper~\cite{savior}, i.e., using the kinematic bicycle model~\cite{kong2015kinematic} and an Extended Kalman Filter (EKF) to predict the system state (i.e., position in x, y coordinates) given the vehicle control commands (i.e., steering and acceleration). Although the vanilla bicycle model does not have tunable parameters, we follow a similar implementation as SAVIOR by adding coefficients to the bicycle model equations~\cite{savior_code}. Same as SAVIOR, we use the \textit{nlgreyest} system identification tool from Matlab~\cite{matlab_si} to find the coefficients that can best fit the sensor and control trace.
+During the evaluation, we continuously calculate the residuals between the GPS measurements and the predicted positions from the EKF, and feed the residuals to a CUSUM anomaly detector for attack detection. An execution that triggers the CUSUM detector will be considered as under attack.
+
+Since the KAIST dataset~\cite{jeong2019complex} does not store the control commands when the traces were collected, which are required for the SAVIOR evaluation, we replay the KAIST sensor traces as inputs to Baidu Apollo v5.0.0~\cite{apollo} to collect the control module outputs, i.e., steering and throttle commands. In particular, the control module calculates such commands based on the localization and a planned trajectory, which is a sequence of trajectory points that the vehicle should follow. However, the planned trajectory is runtime information optimized by the planning module during driving, which is not available in the dataset. Since the ground truth positions in the KAIST traces represent the trajectory points followed by the AD vehicle, we thus convert the ground truth positions into planned trajectories according to the format in Baidu Apollo and use them as one of the control inputs. With the planned trajectories, we then feed the benign localization and attacked localization outputs to obtain the benign control commands and attack influenced control commands respectively.
+
+In addition to the KAIST traces, we also evaluate SAVIOR on a dataset that contains the original control commands to validate SAVIOR's detection performance in an ideal setting. However, similar performance is observed in that dataset to the ones on KAIST traces. More details of this are in Appendix~\ref{app:savior_with_real_control}.
+
+
+\subsection{Evaluating SAVIOR on Dataset with Control Commands} \label{app:savior_with_real_control}
+
+Since SAVIOR requires vehicle control commands, for which we collected by replaying the KAIST traces in Baidu Apollo in our evaluation (Appendix~\ref{app:savior_setup}), one might argue that SAVIOR may perform much better if given the originally collected vehicle control commands. Therefore, we evaluate SAVIOR on the comma2k19 dataset~\cite{comma2k19}, which contains the original vehicle control commands when the traces were collected. Since the comma2k19 dataset does not provide LiDAR data, we thus cannot run the MSF attack. To evaluate SAVIOR, we apply the most aggressive GPS spoofing parameters in the MSF attack ($d=2.0$, $f=2.0$) to the GPS data and examine SAVIOR's capability at detecting such obvious GPS spoofing attempts. As shown in Fig.~\ref{fig:savior_comma2k19}, SAVIOR's detection performance is close to the one on the \textit{ka-highway36} (Fig.~\ref{fig:trace_rocs_devs}) and is still far from a perfect detector.
+
+% Figure environment removed
+
+
+\subsection{Semantic Map APIs Required in \ld{}} \label{app:map_apis}
+
+As mentioned in \S\ref{sec:design_detection}, the \ld{} design queries the semantic map in high-level AD systems to obtain the lateral deviation to lane centerline or lane width at specific positions. Table~\ref{tbl:map_apis} lists the map APIs for \ld{} and their descriptions. Note that all these map APIs are available in typical high-level AD systems, e.g., Baidu Apollo~\cite{apollo} and Autoware~\cite{autoware}.
+
+
+% % Figure environment removed
+
+
+% \begin{table*}[tbp]
+% \footnotesize
+% \centering
+% \caption{Maximum deviations to lane center and attack consequences under different defense settings in the 4 simulation scenarios in \S\ref{sec:simulation}. Each setting was run for 10 times with randomized attack starting times. Benign driving with \ld{} is also presented and was run for 10 times. The maximum deviations are represented as (mean, std) in meters.}
+% \label{tbl:sim_results}
+% % \vspace{-0.1in}
+% \setlength{\tabcolsep}{4.5pt}
+% \begin{tabular}{@{}c|c|cccccc|cc@{}}
+% \toprule
+% \multirow{3}{*}{\begin{tabular}[c]{@{}c@{}}Simulation\\ scenario\end{tabular}} & \multirow{3}{*}{\begin{tabular}[c]{@{}c@{}}Lane\\ straddle\\ dev\end{tabular}} & \multicolumn{6}{c}{Attacked} & \multicolumn{2}{|c}{Benign} \\ \cmidrule(l){3-10} 
+%  &  & \multicolumn{2}{c}{\ld} & \multicolumn{2}{c}{\ld-NaiveAR} & \multicolumn{2}{c}{No Defense} & \multicolumn{2}{|c}{\ld} \\ \cmidrule(l){3-10} 
+%  &  & Max dev & Consequence & Max dev & Consequence & Max dev & Consequence & Max dev & Consequence \\ \midrule
+% SLR-Low & 0.83 & 0.47, 0.08 & Stop in lane & 1.69, 0.06 & Stop w/ lane straddle & 7.94, 0.05 & Fall off road & 0.07, 5e-5 & Reach destination \\
+% SLR-High & 0.83 & 0.69, 0.06 & Stop in lane & 1.64, 0.16 & Stop w/ lane straddle & 7.93, 0.04 & Fall off road & 0.07, 5e-5 & Reach destination \\
+% SF-Straight & 1.00 & 0.67, 0.23 & Stop in lane & 1.02, 0.01 & Hit curb & 1.84, 0.16 & Hit tree or barrier & 0.14, 7e-4 & Reach destination \\
+% SF-Curvy & 0.75 & 0.43, 0.14 & Stop in lane & 0.90, 0.12 & Hit lane divider & 0.97, 0.14 & Hit lane divider & 0.31, 0.01 & Reach destination \\ \bottomrule
+% \end{tabular}
+% % \vspace{-0.1in}
+% \end{table*}
+
+
+
+% \subsection{End-to-End Simulation Setup Details} \label{app:simulation_setup}
+
+% In our evaluation (\S\ref{sec:simulation}), we reuse the SCNN model~\cite{pan2018spatial} in Baidu Apollo for LD, which is currently used only for camera calibration in Baidu Apollo. Specifically, we run the complete Baidu Apollo AD system with all functional modules enabled in an industry-grade AD simulator, LGSVL~\cite{lgsvl}. Since LGSVL does not provide LiDAR locator maps required for MSF, we instead run Baidu Apollo localization in the Real-Time Kinematic mode, which directly takes the ground truth positions from LGSVL. To simulate the \fr{} attack effect, we add the lateral deviations from the same attack trace used in \S\ref{sec:eval_visibility} to the localization outputs.
+
+% To evaluate \ld{}, we create 4 driving scenarios on two LGSVL maps: Single Lane Road (SLR) and San Francisco (SF). Specifically, the SLR map is a long straight road, and we create a low-speed (SLR-Low) and high-speed (SLR-High) driving scenario on it by adjusting the maximum cruising speed in Apollo planning. The SF map is a 1:1 re-creation of a portion of the San Francisco city, from which we select a straight (SF-Straight) and a curvy road (SF-Curvy).
+

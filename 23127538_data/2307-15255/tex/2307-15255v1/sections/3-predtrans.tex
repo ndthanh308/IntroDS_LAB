@@ -1,0 +1,285 @@
+\section{Predicate Transfer}
+\label{sec:pred}
+
+This section describes the proposed predicate transfer algorithm. We use Query 5 in TPC-H benchmark~\cite{tpch} (Figure~\ref{fig:q5}) as a running example. This query contains six tables, six inner joins, and two predicates on tables \texttt{region} and \texttt{orders} respectively. The discussion assumes equi-join between tables. 
+
+%\yxy{we assume only equijoin and innerjoin? Should list all important assumptions here, and later discuss how we can relax them.}
+%\hangdong{only equijoins.. Yannakakis does support aggregations under some restrictions, but beyond the scope of our work for now?}
+
+\subsection{Overview}
+\label{sec:overview}
+
+Similar to the Yannakakis algorithm, predicate transfer executes a query in two phases. 
+
+% Figure environment removed
+
+\vspace{0.05in}
+\noindent
+\textbf{Phase 1: Predicate Transfer Phase.} A join graph is constructed for a query, where each vertex is a table and each edge is a join operation. 
+%A query may have multiple join graphs which affect query performance but not correctness. 
+A local predicate is constructed as a filter (e.g., a Bloom filter) and be transferred across the join graph. 
+%When transferring across edges with different join keys, the filter will be reconstructed in an efficient way. 
+The schedule of the predicate transfer phase introduces a large design space, which we discuss in Section~\ref{sec:transfer-phase}. 
+
+\vspace{0.05in}
+\noindent
+\textbf{Phase 2: Join Phase.}
+After the transfer phase finishes, each table has multiple filters, including both local filters and transferred filters. The database can now apply the filters and perform regular joins. The actual inputs of each join will be substantially smaller if the transferred filters are selective. We discuss the join phase in Section~\ref{sec:join-phase}.
+
+\vspace{0.05in}
+In the next two subsections, we will describe the design space of these two phases and the heuristics we currently use to implement predicate transfer in our prototype. These heuristics are largely intuition-based and a more thorough theoretical analysis is left for future work.
+
+\subsection{Predicate Transfer Phase}
+\label{sec:transfer-phase}
+
+In the rest of this section, we layout the design space of the transfer phase and describe the design choices we adopt in our prototype.
+
+\vspace{0.05in}
+\noindent
+\textbf{Filter Transformation.}  When transferring a filter across edges that have different join keys, the filter must be transformed. For example, a filter constructed on \texttt{region} can be transferred to \texttt{nation}, but the same filter cannot be directly sent to \texttt{supplier} since the join keys do not match. We use the following algorithm to handle the join key mismatch between incoming and outgoing edges on \texttt{nation}. When the incoming filter is received, an empty outgoing filter is created. Then, the columns for both incoming and outgoing join keys in \texttt{nation} are scanned (assuming columnar store; otherwise scan the entire table). Inherent filters of \textit{nation} are applied during the scan. Then for each row, the incoming join key is used to probe the incoming filter. If a match occurs, the outgoing join key is added to the outgoing filter. At the end of the scan, the outgoing filter is sent to downstream tables (i.e., \texttt{supplier}). The algorithm is efficient as it requires scanning the join keys only once.
+
+\vspace{0.05in}
+\noindent
+\textbf{Predicate Transfer Graph.} The join graph determines the topology of predicate transfer. Figure~\ref{fig:join-graph} shows the join graph for Query 5 in TPC-H. Each equi-join is represented as an edge. %Given a specific query, the query parser generates a join graph topology used to prodce a predicate transfer schedule.
+A \textit{predicate transfer graph} is a directed subgraph of the join graph. Transfers happen along the selected edges in the subgraph---local predicates of the source vertex are transferred to the target vertex as a filter. Figure~\ref{fig:pred-trans-graph} shows one predicate transfer graph of TPC-H Q5.
+
+The topology of the predicate transfer graph affects the performance of the predicate transfer phase and also the selectivity of the transferred filters. In this paper, we use a simple heuristic that points an edge from a smaller table to a bigger table. The intuition is the same as why Bloom join builds Bloom filter at the smaller table---to reduce Bloom filter size and increase filter selectivity.  Our current heuristic does not remove any edge in the join graph when generating the predicate transfer graph. It also guarantees that the resulting graph is a Directed Acyclic Graph (DAG).
+%---we simply annotate the direction for each edge, following the rule that the predicates are transferred from the smaller table to the larger table in the forward pass.
+The predicate transfer graph in Figure~\ref{fig:pred-trans-graph} follows this heuristic.
+
+% \vspace{0.05in}
+% \noindent
+% \textbf{Join Graph Topology.} 
+% We make each join edge directional to facilitate the scheduling algorithm that we will describe later. \yxy{in Q5, joins on nationkey happen across 3 tables; maybe worth a discussion on it.} \hangdong{so our topology for 3-way joins can be big <-- small --> big?}\yxy{@Yifei. What's our current heuristics here?} 
+
+\vspace{0.05in}
+\noindent
+\textbf{Transfer Schedule.} The transfer schedule determines when and how the predicates are transferred across the predicate transfer graph. Numerous design decisions can be made in the schedule. In particular, the schedule specifies which tables in the query should construct initial local filters to start the transfer process, and the order of issuing the remaining transfers. For each table that sends the local filter out, the schedule determines when the transfer happens---multiple transfers may happen in serial or parallel. Moreover, the transfer can happen back and forth, following both directions of certain edges. 
+%path \paris{what is a transfer path?} does not have to be one round---the predicate transfer graph specifies single-round transfer directions, but actual transfers may happen in multiple rounds, following the predicate transfer graph back and forth \paris{this is unclear}. 
+Pruning may be adopted to avoid non-beneficial transfers, and the transfer direction may be dynamically adjusted at runtime. Identifying a good transfer schedule is critical to the system performance. 
+
+% The transfer schedule determines when and how the predicates are transferred across the predicate transfer graph. Numerous design decisions should be made in the schedule. In particular, the schedule specifies which tables in the query should construct initial local filters to start the transfer process. For each table that sends the local filter out, the schedule determines when the transfer happens---multiple transfers may happen in serial or parallel. LIP-style~\cite{lip17} filter reordering can be utilized for further optimization.
+% % For each initial local filter, the schedule specifies where the filters should be transferred to, and whether the multiple transfers should happen in serial or in parallel.
+% If the paths of multiple transfer paths converge, the schedule may merge the incoming filters to create a more selective outgoing filter.
+% % \hangdong{here we can adopt the LIP-style filtering.} \yifei{not clear what to add, feel free to change if you feel need.}
+% Moreover, the transfer path does not have to be one round---the predicate transfer graph specifies single-round transfer directions, but actual transfers may happen in multiple rounds, following the predicate transfer graph back and forth.
+% % transfers can happen in both directions across an edge and in more than one round. 
+
+In this paper, we adopt a heuristic that builds the transfer schedule using one \textit{forward pass} and one \textit{backward pass} similar to the Yannakakis algorithm. 
+% \hangdong{as a side note: it is actually a folklore that a forward pass alone (no backward pass) suffices for getting the theoretical guarantees of Yannakakis}.\yxy{In the previous description, backward vs. forward was reversed wrt Section 2. I fixed it to be consistent with Section 2.} 
+The predicate transfer graph is determined at planning time and remains fixed during runtime. 
+In the forward pass, we build initial local filters on the leaf nodes in the predicate transfer graph (i.e., nodes with only outgoing edges but no incoming edge). These filters are transferred following the topological order of the predicate transfer graph, which exists because the graph is a DAG. 
+If one node has one or more incoming edges, the node will collect all the incoming filters before performing the transformation to produce outgoing filters (LIP-style~\cite{lip17} incoming filter ordering can be utilized for further optimization); the transformation will scan the table only once, regardless of the number of incoming or outgoing edges. %Our current heuristics do not remove any edges in the join graph when generating the predicate transfer graph --- we simply annotate the direction for each join edge, following the rule that the predicates are transferred from the smaller table to the larger table in the forward pass.
+% \yxy{we probably need a more theoretically rigorous discussion here. E.g., what if we have a triangle? Maybe we should construct the join graph in a way to avoid cycles?} \hangdong{can we simply say that we take an arbitrary spanning tree? or a good rule could be: avoid passing filters from a large to a small table?}\yxy{@Yifei, what is our current heuristics?}
+The forward pass finishes once all filters are fully transferred. 
+% along the edges in the graph. \paris{We can also say that the forward pass follows the topological order of the predicate transfer graph, which exists because it is a DAG.}
+% to the roots (i.e., nodes with only incoming edges but not outgoing edges). \hangdong{I guess we are allowing multiple roots? I think allowing multiple roots is a good idea: it gives more design space and having multiple roots can possibly make the transfer phase more parallelizable (subgraphs of the join can transfer in parallel, or overlapping transfers and joins).}
+
+The system then starts the backward pass, where we simply reverse the direction of all edges and repeat the same process in the forward pass. After both passes are done, each table has been reduced based on the transformed filters it receives. The later join phase will start from these pre-filtered tables.
+% each table will have some local filters as a result of predicate transfers. In the later join phase (Section~\ref{sec:join-phase}), these filters will be applied before performing the joins. 
+
+In the example of Q5 as shown in Figure~\ref{fig:pred-trans-graph}, the first Bloom filter is constructed for \texttt{region}, sent to \texttt{nation}. The filter is then transformed into two outgoing filters and sent to \texttt{customer} and \texttt{supplier} respectively. Similarly, \texttt{supplier} transfers two outgoing filters following the edges to \texttt{customer} and \texttt{lineitem}. At \texttt{customer}, two separate incoming filters are applied with one outgoing filter produced and sent to \texttt{order}, which is then transformed and sent to \texttt{lineitem}.  The forward pass finishes when both incoming filters arrive at \texttt{lineitem}, and after that the backward pass begins in a symmetric way.
+% , transformed, and then sent to \texttt{supplier}. The filter is then transformed into two outgoing filters and sent to \texttt{customer} and \texttt{lineitem} respectively. At \texttt{customer}, the filter is transformed and transferred to \texttt{orders}, which applies both the incoming filter and its local filter to create the outgoing filter to be transferred to \texttt{lineitem}. Finally, after both incoming filters arrive at \texttt{lineitem}, two outgoing filters are created correspondingly through transformation and the forward pass begins in a symmetric way. 
+
+%\yxy{Walk through the transfer phase for the running example.} 
+%\yxy{We need some analysis (not necessarily deep) on why the heuristics above are good. We can either add some discussion here, or create a separate section for such discussion.}
+
+% \yxy{I think ``Filter Transformation'' should be discussed before ``Transfer Schedule'', since the word Transformation appears in Transfer Schedule but is defined in Filter Transformation. }
+
+\vspace{0.05in}
+\noindent
+\textbf{Filter Type.} Our discussion so far uses Bloom filters to represent the predicates. In fact, other representation of filters can also be used. If a precise representation is used, i.e., the filter precisely encodes all the join keys, then a transfer becomes a semijoin and the algorithm becomes similar to Yannakakis. An ideal filter should be efficient to construct and check, and achieve low false positive rates. We use Bloom filters in our prototype as it is the best candidate available today. But predicate transfer can automatically benefit from any potential improvement in filtering techniques. 
+
+
+\vspace{0.05in}
+\noindent
+\textbf{Transfer Path Pruning.} As discussed above, our current scheduling heuristics make two full passes of the predicate transfer graph. In practice, some transfers may not increase filter selectivity but consume computational resources. 
+%It is possible that a transferred filter does not eliminate any extra rows compared to existing filters. 
+An intelligent transfer scheduler should identify such scenarios and stop transferring these filters further to avoid wasting CPU cycles. Such transfer path pruning can be done at either planning time or runtime. Our current prototype does not incorporate any pruning and always performs the forward and backward passes in full. We observe this already demonstrates significant performance improvement, and believe incorporating path pruning will lead to even larger speedups. 
+
+%\yxy{Somewhere need to discuss the difference between predicate transfer and Yannakakis. E.g., predicate transfer does not have the limitations in Yannakakis and can be applied regardless of the join graph topology. The theoretical guarantees are also different.} 
+
+
+
+\subsection{Join Phase}
+\label{sec:join-phase}
+
+After the predicate transfer phase completes, each table may have already been processed by several filters, including the inherent filters from the query and the transferred filters. The join phase basically executes the original query with the reduced input tables.
+
+\vspace{0.05in}
+\noindent
+\textbf{Unified Query Plan.} As a straightforward design, the database can directly execute the query plan as a regular query in the join phase, with the leaf nodes (i.e. scan) replaced by the filtered tables produced by the predicate transfer phase. The predicate transfer schedule is essentially also a query plan. The two query plans can be concatenated such that the leaf nodes in the join plan are just the output nodes of the predicate transfer schedule. This avoids rescanning in the join phase and requires no changes to the executor---the executor is oblivious to the predicate transfer phase and executes the modified query plan regularly.
+% However, there is a space of optimizations that can further improve performance, % over this straightforward strategy, 
+% as we discuss below.
+
+
+\vspace{0.05in}
+\noindent
+\textbf{More Accurate Cardinality Estimation.} The predicate transfer phase updates the cardinality of the input tables in the join phase. Therefore, the original query plan generated beforehand may become suboptimal based on the stale cardinalities. A replanning step between the two phases may produce a better plan that leads to further performance improvement. Although join performance will be more robust to join orders (as will be shown in Section~\ref{sec:eval-q5}), performance can still be affected by the quality of the query plan, with the factors including the size of materialized intermediate tables, which table to build the hash table and which table to probe, etc. Moreover, similar to the Yannakakis algorithm, predicate transfer bounds the size of the intermediate join tables in the join phase (Section~\ref{sec:discuss}), which can be utilized to improve cardinality estimation. 
+
+
+% \textbf{Caching Filtered Tables.}
+% Note that the predicate transfer phase already needs to scan the tables to perform filter transformation. Therefore, we can cache the filtered tables in the transfer phase to avoid rescanning them in the join phase. In particular, when a table is scanned in the transfer phase (due to a filter transformation), \yxy{what do we cache precisely? Do we cache the entire rows or only the join columns of those rows? I think we need to discuss these details here.} 
+
+% \yxy{Use one table to summarize the design space and explain our current heuristics in each design dimension.}
+
+% \yxy{removing the table for now to save space}
+
+% \begin{table}[h]
+%   \caption{Summary of the Design Space and the Design Choices Adopted in Our Heuristics.}
+%   \label{tab:sum}
+%   \footnotesize
+%   \begin{tblr}{
+%     colspec = {c|cc},
+%     column{2} = {gray!20}
+%   }
+%     \toprule
+%     & \textbf{Our Heuristics} & \textbf{Other Possible Designs}\\
+%     \cmidrule{1-3}
+%     \textbf{Filter Type} & Bloom filter & Semi-join, other probablistic filters\\
+%     \cmidrule{1-3}
+%     \textbf{Trans. Graph} & Directed join graph & Join tree, subjoin graph\\
+%     \cmidrule{1-3}
+%     \textbf{Trans. Direction} & Small to large & Bottom-up in the join tree\\
+%     \cmidrule{1-3}
+%     \textbf{Pruning} & No pruning & Selectivity-based\\
+%     \cmidrule{1-3}
+%     \textbf{Concurrency} & Serial & Parallel\\
+%     \cmidrule{1-3}
+%     \textbf{Passes} & 2 & different number of passes\\
+%     \cmidrule{1-3}
+%     \textbf{Phase Overlap} & No & Yes\\
+%     \bottomrule
+%   \end{tblr}
+% \end{table}
+
+% \vspace{0.05in}
+% To summarize, Table~\ref{tab:sum} demonstrates the design space of predicate transfer and the design choices adopted in our current heuristics.
+
+\subsection{Extension to General Queries}
+
+In the discussion above, we assume table joins are inner equi-joins, and cover queries with only joins and local filters (filters over base tables). In this section, we extend the predicate transfer mechanism to further support general queries. 
+%A naive strategy is to stop the transfer every time there is an operator other than inner joins and local filters. However, it does not fully utilize transfer opportunities since transfer may not always be blocked on those operators.
+
+% In a high level, the extension may break the predicate transfer graph into multiple subgraphs, and transfer occurs within each subgraph individually.
+
+\vspace{0.05in}
+\noindent
+\textbf{Supporting More Operators in Predicate Transfer Graph.} 
+We first extend predicate transfer to support outer joins. In particular, a left outer join operation can be incorporated into the predicate transfer graph by allowing predicate transfer in only one direction, i.e., from the left table to the right table; but the other transfer direction is blocked. Therefore, such a transfer can happen in either forward pass or backward pass, but not in both passes. 
+A right outer join can be supported in a similar way. A full outer join, however, cannot be incorporated into the predicate transfer graph. 
+
+Considering more general opeartors, we note that an operator will block predicate transfer if it does not preserve the join key during the computation (e.g., perform aggregations on the join key). 
+%if the transformed outgoing filter may remove rows that actually have a match in the join\yxy{this sentence is hard to understand}. 
+In particular, we identify the following operators that can also be incorporated into the predicate transfer graph.
+
+
+%We extend predicate transfer to support more join types in the following way. % the following heuristics to support more join types such as outer joins and non-equi joins.
+
+%\vspace{-.1in}
+% \begin{itemize}
+%     \item 
+%     % block predicate transfer from the right (left) table to the left (right) table.
+%     %\item Right outer joins block predicate transfer from the left table to the right table.
+%     % \item Edges of Blocked predicate transfer are removed from the predicate transfer graph.\yxy{what does Blocked mean here?}
+%     \item Non-equi-joins are not reflected as edges of the predicate transfer graph---the two join tables are not connected in the graph.
+% \end{itemize}
+
+% In our current prototype, non-equi-joins are considered when constructing the predicate transfer graph. Then the case of left (right) outer joins is incorporated in the forward pass and backward pass respectively --- only one direction of transfer is blocked.
+
+
+% \yxy{A general strategy can break the query plan into multiple transferable subplans. We can use predicate transfer for each subplan --- does this work and worth mentioning?}
+% \vspace{0.05in}
+% \noindent
+% \textbf{More Operators.} We extend predicate transfer to support operators other than joins and local filters. These operators may block the transfer between the adjacent joins. For example, when one join table is produced by a count(*) aggregation, we may not be able to transfer filters from it to the other join table --- the aggregation consumes more rows than it should have due to Bloom filter's false positives, such that the counting result cannot be used to construct transformed filters. We adopt the following heuristics in our current prototype. Intuitively, an operator blocks the transfer if the transformed filter from its output removes rows that actually have a match in the join.
+% \yxy{it is not entirely clear what does a "transferable non-join operator" mean. Maybe say a bit more here.} The intuition is that no false negatives should be incurred by applying a non-join operator before the transfer.
+
+\begin{itemize}
+    \item Operators including filters between intermediate join tables, column projection, sorting, and top-K do not block predicate transfer.
+    %\item Scalar aggregation blocks the transfer (e.g. count(*)).
+    \item Grouped aggregation does not block predicate transfer when the join key is a subset of the group key.
+    \item Scalar user-defined functions does not block the transfer to the downstream join, but may block the transfer to the upstream join if the function is not invertible.
+\end{itemize}
+
+
+\vspace{0.05in}
+\noindent
+\textbf{Beyond a Single Predicate Transfer Graph.} 
+Some queries may contain operators that cannot be incorporated into a predicate transfer graph. Example operators include but are not limited to full outer joins, scalar aggregations, and group-by aggregations where the join key is being aggregated. When such a scenario is encountered, we can apply predicate transfer only on a subset or several subsets of the query execution plan, and use conventional methods to execute the rest of the query. For example, this means a query can be partially executed first, leading to a subquery plan that can be represented as a predicate transfer graph in order to apply predicate transfer. After the predicate transfer phase and the join phase, the rest of the query can continue execution. It is also possible that predicate transfer can be applied multiple times to different parts of the query plan---the predicate transfer phase and regular query execution can alternate. 
+
+%The predicate transfer graph can be broken into multiple subgraphs. The heuristics above may also generate multiple subgraphs. Specifically, we can execute a subquery plan before starting the predicate transfer phase, which can potentially reduce the initial table sizes of the transfer phase to further improve performance. Besides, the transfer and join phases can potentially be overlapped partially, for example, a subgraph that has finished the transfer phase can start the join phase while other subgraphs are still doing transferring. Bloom join natually interleaves the transfer and join phases on each join operation.
+
+In our current prototype, we apply the heuristics that first identify and execute single-table subquery plans (e.g., group by aggregation on a single table) before the predicate transfer phase begins. %, for instance, a table is first filtered and then consumed by a grouped aggregation before participating the join.
+
+% Tables that participate in the join may have local filters. In the discussion above, local filters are applied at the beginning of the predicate transfer phase. In fact, predicate transfer may be applied to a subplan, for example, a table is first filtered and then consumed by an aggregation. Predicate transfer then starts with the intermediate result of the subplan, with a potential much lower cardinality.
+% local filters can be generalized to incorporate any subqueries over the base table that may reduce the amount the input rows (e.g. grouped aggregation, top-K). Predicate transfer then starts with the subquery result with a potential much lower cardinality.\yxy{This idea seems similar to what I commented above. May the current "Extensions" can be called "Outer Joins", and the "Generalized Local Filter" can be called "Extension to Complex Queries" where you can say predicate transfer can be applied to a subplan as well; it can also be applied after a query is partially executed.}
+
+% \vspace{0.05in}
+% \noindent
+% \textbf{Overlapping Transfer and Join Phases.}
+% The transfer and join phases can potentially be overlapped partially to further improve performance. For example, a part of the join graph that has finished the transfer phase can start the join phase while other parts of the graph are still doing transferring. We can also start predicate transfer after a subquery plan is already executed (e.g., when there are pipeline breakers in the query plan). Bloom join natually interleaves the transfer and join phases on each join operation.
+% % The second optimization has been adopted naturally in Bloom join and can help optimize the generalized predicate transfer as well. 
+% Our current prototype does not overlap these two phases and the design space exploration is left to future work. 
+
+
+
+
+\subsection{Cost Analysis}
+\label{sec:discuss}
+
+Compared to the Yannakakis algorithm, predicate transfer does not provide theoretical optimality, but it is more versatile. Predicate transfer supports both precise filters (like semi-join) and Bloom filters, any join-graph topology, outer joins and cyclic queries, more operators, and complex predicate transfer schedules. 
+
+%Furthermore, predicate transfer breaks free from the restricted semi-join passes in Yannakakis, and thus it is more versatile (e.g. configurable Bloom filters, can be early-stopped when filtering gains diminish), universal (e.g. can be adapted to cyclic queries, outer joins, etc.), and scalable.
+
+In this section, we present a simple cost analysis of predicate transfer compared to the Yannakakis algorithm and show that predicate transfer is more efficient and robust than Yannakakis, and can achieve close to optimal pre-filtering efficiency. Our key idea is to show that using the cheap Bloom filters drastically reduces the cost of excessive hash probes in the semi-join phase of Yannakakis, filters out most tuples not participating in the join, and only incurs a small overhead in the join phase.
+
+
+
+\vspace{0.05in}
+\noindent
+\textbf{Cost Model.}
+Let $t$ be the number of tables in a given join query and $N$ be the input size (i.e. the total number of tuples in all joining tables). We assign a unit cost to each per-tuple scan, hashtable insertion or probe, and a $\beta$ cost per-tuple for Bloom filter insertion or probe. As a Bloom filter is of a small size and thus likely to be cache resident, Bloom filter operations are typically much cheaper than hash table operations, i.e. $\beta \ll 1$. We assume that the Bloom filter has a false positive rate of $\epsilon \ll 1$ that can be appropriately configured (e.g., we can tune $\epsilon$  to be smaller by increasing the Bloom filter size or number of hash functions, but this makes $\beta$ larger). The reader can refer to~\cite{lip17} for an in-depth study on Bloom filter configurations. 
+% Next, we compare the cost of Yannakakis and Predicate Transfer under our cost model.
+
+
+\vspace{0.05in}
+\noindent
+\textbf{Yannakakis algorithm.}
+At the semi-join phase, scanning tables to build or probe hashtables cost $N$ units, independent of the direction of the forward/backward semi-join passes. The cost of building or probing intermediate hashtables can be bounded by $c_y \cdot N$, where $c_y$ is a constant highly sensitive to the choice of the rooted join tree of the query. An ideal join tree and orientation %that prioritize highly-selective filters 
+can drastically reduce the size of intermediate hashtables, leading to a cheaper semi-join phase (smaller $c_y$). The join phase of Yannakakis is perfectly robust, as every join order costs $t \cdot \mathsf{OUT}$ units of hash probes. 
+
+\vspace{0.05in}
+\noindent
+\textbf{Predicate Transfer.}
+At the predicate transfer phase, scanning tables to build or probe Bloom filters costs $N$ units. As we only build and probe Bloom filters, the cost can be  bounded by $\beta \cdot c_p \cdot N$ units, where $c_p$ is a constant that depends on the choice of the join graph topology and transfer schedule. As $\beta \ll 1$, the sensitivity of the runtime to the constant  $c_p$ shrinks by a factor of $\beta$.
+
+In the join phase, the tables are slightly larger than the maximum filtered tables after semi-joins phase of Yannakakis, by a factor of $(1 + \epsilon)^{t} \approx 1 + \epsilon t$. Thus, in the join phase, the cost of predicate transfer can be approximated as $t \cdot \mathsf{OUT} \cdot (1 + \epsilon) $ units. The choice of the join order only affects the extra $\epsilon t \cdot \mathsf{OUT}$ term. Assuming $\epsilon \ll 1$ (and so $\epsilon t \cdot \mathsf{OUT}$ is small), the join phase still attains near-perfect robustness. 
+
+As a summary, the Yannakakis algorithm guarantees maximum filtering at the semi-join phase and perfect robustness at the join phase, but at the cost of a much more expensive and unstable semi-join phase (our evaluation in Section~\ref{sec:eval-q5} verifies this).
+In contrast, predicate transfer addresses the shortcomings via a more stable and efficient Bloom filter transfer scheme,% as a replacement of semi-joins, 
+while maintaining near-maximum filtering capabilities at the predicate transfer phase and near-perfect robustness in the join phase. 
+
+% \hangdong{a more in-depth analysis is a future work.}
+
+
+
+% The per-tuple cost of Bloom filter insertion or probe 
+
+%   - predicate transfer no longer carries the theoretical guarantee of Yannakakis 
+
+%   + predicate transfer can be applied to any join graph (e.g., multi-root or cyclic, with potential early pruning) that does not work in Yannakakis algorithm. 
+
+%   + predicate transfer can be much faster and more practical.
+
+% % \hangdong{predicate transfer no longer carries the theoretical guarantee of Yannakakis (if not strictly following the schedule of Yannakakis), but it can be applied to any join graph and early stopping can be applied to avoid transfers with diminishing gains.}
+
+% \vspace{0.05in}
+% \noindent
+% \textbf{Stability.}
+
+%   - predicate transfer improves the stability of query processing. 
+
+
+
+
+

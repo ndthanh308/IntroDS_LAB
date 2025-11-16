@@ -1,0 +1,156 @@
+\section{Proposed Method}
+\label{sec:proposed_method}
+In this section, after a brief introduction to network quantization (\Cref{subsec:preliminaries}), we first analyze the mismatch in the features of SR networks (\Cref{subsec:activation-mismatch}).
+Subsequently, we propose a solution to reduce this feature mismatch during training (\Cref{subsec:cooperative-mismatch}).
+Additionally, we examine the mismatch in weights across SR networks (\Cref{subsec:weight-mismatch}) and introduce a quantization range selection scheme that addresses the weight mismatch (\Cref{subsec:weight-clipping}).
+The overall training process is summarized in \Cref{algo-odm}.
+
+
+\subsection{Preliminaries}
+\label{subsec:preliminaries}
+To reduce the heavy computations of convolutional and linear layers in neural networks, the input features (activations) and weights of each convolution/linear layer are quantized to low-bit values~\cite{cai2017deep,choi2018pact,jung2019learning,gholami2022survey}.
+Given the input feature of the $i$-th convolution/linear layer $\mX_i\in\mathbb{R}^{B\times C\times H\times W}$, where $B, C, H,$ and $W$ represent the dimensions of the input batch, channel, height, and width, respectively, a quantization operator $q(\cdot)$ quantizes the feature $\mX_i$ with bit-width $b$:
+\begin{equation}
+\label{eq:quant}
+    q(\mX_i; l, u) = \text{Int}({ \frac{\text{clip}(\mX_i, l, u) - l}{s} }) \cdot s + l,
+\end{equation} 
+where $ \text{clip}(\cdot, l, u)$ truncates the input into the quantization range of $[l, u]$ and $s = \frac{u - l}{2^b-1}$.
+After truncation, the truncated feature is scaled to $[0, 2^b-1]$, then rounded to integer values with Int$(\cdot)$, and rescaled to range $[l, u]$.
+
+For activation quantization, the quantization range is defined by [$l_a, u_a$].
+To obtain better quantization ranges in SR networks, the clipping parameters $l_a, u_a$ for each layer are typically learned through quantization-aware training~\cite{Li2020pams,zhong2022ddtb}.
+Since the rounding function is not differentiable, a straight-through estimator (STE)~\cite{bengio2013estimating} is used to train the clipping parameters in an end-to-end manner.
+Following~\cite{zhong2022ddtb}, we initialize $l_a$ and $u_a$ as the (100-$j$)-th and $j$-th percentile values of the feature, averaged among the training data, where $j$ is set to 99 in our experiments to avoid outliers that corrupt the quantization range.
+For weights, as their distributions tend to be symmetric and the mean approximates zero, we utilize a symmetric quantization function.
+Thus, for the weight $\mW$ of each convolution/linear layer, the quantization range is defined by [$-u_w, u_w$].
+
+
+\input{sections/figures/method-obs}
+
+
+\subsection{Distribution Mismatch in SR Networks}
+\label{subsec:activation-mismatch}
+
+
+
+The unfriendliness to quantization in SR networks arises from diverse feature (activation) distributions, as reported in previous studies~\cite{Li2020pams,hong2022daq,zhong2022ddtb}, primarily due to the absence of batch normalization layers in SR networks.
+As illustrated in \Cref{fig:method-motiv}, where there are notable discrepancies between the channel and image distributions, quantization grids are unnecessarily allocated to regions with minimal feature density.
+Early SR quantization methods tackled this issue by employing learnable quantization range parameters~\cite{Li2020pams} for each feature.
+However, even though the quantization-aware training process strives to find the optimal range for each feature, it fails to account for the channel-wise and input-wise variance in distributions.
+% Regardless of how precisely the quantization range is chosen, a fixed range can only align with a limited number of channels or images and fails to accommodate others.
+This mismatch results in a large quantization error that can impair SR performance.
+To deal with these distribution mismatches, existing methods adopt different quantization ranges for each channel~\cite{hong2022daq} or input image~\cite{zhong2022ddtb,hong2022daq}.
+Nevertheless, the test-time adaptation modules used to determine these ranges introduce unwanted computational overhead during inference.
+Thus, our straightforward solution is to pre-adjust the distributions to be quantization-friendly, thereby eliminating the need for additional adaptations at inference.
+The following sections will introduce a new quantization-aware training scheme designed to resolve the distribution mismatch problem.
+
+
+\subsection{Cooperative Mismatch Regularization}
+\label{subsec:cooperative-mismatch}
+
+\input{sections/figures/method-loss}
+
+Instead of trying to identify a quantization range capable of accommodating diverse feature distributions, our approach aims to regularize the distribution mismatch beforehand.
+Obtaining an appropriate quantization range for a feature with high image- and channel-wise variance is difficult, as a certain number of channels or images will invariably be distant from the selected quantization range.
+In this work, we refer to the total distance of each feature from the selected quantization grid as the mismatch,
+\begin{equation}
+    M(\mX_i) = ||\mX_i-q(\mX_i; l_a, u_a)||_2,
+\label{eq:mismatch}
+\end{equation}
+where $||\cdot||_2$ calculates the Frobenius norm.
+Further analyses of the definition of mismatch are provided in the supplementary material.
+We can reduce the overall mismatch by directly regularizing the mismatch of each feature to be quantized.
+The mismatch regularization loss is obtained by summing the mismatch over all quantized features:
+\begin{equation}
+    \mathcal{L}_{M} = \sum_i^{\#\text{layers}}  M(\mX_i).
+\label{eq:loss-mismatch}
+\end{equation}
+The mismatch regularization loss can be used in line with the original reconstruction loss typically used in the general quantization-aware training pipeline for SR networks:
+\begin{equation}
+    \mathcal{L}_R = \mathcal{L}_1(\gQ(\mI_{LR}), \mI_{HR}), 
+\label{eq:loss-rec}
+\end{equation}
+where
+$\mathcal{L}_1$ loss indicates the $l_1$ distance between the reconstructed image using the quantized network $\gQ$ and the ground-truth HR image $\mI_{HR}$.
+Then, the optimization of the parameter $\theta^t$ is formulated as:
+\label{subsec:loss}
+\begin{equation}
+    {\theta}^{t+1} = \theta^{t} - \beta^{t} \cdot (\nabla_\theta \mathcal{L}_R(\theta^t) + \nabla_\theta \mathcal{L}_M(\theta^t) ), 
+\end{equation}
+where $\nabla_\theta \mathcal{L}_R(\theta^t)$ denotes the gradient from the original reconstruction loss and $\nabla_\theta \mathcal{L}_M(\theta^t)$ is the gradient from mismatch regularization loss, and $\beta^t$ refers to the learning rate. 
+Updating the network to minimize the mismatch regularization loss will reduce the overall error from feature quantization.
+
+However, then a question arises: \textit{does reducing the quantization error of each feature lead to improved reconstruction accuracy}?
+The answer is, according to our observation in \Cref{fig:method-conflict}, not necessarily.
+During the training process, the mismatch regularization loss can collide with the original reconstruction loss.
+That is, for some parameters, the direction of the gradient from reconstruction loss and that of the mismatch regularization are opposing, referred to as gradient conflict~\cite{du2018adapting}.
+As in \Cref{fig:method-conflict-b}, the cosine similarity of two gradients oscillates between positive and negative values during training, indicating that the directions of two gradients do not converge and the gradient occasionally conflicts.
+Furthermore, as shown in \Cref{fig:method-conflict-c}, the proportion of parameters undergoing gradient conflict is not minor, implying that the regularization loss can severely hinder the reconstruction loss.
+
+
+We aim to avoid the conflict between these two losses, in other words, to minimize the mismatch as long as it does not hinder the reconstruction loss.
+Thus, we dismiss the mismatch regularization term when it is not cooperative with reconstruction loss and make more use of it when it is cooperative.
+Specifically, we determine whether the two losses are cooperative by examining the cosine similarity of the gradients of each loss and then simply weigh the gradient of mismatch regularization by the gradient similarity. 
+Our cooperative mismatch regularization can be formulated as follows:
+\begin{equation}
+    \theta^{t+1} = 
+    \theta^{t} - \beta^{t} \cdot (\lambda_R \cdot \nabla_\theta \mathcal{L}_R(\theta^t) + \lambda_M \cdot \underline{sim(\nabla_\theta \mathcal{L}_R(\theta^t), \nabla_\theta \mathcal{L}_M(\theta^t))} \cdot \nabla_\theta \mathcal{L}_M(\theta^t) ),    
+    \label{eq:loss-coop}    
+\end{equation}
+where the underlined term, gradient similarity, is defined as $sim(\vv_a, \vv_b)\Equal \frac{cos(\vv_a, \vv_b)\Plus 1}{2}$ and $cos(\cdot, \cdot)\in[\Minus1,1]$ calculates the cosine similarity between two vectors. $\lambda_R, \lambda_M$ are hyper-parameters to balance the two gradients.
+If the directions of two gradients are similar (\ie, smaller than $90^\circ$ and closer to $0^\circ$), the gradient similarity is a large value, then the parameter is updated in the direction where mismatch regularization is also substantially considered.
+On the contrary, if the two gradients point in the other direction (\ie, larger than $90^\circ$ and closer to $180^\circ$), the two losses restrain each other, and the gradient similarity is close to 0.
+In this case, we follow the gradient of reconstruction loss.
+This allows the network to reduce the quantization error cooperatively with the reconstruction error.
+Details on gradient similarity are in the supplementary material.
+
+
+\subsection{Distribution Mismatch in Weights}
+\label{subsec:weight-mismatch}
+\input{sections/figures/method-weight}
+
+The weight distributions of SR networks have remained relatively unexplored in previous literature.
+This is because the weights in SR networks typically exhibit bell-shaped distributions, which are considered easier to quantize compared to the long-tailed, input-wise and channel-wise distinct activation distributions.
+Consequently, many studies~\cite{Li2020pams,hong2022cadyq,tian2023cabm} simply adopt max quantization for weights, setting the quantization range with the maximum value of the current weight distribution.
+However, we notice that this is suboptimal and may contribute to low performance when SR networks are quantized to ultra-low bits (\eg, 2-bit).
+The issue arises because, in some layers, the outliers are far from the distribution mean, as visualized in \Cref{fig:method-weight-b,fig:method-weight-c}.
+Thus, when the maximum value is used to determine the quantization range for such distributions, the quantization range is dominated by outliers, with quantization grids not allocated to high-density regions (\eg, near 0).
+This leads to substantial quantization errors that can accumulate and degrade restoration performance.
+In the case of 4-bit quantization (\Cref{fig:method-weight-b}), although grids still cover high-density regions to an extent, a number of grids are wasted on low-density areas.
+The problem intensifies with low-bit (2-bit) quantization (\Cref{fig:method-weight-c}), where quantization errors become significantly larger.
+This observation underscores the need for careful selection of the quantization range for layer-wise weights, particularly in low-bit quantization scenarios.
+
+\input{sections/tables/alg}
+
+\subsection{Weight Clipping Correction}
+\label{subsec:weight-clipping}
+Also, we notice that the error from weight quantization varies across different layers, as shown in \Cref{fig:method-weight-a}.
+For instance, employing the maximum value as the quantization range can be an effective policy for certain layers, yet this policy proves inadequate for others (\eg, the layer shown in \Cref{fig:method-weight-c}).
+Given the unique tendency of each layer, applying a uniform global policy for selecting the quantization range across all layers is suboptimal.
+Existing methods~\cite{Li2020pams,hong2022cadyq,tian2023cabm} utilize a fixed global policy throughout training to set the quantization range clipping parameter $u_w$ as follows:
+\begin{equation}
+\label{eq:weight-global}
+    u_w^{t} = f(\mW^{t}),
+\end{equation}
+where the global policy $f(\cdot)$ is the same function for all layers (\eg, $max(\cdot)$).
+A simple solution to accommodate layer-specific variations is to make the clipping parameter $u_w$ for each layer a learnable parameter~\cite{esser2019learned}:
+\begin{equation}
+\label{eq:weight-lsq}
+    u_w^{t+1} = u_w^t - \beta^t \cdot \nabla_{u_w} \mathcal{L}_R(u_w^t),
+\end{equation}
+where $\beta^t$ denotes the learning rate.
+This process determines the clipping parameter $u_w^{t}$ to quantize $\mW^t$ based on the weight of the previous iteration, $\mW^{t-1}$.
+However, since the weight is also updated at iteration step $t$ ($\mW^{t-1}\shortrightarrow \mW^{t}$), a mismatch occurs between the current weight and the weight quantization range derived from the previous weight.
+To address this, we first obtain the quantization range by applying the global policy to the current weight, then adjust the range with a learnable parameter that accounts for layer-specific tendencies.
+Our clipping parameter is formulated as follows:
+\begin{equation}
+\label{eq:weight-ours}
+    % u_w^l = f(W) \cdot \alpha^l,
+    u_w^{t+1} = f(\mW^{t+1}) \cdot (\gamma_w^t - \beta^t \cdot \nabla_{\gamma_w} \mathcal{L}_R(\gamma_w^t) ),
+\end{equation}
+where $\gamma_w$ is the learnable parameter for each layer representing the layer-wise adjustment.
+Each $\gamma_w$ is initially set to 1.
+To prevent outliers from dominating the initial quantization range, we set the global policy $f(\cdot)$ as the $j$-th percentile function.
+Our clipping correction scheme introduces only one additional parameter per layer; thus, the overall computational overhead is minimal. For further details, please refer to \Cref{subsec:complexity}.
+
+

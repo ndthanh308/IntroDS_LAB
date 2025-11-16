@@ -1,0 +1,12 @@
+rm -rf *.out
+rm -rf *.aux
+rm -rf *.bbl
+rm -rf *.blg
+rm -rf *.fgb_latexmk
+rm -rf *.log
+rm -rf *.fls
+rm -rf *.fdb_latexmk
+rm -rf *.dvb
+rm -rf *.dvi
+rm -rf *.synctex.gz
+rm -rf *.xcp

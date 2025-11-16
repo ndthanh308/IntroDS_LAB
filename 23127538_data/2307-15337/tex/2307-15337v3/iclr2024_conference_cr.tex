@@ -1,0 +1,763 @@
+
+\documentclass{article} %
+\usepackage{iclr2024_conference,times}
+
+\input{math_commands.tex}
+\input{macro}
+
+\usepackage{booktabs}       %
+\usepackage{enumerate}
+\usepackage{url}
+\usepackage{xspace}
+
+\usepackage{minitoc}
+\renewcommand \thepart{}
+\renewcommand \partname{}
+
+\usepackage{xcolor}         %
+\newcommand{\says}[3]{{\color{#3}#1:\emph{#2}\color{black}}\xspace}
+\newcommand{\todo}[1]{\says{TODO}{#1}{orange}}
+\newcommand{\toupdate}[1]{{\color{red}\emph{#1}\color{black}}\xspace}
+\newcommand{\revise}[1]{#1}
+
+
+\title{\method{}: Prompting LLMs for Efficient Parallel Generation}
+
+
+\author{Xuefei Ning$^1$\thanks{Equal contribution.}\\
+\texttt{foxdoraame@gmail.com} 
+\And
+Zinan Lin$^{2*}$ \\
+\texttt{linzinan1995@gmail.com} 
+\And
+Zixuan Zhou$^{14*}$ \\
+\texttt{zhouzx21@mails.tsinghua.edu.cn} 
+\And
+Zifu Wang$^{3}$ \\
+\texttt{zifu.wang@kuleuven.be} 
+\And
+Huazhong Yang$^{1}$ \\
+\texttt{yanghz@tsinghua.edu.cn} 
+\And
+Yu Wang$^{1}$ \\
+\texttt{yu-wang@tsinghua.edu.cn} 
+}
+
+
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\arxivtrue
+\iclrfinalcopy %
+\begin{document}
+
+\doparttoc %
+\faketableofcontents %
+
+\maketitle
+
+\begin{center}
+  \vspace{-22pt}
+  {$^{1}$ Department of Electronic Engineering, Tsinghua University, Beijing, China\\$^{2}$ Microsoft Research, Redmond, Washington, USA\\$^{3}$ ESAT-PSI, KU Leuven, Leuven, Belgium\\$^{4}$ Infinigence-AI}%
+  \\~\\
+  Website: \url{https://sites.google.com/view/sot-llm}\\
+  Code: \url{https://github.com/imagination-research/sot}
+\end{center}
+
+\begin{abstract}
+  This work aims at decreasing the end-to-end generation latency of large language models (LLMs). One of the major causes of the high generation latency is the sequential decoding approach adopted by almost all state-of-the-art LLMs. In this work, motivated by the 
+  thinking and writing process of humans, we propose \emph{\method{} (\methodshort{})}, which first guides  LLMs to generate the \emph{skeleton} of the answer, and then conducts parallel API calls or batched decoding to 
+  complete the contents of each skeleton point \emph{in parallel}.
+  Not only does \methodshort{} provide considerable speed-ups across 12 LLMs,
+  but it can also potentially improve the answer quality on several question categories. 
+  \methodshort{} is an initial attempt at data-centric optimization 
+  for inference efficiency, and \revise{showcases the potential of eliciting high-quality answers by explicitly planning the answer structure in language}.
+\end{abstract}
+
+\section{Introduction}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Large language models (LLMs)~\citep{brown2020gpt3,touvron2023llama,du2022glm,openai2023gp4,zheng2023judging} have shown exceptional performance in natural language processing and %
+chatbot systems.
+However, the inference process of the state-of-the-art LLMs is slow, hindering their interactive use.
+For example, it takes 22 seconds for Claude \citep{claude} (accessed through Slack API) and 43 seconds for \Remark{vicuna33B1.3} (a 33B LLaMA-based model, running locally on one NVIDIA A100 GPU) to answer the question in \cref{fig:sequential-vs-sot}.
+
+
+
+We conclude three major causes of LLMs' slow inference: (1) A \emph{large model size} requires a large amount of memory, memory access, and computation. For example, the FP16 weights of 175B GPT-3 take 350GB memory, which means at least 5$\times$80GB A100 GPUs are needed to keep the model in GPU memory. Even with enough GPUs, the heavy memory access and computation slow down the inference. (2) %
+The \emph{attention operation} in the prevailing transformer architecture is I/O bounded and has a quadratic memory and computation complexity in sequence length. (3) The \emph{sequential decoding} approach in inference generates tokens one by one. %
+This approach introduces a significant inference latency since the generation of tokens cannot be parallelized. 
+There is a bunch of literature addressing the first two axes: \emph{large model size}~\citep{xiao2022smoothquant,frantar2022gptq,lin2023awq,sheng2023flexgen,wang2021spatten} and \emph{attention operation}~\citep{kitaev2020reformer,wang2020linformer,dao2022flashattention,zaheer2020big,chen2023dynamic}. These works either compress/redesign the model~\citep{xiao2022smoothquant,frantar2022gptq,lin2023awq,kitaev2020reformer,wang2020linformer,dao2022flashattention,zaheer2020big} or redesign the serving system~\citep{sheng2023flexgen,chen2023dynamic} and hardware~\citep{wang2021spatten}.
+
+
+% Figure environment removed
+
+In contrast to prior work, we tackle the third axis and question the common assumption that LLMs have to do fully sequential decoding. We show the feasibility of \textbf{parallel decoding of off-the-shelf LLMs \emph{without} any changes to their model, system, or hardware}. For instance, for the question in \cref{fig:sequential-vs-sot}, we can reduce the latency from 22 seconds to 12 seconds (1.83$\times$ speed-up) with Claude, %
+and from 43 seconds to 16 seconds (2.69$\times$ speed-up) with Vicuna-33B V1.3 on an NVIDIA A100.
+
+
+
+The idea stems from reflecting on how humans ourselves answer questions. 
+Humans do \emph{not} always think about questions and write answers in a sequential fashion. In contrast, for many question types, we first derive the \emph{skeleton} according to some protocols and strategies, and then add evidence and details to explain each point. This is especially the case on %
+occasions like offering consultancy, taking tests, writing papers, and so on. 
+\revise{This intuition has our back to question the necessity of fully sequential decoding.}
+In this paper, we propose \emph{\method{} (\methodshort{})}. Specifically, as shown in \cref{fig:sequential-vs-sot}, we guide the LLM to derive a skeleton first by itself. Based on the skeleton, the LLMs can complete each point \emph{in parallel} so that we get a speed-up. \methodshort{} can be utilized to accelerate both open-source models with batched decoding and API-based models with parallel API calls.
+
+\revise{The current \methodshort{} is suitable for questions that require a long answer whose structure can be planned ahead, while not suitable for questions that require step-by-step reasoning or only need a short answer. Therefore,} to make the overall solution more practical, we design an extension, \methodshort{} with router (\methodrshort{}), which employs a router to only trigger \methodshort{} for suitable questions.
+
+We test \methodshort{} on 12 recently released LLMs. Not only does \methodshort{} provide considerable speed-ups (up to 2.39$\times$), but it can also improve the answer quality in many cases (\cref{fig:sequential-vs-sot}).
+
+Note that in contrast to existing model- and system-level efforts for inference efficiency, \methodshort{} takes a novel ``data-level'' pathway %
+by letting the LLM organize its output content. This novel perspective is becoming feasible and is expected to grow in importance, owing to the evolving capabilities of state-of-the-art LLMs. We hope this work can stimulate more research in the realm of data-centric optimization~\citep{zha2023data,dcai2023} for efficiency.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The rest of the paper is organized as follows. We first introduce \methodshort{} in \cref{sec:method} and show its results in \cref{sec:exp}. %
+Then, we expand on the \methodrshort{} extension in \cref{sec:router}.
+\cref{sec:literature} positions \methodshort{} in the research ecosystem (expanded in \cref{sec:literature_complete}). Finally, we analyze the limitations and share outlooks of \methodshort{} in \cref{sec:limit-and-outlook}.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{\method{} (\methodshort{})}
+\label{sec:method}
+
+\subsection{Method}
+
+\myparatightestn{Overview.}
+Based on the intuition that humans usually think about and answer a question in an organized way, the core idea of this work is to guide the LLM itself to give a skeleton first and then write the overall answer parallelly instead of sequentially.
+\cref{fig:sequential-vs-sot} illustrates how \methodshort{} produces the final answer to a user \concept{question} $q$. 
+
+\myparaemphtightestn{(1) Skeleton stage.}
+\methodshort{} first assembles a \concept{skeleton request}, $T^s(\mbox{question}=q)$, using the \concept{skeleton prompt template} $T^s$ (\cref{prompt:ts}, and \cref{prompt:ts_full} in \cref{app:implementation_details_prompt}) with the question $q$ as the parameter. 
+The skeleton prompt template is written to guide the LLM to output a concise skeleton of the answer. Then, we extract the $B$ points from the \concept{skeleton response} $R^s$ of the LLM.
+
+\myparaemphtightestn{(2) Point-expanding stage.} Based on the skeleton, we let the LLM expand on each point in parallel. Specifically, for the point with index $b$ and skeleton $R^s_b$, \methodshort{} uses $T^{pe}(\mbox{question}=q, \mbox{skeleton}=R^s, \mbox{point index}=b, \mbox{point skeleton}=R_{b}^s)$ as the \concept{point-expanding request} for the LLM, where $T^{pe}$ is the \concept{point-expanding prompt template} (\cref{prompt:tp}). Finally, after completing all points, we concatenate the point-expanding responses $\{R^{pe}_b\}_{b=1,\cdots,B}$ to get the \concept{final answer}. 
+
+\begin{promptenv}{Skeleton Prompt Template $T^s$}{You're an organizer responsible for only giving the skeleton (not the full content) for answering the question. Provide the skeleton in a list of points (numbered 1., 2., 3., etc.) to answer the question. Instead of writing a full sentence, each skeleton point should be very short with only 3$\sim$5 words. Generally, the skeleton should have 3$\sim$10 points. Now, please provide the skeleton for the following question.\\\promptarg{question}\\Skeleton:}{1.}
+  \label{prompt:ts}
+\end{promptenv}
+
+\begin{promptenv}{Point-Expanding Prompt Template $T^{pe}$}{You're responsible for continuing the writing of one and only one point in the overall answer to the following question.\\\\\promptarg{question}\\\\The skeleton of the answer is\\\\\promptarg{skeleton}\\\\Continue and only continue the writing of point \promptarg{point index}. Write it **very shortly** in 1$\sim$2 sentence and do not continue with other points!}{\promptarg{point index}. \promptarg{point skeleton}}
+  \label{prompt:tp}
+\end{promptenv}
+
+
+
+
+
+\myparatightestn{Parallel point expanding.}
+We conduct \emph{parallel} point-expanding so that \methodshort{} is able to achieve a speed-up than \methodbase{} decoding. 
+
+\myparaemphtightestn{(1) For proprietary models with only API access}, we can issue multiple parallel API calls to get an end-to-end latency gain at the cost of an increased number of API requests and tokens. %
+
+\myparaemphtightestn{(2) For open-source models that we can run locally}, we let them process the point-expanding requests as a batch (paddings are added to the left of the point-expanding requests). We explain below why this could achieve speed-ups.
+A typical LLM generative process consists of two phases: (a) the \emph{prefilling} phase in which the prompt is parsed to generate the key-value cache for further use, and (b) the \emph{decoding} phase in which tokens are generated one by one in a sequential manner.
+The decoding phase accounts for the majority of the end-to-end latency, especially when generating a long response. Note that the decoding phase is bottlenecked by weight loading instead of activation loading or computation.\footnote{This is true when the number of concurrent queries is small; see \cref{sec:limit-and-outlook} for discussion on other scenarios.}
+Consequently, running LLM inference with increased batch sizes does not increase the per-token latency much.
+Therefore, \methodshort{} 
+allows us to decode roughly $B\times$ more tokens within the same amount of time if we parallelly decode $B$ points. 
+See \cref{app:why_sot_reduce_latency_local} for the expanded discussions and the supporting experiments.
+Please refer to \cref{app:implementation_details} for more implementation details. %
+
+
+
+\section{\methodshort{} Evaluation}
+\label{sec:exp}
+\vspace{-0.1cm}
+
+\myparatightestn{Datasets.} We evaluate \methodshort{} on two recent assistant-style datasets: (1) \vicunadataset{}~\citep{vicuna2023}, which contains 80 questions spanning nine categories, such as \textit{coding}, \textit{math}, \textit{writing}, \textit{roleplay}, and so on, and (2) \wizardlm{}~\citep{xu2023wizardlm}, which contains 218 questions spanning more categories and diverse difficulties. Due to space constraints, we only report \vicunadataset{} results in the main paper, and defer \wizardlm{} results to the \cref{app:efficiency,app:quality}. %
+
+
+
+\myparatightestn{Models.} We test \methodshort{} on 12 models, including 9 open-source models and 3 API-based models. We obtain the weights of all the open-source models from Hugging Face. See \cref{app:model_details} for more details. 
+
+
+\subsection{Evaluation of Efficiency}
+\label{sec:eval_eff}
+
+
+
+
+\myparatightestn{API-based models.} We record the latency of every API call with \verb/start = time.time(); ...; elapsed_time = time.time() - start/, and add the latency of the skeleton API call and the slowest point-expanding API call as the \methodshort{} latency.
+
+\myparatightestn{Open-source models.} All open-source models we currently evaluate are based on the \Remark{llama} 7B, 13B, or 33B architectures. Thus, to enable fast analysis, we first make a latency profiling table for each \Remark{llama} architecture on NVIDIA A100. The table contains the architecture's (1) latency for prefilling sequences of length 1 to 700 with different batch sizes (from 1 to 16), and (2) decoding one token with a context of length 1 to 1024 with different batch sizes (from 1 to 16). With these three latency profiling tables, given the number of points $B$, the token lengths of the requests and responses in the skeleton and point-expanding stages, we can quickly estimate the \methodshort{} latency by simply looking up entries in the tables and adding them up. See \cref{sec:app-profiling-estimate} for a more detailed description of how we conduct the profiling and estimate the latency. %
+
+
+
+In addition to the above approach, 
+we also compare the actual latency of \methodshort{} and \methodbase{} sequential generation (abbreviated as ``\methodbase{}'' in the following discussion)  in \cref{sec:app-actual-eff-test}.
+
+The rest of this section shows the speed-ups of \methodshort{} on different models (\cref{sec:eval_eff_model}) and question categories (\cref{sec:eval_eff_category}). In addition, we also report the latency breakdown of \methodshort{} stages in \cref{app:latency_breakdown_stage_phase} and the \methodshort{} speed-ups on an RTX 3090 GPU in \cref{sec:app-3090}.
+
+
+
+\subsubsection{Speed-up Breakdown: Models}
+\label{sec:eval_eff_model}
+
+We investigate how \methodshort{} reduces the end-to-end latency on different models. \cref{fig:speed-up_model_average} shows the average speed-up for each model across all question categories. We can see that  \methodshort{} obtains a $>$2$\times$ speed-up (up to 2.39$\times$) on 8 out of 12 models. %
+
+
+We report the detailed statistics about token lengths and numbers of points in \cref{fig:statistics}.
+(1) In terms of \emph{the point number $B$} (\cref{fig:outline_num_points_average}), \Remark{llama2}, \Remark{vicuna7B1.1}, \Remark{vicuna7B1.3}, and \Remark{chatgpt} yield relatively fewer points ($<$6), while \Remark{gpt4} and \Remark{stablevicuna13B} generates the largest number of points on average ($\approx$9).
+(2) Regarding \emph{the point-expanding response length}, \cref{fig:naive_response_average,fig:outline_response_2_average,fig:maxlen_div_len_average} show that the API-based models, \Remark{chatgpt}, \Remark{claude}, and \Remark{gpt4}, follow the point-expanding request better and generate shorter point-expanding responses than the open-source models.  %
+One can also notice that \Remark{stablevicuna13B}'s longest point-expanding responses for many question categories %
+can be as lengthy as the overall \methodbase{} answer, 
+since it fails to adhere to the ``Write it **very shortly**'' instruction in the point-expanding request. Consequently, \methodshort{} cannot accelerate \Remark{stablevicuna13B} well.
+(3) Regarding \emph{the length balance degree between point responses}, \cref{fig:balance_average}
+shows that \Remark{llama2} and the API-based models generate more balanced point-expanding responses.
+(4) As for \emph{the overall length of the final aggregated answer} (\cref{fig:totlen_div_len_average}), employing \methodshort{} on most models results in answers that are, on average, 1$\sim$2$\times$ longer than the \methodbase{} answer.
+
+
+% Figure environment removed
+
+
+
+\subsubsection{Speed-up Breakdown: Question Categories}
+\label{sec:eval_eff_category}
+
+Here we investigate how \methodshort{} reduces the end-to-end latency for different question categories. \cref{fig:speed-up_category_average} shows the average speed-up for each question category across all models. The question categories for which \methodshort{} can provide high-quality answers are marked in green, and other categories are marked in red (see \cref{sec:eval_algo_category} for the answer quality evaluation). We can see that \methodshort{} can obtain speed-ups for all question categories. For the five question categories that \methodshort{} can provide high-quality answers (i.e., \textit{knowledge}, \textit{generic}, \textit{common-sense}, \textit{roleplay}, \textit{counterfactual}), \methodshort{} can speed up the overall answer generation process by 1.89$\times$ to 2.33$\times$ in the meantime.
+
+
+
+
+\subsection{Evaluation of Answer Quality}
+\label{sec:eval_algo}
+
+In order to compare the answer quality of the \methodbase{} sequential generation (abbreviated as ``\methodbase{}'' in the following discussion) and \methodshort{} generation, we adopt two LLM-based evaluation frameworks: \fastchat{} \citep{zheng2023judging} and \llmzoo{} \citep{llm-zoo-2023}. The evaluation process is to present a question and a pair of answers (from \methodbase{} or \methodshort{} generation) to an LLM judge (\Remark{gpt4} in the main paper; see \cref{app:quality_gpt3.5} for the results evaluated using \Remark{chatgpt}) and ask for its preference.
+
+Here are more details about the evaluation of the answer quality:
+
+\myparaemphtightestn{(1) Detailed metrics.} \fastchat{} provides one metric for the general answer quality. In addition to a general metric, \llmzoo{} provides five detailed metrics on the answers' coherence, diversity, immersion, integrity, and relevance. 
+
+\myparaemphtightestn{(2) Question categories.} \fastchat{} provides two special evaluation prompts for coding and math questions for more accurate evaluation, whereas \llmzoo{} does not. Following the implementation in \llmzoo{}, we exclude math and coding questions in all \llmzoo{} evaluation results.
+
+\myparaemphtightestn{(3) Extentions to avoid evaluation bias.}
+To avoid the potential bias from the order of the two answers presented to the LLM judge, we extend \fastchat{} and \llmzoo{} evaluation frameworks by running the evaluation twice with either ordering of the two answers. In either evaluation, a score of 1, 0, and -1 is assigned when \methodshort{} wins, ties, or loses, respectively. The final evaluation is that \methodshort{} wins/ties/loses when the sum of the two scores is positive/zero/negative. For example, if \methodshort{} wins in one evaluation and loses in the other evaluation, the result is ``tie''. If \methodshort{} wins (loses) in one evaluation and ties in the other, the result is ``win'' (``lose'').
+
+\myparaemphtightestn{(4) Net win rates.} We further define net win rates to give a summarized view of the answer quality. Given the number of questions that \methodshort{} wins (\#win) and loses (\#lose), we define \emph{net win rates} as $\nicefrac{\text{\#win}-\text{\#lose}}{\text{total number of questions}}$.
+0\% means that \methodshort{} performs competitively to the \methodbase{} baseline (wins and loses in the same number of questions). Higher values mean that \methodshort{} performs better. 
+
+In the following sections, we first present the overall quality of \methodshort{} answers (\cref{sec:eval_algo_overall}), and then go into the details across different question categories (\cref{sec:eval_algo_category}), models (\cref{sec:eval_algo_model}), and metrics (\cref{sec:eval_algo_metric}).
+
+
+\subsubsection{Overall Quality}
+\label{sec:eval_algo_overall}
+
+In \cref{fig:win_tie_lose_bar_GENERAL_gpt4}, we show the win/tie/lose rates (the percentage of the cases when \methodshort{} wins/ties/loses compared to \methodbase{} generation) across all models and questions using the two metrics from \fastchat{} and \llmzoo{} that capture the general quality of the answers. We notice a discrepancy between the two metrics on when \methodshort{} is strictly better than the baseline (45.8\% v.s. 29.5\%). Despite that, the two metrics agree that \methodshort{} is not worse than the baseline in around 60\% of the cases, and the win rates are close to the lose rates.
+\emph{This result suggests that the answers of \methodshort{} maintain good quality of that of the normal generation.}
+
+% Figure environment removed
+
+\subsubsection{Quality Breakdown: Models}
+\label{sec:eval_algo_model}
+We compute net win rates on all models in \cref{fig:net_win_rates_model_gpt4}. Again, we see that the two general metrics from \fastchat{} and \llmzoo{} have different absolute values but similar rankings. In particular, both metrics agree that \Remark{openchat13B}, \Remark{vicuna7B1.1}, \Remark{claude}, \Remark{llamachat13B2} have \emph{low} net win rates, whereas \Remark{vicuna13B1.3}, \Remark{stablevicuna13B}, and \Remark{ultralm13B} have \emph{high} net win rates. 
+
+% Figure environment removed
+
+We investigate the answers in \cref{sec:app-eval-quality-model-pattern}, and summarize the key takeaways as follows.
+Some models have low \methodshort{} %
+net win rates
+as they cannot understand the skeleton and point-expanding prompts well. 
+Some other models have low \methodshort{} %
+net win rates
+as their normal answers already have good quality, making it hard for \methodshort{} to beat them (e.g., \Remark{claude}). 
+For models that are able to understand the \methodshort{} prompts and the normal answers are not good enough,
+\methodshort{} can improve the answer quality. %
+We expect that further improving SoT prompts or
+fine-tuning the models can make it easier for LLMs to understand the skeleton and point-expanding
+prompts and ultimately result in better answer quality.
+
+
+
+\subsubsection{Quality Breakdown: Question Categories}
+\label{sec:eval_algo_category}
+We compute net win rates on all question categories
+in \cref{fig:net_win_rates_category_gpt4}. Similar to \cref{fig:win_tie_lose_bar_GENERAL_gpt4}, we see that \llmzoo{} tends to be more optimistic about the quality of \methodshort{} than \fastchat{}. 
+Nevertheless, the conclusions are consistent: \methodshort{} performs relatively \emph{well} on \textit{generic}, \textit{common-sense}, \textit{knowledge}, \textit{roleplay}, and \textit{counterfactual}, and relatively \emph{poorly} on \textit{writing}, \textit{fermi}, \textit{math}, and \textit{coding}. %
+
+% Figure environment removed
+
+
+We investigate the answers in \cref{sec:app-eval-quality-category-pattern}, and summarize the key takeaways as follows.
+\methodshort{} performs well when the question can be answered in several points whose details can be expanded independently. This includes a wide range of real-world questions.
+On the other hand, it is fundamentally challenging to apply \methodshort{} on questions that require step-by-step thinking, in which the latter steps require the details from the earlier steps, such as math questions. 
+To make \methodshort{} general across broader question categories, one promising pathway is to enable \methodshort{} to adaptively fall back to normal generation, which we explore in \cref{sec:router}. 
+Interestingly, our results suggest that some LLMs are already able to do that occasionally without special prompting or tuning (see \cref{sec:app-eval-quality-category-pattern}).
+
+\subsubsection{Quality Breakdown: Metrics}
+\label{sec:eval_algo_metric}
+In \cref{fig:win_tie_lose_bar_DETAILS_gpt4}, we show more detailed metrics from \llmzoo{} to reveal in which aspects \methodshort{} can improve or hurt the answer quality. On average, we can see that \methodshort{} improves the diversity and relevance while hurting the immersion and coherence.
+
+% Figure environment removed
+
+Through answer investigation (\cref{sec:app-eval-quality-metric-pattern}), we summarize the key takeaways as follows.
+The skeleton stage of \methodshort{} explicitly require LLMs to discuss the answers from multiple aspects without filler words. This improves the diversity and relevance of the answers. %
+As for coherence and immersion, \methodshort{} is not worse than the \methodbase{} generation around 60\% of the time. One future direction is to improve the \methodshort{} prompts or pipeline so that the answers can be better in more metrics.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{\methodshort{} with Router (\methodrshort{}): Adapatively Triggering \methodshort{}}
+\label{sec:router}
+\vspace{-0.2cm}
+In \cref{sec:exp}, we see that \methodshort{} provides considerable speed-ups while maintaining (or even improving) answer quality for many question types. However, the biggest limitation is that \methodshort{} is not suitable for questions that require step-by-step reasoning (\cref{sec:eval_algo_category}). 
+Towards pushing the practical adoption of \methodshort{}, we explore the possibility of \emph{adaptively triggering \methodshort{}} only when it is suitable. To achieve that, we propose a \emph{router} module that decides if \methodshort{} should be applied for the user request, and then call either \methodshort{} or \methodbase{} decoding accordingly. This paradigm aligns with the recent trends of composing multiple models to solve complicated tasks \citep{Chase_LangChain_2022,shen2023hugginggpt}. To implement the router, we explore two options: LLM prompting as the router (no model training is needed) (\cref{sec:fallback_prompting}), and trained \roberta{} as the router (\cref{sec:trained_roberta}). The evaluation is provided in \cref{sec:router_exp}.
+
+
+\vspace{-0.1cm}
+\subsection{Prompting Router}
+\label{sec:fallback_prompting}
+
+We directly ask an LLM if the question is suitable for \methodshort{}. More specifically, we ask the LLM if the desired answer is in a list of independent points (see \cref{app:prompting_router} for the prompt). If the answer is yes, we will use \methodshort{}; otherwise, we will use \methodbase{} generation (i.e., directly feeding the question to the LLM). We employ \Remark{gpt4} as the LLM router given its strong capability. %
+
+\subsection{Trained Router}
+\label{sec:trained_roberta}
+
+While leveraging GPT-4 as the router obviates the need for model training, its performance remains sensitive to prompt design. %
+Therefore, we approach the problem as a sequence classification task by fine-tuning a small language model as the router. Specifically, we annotate the LIMA dataset \citep{zhou2023lima} as the training set to train a \roberta{} model \citep{liu2019roberta}, which has only 120M parameters.
+Details about the annotation and training can be found in \cref{app:annotation_process_router,app:training_details_roberta}.
+
+
+
+
+
+\subsection{\methodrshort{} Evaluation}
+\label{sec:router_exp}
+We compare \methodshort{} and \methodrshort{} under the same evaluation setup in \cref{sec:exp}. Besides the prompting and trained routers, we also consider a ``human router'' where we manually judge whether \methodshort{} should be applied for each question. This serves as a benchmark for comparison.
+
+\vspace{-0.3cm}
+\subsubsection{Evaluation of Efficiency}
+\vspace{-0.2cm}
+
+
+
+\cref{fig:efficiency_router_vicuna} shows the speed-ups of \methodshort{} and \methodrshort{} for different models on \vicunadataset{} (see \cref{sec:more-effiency-sotr} for results on the \wizardlm{} dataset). We can see that: (1) As expected, \methodrshort{} obtains lower speed-ups than \methodshort{}, since \methodshort{} is not triggered for some questions and the router induces a small latency overhead. Nevertheless, \methodrshort{} can still benefit most models with $>$1$\times$ speed-ups. (2) %
+\methodrshort{} with the trained router obtains slightly higher speed-ups for 7 out of 12 models on \vicunadataset{}, while \methodrshort{} with the prompting router obtains higher speed-ups for all models on WizardLM (\cref{fig:efficiency_router_wizardlm_model}).
+
+
+
+% Figure environment removed
+
+
+\vspace{-0.2cm}
+\subsubsection{Evaluation of Answer Quality}
+\vspace{-0.1cm}
+\cref{fig:quality_router_gpt4_fastchat} shows the net win rates (averaged across all models) of \methodshort{} and \methodrshort{} on \vicunadataset{} with the \fastchat{} metrics (see \cref{app:quality_router} for results of the \wizardlm{} dataset and \llmzoo{} metrics). We can see that: (1) \methodrshort{} significantly improves the answer quality on questions where \methodshort{} is not suitable (e.g., \textit{coding}, \textit{math}, \textit{writing}, \textit{fermi}) by falling back to \methodbase{} decoding. At the same time, \methodrshort{} maintains answer quality improvements on questions where \methodshort{} is good at. (2) The trained router performs similar to (on \vicunadataset{}) or better than (on \wizardlm{}; see \cref{app:quality_router}) the prompting router. This accords with our intuition in \cref{sec:trained_roberta}. (3) The prompting and trained routers could even surpass human router (e.g., on roleplay questions; see more examples on \wizardlm{} in \cref{app:quality_router}).
+
+We discuss the consistency across three routers in \cref{app:router_consistency}. The primary takeaways include: (1) on \vicunadataset{}, there is a notable consistency among all three routers, and (2) on \wizardlm{}, greater discrepancies emerge, with the trained router showing higher alignment with human annotations.
+
+
+\vspace{-0.2cm}
+\section{\methodshort{} In the Context of Literature}
+\label{sec:literature}
+\vspace{-0.2cm}
+This section positions \methodshort{} in related work to reveal how \methodshort{} (1) is connected to, (2) is different from, and (3) can harness the power of other methods. See \cref{sec:literature_complete} for the expanded discussion.
+
+\myparatightestn{Efficient LLM methods at model and system levels.}
+At the model level, prior work proposes efficient architectures, including dynamic mixture-of-experts~\citep{lepikhin2021gshard}, low-complexity attention~\citep{kitaev2020reformer}, and multi-query attention~\citep{shazeer2019fast}. However, they usually require a significant re-training cost. In contrast, compression methods require a smaller amount of fine-tuning cost by reducing the complexity of pre-trained LLMs,  %
+such as quantization~\citep{frantar2022gptq} and weight or activation sparsification~\citep{semi_first,zaheer2020big}. %
+
+At the system level, prior work (1) optimizes the computational graph~\citep{dao2022flashattention}, (2) optimizes the assignment and scheduling of computational graph on devices~\citep{sheng2023flexgen}, or (3) designs batching or caching mechanisms for serving multiple users~\citep{fang2021turbotransformers}. These techniques address the large memory access and footprint posed by the vast model scale and attention mechanism, and mainly aim at enhancing the throughput rather than the end-to-end latency. As \methodshort{} trades off throughput for end-to-end latency, \textit{\methodshort{} can 
+make
+these throughput-oriented techniques %
+help with
+end-to-end latency}. This interesting synergy offers opportunities for achieving better trade-offs between latency and throughput in future serving systems.
+
+\textit{In contrast to model- and system-level techniques, SoT is a data-level technique in a new ``content co-organization for efficiency'' paradigm}.
+See \cref{sec:limit-and-outlook} for more discussions. %
+
+
+
+
+
+\myparatightestn{Efficient LLM methods through parallel generation.}
+Some prior work also addresses
+the sequential decoding issues. 
+Speculative decoding (SD) methods~\citep{stern2018blockwise} employ smaller models %
+to generate some consecutive tokens sequentially and apply the target LLMs to verify them parallelly. Non-autoregressive generation (NAG) methods~\citep{gu2018nonautoregressive,xiao2023survey} sample and refine consecutive tokens parallelly, often with the support of a modified and tuned model.
+
+
+Relying on either assisting models or special models and sampling schemes, SD and NAG methods conduct \textit{parallel verification or sampling and refinement of consecutive tokens}. In contrast, \methodshort{} prompts the LLM \emph{itself} to plan the contents in a way that permits \textit{the parallel generation of tokens in different segments}, by exploiting the emerging instruction-following and planning ability of LLMs. %
+
+
+\myparatightestn{Prompting methods for LLMs.}
+Recent years have witnessed the emergence of the ``pre-train, prompt, and predict'' paradigm, %
+which has shown promise in enhancing LLMs' quality in math and commonsense reasoning~\citep{wei2022chain,kojima2022large,wang2022selfconsistency,chen2022program} and planning for multi-modality tasks~\citep{shen2023hugginggpt,zhu2023ghost}. %
+Instead of focusing on answer quality, \textit{\methodshort{} is a first attempt at exploiting the power of prompting to improve efficiency}.
+
+\vspace{-0.3cm}
+\section{Limitations, Future Work, and Open Questions}
+\label{sec:limit-and-outlook}
+\vspace{-0.3cm}
+
+\myparatightestn{Answer quality evaluation.} Our answer quality evaluation is far from perfect due to the limited prompt set, the potential bias of GPT-4 judges, and the inherent difficulty of evaluating LLM generations. %
+Currently, we did not conduct human evaluation since it is easy for a human to tell whether an answer is generated with \methodshort{} due to its distinctive pattern, which might cause evaluation bias.
+
+\myparatightestn{Eliciting or improving LLMs' ability.}
+\cref{sec:eval_algo_metric} demonstrates \methodshort{}'s potential of enhancing answer quality. It is part of a broader trend in recent research, exemplified by work including CoT~\citep{kojima2022large,wei2022chain}, ToT~\citep{yao2023tree}, and ReAct~\citep{yao2022react}, which collectively affirm the notion that \emph{explicitly articulating the thought process in language can elicit high-quality answers from LLMs}.
+These findings resemble human thinking: rather than relying solely on the first intuition or purely sequential thinking, 
+we often document step-by-step reasoning or thought organization to attain 
+high-quality answers. This intriguing parallel prompts us to explore further how we can draw from the human thinking process to facilitate more effective and efficient AI.
+
+For instance, \methodshort{} currently 
+ignores the dependencies between points. A conceptually better way is to organize the points as \emph{Graph-of-Thoughts}, where the edges represent the dependencies, and each point is decoded conditioned on the contents of its ancestor points.
+In addition, instead of complying with a \emph{static} graph, we expect the need %
+of having
+\emph{dynamic Graph-of-Thoughts}, where the high-level thought structure is adjusted dynamically by LLMs themselves. This could potentially combine the efficiency and global thinking advantages of \methodshort{} with the logical reasoning and impromptu thinking strengths of methods like CoT~\citep{kojima2022large,wei2022chain}. Notably, a contemporary work~\citep{besta2023graph} has attempted to design Graph-of-Thoughts to elicit reasoning.
+Furthermore, %
+it is interesting to explore how the \methodshort{} answers can be used to fine-tune LLMs to generate more structured answers in a self-improving way~\citep{zelikman2022star,huang2022large}.
+
+
+\myparatightestn{Efficiency and overhead of \methodshort{} in different scenarios.}
+Serving systems commonly adopt batch processing to handle concurrent queries. %
+This raises a concern of whether \methodshort{} may hurt %
+serving throughput due to parallel requests.
+(1) When there is an unsaturated number of concurrent queries,
+\methodshort{} can effectively 
+reduce latency and
+enhance GPU utilization. %
+Example scenarios include (a) Edge-side applications with a single user; (b) Centralized services during periods with unsaturated user requests and underutilized computing capacity.
+It is %
+interesting %
+to study the appropriate \methodshort{} triggering conditions based on system workloads.
+(2) When there is a saturated number of concurrent queries, %
+\methodshort{} is still useful for improving answer quality.
+However, in this case, it is important to consider the computation overhead from \methodshort{}. %
+We delve into this concern in \cref{sec:app-token-overhead}.
+
+For API-based models, a notable concern arises regarding the increased number of prefilling tokens (\cref{sec:app-token-overhead}). Given that many APIs charge token usage, \methodshort{} may lead to higher costs. To address this, one can %
+use prompt tuning to design shorter \methodshort{} prompts\revise{~\citep{jiang-etal-2023-llmlingua}}. %
+
+\myparatightestn{Data-centric efficiency optimization.}
+While data-centric engineering for improving answer \emph{quality}~\citep{zha2023data,dcai2023} is gaining popularity,
+its potential for \emph{inference efficiency} is not explored yet. \methodshort{} is the first attempt. %
+As LLM capabilities and the amount of LLM-generated data are growing rapidly, data-centric techniques could become more useful in the future.
+\revise{To pave the way towards that, there are a lot to explore. For example, the acceleration ratio of \methodshort{} depends on the SoT prompt, the model, and the question, and thus not as predictable and controllable as model- or system-level techniques, which might hinder the practical adoption.}
+We look forward to future work
+to unlock the full potential of data-centric efficiency optimization.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section*{Acknowledgements}
+We thank Sergey Yekhanin (Microsoft Research), and Tianji Wu (Infinigence AI) for their support and suggestions on the work. We thank Tianyu Fu for many initial discussions on the idea. We thank Ke Hong and Genghan Zhang for their discussions about profiling. We thank Yue Wu for the help on the \Remark{claude} scripts. We thank Da Yu, Chulin Xie, and Saiqian Zhang for their suggestions on revising the first version of the paper. We thank Rui Hu, Cheng Cheng, Jack Jin, Zhoutong Ye, Mingze Sun, Jun Yan, Zhi Zhang, Yuxuan Tong, Nianhui Guo, and Andrea Santilli for their suggestions on revising the second version of the paper.
+We thank Chris Stetkiewicz, Amanda Melfi, and Amber Tingle from Microsoft for their suggestions and help on writing.
+We thank the anonymous reviewers for their insightful questions and suggestions.
+
+
+\bibliographystyle{iclr2024_conference}
+\bibliography{top,iclr2024_conference}
+
+\clearpage
+\appendix
+\part{Appendix}
+\parttoc
+\clearpage
+
+\section{Model Details}
+\label{app:model_details}
+\input{texts/model_details}
+
+\section{Implementation Details of \method{}}
+\label{app:implementation_details}
+
+\subsection{Prompt}
+\label{app:implementation_details_prompt}
+
+
+The skeleton prompt is shown in \cref{prompt:ts,prompt:ts_full} and the point-expanding prompt is shown in \cref{prompt:tp}.
+
+\begin{promptenv}{Skeleton Prompt Template $T^s$ (with Two-Shot Demonstrations)}{You're an organizer responsible for only giving the skeleton (not the full content) for answering the question. Provide the skeleton in a list of points (numbered 1., 2., 3., etc.) to answer the question. Instead of writing a full sentence, each skeleton point should be very short with only 3$\sim$5 words. Generally, the skeleton should have 3$\sim$10 points.\\\\Question:\\What are the typical types of Chinese dishes?\\Skeleton:\\1. Dumplings.\\2. Noodles.\\3. Dim Sum.\\4. Hot Pot.\\5. Wonton.\\6. Ma Po Tofu.\\7. Char Siu.\\8. Fried Rice.\\\\Question:\\What are some practical tips for individuals to reduce their carbon emissions?\\Skeleton:\\1. Energy conservation.\\2. Efficient transportation. \\3. Home energy efficiency. \\4. Reduce water consumption. \\5. Sustainable diet. \\6. Sustainable travel.\\\\Now, please provide the skeleton for the following question.\\\promptarg{question}\\Skeleton:}{1.}
+  \label{prompt:ts_full}
+\end{promptenv}
+
+
+\myparatightestn{Skeleton prompt template.} 
+In order to make the output skeleton short and in a consistent format for the good of efficiency and ease of point extraction, the skeleton prompt template (1) describes the task precisely, %
+and (2) provides a partial answer ``1.'' for the LLM to continue writing. 
+The skeleton responses are in the desired format in most cases. Therefore, we can use a simple regular expression \verb/(\d+)\.\s?([\s\S]+?)(?=\n|\n*$)/ to extract point indexes and point skeletons from the skeleton response.
+
+We find that \Remark{gpt4} can work well without the two demonstrations in the skeleton prompt. Therefore, we do not include the two demonstrations for \Remark{gpt4} (\cref{prompt:ts}). For all other models, the two demonstrations are included, as shown in \cref{prompt:ts_full}.
+
+\myparatightestn{Point-expanding prompt template.}
+It describes the point-expanding task and provides a partial answer. We also provide instructions ``Write it **very shortly** in 1$\sim$2 sentence'' so that the LLMs keep the answers concise. Unlike the skeleton prompt template, we find that demonstrations are not necessary to get reasonable results.
+
+We find that \Remark{claude} and \Remark{gpt4} follows the instruction ``Write it **very shortly** in 1$\sim$2 sentence and do not continue with other points!'' in \cref{prompt:tp} very well, so that the answers are very short. Therefore, we delete ``**very shortly**'' from the prompt template in \Remark{claude} and \Remark{gpt4}. %
+
+\paragraph{Partial answer.} In the \cref{prompt:ts,prompt:tp}, we provide partial answers so that LLMs can follow the desired response format better.
+
+We can put the partial answer at the end of the prompt for the open-source models to continue writing. An implementation detail is that different open-source models have different conversation templates (i.e., different ways to combine user and assistant messages into one string). 
+For example, \Remark{vicuna}~\citep{vicuna2023} uses the string ``USER:'' and `` ASSISTANT:'' for the placeholder ``\textbf{[User:]}'' and ``\textbf{[Role]}'' in the \cref{prompt:ts,prompt:tp}, respectively, while \Remark{ultralm}~\citep{ding2023enhancing} uses ``User:'' and ``\textlangle/s\textrangle Assistant:''. We build our open-source model experiments with the help of the FastChat codebase~\citep{zheng2023judging}, in which the conversation templates of many models are already  handled correctly. We implement the conversation templates of \Remark{openchat13B}, \Remark{stablevicuna13B}, and \Remark{ultralm13B} according to their official guides and codes.
+
+For \Remark{chatgpt}, we provide partial answers as a last message in the chat history from the assistant. Note that it is not a documented approach. We find it works well in most cases, in that \Remark{chatgpt} continues the texts from the provided partial answer. However, in some rare cases, \Remark{chatgpt} repeats the provided partial answers.
+
+For \Remark{claude} over Slack, there is no obvious way to give the API a partial answer. We resort to modifying the prompt template slightly by adding \begin{center}\textit{Please start your answer from ``\promptarg{partial answer}'' and do not output other things before that} \end{center} at the end. We find that \Remark{claude} understands and obeys it well. For \Remark{gpt4}, we also take this approach.
+
+\paragraph{System Message.}
+We do not include the system message in the prompts for open-source models except \Remark{llama2}.
+
+The partial answer, ``**very shortly**'', and the 2-shot demonstrations discussed above are the only differences between the prompts we used across all models and all evaluations.
+
+
+
+
+
+
+
+
+
+
+\subsection{Supporting Multi-Round Conversation}
+To use \methodshort{} in a multi-round conversation, we can just put the question and the final aggregated answer in the history, removing all the \methodshort{} prompts. In this way, using \methodshort{} in one conversation round will not introduce additional prefill cost in future rounds.
+
+
+\section{Implementation Details of \method{} with Router}
+\label{app:implementation_details_router}
+\input{texts/app_router_implementation}
+
+
+\section{\methodshort{} In the Context of Literature (Expanded)}
+\label{sec:literature_complete}
+\input{texts/literature}
+
+\section{Efficiency Analysis}
+\input{texts/efficiency_analysis}
+
+\section{Efficiency Profiling}
+\input{texts/efficiency_profiling}
+
+\section{Efficiency Evaluation}
+\label{app:efficiency}
+\input{texts/efficiency_evaluation}
+
+
+\section{Overhead of \methodshort{} in Different Scenarios}
+\label{sec:app-token-overhead}
+\input{texts/sot_overhead}
+
+\section{Answer Quality Evaluation}
+\label{app:quality}
+
+\subsection{\method{}}
+\input{texts/answer_analysis_model}
+\input{texts/answer_analysis_category}
+\input{texts/answer_analysis_metric}
+
+\subsubsection{Quality Breakdown: Question Categories and Models}
+\revise{In the main text, we analyze how question categories and models affect \methodshort{}'s answer quality. Here, \cref{fig:model_category_gpt4} show the per-model and per-category results.}
+
+% Figure environment removed
+
+\subsection{\method{} with Router}
+\label{app:quality_router}
+
+\cref{fig:quality_router_gpt4_llmzoo} shows net win rates of \methodshort{} on \vicunadataset{} dataset with \llmzoo{} metrics, and \cref{fig:quality_router_gpt4_fastchat_wizardlm} shows net win rates of \methodshort{} on \wizardlm{} dataset with \fastchat{} metrics.
+The key takeaways are:
+(1) In both cases, \methodrshort{} achieves similar or better quality than \methodshort{}, and the net win rates of \methodrshort{} are usually non-negative. This indicates that \methodrshort{} falls back to \methodbase{} decoding on the right question categories. 
+(2) On the \wizardlm{} dataset, we see that the trained router has better performance than the prompting router in most cases. This is reasonable, as the prompting router is limited by the capability of \Remark{gpt4}, whereas the trained router is dedicated to this task.
+(3) Sometimes, our routers can even achieve better performance than humans. 
+
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+\revise{\cref{fig:sequential-vs-sot}(b) in the main text has showed \methodshort{}'s quality and speed-up plot evaluated with the \fastchat{} quality metric, here, \cref{fig:quality_eff_quality_tradeoff_gpt4_llmzoo} shows the results evaluated with the \llmzoo{} quality metric.}
+
+% Figure environment removed
+
+
+\subsection{Quality Comparison with Longer Normal Answer}
+\label{app:quality_longer_normal}
+
+\revise{When assessing the answer quality, the GPT-4 judge might exhibit bias towards longer responses. To take this factor into consideration, we add a comparison between a longer sequentially generated answer and the \methodshort{} generated answer. Specifically, we add a instruction prefix to the prompt for normal generation. The prefix is ``Please give a slightly long answer for the following question.'' and ``Please give a long answer for the following question.'' for \Remark{chatgpt} and \Remark{llamachat7B2}, respectively. \cref{fig:length_normallong} shows the ratios of the length of \methodshort{} answers to normal answers, and \cref{fig:quality_normallong_judge_gpt4} shows the quality comparison. We can see that for both models, when the overall answer lengths are similar, the quality of the \methodshort{} answer is comparable to that of the long normal answer.}
+
+% Figure environment removed
+
+% Figure environment removed
+
+\subsection{\Remark{chatgpt} as the Judge}
+\label{app:quality_gpt3.5}
+\input{texts/answer_evaluation_chatgpt_judge}
+
+
+\section{Combining SoT-R with Model Quantization}
+
+\revise{Model quantization is a widely-used model-level optimization to accelerate LLM inference, which is orthogonal to \methodshort{}. In this section, we evaluate the speed-ups of open-source models with both quantization and SoT on the Vicuna-80 dataset. Specifically, we adopt GPTQ~\citep{frantar2022gptq}\footnote{https://github.com/qwopqwop200/GPTQ-for-LLaMa} to apply 4-bit weight-only quantization and use \methodrshort{} instead of plain \methodshort{}.}
+
+\subsection{Speed-ups of \methodshort{} + Quantization on Quantized Models}
+
+\revise{We first compare the latency of the quantized models in the normal and \methodshort{} modes to evaluate how much \methodshort{} can speed up quantized models. \cref{fig:new_new_bar_quant_sotr_vicuna_speedup_model} shows the speed-ups of \methodrshort{} on different quantized models. SoT-R obtain $1.08\times$ to $1.99\times$ speed-ups on all the models. \cref{fig:new_new_bar_quant_sotr_vicuna_speedup_category} shows the speed-ups of SoT-R on different categories. We can see that on the five question categories for which \methodshort{} can provide high-quality answers (i.e., \textit{knowledge}, \textit{generic}, \textit{common-sense}, \textit{roleplay}, \textit{counterfactual}), \methodrshort{} can speed up the overall answer generation process by 1.07$\times$ to 2.38$\times$.}
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+\subsection{Speed-ups of \methodshort{} + Quantization on Unquantized Models}
+
+\revise{Here, we report the overall speed-ups of the quantization model with \methodrshort{} generation w.r.t. the unquantized model with normal generation. \cref{fig:new_bar_quant_sotr_vicuna_speedup_model} shows the speed-ups of SoT-R on different models. \methodrshort{} can obtain $1.54\times$ to $2.07\times$ speed-ups. \cref{fig:new_bar_quant_sotr_vicuna_speedup_category} shows the speed-ups of \methodrshort{} on different categories. On the five question categories for which \methodshort{} can provide high-quality answers (i.e., \textit{knowledge}, \textit{generic}, \textit{common-sense}, \textit{roleplay}, \textit{counterfactual}), \methodrshort{} can speed up the generation by 1.33$\times$ to 3.41$\times$ with the prompting and trained routers.}
+
+% Figure environment removed
+
+% Figure environment removed
+
+\section{Additional SoT-R statistics}
+
+\subsection{Number of Suitable Questions}
+
+\revise{Overall, there are 37/80, 58/218, 371/1030 questions that are suitable for \methodshort{} in the \vicunadataset{}, \wizardlm{}, and LIMA datasets (according to human assessment), respectively.}
+
+\revise{\cref{fig:bar_vicuna_sotr_num} shows the number of questions that are suitable for \methodshort{} 
+on Vicuna-80. On \textit{counterfactual}, \textit{commen-sense}, \textit{knowledge}, \textit{generic} categories, most questions are suitable for \methodshort{} based on the human assessment. The trained router and prompting router give out similar judgments.} %
+
+% Figure environment removed
+
+\subsection{Peak Memory Overhead}
+
+\revise{\cref{fig:bar_vicuna_mem_gpt4_model} and \cref{fig:bar_vicuna_mem_gpt4_category} show the peak memory overhead of \methodrshort{} (with prompting router) on different models and different categories, respectively, on the Vicuna-80 dataset. We can see that, on all models and categories, the overhead of peak memory is quite small ($<$1.11$\times$).}
+
+% Figure environment removed
+
+% Figure environment removed
+
+\subsection{Speed-ups with Different Number of Points}
+
+\revise{\cref{fig:bar_vicuna_point_speedup} shows the speed-ups with different numbers of points on Vicuna-80. 
+To maintain clarity in the figure, we've chosen to display statistics for only three models. 
+Note that as \methodshort{} cannot control the overall length to be the same as that of normal generation, it is not the case that a higher number of points leads to higher speed-ups.}
+
+% Figure environment removed
+
+
+\section{Notes on Application Scenarios}
+\revise{In a chatbot application, one might wonder why a reduced end-to-end latency can enhance the user experience. While human reading speeds are limited, there are many situations where we do not read responses sequentially.
+Rather than reading the entire answer, one might prefer to (1) swiftly check the response's structure to confirm if the chatbot comprehended the question or (2) extract specific information rapidly without waiting for the generation of prologue or preceding points. Besides, from the quality aspect, even if we would like to check the entire answer, a well-defined structure in responses assists us in quickly parsing all the information.}
+
+
+\revise{Moreover, beyond enhancing user experience, reduced end-to-end latency can significantly benefit emerging application scenarios like agent-agent interaction.}
+\end{document}

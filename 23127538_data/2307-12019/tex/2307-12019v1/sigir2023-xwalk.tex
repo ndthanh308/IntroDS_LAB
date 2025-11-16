@@ -1,0 +1,291 @@
+
+\documentclass[sigconf,natbib=true,anonymous=false,review=false]{acmart}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{amsmath}
+\usepackage{bbm}
+\bibliographystyle{plain}
+\setcopyright{rightsretained}
+%Conference
+\acmConference[SIGIR eCom'23]{ACM SIGIR Workshop on eCommerce}{July 27, 2023}{ Taipei, Taiwan}
+\acmYear{2023}
+\copyrightyear{2023}
+\makeatletter
+\renewcommand\@formatdoi[1]{\ignorespaces}
+\makeatother
+\acmISBN{}
+
+\newcommand{\yk}[1]{\textcolor{magenta}{yk: #1}}
+\newcommand{\je}[1]{\textcolor{red}{je: #1}}
+\newcommand{\as}[1]{\textcolor{blue}{as: #1}}
+
+\begin{document}
+
+%%\title{XWalk: Candidate Retrieval for Large-Scale Search using Implicit Feedback}
+\title{XWalk: Random Walk Based Candidate Retrieval for Product Search}
+
+\author{Jon Eskreis-Winkler}
+\email{jeskreiswinkler@etsy.com}
+\affiliation{%
+  \institution{Etsy, Inc.}
+  \country{USA}
+}
+\author{Yubin Kim}
+\email{ykim@etsy.com}
+\affiliation{%
+  \institution{Etsy, Inc.}
+  \country{USA}
+}
+\author{Andrew Stanton}
+\email{astanton@etsy.com}
+\affiliation{%
+  \institution{Etsy, Inc.}
+  \country{USA}
+}
+
+%%
+%% Keywords. The author(s) should pick words that accurately describe
+%% the work being presented. Separate the keywords with commas.
+\keywords{e-commerce search, product search, graph, random walks, implicit feedback}
+
+\begin{abstract}
+
+%% Old abstract 
+% Large-scale search engines are often designed as multi-tiered systems; the candidate retrieval layer efficiently generates a small subset of potentially relevant documents from a corpus many orders of magnitude larger in size, prioritizing recall and latency. 
+% %Recent neural retrieval approaches exhibit the ability to infer semantic meaning and extrapolate from user behavioral data, but can underperform simpler methods for common queries, and suffer from latency limitations. 
+% In this paper, we propose XWalk, a random walk-based graph approach to candidate retrieval for search in realistic large-scale product search settings with implicit feedback. 
+% We demonstrate that XWalk is fast and effective. Our experiments demonstrate that when candidates from XWalk are combined with candidates from a BM25-based inverted index, it substantially improves overall search accuracy while being much quicker to train and inference than more complex neural approaches. We further show improvements compared to state of the art neural models, improving Recall@1000 by 13\% for top queries.  We explore efficiency implications of the architecture, yielding latency improvements of over 76\% compared to existing methods. Finally, we validate the benefits both offline and with online A/B tests.
+
+In e-commerce, head queries account for the vast majority of gross merchandise sales and improvements to head queries are highly impactful to the business.
+While most supervised approaches to search perform better in head queries vs. tail queries, we propose a method that further improves head query performance dramatically. We propose XWalk, a random-walk based graph approach to candidate retrieval for product search that borrows from recommendation system techniques. XWalk is highly efficient to train and inference in a large-scale high traffic e-commerce setting, and shows substantial improvements in head query performance over state-of-the-art neural retreivers. Ensembling XWalk with a neural and/or lexical retriever combines the best of both worlds and the resulting retrieval system outperforms all other methods in both offline relevance-based evaluation and in online A/B tests.
+
+\end{abstract}
+
+\maketitle
+\input{intro.tex}
+
+%\input{relatedwork.tex}
+
+\section{Method}
+
+% Etsy inventory is unlike other inventory in e-commerce; artisans craft unique items that defy normal taxonomic categorization, are often one of a kind, and typically align along a individual niches.  When taking step back and looking at the marketplace as whole, we observe Etsy is in practice a loosely connected set of thousands individual marketplaces with sellers dedicated to their individual areas of specialization.  In particular, queries are highly conditioned on the specific area of interest - that is, common search terms shift radically depending on the particular niche of choice (TODO: Example Needed).  This ambiguity is especially challenging for traditional term matching techniques and require a rethinking of the problem.
+
+
+%To capture community sentiment scalably, 
+We take inspiration from the recommendation space and recast the search problem as a query-to-product listing recommendation problem using implicit feedback: predict the best $k$ product listings $L_{q_i}$ to ``recommend'' to a query $q_i$, by learning from implicit user feedback, i.e. a query log.
+From the query log, we construct an undirected, weighted bipartite graph $G = (Q,L,E,W)$ where $Q$ are nodes representing queries, $L$ are nodes representing product listings, $E$ are edges $E = \{e_{i,j} = (q_i, l_j) \mid q_i \in Q \land l_j \in L\}$, and $W$ are edge weights.
+
+
+% One challenge of encoding raw user feedback into an unweighted graphs is capturing popularity.  Due to the sparse community structure in the Etsy marketplace, edge weighting becomes necessary; while graphs often make the assumption that node degree is a reasonable proxy for popularity(TODO: Add reference to Fortunato paper), in this framing node degree also capture generality - that is, the greater the cardinality of queries associated with a listing, the more likely it's satisfying a discovery oriented query (e.g. "gift").  To account for this, we weight the edges $\it{w}$ to capture Query to Listing popularity.
+
+
+\subsection{Graph Construction (Offline Training)}
+
+Given a query log which records for each query $q_i$ the set of listings $L_i^{click},L_i^{cart},L_i^{purchase} $ that the user clicked on, added to their shopping cart, and purchased, respectively, we construct our graph through the following process:
+
+\begin{enumerate}
+    \item For each unique (by text string) query in the query log $\hat{q}_i$, add $\hat{q}_i$ to $Q$.
+    \item For each unique (by listing ID) listing in the query log $l_j$, add $l_j$ to $L$.
+    \item Collate the query log by query-listing pairs $(\hat{q}_i, l_j)$, counting the number of occurrences of $click_{i,j}$, $cart_{i,j}$, and $purchase_{i,j}$ interactions for each unique $(\hat{q}_i, l_j)$ pair. 
+    \item For each $(\hat{q}_i, l_j)$, add $e_{i,j}$ to $E$ and its weight $w_{i,j}$ to $W$, where $w_{i,j}$ is calculated Equation \ref{eq:weighted_edge}. 
+\end{enumerate}
+
+Intuitively, edge weights represent the popularity or trustworthiness of the edge, i.e. if many different users bought listing $l_i$ from query $q_j$, $w_{i,j}$ will be higher because we are more confident in the relationship represented by the edge. To weight edges, we use a simple linear combination:
+\begin{equation} \label{eq:weighted_edge}
+    w_{i,j} = C_1\cdot\it{|click_{i,j}|} + C_2\cdot{\it{|cart_{i,j}|}} + C_3\cdot{\it{|purchase_{i,j}|}}
+\end{equation}
+
+In practice, the best coefficients are $C_1 < C_2 < C_3$, as the goal is to bias walks toward listings which convert well for a given query.  
+
+\subsubsection{Graph representation for efficient inference}
+    %\item For each node ($\{Q, L\}$), convert weights into CDF format for Inverse Transform Sampling.
+    %\item Convert the graph into Compressed Sparse Row format.  Sort the nodes in descending order of node degree.
+XWalk is designed for sparse graphs scaling up to billions of nodes and tens of billions of edges. The costliest part of random walk graph inference is sampling edges to walk, especially from high degree nodes. For efficient inference, we choose our graph representation carefully.
+
+We store edge weights as cumulative distribution functions in order to use Inverse Transform Sampling,
+%(citation to Knight paper) 
+which allows sampling in $O(log(N))$ time. Note, we choose this approach over the alias method,
+%(citation to smola paper), 
+which allows for constant time sampling, due to the doubling of memory needed for the transform.  As XWalk's space complexity is dominated by edges and corresponding weights, we develop other methods for efficient sampling (Section \ref{weighted-sampling}).
+
+To transform edge weights in to CDF format, for each node $n$, we sort its adjacent edges $E_{n,*}$ in decreasing order of their weights $W_{n,*}$, such that $w_{n,i} > w_{n,i+1}$.  We then compute the cumulative distribution of all weights:
+
+\begin{equation} \label{eq:cdf}
+    CDF_{n,i} = \frac{\sum_{j=0}^{i}{w_{n,j}}}{\sum_{i=0}^{|E_{n,*}|}w_{n,i}}
+\end{equation}
+
+To sample an edge from $E_{n,*}$, we randomly sample $p \sim Uniform(0,1)$ and find the corresponding edge through binary search. This formulations provides us a few valuable advantages:
+\begin{enumerate}
+    \item Weighted sampling is $O(log(|E_{n,*}|)$.  Given some nodes have degrees in the millions, logarithmic growth is critical for performance.
+%    \item Due to sorting by decreasing weight, we can retrieve top K neighbors in constant time.
+    \item Normalizing the CDF to 1 allows us to reconstruct the the transition probability for outbound edges.  This is key for the Metropolis-Hastings sampling strategy (Section \ref{weighted-sampling}).
+    \item Better cache coherence as the bulk of the weights are located near the front of the distribution.
+\end{enumerate}
+
+Finally, we convert the graph into Compressed Sparse Row format, guaranteeing a $O(1)$ lookup cost for edges. % and sort the nodes in descending order of node degree.
+
+Note that all of the above graph construction steps are simple ETL (extract, transform, load) operations with no expensive parameter training steps. Compared to neural dense retrievers, ``training'' an XWalk graph model takes only a fraction of the cost and time.
+
+\subsection{Graph Inference (At Query Time)}
+
+Inferencing a graph with random walks is challenging to do efficiently. Despite the $O(1)$ edge lookup guarantee of the Compressed Sparse Row format used in graph construction, a naive walk approach that uses depth first search and binary search node lookups create random memory access patterns which result in high rates of costly cache misses~\cite{yang_random_2021}. We present an approach for XWalk that scales to graphs of billions of nodes and tens of billions of edges.
+
+At query time, XWalk retrieves relevant listings for a query $q_i$ by sampling nodes in $G$ using $k$-hop fixed paths \cite{christoffel_blockbusters_2015,eksombatchai_pixie_2018} with node $q_i$ as the starting point. When $k$ is an odd number, the last node in a $k$-hop path will always be a listing node ($L$) due to the bipartite nature of $G$. XWalk returns listings ranked by the frequency of which they were sampled.
+
+% For a set of outbound edges E, a query node, and the fixed length l, we arrive at the basic method: 
+% 
+% \begin{algorithm}[h]
+% \textbf{Input: } 
+% Query q,
+% Walk-length l,
+% Edges E,
+% Number of walks W \\
+% \For{step = \{1, 2, .., W\}} {
+%     $node = q$ \\
+%     \For{i = \{1, 2, .., l\}} {
+%         $ next\_node = \text{ Sample from } E_{node} \text{ via equation \ref{eq:weighted_edge} }$ \\
+%         $node = next\_node$
+%     }
+%     $Counter[node] += 1$  \\
+% }
+% $ Nodes = Sort(node \in Counter) \text{ in non-increasing order } \{Counter[n_1] \geq Counter[n_2] \geq .. Counter[n_{\lambda}\}] $ \\
+% \Return Nodes \\
+% \caption{Basic Fixed Length Random Walk}
+% \label{basic-fixed-length}
+% \end{algorithm}
+% 
+% While the above method is effective, it exhibits poor cache properties.  Graphs are notorious for random access patterns (cite Random Walks on Huge Graphs at Cache Efficiency).  Combined with popular queries having large numbers of inbound and outbound edges, XWalk seeks to improve the weighted sampling of the base algorithm:
+% 
+% \begin{enumerate}
+%     \item Binary search, while exhibiting logarithmic performance, is still slower than the alias method $O(1)$.
+%     \item Random access of edges, despite the $O(1)$ lookup cost guaranteed by compressed sparse formats, is expensive, especially in NUMA architectures.  Reducing the number of random accesses significantly improve L2/L3 cache hit rates \cite{yang_random_2021}.
+%     \item Ideally maintain the option of multi-threaded querying.
+% \end{enumerate}
+% 
+% To achieve the above, we reformulate the algorithm in the following ways:
+% \begin{enumerate}
+%     \item We convert the algorithm to a breadth first search instead of depth first search.  This reduces duplicate lookups of edges, decreasing the number of random accesses.
+%     \item While we use binary search for the initial node lookup, we use the Metropolis-Hastings MCMC algorithm to sample additional nodes.  This reduces the computational complexity from $K*O(Log(N))$ to $O(Log(N)) + K$.  For small values of K, the improvements are minimal.  However, in cases where K is large (such as with the initial query node), the computational improvements are substantial.
+% \end{enumerate}
+
+\label{weighted-sampling}
+
+To reduce costly random memory access patterns, we use a breadth first search instead of depth first search for our random walks. We also improve upon the Inverse Transform Sampling strategy by using the Metropolis-Hastings algorithm (a Markov chain Monte Carlo method) in most places. 
+ Given the sorted CDF format of edge weights (Eq. \ref{eq:cdf}), we can reconstruct the original edge transition probabilities: $P(n_j|E_{n_i,*}) = w_{n_i,j} - w_{n_i,j-1}$. As Metropolis-Hastings requires a symmetric distribution, we take the absolute value of the proposal index for each edge and sample from the Normal distribution.  Ablation testing indicated XWalk is not sensitive to the variance for the proposal distribution, $\sigma^2$. We set $\sigma^2 = 0.2$.
+ 
+Metropolis-Hastings improves the cost of $c$ edge samples to $O(\log(|E_{n,*}|)) + c$ compared to $c*O(\log(|E_{n,*}|))$ of Inverse Transform Sampling. In cases where $c$ is large (e.g. the initial query node), the computational improvements are substantial.  A known limitation of MCMC methods is the auto-correlation of samples, usually requiring a mix time prior to sampling.  Therefore, for our first sample, we use Inverse Transform Sampling to get an unbiased starting point and use Metropolis-Hastings for subsequent samples. In preliminary testing we found no reduction in model accuracy for this implementation compared to using only Inverse Transform Sampling while seeing the expected substantial latency benefits. 
+ 
+Our overall random walk strategy is presented in Algorithm \ref{alg:xwalk-bfs}.
+\vspace{-1 em}
+
+%Details of Metropolis-Hastings is presented in Algorithm \ref{alg:metropolis}. 
+
+%\begin{algorithm}[h]
+%\textbf{Global variables: } 
+%Variance $\sigma^2$,
+%Dictionary of nodes to counts $Counter$ \\
+%\textbf{Input: } 
+%Starting node $n$,
+%Number of walks $c$,
+%Walk-length $k$,
+%Edges $E$,
+%Weights $W$,
+%Multiplier $m$ (default 1) \\
+%$p \sim Uniform(0, 1)$ \\
+%$i = BinarySearch(E_{n,*}, W_{n,*}, p)$ \\
+% \tcc{the $i$'th node of ordered neighbors of $n$}
+%$Counter[node(E_{n,i})] += m $ \\
+%\For{step = \{2, .., c\}} {
+%    $j = Metropolis(i, E_{n_i,*}, W_{n_i,*}, \sigma^2)$ \\
+%    \tcc{the $j$'th node of ordered neighbors of $n_i$}
+%    $Counter[node(E_{n_i,j})] += m$ \\
+%    $i = j$
+%}
+%\uIf{\text{k > 0}} {
+%    $counts = \emptyset$ \\
+%    \For{\{n_i, count\} \in Counter} {
+%        $counts = counts \cup XWalkBFSSampler(n_i, c, k-1, E, W, count)$
+%    }
+%    \Return $counts$ 
+%}\Else{
+%    $ Nodes = Sort(node \in Counter) \text{ in non-increasing order } \{Counter[n_1] \geq Counter[n_2] \ldots \geq  Counter[n_{\lambda}]\} $ \\
+%    \Return Nodes \\
+%}
+%\caption{XWalkBFSSampler}
+%\label{alg:xwalk-bfs}
+%\end{algorithm}
+
+\begin{algorithm}[h]
+\textbf{Global variables: } 
+Var of Normal distribution $\sigma^2$,
+Dictionary of nodes to counts $Counter$ \\
+\textbf{Input: } 
+Starting node $n$,
+Number of walks $c$,
+Walk-length $k$,
+Edges $E$,
+Weights $W$,
+Multiplier $m$ (default 1) \\ 
+$p \sim Uniform(0, 1)$ \\
+$i = BinarySearch(E_{n,*}, W_{n,*}, p)$ \\
+ \tcc{the $i$'th node of ordered neighbors of $n$}
+$Counter[node(E_{n,i})] += m $ \\
+\For{step = \{2, .., c\}} {
+    $j = Metropolis(i, E_{n_i,*}, W_{n_i,*}, \sigma^2)$ \\
+    \tcc{the $j$'th node of ordered neighbors of $n_i$}
+    $Counter[node(E_{n_i,j})] += 1$ \\
+    $i = j$
+}
+\uIf{\text{k > 0}} {
+    $counts = \emptyset$ \\
+    \For{$\{n_i, count\} \in Counter$} {
+        $counts = counts \cup XWalkBFSSampler(n_i, count, k-1, E, W)$
+    }
+    \Return $counts$
+}  \Else {
+    $ Nodes = Sort(node \in Counter) \text{ in non-increasing order } \{Counter[n_1] \geq Counter[n_2] \ldots \geq  Counter[n_{|Counter|}]\} $ \\
+    \Return Nodes \\
+}
+\caption{XWalkBFSSampler}
+\label{alg:xwalk-bfs}
+\end{algorithm}
+
+% \begin{algorithm}[h]
+% \textbf{Input: } 
+% Index $i$,
+% Edges $E_{n_i,*}$,
+% Weights $W_{n_i,*}$,
+% Variance $\sigma^2$ \\
+% $p \sim Normal(0, \sigma^2)$ \\
+% $proposal = \lfloor |i + p \cdot |E_{n_i,*}|| \rfloor$ \\
+% \uIf {$proposal > |E_{n_i,*}|$} {
+%     \Return $i$
+% }\Else {
+%     $acceptance = \frac{w_{n_i, proposal}}{w_{n_i, i}}$ \\
+%     \uIf{a \sim Uniform(0,1); a < acceptance} {
+%         \Return proposal
+%     }\Else {
+%         \Return i
+%     }
+% }
+% \caption{Metropolis}
+% \label{alg:metropolis}
+% \end{algorithm}
+
+\vspace{-2 em}
+\subsection{Extending the Graph}
+\label{section:shoptags}
+Our e-commerce platform is a two-sided marketplace and our inventory comes from independent sellers. Thus, listings are naturally grouped by shops. In addition, sellers may add tags to their listings to better describe them (e.g. ``christmas'', ``gift'', etc.). 
+
+For the sake of notation simplicity, we described the graph construction and inference above assuming our graph only contains two types of nodes, $Q$ and $L$. However, in practice, we extend the graph by adding shop nodes ($S$) and tag nodes ($T$) to the graph; this allows us to retrieve listings without implicit user feedback (e.g. the cold start problem) and further increase connectivity of the graph. Note that $G$ remains bipartite: $\{Q, S, T\}$ is a separate partition from $L$ and thus the algorithms described in this section can be used unchanged. The weights of edges between shops/tags and listings are set to 1. $w_{q_i,s_j} = w_{q_i,t_j} = 1$.
+
+\input{experiments.tex}
+
+\section{Conclusion}
+Head queries are responsible for the large majority of purchases in e-commerce. We presented XWalk, a novel candidate retrieval engine, which by frames search as a query-to-product recommendation problem, leverages powerful, highly efficient graph methods to substantially improve head query performance in product search. XWalk is also complementary to other common retrieval engines such as BM25 and dense retrieval, and ensembling produces a powerful retrieval engine.
+
+\bibliography{sigir2023-xwalk}
+
+\end{document}
+\endinput
+%%
+%% End of file `sample-sigconf.tex'.

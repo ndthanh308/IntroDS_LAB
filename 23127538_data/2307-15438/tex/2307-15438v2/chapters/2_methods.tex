@@ -1,0 +1,159 @@
+%******************************************************************************%
+%*******************************    METHODS   *********************************%
+%******************************************************************************%
+\section{Materials and Methods}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Problem Definition}
+The system to be controlled consists of a processing node that contains a SoC based on ARM architecture with 16 cores that can be controlled independently.
+In this manner, thermal management entails regulating processor power by choosing which cores are activated and in which frequency profile.
+
+The architecture for the temperature control system proposed in this work is schematized in Fig. \ref{fig:general}.
+
+% Figure environment removed
+
+Prior to beginning thermal management, the temperature limit must be established since the agent will use it to gauge how close the current temperature is to the limit. The system temperature is measured using thermistors, and this information, along with the temperature limit set and the hardware status, is used to calculate the state that the agent will use to determine the next course of action, which may change the hardware configuration, affect the system temperature and close the loop.
+
+The agent interacts with the environment using a standard API created with the OpenAI's Gym library \cite{gym}. Utilizing this adaption layer permits:
+\begin{itemize}
+    \item The usage of different RL algorithms as most of them are using this standard API.
+    \item The adaptation of both the actions and the states between the model and the real-world scenario.
+    \item The problem modeling for pre-training and tuning the RL algorithm on the scenario.
+\end{itemize}
+
+% Figure environment removed
+
+A sustained load --and a consequently sustained power consumption-- is needed for simplifying the modeling of the problem as described in \ref{modelling}. To this end,  a containerized version of the \emph{stress-ng} tool was used and controlled from the OpenAI's Gym scenario setup.
+%In addition, although iterations in RL algorithms usually require little computational power, the full RL processing was extracted and executed outside the board.
+
+
+While interacting with the environment, the agent will explore sub-optimal policies that, in certain situations, may allow the temperature to scale to values that are not suitable for some components. That is why rigid thermal control was imposed that powers-off the processing node (SoC) when its temperature is out of range to keep it into operational temperature range.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Deep Reinforcement Learning}
+\subsubsection{Soft Actor-Critic}
+Reinforcement learning has been successfully applied to multiple problems in the digital world. However, it is still difficult to use these types of algorithms in real life problems due to the low efficiency in the use of experience. A large number of interactions with the environment are necessary for the algorithms to learn to behave correctly.
+Contrary to on-policy algorithms in which the collected samples are discarded after a policy update, off-policy algorithms collect samples in a replay buffer that is used on every policy update making them ideal in cases where gaining experience has a high cost because they can efficiently learn from past events and decisions.
+
+A model-free, off-policy algorithm called Soft Actor-Critic \cite{haarnoja2018soft} (SAC) was used to train the agent. SAC is an actor-critic algorithm, and as such follows of policy-based and value-based approach, that concurrently learns a policy and two Q-functions. 
+In SAC, the policy is trained to maximize a trade-off between expected return and entropy, a measure of randomness in the policy.
+
+In this study, Stable Baselines3 (SB3) \cite{stable-baselines3} implementation of SAC is used. SB3 is a set of implementations of reinforcement learning algorithms in Pytorch that uses the OpenAI's Gym library as an abstraction for the environments.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{Actions}
+
+The agent is able to control the processing power by modifying both the power status and clock speed for the available CPUs.
+
+The power status of the CPUs can be managed using the CPU hotplug feature which allows to switch cores on or off dynamically using the sysfs interface.
+
+The CPU clock speed can be managed via the CPUFreq subsystem which allows the operating system to scale the CPU frequency up or down to save power or improve performance.
+
+The actions to be carried out by the agent are intended to establish the states listed in Table \ref{table:cpu_status} on each CPU.
+
+\begin{table}[htp]
+\centering
+\begin{tabular}{|p{1cm}|p{2.5cm}|p{3.5cm}|}
+\hline
+\textbf{Power Status} & \textbf{Clock Speed} & \textbf{Observations}                                                                                                                                  \\ \hline
+\multirow{2}{*}{On}   & Low (1MHz)           & ------                                                                                                                                                      \\ \cline{2-3} 
+                      & High (up to 2MHz)    & An on-demand governor is used to let the system scale the frequency dynamically according to current load in the range {[}1MHz-2MHz{]} \\ \hline
+Off                   & ------               & ------                                                                                                                                                      \\ \hline
+\end{tabular}
+\caption{Available options for setting on each CPU in terms of power and clock speed}
+\label{table:cpu_status}
+\end{table}
+
+Although CPUs can be uniquely identified by their number and their state modified independently, in this study the agent controls the state of the CPUs without distinction between them. This model reduces the action space and therefore increases the learning performance as suggested by \cite{booth2019ppo}.
+
+
+Accordingly, the agent is allowed to choose the following quantities from a reduced and continuous action space:
+\begin{itemize}
+\item \textbf{Powered-on CPUs}: Percentage of the total amount of CPUs present in the board that are powered-on.
+\item \textbf{High frequency CPUs}: Percentage of the powered-on CPUs that are in high clock speed
+\end{itemize}
+
+
+
+Since the total number of CPUs is a known number, it is easy to deduce that through its actions, the agent is establishing:
+\begin{itemize}
+\item The number of CPUs that are powered-off
+\item The number of CPUs that are powered-on and in low clock speed (1MHz)
+\item The number of CPUs that are powered-on and in high clock speed (2MHz)
+\end{itemize}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{State}
+
+The board used for the experimentation has 9 temperature sensors available to monitor its temperature. Seven of them are included inside the SoC, distributed on different measurement sites, and the other two sensors are located on the top and bottom sides of the board.
+
+The agent receives a normalized continuous state that includes the following quantities:
+\begin{itemize}
+\item \textbf{CPU state ($P$)}: This parameter is calculated in equation \ref{eq:parameter} and reflects the current processing power considering the power status (on/off) and frequency level assigned (low/high) on each CPU.
+
+\begin{equation} \label{eq:parameter}
+    P=\frac{\sum_{cpu=1}^{n} P_{cpu}}{2*n}
+\end{equation}
+
+\[
+P_{cpu}= \left\{ \begin{array}{lcl}
+          0 &  if  &  \textrm{cpu=off} \\
+          1 &  if  &  \textrm{cpu=on and frequency=low} \\
+          2 &  if  &  \textrm{cpu=on and frequency=high} 
+          \end{array}
+\right.
+\]
+
+In the equation, \emph{n} represents the number of available CPUs (16 in the SoC used).
+
+\item \textbf{Margin to limit ($\Delta T=T_{limit} - T$)}: Represents the available margin before reaching the temperature limit ($T_{limit}$) considering the current temperature of the system ($T$) (Represented in Fig. \ref{fig:state}).
+\item \textbf{Slope ($m$)}: Expresses the rate of change of temperature. Instead of the derivative of an unknown temperature function, this quantity is replaced with the slope of a secant line that is calculated using real temperature measures in a brief period (Represented in Fig. \ref{fig:state}).
+\end{itemize}
+
+% Figure environment removed
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{Rewards}
+The goal is to operate as many CPUs at the highest frequency possible while maintaining the required temperature range.
+Positive rewards are accumulated by the agent while the temperature is below the temperature threshold, and a negative reward is given when this threshold is achieved to allow the agent to learn while interacting with the environment.
+
+On each step, if the threshold temperature has not been reached, the reward is calculated with Equation \ref{eq:reward}.
+
+\begin{equation} \label{eq:reward}
+    R=\frac{cpus_{high}*C_{high} + cpus_{low} * C_{low} + cpus_{off}* C_{off}}{n}
+\end{equation}
+
+As in previous equations, \emph{n} represents the number of available CPUs (16 in the SoC used). $C_{high}$, $C_{low}$ and $C_{off}$ are constants used to weigh independently each term and to express how each state (power status and clock speed of the CPUs) conditions the reward.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsubsection{Temperature Modeling} \label{modelling}
+
+The idea behind the modeling is to explore fast and minimize the impact of the initial iterations of the RL algorithm on the real environment. Although the model represents only some aspects of the real environment it lets the agent discover the relation between the available temperature margin, the current steepness of the temperature curve and the assigned processing power in a harmless environment. The agent can learn and adapt later its behavior in relation to the real scenario.
+
+In addition, a modeling of the scenario allowed us to explore the performance of different DRL algorithms on the problem at hand and to tune the hyperparameters of the chosen algorithm.
+
+A stable load produces a stable power consumption which in turn causes a temperature rise that follows a saturation function in time approaching a horizontal asymptote. However, the actions change the consumption profile and with it the temperature function. 
+
+To model this behavior, a family of temperature functions over time conditioned not only by time but also by a variable determined by the state of the CPU was proposed as a naive modeling of the temperature curve followed by the system.
+
+Equation \ref{eq:temperature_estimator} represents the family of equations used in temperature evolution estimation.
+
+\begin{equation} 
+    Y(x)=T_{init} + (2 + \frac{P}{8}) \ln(2x)
+\label{eq:temperature_estimator}
+\end{equation}
+
+In equation \ref{eq:temperature_estimator} the parameter \emph{$P$}, also included in the state data equation (\ref{eq:parameter}),  determines a concrete equation in relation to the CPU state.
+
+A representation of this equation family is shown in Fig.\ref{fig:M1} for different \emph{$P$} parameters and fixed initial and limit temperatures of a scenario.
+
+%\[
+%x=\frac{1}{4}\ln(\frac{8y-8T_{init}+P+16}{-8y+8T_{init}+P+16})
+%\]
+
+
+% Figure environment removed

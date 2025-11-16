@@ -1,0 +1,156 @@
+
+\section{Method}
+\label{sec:method}
+
+In this section, we introduce our proposed method called UniAP. Apart from current AP methods, UniAP jointly optimizes the two categories of
+parallel strategies, including PP, DP, TP, and FSDP, to find an optimal solution. Visualization on the differences between existing parallel methods and UniAP is available in Appendix~\ref{appendix:different-parallel-methods}.
+% Figure~\ref{fig:parallel_methods} illustrates the difference between UniAP and other AP methods. Inter-layer-only and intra-layer-only AP methods optimize~(search) from a set of candidate inter-layer-only and intra-layer-only parallel strategies, respectively. 
+% Hierarchical AP methods first adopt greedy or dynamic programming to propose candidate inter-layer parallel strategies. Then, they optimize the intra-layer parallel strategy for every fixed inter-layer parallel strategy. 
+% Apart form them, UniAP has the largest strategy space for exploration~(joint optimization).
+%Hierarchical AP methods first optimize the inter-layer parallel strategy, and then optimize the intra-layer parallel strategy after the inter-layer parallel strategy has been optimized and fixed.
+% Figure environment removed
+
+Figure~\ref{fig:overview} illustrates the flowchart of UniAP. UniAP first profiles the runtime information for the user's hardware environment and the deep learning model. After that, UniAP estimates inter- and intra-layer costs given the computation graph and profiling results with its cost models. The estimated costs and the computation graph are then transformed into an MIQP problem. The objective function of the MIQP is to maximize the training throughput, or in other words, to minimize the training time per iteration (TPI). By iteratively applying the cost model and MIQP with different parameters, UniAP determines the minimal TPI and its corresponding parallel strategies. We name this process the Unified Optimization Process~(UOP). Finally, UniAP interprets the parallel strategies into the execution plan for the designated model.
+
+
+\subsection{Profiling}\label{subsec:method:profiling}
+UniAP collects runtime information about the hardware environment and deep learning model during profiling. For the hardware environment, UniAP evaluates the efficiency of all-reduce and point-to-point (P2P) communication for different device subsets. For example, when profiling a node with 4 GPUs, UniAP measures the all-reduce efficiency for various DP, TP, and FSDP combinations across these GPUs. Additionally, UniAP ranks these GPUs from 0 to 3 and evaluates the speed of P2P for two pipeline options: ($0\rightarrow 2$ and $1\rightarrow 3$) and ($0\rightarrow 1$, $1\rightarrow 2$ and $2\rightarrow 3$). Furthermore, UniAP estimates the computation-communication overlap coefficient~(CCOC)~\citep{miao_galvatron_2022,rashidi_enabling_2021}.
+
+UniAP acquires two types of information for the deep learning model: computation time and memory usage. On one hand, UniAP distinguishes the forward computation time per sample for different types of hidden layers. On the other hand, UniAP collects memory usage information for each layer, including the memory occupied by parameters and the memory usage of activation per sample in different TP sizes. 
+
+\subsection{Cost model}\label{subsec:method:cost-model}
+UniAP employs two primary cost models, namely the time cost model and the memory cost model. 
+
+\textbf{Time cost model}\quad To estimate computation time, UniAP first calculates the forward computation time by multiplying the batch size with the forward computation time per sample obtained from profiling. Users can obtain a more precise result by profiling the forward time on the specified batch size. For Transformer-based models that mainly consist of the MatMul operator, the computation time in the BP stages is roughly twice that of the FP stages~\citep{narayanan_efficient_2021,li_chimera_2021,miao_galvatron_2022}. Additionally, UniAP estimates the communication time by dividing the size of transmitting tensors by the profiled communication efficiency for different communication primitives. To accommodate overlapping, UniAP multiplies the profiled CCOC by the overlapping interval of computation and communication. To model the communication time between pipeline stages, UniAP calculates the cross-stage cost between consecutive stages by the summation of P2P costs.
+
+\textbf{Memory cost model}\quad UniAP estimates memory consumption for each layer with its memory cost model. This estimation consists of three steps for a given layer. First, it computes the activation memory cost $m_a$ by multiplying the batch size and the profiled activation memory cost per sample of the TP size used by the strategy. Next, UniAP calculates the memory cost of model states $m_{s}$ for each layer based on their parameter size $ps$, TP size $ts$, FSDP size $fs$, and a constant $c_{dtype}$ dependent on the data type. Formally, we have 
+\begin{equation}
+m_s=\frac{c_{dtype}\times ps}{ts\times fs}.
+\end{equation}
+For example, if we choose precision as FP32, then $c_{dtype}=(4+4+4+4)/4=4$ since the learnable parameters, gradients, momentum and variance consume equal size of memory. If we opt for mixed precision with FP16 activated, then $c_{dtype}=(4+4+4+2+2)/2=8$. Finally, UniAP aggregates the activation memory cost $m_a$, memory cost of model states $m_s$, and context memory cost $m_c$ to a constant matrix $\M$, where $\M_{uk}$ denotes the memory cost for the $k$-th intra-layer strategy of layer $u$ on a single device.
+% Overall, these two cost models employed by UniAP strike a balance between complexity and accuracy.
+
+\subsection{Mixed integer quadratic programming}\label{subsec:method:miqp}
+%This section describes our MIQP expression in terms of a formulation-oriented approach. We will firstly elaborate the objective function, and then move on to the constraints.
+% The estimated costs, along with the computation graph, are then transformed into an MIQP problem, the formulation of which  includes an objective function and several constraints.
+The estimated costs and the computation graph are then transformed into an MIQP problem. Its formulation includes an objective function and several constraints.
+
+\subsubsection{Objective function}\label{subsubsec:method:objective-function}
+% Figure environment removed
+The objective function tries to minimize TPI. In this paper, we have chosen GPipe as our PP strategy for illustration.\footnote{UniAP is also compatible with other PP strategies. For example, users need to modify only the memory constraint in Section \ref{subsubsec:method:constraints} to adapt to synchronous 1F1B pipeline~\citep{narayanan_memory-efficient_2021,fan_dapple_2021}.} Figure~\ref{fig:gpipe} depicts the time cost decomposition of a GPipe-style PP with non-negligible communication costs. The time needed to apply gradients at the end of each iteration is not included, as it depends on the optimizer and is insignificant compared to the total time spent on FP and BP.
+
+We denote the cost for computation stages as $\mathbb{P}=\{p_1, p_2, \dots, p_{pp\_size}\}$ and the cost for communication stages as $\mathbb{O}=\{o_1, o_2, \dots, o_{pp\_size-1}\}$. Here, $pp\_size$ represents the number of computation stages, which corresponds to the pipeline parallel size. In Figure~\ref{fig:gpipe}, $fp_i$ and $bp_i$ denote forward and backward computation time for computation stage $i$, respectively. $fo_j$ and $bo_j$ denote forward and backward communication time for communication stage $j$, respectively. Hence, we have $p_i=fp_i+bp_i$ and $o_j=fo_j+bo_j$.
+
+In a GPipe-style pipeline, we use $c$ to denote the number of micro-batches. As illustrated in Figure \ref{fig:gpipe}, a mini-batch is uniformly split into four micro-batches, and the total TPI is determined by the latency of all computation and communication stages and the latency of the slowest stage. We further denote TPI in GPipe as $tpi_{gpipe}$. Given that a stage with a higher FP computation cost leads to a higher BP computation cost with high probability, we can write the objective function of GPipe-style pipeline as follows:
+\begin{equation}
+\min tpi_{gpipe}=\sum_{i=1}^{pp\_size} p_i + \sum_{j=1}^{pp\_size-1} o_{j} + (c - 1)\max\left(\mathbb{P}\cup \mathbb{O}\right). %\tag{MIQP}
+\label{eqn:method:lp-contig}
+\end{equation}
+\subsubsection{Constraint}\label{subsubsec:method:constraints}
+We first introduce additional notations before presenting the constraints. For a given layer $u \in \VB$, $\SB_u$ represents its set of intra-layer parallel strategies, $\A_{uk}$ denotes the $k$-th intra-layer execution cost obtained from our time cost model. Additionally, we use $\S_{uk} \in \{0,1\}$ to indicate whether the $k$-th parallel strategy is selected for the layer $u$, and use $\P_{ui}\in \{0,1\}$ to indicate whether layer $u$ is placed on the $i$-th computation stage. Each edge $\langle u,v\rangle\in \EB$ is assigned a resharding cost denoted by $\R_{uv}$ if the vertices are located within the same pipeline stage. Alternatively, if the vertices are located across consecutive stages, the resharding cost between them is denoted by $\R'_{uv}$. These two resharding costs are constant matrices derived from our time cost model.
+
+%Subsequently, we proceed to the constraints of the MIQP. 
+
+\textbf{Computation-stage constraint}\quad To compute the total cost for a single computation stage $i$, all computation and communication costs associated with that stage must be aggregated and assigned to $p_i$. This constraint can be formulated as follows:
+\begin{equation}
+    \sum_{u\in \VB}\P_{ui}\S_{u}^\mathsf{T}\A_{u}+\sum_{\langle u,v\rangle\in \EB}\P_{ui}\P_{vi}(\S_{u}^\mathsf{T}\R_{uv}\S_{v})=p_i,~\forall i\in\{1,\dots, pp\_size\}.
+\label{eqn:method:intra-stage}
+\end{equation}
+On the left side of Equation~\eqref{eqn:method:intra-stage}, the first polynomial term represents the cost of choosing specific intra-layer strategies for layers placed in stage $i$. The second term represents total resharding costs within stage $i$.
+
+\textbf{Communication-stage constraint}\quad To calculate the total cost for a single communication stage $j$, we should aggregate the P2P costs incurred between consecutive stages and assign them to $o_j$. This constraint can be formulated as follows:
+\begin{equation}
+\begin{aligned}
+    \sum_{\langle u,v\rangle\in \EB}\P_{uj}\P_{v(j+1)}(\S_{u}^\mathsf{T}\R'_{uv}\S_{v})&=o_j,~\forall j\in\{1,\dots,pp\_size-1\}.
+\end{aligned}
+\label{eqn:method:inter-stage}
+\end{equation}
+\textbf{Memory constraint}\quad We need to guarantee that no devices~(GPUs) will encounter out-of-memory~(OOM) exceptions during training process. This constraint can be formulated as follows:
+\begin{equation}
+\sum_{u\in \VB}\P_{ui} \S_u^\mathsf{T} \M_u\leqslant m,~\forall i\in\{1,\dots,pp\_size\}.
+\label{eqn:method:memory-constraint}
+\end{equation}
+Here, $m$ denotes the memory limit for each device. In the case of homogeneous computing devices, the value of $m$ remains constant throughout all stages. But the value of $m$ varies in the case of heterogeneous computing devices.
+
+
+\textbf{Order-preserving constraint}\quad PP is not a single-program multiple-data~(SPMD) parallel strategy~\citep{huang_gpipe_2019}. Hence, we need an order-preserving constraint to ensure that the subgraphs of $\mathcal{G}$ are contiguous. We adopt the definition of \emph{contiguous} from previous work~\citep{tarnawski_efficient_2020,tarnawski_piper_2021}. 
+\begin{definition}\label{def:contiguous}
+A set $\WB \subseteq \VB$ is contiguous if there do not exist nodes $u \in \WB$, $v \in \VB \setminus \WB$, and $w \in \WB$ such that $v$ is reachable from $u$ and $w$ is reachable from $v$.
+\end{definition}
+% % Figure environment removed
+
+Figure~\ref{fig:contiguous} illustrates an example of a contiguous set $\WB$, in which we cannot find any reachable node pairs $\langle u,v\rangle$ and $\langle v,w\rangle$ where $u,w\in \WB$ and $v \in \VB \setminus \WB$. 
+
+In our case, our model will not be assigned to different pipeline stages in a disordered manner if we ensure that all subgraphs on each computation stage are contiguous. After reformulating this constraint in linear form, we have
+\begin{subequations}
+\label{eqn:method:order-preserving}
+\begin{align}
+    \Z_{vi}&\geqslant \P_{vi},~&\forall v\in \VB,~\forall i\in\{1,2,\dots,pp\_size\},\label{eqn:method:order-preserving:1}\\
+    \Z_{vi}&\leqslant \Z_{ui},~&\forall u,v\in \VB,~\forall \langle u,v\rangle\in \EB,~\forall i\in\{1,2,\dots,pp\_size\},\label{eqn:method:order-preserving:2}\\
+    \Z_{vi}&\leqslant \P_{vi}-\P_{ui} +1,~&\forall u,v\in \VB,~\forall \langle u,v\rangle\in \EB,~\forall i\in\{1,2,\dots,pp\_size\}.\label{eqn:method:order-preserving:3}
+\end{align}
+\end{subequations}
+Detailed proof can be found in Appendix~\ref{appendix:linear-form-of-contigous-constraint}.
+
+
+\textbf{Layer-placement constraint}\quad All layers should be placed on exactly one pipeline stage and at least one layer should be placed on each pipeline stage. This constraint can be formulated as follows:
+\begin{subequations}
+\label{eqn:method:layer-placement}
+\begin{align}
+    &\sum_{i=1}^{pp\_size} \P_{ui}=1,&\forall u\in \VB,\label{eqn:method:layer-placement:1}\\
+    &\sum_{u\in \VB}\P_{ui}\geqslant 1,&\forall i\in\{1,\dots,pp\_size\},\label{eqn:method:layer-placement:2}\\
+    &\P_{ui}\in\{0,1\},&\forall u\in \VB,~i\in\{1,\dots,pp\_size\}.\label{eqn:method:layer-placement:3}
+\end{align}
+\end{subequations}
+
+\textbf{Strategy-selection constraint}\quad 
+Each layer must and can choose only one strategy. This constraint can be formulated as follows:\begin{subequations}
+\label{eqn:method:strategy-selection}
+\begin{align}
+    &\sum_{k = 1}^{\lvert \SB_u\rvert}\S_{uk}=1,&\forall u\in \VB,\label{eqn:method:strategy-selection:1}\\
+    &\S_{uk}\in\{0,1\},&\forall u\in \VB,~k\in \{1,\dots,|\SB_u|\}.\label{eqn:method:strategy-selection:2}
+\end{align}
+\end{subequations}
+The MIQP formulation for UniAP includes the objective function in Equation~\eqref{eqn:method:lp-contig} and all the constraints from Euqation~\eqref{eqn:method:intra-stage}~-~\eqref{eqn:method:strategy-selection:2}.
+ %UniAP eventually obtains the minimum TPI and its corresponding parallel strategies by solving the MIQP expression using an off-the-shelf solver. For a visualization of a potential solution to MIQP, please refer to Appendix \ref{appendix:visualization_for_p_and_s}.
+
+\subsection{Unified optimization process}\label{subsec:method:unified-optimization}
+\begin{algorithm}[t]
+    \caption{Unified Optimization Process}
+    \label{alg:unified-opt-proc}
+\begin{algorithmic}
+    \STATE {\bfseries Input:} Profiling results $PR$, strategy dictionary $SD$, mini-batch size $B$, computation graph $\mathcal{G}$, and the number of GPUs $n$.
+    \STATE {\bfseries Output:} Optimal cost $cost^{*}$, pipeline parallel size $pp\_size^{*}$, the number of micro-batches $c^{*}$, layer placement $\P^{*}$, and intra-layer strategy $\S^{*}$
+    \STATE $pp\_size^{*} = 1$;
+    \STATE $c^{*} = B$;
+    \STATE $A$, $R$, \_, $M$ = \verb+CostModeling+($PR$, $SD[1]$, $\mathcal{G}$, $B$);
+    \STATE $cost^{*}$, $P^{*}$, $S^{*}$ = \verb+QIP+($\A$, $\R$, $\M$);
+    \STATE Get all factors for $n$ except 1 and insert them to set $\FB$;
+    \STATE Get all factors for $B$ except 1 and insert them to set $\BB$;
+    \FOR{$pp\_size$ \textbf{in} $\FB$}
+        \FOR{$c$ \textbf{in} $\BB$}
+            \STATE Micro-batch size $b = B/c$;
+            \STATE $\A$, $\R$, $\R'$, $\M$ = \verb+CostModeling+($PR$, $SD[pp\_size]$, $\mathcal{G}$, $b$);
+            \STATE $cost$, $\P$, $\S$ = \verb+MIQP+($\A$, $\R$, $\R'$, $\M$, $pp\_size$, $c$);
+            \IF{$cost < cost^{*}$}
+                \STATE $cost^{*}$, $pp\_size^{*}$, $c^{*}$, $\P^{*}$, $\S^{*}$ = $cost$, $pp\_size$, $c$, $\P$, $\S$;
+            \ENDIF
+        \ENDFOR
+    \ENDFOR
+\end{algorithmic}
+\end{algorithm}
+UOP integrates the cost model and MIQP based on the profiling results and the computation graph to return the optimal parallel strategy and the corresponding TPI. Algorithm \ref{alg:unified-opt-proc} summarizes the whole process. In Algorithm \ref{alg:unified-opt-proc}, we denote intra-layer cost as $\A$, inter-layer cost as $\R$, cross-stage cost as $\R'$, and memory cost as $\M$. The \verb+CostModeling+ process calculates these four costs based on the cost model described in Section~\ref{subsec:method:cost-model}. 
+
+First, UOP optimizes intra-layer-only parallelism for cases in which pipeline parallelism is not adopted. Several works~\citep{zheng_alpa_2022,liu_colossal-auto_2023} have used quadratic integer programming~(QIP) to optimize intra-layer-only parallel strategy and achieved promising results. UniAP provides a QIP formulation for intra-layer-only parallelism in Appendix \ref{appendix:miqp-for-intra-layer-parallelism}.
+
+Then, UOP enumerates all factors of $n$ except 1 as the pipeline parallel size $pp\_size$. For each $pp\_size$, UOP enumerates all factors of $B$ except 1 as the number of micro-batches $c$. These enumerations aim to achieve load balance on a homogeneous cluster.
+
+For each candidate $pp\_size$ and $c$, UOP formulates the cost for a training iteration to an MIQP expression. It then waits for the MIQP solver to return the optimal cost and parallel strategy under the current configuration. Specifically, our implementation adopts the Gurobi Optimizer~\citep{gurobi_optimization_llc_gurobi_2023} as our QIP and MIQP solver.
+
+Finally, UOP returns the minimum cost $cost^{*}$ and its corresponding pipeline parallel size $pp\_size^{*}$, number of micro-batches $c^{*}$, layer placement $\P^{*}$, and intra-layer strategies $\S^{*}$. We provide visualization for a candidate solution to UOP in Appendix~\ref{appendix:visualization_for_p_and_s}.
+
+
+
+\subsection{Complexity analysis}\label{subsec:method:complexity-analysis}
+Let $\lvert \VB\rvert$, $\lvert \SB\rvert$, and $n$ denote the number of layers, parallel strategies, and GPUs, respectively. As illustrated in Algorithm \ref{alg:unified-opt-proc}, UniAP enumerates all factors of $n$ except 1 as the $pp\_size$ in the outer loop and all factors of $B$ except 1 in the inner loop. Since the time complexity of enumerating factors of any positive integer $a~(a\in\NB_+)$ is $\mathcal{O}(\sqrt{a})$, the time complexity for the two loops in the UniAP algorithm is $\mathcal{O}(\sqrt{Bd})$. Within the inner loop body, UniAP calls \verb+CostModeling+ to model the cost of each stage for each parallel strategy. Furthermore, the optimization time limit of the MIQP solver can be set as a constant hyperparameter when UniAP calls it. Therefore, the overall computational complexity of UniAP is $\mathcal{O}(\lvert \VB \rvert \lvert \SB\rvert \sqrt{Bd})$.
+ 

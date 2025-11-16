@@ -1,0 +1,110 @@
+\vspacebeforesection
+\section{Background}
+\label{sec:background}
+
+In this section, we provide the necessary background information to ensure a comprehensive understanding of the attack described in this paper. We start with a description of the Distributed Hash Table (DHT) used by IPFS, followed by its content resolution mechanisms. We also detail techniques for network size estimation, necessary for our attack detection and mitigation mechanisms.
+
+\vspacebeforesection
+\subsection{IPFS DHT}
+\label{sec:kad_dht}
+
+We review the features of the Kademlia DHT~\cite{maymounkov2002kademlia} and its \texttt{libp2p} implementation~\cite{libp2p_github} that are the most relevant to our attack.
+To participate in the DHT, each peer generates a public/private key pair and derives an identity $\peerid \in \{0,1\}^{256}$ as the hash of its public key.
+Ideally, each peer generates a random key pair and, therefore, peer IDs are distributed uniformly and independently over the space $\{0,1\}^{256}$.
+While honest nodes follow this rule, malicious nodes may generate and choose from an arbitrary number of key pairs.
+Each peer maintains a routing table consisting of $m=256$ buckets.
+The $i$-th bucket contains the addresses of up to $k=20$ peers whose peer IDs share a common prefix of exactly $i$ bits with the peer's own peer ID. 
+
+%
+A new participant node joins the IPFS network by contacting one of the hardcoded bootstrap nodes. This bootstrap node provides the new node with some initial peers allowing it to join the DHT. The new node uses this information to perform a walk through the DHT towards its own peer ID.
+The walk allows to: \textit{(i)}~make sure that there is no other node in the network with the same ID; \textit{(ii)}~discover new peers and fill the newcomer's DHT routing table. At the same time, the newcomer establishes \bitswap~\cite{de2021accelerating} connections to a subset of encountered peers (usually around 300 of them). The core role of the \bitswap protocol is to enable bilateral content transfer and to play the role of a cache for recently-accessed content.
+
+The main DHT operation $\Call{GetClosestPeers}{\key}$ returns the $k=20$ closest peers to $\key$. 
+%
+In Kademlia, the distance between two keys $x$ and $y$ in the key space is given by $x \oplus y \in \{0,...,2^{256}-1\}$, where $\oplus$ denotes the bitwise XOR operation on the keys; the resulting binary string is interpreted as an integer.
+%
+When a client wants to find the peers with IDs closest to $\key$, it sends a request to the $\alpha=3$ peers in its routing table whose peer IDs are closest to $\key$. Each of these peers returns the $k$ closest peers to $\key$ in its own routing table and the addresses of these peers. 
+%
+The client again sends a request to the $\alpha$ peers closest to $\key$, among peers in its routing table and those whose addresses it just received. This process repeats until the client does not find any more peers closer to $\key$.
+Due to network churn and imperfect routing tables, we observed in our experiments that successive calls to $\Call{GetClosestPeers}{\key}$ do not always return the true set of $k=20$ closest peers (we provide more details in \Cref{sec:evaluation}, \Cref{fig:20closest}).
+%
+
+\vspacebeforesection
+\subsection{Content Resolution in IPFS}
+\label{sec:ipfs}
+
+IPFS is a content-centric network.
+It allows its participant to request files without specifying their location. 
+%
+Content is indexed by content IDs $\cid \in \{0,1\}^{256}$ that are derived from a hash of that content.
+Both peer IDs and CIDs are used as keys in the DHT.
+Each node can play the role of a \provider, \downloader, or \resolver. 
+The process of content advertisement and resolution is illustrated in \Cref{fig:add_get_provider}.
+
+%
+When a \provider wishes to publish content with a given $\cid$ on IPFS, it creates a \emph{provider record} that contains $cid$ and the \provider's address.
+During a $\Call{Provide}{\cid}$ operation, the \provider first uses $\Call{GetClosestPeers}{\cid}$ to locate the $k=20$ peers with their peer IDs closest to $\cid$, 
+%
+and then sends them a $\mathsf{PutProvider}$ message including the provider record (\Cref{fig:add_get_provider}(a)).
+We call the peers that hold provider records for $\cid$ the \emph{resolvers} for $\cid$.
+
+Each CID can have several \providers. In fact, by default, each IPFS client becomes a provider for each piece of content it downloads for a fixed amount of time (12h, 24h, or 48h depending on the client version or custom configuration). As a result, the system provides an auto-scaling feature with supply automatically rising with demand.
+
+%
+When a \downloader wishes to fetch a piece of content, it first sends a request to all its \bitswap peers. If none of them has the content, the \downloader uses the DHT-based resolution system. We stress that the \bitswap protocol plays the supporting role of a cache in the dissemination of popular files. However, the mechanism does not provide reliable content resolution, in particular for new or less popular content. %
+
+When \bitswap unstructured search fails, the \downloader resolves $\cid$ using $\Call{FindProviders}{\cid}$. This operation uses a DHT walk identical to that of $\Call{GetClosestPeers}{\cid}$ to find $k$ \resolvers but also queries encountered nodes for a provider record for $\cid$ (\Cref{fig:add_get_provider}(b)). The process terminates when either 20 \providers have been found, or all \resolvers have been asked. Querying all encountered nodes (\ie, not only the designated \resolvers) is useful because some of the encountered nodes may have a provider record in their cache.
+%
+
+Upon receiving a provider record, the client connects to the address specified in the provider record to retrieve the actual content (\Cref{fig:add_get_provider}(c)).
+Provider records are not authenticated, and therefore malicious \providers may respond with incorrect provider records (or may not respond at all). However, the integrity of the content is preserved because the hash of the retrieved content can be verified against its $\cid$.
+%
+
+
+%
+
+\input{img/add_get_provider.tex}
+
+\vspacebeforesection
+\subsection{Network Size Estimator}
+\label{sec:netsize}
+
+The number of nodes in a decentralized system is generally unknown due to the avoidance of centralized membership management.
+This number is nonetheless useful for optimizations, deciding on individual node configurations, or security mechanisms.
+Various methods were proposed for the decentralized estimation of unstructured and structured networks~\cite{eli-sohl-dht-size-estimation,kostoulas2005decentralized, manku2003symphony}.
+We use in this work a mechanism developed initially by Protocol Labs as part of a mechanism for decreasing the latency of publishing content in IPFS~\cite{network-size-estimation-notion,network-size-estimation-github-pr}.
+
+%
+%
+%
+%
+%
+%
+%
+%
+%
+%
+
+Each node in the DHT refreshes its routing table periodically (every $10$ minutes in \texttt{libp2p}). 
+For this, the node samples $m$ random keys (one for each bucket of its routing table)
+%
+and queries the DHT to obtain the $k=20$ closest peer IDs to each key.
+Using these, the node then computes the average distance between each one of these keys $\key_j$ for $j=1,\dots,m$ and their $i$-th closest peer ID for $i=1,...,k$ (with $m=256$ and $k=20$).
+\begin{equation}
+    \label{equ:avg-dist}
+    \overline{D}_i = \frac{1}{m} \sum_{j=1}^m \operatorname{dist}(\key_j, \peerid_{j}^{(i)})
+\end{equation}
+where $\peerid_{j}^{(i)}$ is the $i$-th closest peer ID to $\key_j$.
+With $N$ peers in the DHT and peer IDs uniformly distributed in the hash space, the expected distance between a $\key$ and its $i$-th closest peer ID is $\frac{2^{256}i}{N+1}$. The node then runs a least square regression to compute the value of $N$ for which the expected distances best fit the empirical average distances, \ie,
+\begin{equation}
+    \label{equ:netsize-least-squares}
+    \hat{N} = \arg\min_{N} \sum_{i=1}^k \left(\overline{D}_i - \frac{2^{256}i}{N+1}\right)^2.
+\end{equation}
+The resulting estimate $\hat{N}$ can be computed in closed form.
+%
+
+When a node starts running, it must perform DHT queries for a few random keys to initialize its network size estimate. 
+Since a larger number of queries will result in higher accuracy, making more queries than what is needed to initialize one's routing table is recommended.
+Thereafter, keeping the estimate up-to-date does not require any excess DHT queries beyond what is already used for refreshing the routing table as this is done frequently (every 10 minutes).
+
+While the network size estimate has a stochastic variance resulting from the probability distribution of the honest peer IDs, it is hard for an attacker to bias the estimate significantly. Since the estimator uses the density of peer IDs around keys chosen uniformly at random, the adversary would require numerous Sybil nodes (on the order of the whole network size) to significantly affect the peer ID density around those keys.

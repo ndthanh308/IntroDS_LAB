@@ -1,0 +1,150 @@
+
+
+\section{PG-RCNN}
+PG-RCNN is a two-stage method for 3D object detection composed of a region proposal stage and a proposal refinement stage. 
+Figure \ref{fig:2_framework} illustrates the overview of the PG-RCNN framework. 
+For the first stage, the region proposal network (RPN) with a voxel-based backbone generates the initial bounding box proposals. 
+Our main novelty lies in the second stage, where we introduce the RoI point generation (RPG) module to create a semantic surface point cloud for each proposal. 
+The RPG module aggregates the backbone voxel features in a grid and uses a Transformer \cite{transformer_vaswani} encoder to capture the global context of the RoI.
+Then an MLP is individually applied to each grid point feature to output the coordinates offset and the semantic feature of the generated point.
+Lastly, the detection head produces the final detection output using the bounding box refinement features extracted from the generated point clouds with semantic features.
+
+%Lastly, the detection head uses the PointNet++ \cite{pointnet++_qi} encoder to extract refinement features from the generated point clouds with semantic features, producing the final detection output.
+
+\subsection{Region Proposal Network}
+
+Following many recent works \cite{pvrcnn_shi, voxelrcnn_deng, ct3d_sheng, pdv_hu}, we adopt SECOND \cite{second_yan} as our RPN for its high efficiency and recall.
+%To generate 3D region proposals, we adopt SECOND \cite{second_yan}, a widely used voxel-based object detector due to its high efficiency. 
+The input raw point cloud is first divided into evenly spaced voxels and gradually processed with the 3D backbone network composed of a series of sparse convolution layers, resulting in multiple scales of feature volumes.
+% The downsampled feature volumes are then projected along the Z-axis and converted into a bird's-eye view (BEV) feature map, where the proposal layers produce dense prediction with the classification and box regression branch to generate initial detection output for the later refinement stage.
+The downsampled feature volumes are projected along the Z-axis and converted into a bird's-eye view (BEV) feature map.
+The proposal layers use the BEV feature map to produce dense predictions with the classification and box regression branches to generate initial detection output for the later refinement stage.
+
+
+\subsection{RoI Point Generation Module}
+
+ Previous approaches \cite{sienet_li, pcrgnn_zhang} leverage point-based completion models, using raw points pooled from RoI as input. 
+Instead, our RPG module exploits voxel features from the 3D backbone, which contain rich context information about their surroundings.
+
+We begin by dividing a region proposal into $G \times G \times G$ regular sub-voxels, using the center coordinates of these sub-voxels as grid points.
+Then, we use a method from Voxel R-CNN \cite{voxelrcnn_deng} to aggregate voxel features at the grid points.
+Specifically, a grid point $\mathbf{g}_i$ is quantified into a voxel, so that the neighboring voxels are efficiently obtained by indices translation.
+Using a PointNet++ \cite{pointnet++_qi} module, we aggregate its feature $\mathbf{f}_{\mathbf{g}_i}$ from the sampled set of neighboring voxels $\Gamma_i = \{\mathbf{v}_i^1, \mathbf{v}_i^2, \cdots, \mathbf{v}_i^K\}$ as follows:
+\begin{equation}
+\mathbf{f}_{\mathbf{g}_{i}} = {MaxPool} \left( \{{\mathcal{A}^{agg}([\mathbf{v}_i^k - \mathbf{g}_i; \mathbf{f}_{\mathbf{v}_i^k}])}\}_{k=1}^K \right),
+\end{equation}
+where $\mathcal{A}^{agg}(\cdot)$ represents the MLP for feature aggregation, $\mathbf{v}_i^k - \mathbf{g}_i$ represents relative coordinates, and $\mathbf{f}_{\mathbf{v}_i^k}$ is the feature of voxel $\mathbf{v}_i^k$. The RPG module aggregates voxel features from feature volumes of the last three stages in the 3D backbone network and concatenates the multi-scale features.
+
+%The features pooled at the grid points are independently aggregated at their position and lack RoI-level context information for estimating object shapes.
+The feature pooled at each grid point contains local information about its surroundings but lacks RoI-level context information for estimating object shapes.   
+%Features are independently pooled from the grid points lack RoI-level context information for estimating object shapes.
+%Features independently pooled from the grid points lack RoI-level context information for estimating object shapes.
+To capture the long-range dependencies between the grid points, we further process the features with a Transformer encoder.
+In Section \ref{sec:4.4}, we demonstrate the effectiveness of utilizing the Transformer encoder in enhancing object detection performance.
+The refined grid point feature $\Tilde{\mathbf{f}}_{\mathbf{g}_i}$ is formulated as
+\begin{equation}
+    \Tilde{\mathbf{f}}_{\mathbf{g}_i} = \mathcal{T}(\mathbf{f}_{\mathbf{g}_i}, \mathbf{\delta}_{\mathbf{g}_i}),
+\end{equation}
+where $\mathbf{\delta}_{\mathbf{g}_i}$ is the positional encoding, and $\mathcal{T}(\cdot)$ is a standard Transformer encoder. To encode positional information, we apply a shallow feedforward neural network (FFN) to the relative coordinates of the grid point with respect to the region proposal bounding box, as described in \cite{ct3d_sheng}:
+\begin{equation}
+    \mathbf{\delta}_{\mathbf{g}_i} = \mathcal{A}^{pos}([\mathbf{g}_i - \mathbf{r}^c; \mathbf{g}_i - \mathbf{r}^1; \mathbf{g}_i - \mathbf{r}^2; \cdots; \mathbf{g}_i - \mathbf{r}^8]),
+\end{equation}
+where $\mathcal{A}^{pos}(\cdot)$ represents the FFN, $\mathbf{r}^c$ is the center, and $\mathbf{r}^{1,2,\cdots,8}$ are the eight corners of the bounding box.
+
+% Finally, an MLP is applied to $\Tilde{\mathbf{f}}_{\mathbf{g}_i}$ and outputs $[\mathbf{o}_j ; \mathbf{f}_{\mathbf{p}_i}] \in \mathbb{R}^{3+C}$
+Finally, a two-layer MLP $\mathcal{A}^{gen}(\cdot)$ is applied to the refined features to generate the offset $\mathbf{o}_i$ from the grid point, as well as the semantic feature of the generated point $\mathbf{f}^{se}_{\mathbf{p}_i}$:
+\begin{equation}
+    [\mathbf{o}_i; \mathbf{f}^{se}_{\mathbf{p}_i}] = \mathcal{A}^{gen}(\Tilde{\mathbf{f}}_{\mathbf{g}_i}).
+\end{equation}
+The generated point's coordinates $\mathbf{p}_i = (x_i,y_i,z_i)$ can be calculated as  $\mathbf{g}_i + \mathbf{o}_i$, and the foreground score $s_i$ for each generated point is calculated by applying a linear projection $A$ and a sigmoid function $\sigma$ to its semantic feature, \ie, 
+\begin{equation}
+    s_i = \sigma(A\mathbf{f}^{se}_{\mathbf{p}_i}).
+\end{equation}
+
+\subsection{Detection Head}
+
+%We use a PointNet-based encoder to extract shape-aware RoI features from the generated points with semantic features.
+Our detection head is inspired by the design of PointRCNN \cite{pointrcnn_shi} where it uses the PointNet++ encoder to extract refinement features from semantic point clouds.
+For every generated point, we obtain the local spatial feature $\mathbf{f}^{sp}_{\mathbf{p}_i}$ with an MLP $\mathcal{A}^{loc}$ as follows:
+\begin{equation}
+    \mathbf{f}^{sp}_{\mathbf{p}_i} = \mathcal{A}^{loc} \left( \left[x_i^c, y_i^c, z_i^c, d_i, s_i \right]\right).
+\end{equation}
+Here, $(x_i^c, y_i^c, z_i^c)$ are the coordinates of the generated point $\mathbf{p}_i$ in the canonical coordinates system of the bounding box, and $d_i=\sqrt{x_i^2 + y_i^2 + z_i^2}$ is the depth of the point. 
+The canonical transformation facilitates robust local spatial feature learning.
+However, the transformation causes the inevitable loss of points' depth information, so we append $d_i$ as an additional feature. 
+The estimated foreground score $s_i$ is also appended as the feature that represents the significance of the generated point.
+%The canonical transformation facilitates robust local spatial feature learning, and depth and foreground score are concatenated as additional features that implicitly represent the reliability and importance of each point.
+We merge $\mathbf{f}^{sp}_{\mathbf{p}_i}$ and $\mathbf{f}^{se}_{\mathbf{p}_i}$ for each point $\mathbf{p}_i$, and feed the point set with features into the PointNet++ encoder to obtain the refinement feature for RoI $\mathbf{f}^{r}$:
+\begin{equation}
+   \mathbf{f}^{r} = \mathcal{P}\left( \{\mathbf{p}_i\}_{i=1}^{G^3}, \{[\mathbf{f}^{sp}_{\mathbf{p}_i};\mathbf{f}^{se}_{\mathbf{p}_i}]\}_{i=1}^{G^3}\right), 
+\end{equation}
+where $\mathcal{P}(\cdot)$ denotes the PointNet++ encoder taking the set of point coordinates and the corresponding feature set as input.
+The RoI feature serves as the input for confidence classification and bounding box refinement branches, resulting in the final detection output.
+
+\subsection{Training Losses}
+
+PG-RCNN is an end-to-end model trained with the summation of the region proposal loss $\mathcal{L}_{\mathrm{RPN}}$, the proposal refinement loss $\mathcal{L}_{\mathrm{head}}$, and the point generation loss $\mathcal{L}_{\mathrm{RPG}}$:
+\begin{equation}
+    \mathcal{L}_{total} = \mathcal{L}_{\mathrm{RPN}} + \mathcal{L}_{\mathrm{head}} + \mathcal{L}_{\mathrm{RPG}}. 
+\end{equation}
+
+$\mathcal{L}_{\mathrm{RPN}}$ and $\mathcal{L}_{\mathrm{head}}$ are conventional training losses for two-stage detectors calculated with the outputs of the RPN and the detection head, respectively.
+Both losses are composed of a classification and a regression term.
+The classification targets are assigned based on the intersection-over-union (IoU) of the anchors and the proposals with the ground truth bounding boxes. Only foreground anchors and proposals contribute to the regression losses, using the regression target given by their ground truth residuals.
+Focal Loss \cite{focal_yun} is used for the RPN's classification branch output, while binary cross-entropy loss is used for the detection head's confidence branch output. For the regression loss, we use the smooth-L1 loss for both losses.
+%The $\mathcal{L}_{\mathrm{RPN}}$ is formulated as:
+%\begin{multline}
+%    \mathcal{L}_{\mathrm{RPN}} = \frac{1}{N_{fg}} \sum_j \left[ \mathcal{L}_{focal} (c_j, c_j^*) \right. \\ 
+%    \left.+ \mathbb{1}(c_j^* > 1)\mathcal{L}_{smooth-L1} (r_j, r_j^*) \right],
+%\end{multline}
+%where $N_{fg}$ is the number of foreground anchors, and $c_j$ and $r_j$ are the 3D RPN's outputs of classification and box regression branches, $c_j^*$ and $r_j^*$ are the classification labels and ground-truth anchor residual. $\mathbb{1}(c_j^* > 1)$ indicates that foreground anchors contribute to the regression loss. Here, Focal loss \cite{focalloss} was utilized for the classification branch, and smooth-L1 loss for the box regression branch.
+
+$\mathcal{L}_{\mathrm{RPG}}$ is an auxiliary loss term that specifically supervises point generation, calculated with the RPG module outputs:
+\begin{equation}
+    \mathcal{L}_{\mathrm{RPG}} = \mathcal{L}_{score} + \mathcal{L}_{offset}.
+\end{equation}
+$\mathcal{L}_{score}$ is a point-level segmentation loss that governs the foreground scores of generated points.
+We assign segmentation labels to generated points by checking if they are inside a ground-truth bounding box.
+Since we generate $G^3$ points for each proposal, calculating loss at all generated points would be computationally expensive.
+We select $N_p$ points from the scene using the FPS algorithm and apply Focal Loss on the sampled points, \textit{i.e.},
+\begin{equation}
+    \mathcal{L}_{score} = -\frac{1}{N_p} \sum_{j}{(1-s_j)^\gamma \log{s_j}}
+\end{equation}
+where $s_j, j=1, 2, \cdots N_p$ are the foreground score of the sampled points. 
+
+
+% Figure environment removed
+
+On the other hand, $\mathcal{L}_{offset}$ supervises the shape of the generated point clouds. 
+Since the KITTI dataset does not provide complete point clouds of the object instances, previous approaches \cite{pcrgnn_zhang, sienet_li} used external datasets such as ShapeNet \cite{shapenet} to train their point cloud completion network in advance. 
+Instead, we exploit other object instances within the provided dataset to approximate the complete shape of the object.
+Specifically, we use the approximation method proposed in \cite{btc_xu}.
+We first search for other objects of the same class that have similar bounding boxes and point distributions.
+Then we combine the point sets of two best-matching objects with the original points and produce a dense point cloud.
+For cars and cyclists, we assume symmetry along the object's heading axis and mirror the points accordingly.
+Figure \ref{fig:3_target} displays an example of a completed point cloud for each class.
+%Figure \ref{fig:3_target} displays an example generation target for each class, and we explain the approximation method for the KITTI dataset in Section \ref{sec:4.1}.
+Using the completed point clouds as generation targets, we employ Chamfer Distance on foreground proposals as follows:
+\begin{multline}
+    \mathcal{L}_{offset} = \frac{1}{N_{fp}}\sum_{r}\left(\dfrac{1}{|\mathbf{P}_r|} \sum_{\mathbf{x} \in \mathbf{P}_r}\min_{\mathbf{y}\in \mathbf{P}_r^*}||\mathbf{x}-\mathbf{y}||^2_2 + \right. \\
+    \left. \dfrac{1}{|\mathbf{P}_r^*|} \sum_{\mathbf{y} \in \mathbf{P}_r^*}\min_{\mathbf{x}\in \mathbf{P}_r}||\mathbf{y}-\mathbf{x}||^2_2 \right),  
+\end{multline}
+where $N_{fp}$ is the number of foreground proposals, and $\mathbf{P}_r$ and $\mathbf{P}_r^*$ are the generated and the target point cloud of the $r$-th foreground proposal where $r=1, 2, \cdots, N_{fp}$, respectively.
+
+%Formally, $\mathcal{L}_{\mathrm{RPG}}$ is formulated as:
+%\begin{multline}
+%    \mathcal{L}_{\mathrm{RPG}} = \frac{1}{N_p}\sum_{j}\mathcal{L}_{focal}(s_{j}, s_{j}^*) + \frac{1}{N_{fg}}\sum_{r}\mathcal{L}_{CD}(\mathbf{P}_r, \mathbf{P}_r^*)
+%    \frac{1}{N_{fg}}\sum_{r}\left(\dfrac{1}{|\mathbf{P}_r|} \sum_{x \in \mathbf{P}_r}\min_{y\in \mathbf{P}_r^*}||x-y||^2_2 + \dfrac{1}{|\mathbf{P}_r^*|} \sum_{y \in \mathbf{P}_r^*}\min_{x\in \mathbf{P}_r}||y-x||^2_2 \right)
+%\end{multline}
+
+
+%In order to generate points that accurately represent the surface of objects, it is necessary to have additional supervision for learning the complete shape of the objects.
+%For supervision, a dense and complete point cloud of objects is required, but the datasets \cite{kitti, waymo} used for training do not provide this.
+%Therefore, other object detection models \cite{pcrgnn_zhang, sienet_li} that generate points according to objects' shape used a pre-trained point completion network using the external dataset, ShapeNet \cite{shapenet}.
+%In contrast to previous approaches, we simultaneously train point generation and object detection rather than using a pre-trained model.
+%Since this method requires a dense and complete target corresponding to each object, we generate the target using the method motivated by \cite{btc_xu, sparse2dense_wang}.
+%First, it is necessary to find the point sets that match the original points of the object. In the case of KITTI \cite{kitti}, the points with the most similar distribution to the original points are matched among the same class. In contrast, in the case of the Waymo Open Dataset \cite{waymo} with multi-frame, points of the same object appearing in other frames are matched.
+%The matching point sets found in this way are then combined with the original points.
+%Assuming that Car and Cyclist are approximately symmetrical, we mirror the points about the object's heading axis.
+%As a result, a target with dense and complete points is generated for each object.
+%Further details on target generation are described in the supplementary.

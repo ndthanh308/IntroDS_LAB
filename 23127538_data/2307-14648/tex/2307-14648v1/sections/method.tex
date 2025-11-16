@@ -1,0 +1,105 @@
+\section{Method}
+% Given an input image $\scalemath{\bx_0}$ of resolution $\scalemath{H \times W}$, we use discrete wavelet transform (DWT) in Haar wavelet~\cite{} to decompose it into four subbands representing low-frequency and high-frequency information. Specifically, we use $L=\frac{1}{\sqrt{2}}[1,1]$ and $\scalemath{H=\frac{1}{\sqrt{2}}[-1,1]}$ to construct four convolutional kernels $\scalemath{LL^T, LH^T, HL^T}$ and $\scalemath{HH^T}$ to decompose $\scalemath{\bx_0}$ to $\scalemath{\bu_0 = [\bU_{ll}, \bU_{lh}, \bU_{hl}, \bU_{hh}]}$, each subband is with a downsampled resolution of the original image. Note that such decomposition is exactly invertible with inverse wavelet transformation (IWT) so that we don't have any information loss in pixel space.
+% Instead of concatenating the subbands along the channel dimension~\cite{}, we adopt the 5D data structure of $\scalemath{[B, C, F, H/2, W/2]}$, where $\scalemath{B, C}$ and $\scalemath{F}$ denote the 
+% size of batch size, channels and subbands, respectively. $\scalemath{H/2}$ and $\scalemath{W/2}$ are spatial resolution of each subband. 
+% We explicitly separate feature, frequency and spatial dimensions to facilitate the parallel processing of different wavelet subspaces within our proposed spatial-frequency block.   
+% \jianfw{
+Given an input image $\scalemath{\bx_0}$ of resolution $\scalemath{H \times W}$, we utilize the discrete wavelet transform (DWT) (Haar wavelet~\cite{DBLP:journals/siamrev/Brewster93}) to decompose it into four subbands. 
+We define the low-pass filter $L=\frac{1}{\sqrt{2}}[1,1]^T$ and the high-pass filter $H=\frac{1}{\sqrt{2}}[-1,1]^T$. 
+With these filters, we construct four convolutional kernels: $LL^T$, $LH^T$, $HL^T$, and $HH^T$. 
+The $LL^T$ kernel effectively performs average pooling over $2\times 2$ windows, capturing low-frequency components. 
+The other kernels extract different higher-level frequencies. 
+By applying these kernels, we represent the input image  $\scalemath{\bx_0}$  as 
+$\scalemath{\bu_0 = [\bU_{ll}, \bU_{lh}, \bU_{hl}, \bU_{hh}]}$ ($\bU_{*} \in \mathcal{R}^{H/2 \times W/2}$).
+Note that, each subband has a downsampled resolution with a factor of 2 compared to the original image.
+Importantly, this decomposition is exactly invertible using the inverse wavelet transform (IWT), preserving all the information in the pixel space.
+To this end, the input image $\scalemath{H \times W}$ is transformed to a 3D signal $\scalemath{4 \times H/2 \times W/2}$.
+Instead of concatenating the subbands along the channel dimension~\cite{DBLP:journals/corr/abs-2211-16152,DBLP:journals/corr/abs-2304-01994}, 
+we adopt, in practice, a 5D data structure of $\scalemath{[B, C, F, H/2, W/2]}$, where $\scalemath{B}$, $\scalemath{C}$ and $\scalemath{F}$ denote the 
+batch size, number of channels and subbands, respectively. 
+Initially, the channel $C$ is set to 3, representing the R, G, and B channels.
+We explicitly separate feature, frequency and spatial dimensions to facilitate the parallel processing of different wavelet subspaces within our proposed spatial-frequency block. 
+% }
+
+
+
+
+
+As an analogy to the pixel DDPM~\cite{DBLP:conf/nips/HoJA20}, we generate a noisy wavelet sample $\scalemath{\bu_t}$ from $\scalemath{\bu_0}$ through the forward diffusion in the wavelet space:
+\begin{eqnarray}\label{eq:q_sample}
+    \scalemath{
+    q(\bu_t|\bu_0):= \mathcal{N}(\bu_t; \sqrt{\bar{\alpha}_t}\bu_0, (1-\bar{\alpha}_t)I),
+    } \nonumber \\
+    \scalemath{
+    \bu_{t} = \sqrt{\bar{\alpha}_t}\bu_0 + \sqrt{1-\bar{\alpha}_t}\epsilon, \epsilon \sim \mathcal{N}(0,1),
+    }
+\end{eqnarray}
+where $\scalemath{\alpha_t = 1 - \beta_t, \bar{\alpha}_t = \prod_{s=1}^t \alpha_t}$.
+% \jianfw{
+Next, we first describe our architecture in Sec.~\ref{sec:unet} to recover the noise from this noisy $u_t$, and then details the training and inference in Sec.~\ref{sec:train_infer}.
+% }
+
+% Figure environment removed
+
+\subsection{Spatial-Frequency U-Net}\label{sec:unet}
+To accomplish the denoising task in the wavelet space while maintaining the compatibility to the standard DDPM training process, we propose two spatial-frequency components to serve as an replacement of the original design in DDPM U-Net.
+Figure~\ref{fig:framework} shows the overview of the proposed spatial-frequency U-Net block. 
+
+\noindent \textbf{Spatial-Frequency Convolution}
+Suppose we have the wavelet 5D input data of size $\scalemath{[B\times N_{i-1} \times F \times s_1 \times s_2]}$ for $i$-th block, where $N_{i - 1}$ is the channel size.
+One 
+% natural
+straightforward
+design is to upgrade 2D convolutional filters of size $\scalemath{N_{i-1} \times k\times k}$ to full 3D convolutions, in which each filter is 4-dimensional ($\scalemath{N_{i-1} \times f \times k\times k}$) ($f$ is the kernel size for frequency) and all $\scalemath{N_i}$ filters are convolved over spatial and frequency dimension together.  
+
+For computational efficiency, we frame a (2+1)D convolution, built upon~\cite{DBLP:conf/cvpr/TranWTRLP18} within the context of spatial-frequency domain: similar to the spatial-temporal modeling, the spatial-frequency convolution consists of a 2D convolution followed by a 1D convolution, which are capable of approximating the full 3D convolution while allowing joint learning capability over both spatial and frequency subspaces to emerge as needed.
+As shown in Figure~\ref{fig:framework}, 
+The new convolution module consists of $\scalemath{M_i}$ 2D filters of size $\scalemath{N_{i-1} \times 1 \times k \times k}$ and $\scalemath{N_i}$ 1D filters of size $\scalemath{M_i \times f \times 1 \times 1}$, in which $\scalemath{M_i}$ is $[\frac{fk^2N_{i-1}N_{i}}{k^2n_{i-1}+fN_i}]$ to approximate the parameters of a full 3D convolution.
+
+\noindent \textbf{Spatial-Frequency Attention}
+Attention layers in WaveDiff U-Net ignore the frequency ordering
+in the wavelet space and process different subbands analogously to channels. 
+Considering the complementary information among low-sub and high-sub(s), 
+we design a simple yet effective attention mechanism with both spatial and frequency.
+We build both attention layers upon the scaled dot attention\cite{DBLP:conf/nips/VaswaniSPUJGKP17}: 
+\vspace{-0.5em}
+\begin{eqnarray}\label{eq:attention}
+    \scalemath{\text{Attention}(Q,K,V) = \bm{m} \cdot V, }\nonumber \\
+    \scalemath{\bm{m} = \text{Softmax}(\frac{QK^T}{\sqrt{d}})}
+\end{eqnarray}
+% \vspace{-0.5em}
+where $d$ is the dimension of queries and keys.
+In the context of self-attention, individual entries of the mask $\bm{m}_{i,j}$ represent the contribution of the $j$-th location towards the $i$-th one.
+Given intermediate features processed by the spatial-frequency convolutions, denoted as $\scalemath{\bh_{u}}$ of shape $\scalemath{B\times N_i \times F \times s_1 \times s_2}$, we have the flexibility to permute the data structure to realize both spatial and frequency attention while maintaining the unified definition in Eq.~\ref{eq:attention}. 
+Specifically, for spatial attention, we permute $\scalemath{\bh_{u}}$ to be the shape of $\scalemath{(B*F , N_i , s_1*s_2)}$, denoted as $\hat{\bh}_{u}$. Then Query $\scalemath{Q_s = W^{Q}_s(\hat{\bh}_{u})}$, Key $\scalemath{K_s = W^{K}_s(\hat{\bh}_{u})}$, and Value $\scalemath{V_s = W^{V}_s(\hat{\bh}_{u})}$ are computed with the learnable projections $\scalemath{W^{Q}_s}$, $\scalemath{W^{K}_s}$ and $\scalemath{W^{V}_s}$ applied on $\scalemath{\hat{\bh}_{u}}$ and processed with Eq.~\ref{eq:attention} to generate $\scalemath{\hat{\br}_{u}}$.
+Similarly for frequency attention, we permute $\scalemath{\br_{u}}$ to be the shape of $\scalemath{(B*s_1*s_2, N_i,F)}$, compute $\scalemath{Q_f}$, $\scalemath{K_f}$ and $\scalemath{V_f}$ using learnable projections, which is followed by self-attention defined in Eq.~\ref{eq:attention}.
+
+We construct our spatial-frequency U-Net, parameterized as $\theta$, with the proposed spatial-frequency convolution and attention blocks, and make the noise prediction $\hat{\epsilon}_{\theta}$ of shape $\scalemath{B \times 3 \times F \times H/2 \times  W/2}$.
+
+
+% \textbf{}
+\subsection{Training and Sampling with Standard Denoising Diffusion}\label{sec:train_infer}
+We train the model in an end-to-end manner, with the simple denoising objective in DDPM.
+As such, the model weights $\theta$ can be optimized by minimizing the MSE loss of noise prediction:
+\begin{eqnarray} \label{eq:loss}
+    \scalemath{L = \mathbb{E}||\epsilon - \hat{\epsilon_{\theta}}||_2^2}
+\end{eqnarray}
+We summarize the training in Algorithm~\ref{alg:training}.
+
+After the training finishes, we sample realistic images with reversed diffusion process, starting from the input noise $\scalemath{\bu_T \sim \mathcal{N}(0,1)}$ of shape $\scalemath{B \times 3 \times F \times H/2 \times  W/2}$.
+The reversed diffusion process is to predict $\bu_{t-1}$ from $\bu_{t}$, which is formulated as:
+\begin{eqnarray}
+    \scalemath{\bu_{t-1} = \frac{1}{\sqrt{\alpha_t}}(\bu_t -\frac{1-\alpha_t}{\sqrt{1-\bar{\alpha_t}}}\theta(\bu_t,t))+\sigma_t\bz,} \label{eq:r_diff}\\
+    \scalemath{\bz \sim \mathcal{N}(0,1) \quad \text{if} \quad  t>1 \quad  \text{else} \quad  \bz=0.} \label{eq:sample_z}
+\end{eqnarray}
+where  $\scalemath{\sigma_t}$ is empirically set according to the noise scheduler~\cite{DBLP:conf/nips/HoJA20}. Our model performs T steps of the reversed diffusion process to produce the generation of all frequency components in the wavelet space. We then reconstruct the image $\scalemath{\hat{\bx}_0}$ using inverse wavelet transform (IWT) when $\scalemath{t=1}$. We summarize this sampling process in Algorithm~\ref{alg:eval}.
+
+% Figure environment removed
+
+
+
+
+
+
+
+

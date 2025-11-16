@@ -1,0 +1,66 @@
+\section{Implementation challenges}
+\label{section:implementation}
+
+\subsubsection{Finding good RSS keys}
+The first set of keys found by the solver is often not ideal.
+If, for example, the solver finds a key with all but the first bit set to zero, the hash, though semantically valid, will only ever be $\mathtt{0x0}$ or $\mathtt{0x80000000}$. This leads to packets being sent to only two cores.
+
+The solution employed by \librs involves setting the value 1 to as many bits as possible in the keys, so long as they still satisfy the given statement. This is known as a Partial MAXSAT problem \cite{cha1997local}.
+We give the solver a statement that its corresponding solutions should always satisfy---\cref{eq:statement_multikeys}, hard constraints---and also a set of clauses that they should try to satisfy---soft constraints. The soft constraints correspond to a chain of logical \textit{ANDs} setting each key bit to 1.
+There is no need for maximizing the number of satisfied soft constraints.
+Most of the times, a randomly selected set of bits with the value 1 is enough to avoid corner case problems like the one mentioned above.
+As such, \maestro uses a slightly modified version of the diagnosis-based approach introduced by Fu and Malik \cite{fu2006solving}.
+It begins by seeding the key with random bits.
+Then, if the combined hard and soft constraints are not satisfiable, we get the UNSAT core from the solver and randomly discard a subset of these soft constraints, repeating as necessary until either a key is found or no further soft constraints are left, indicating that no such key exists.
+Due to the randomized nature of this algorithm, we use multiple parallel solvers to independently find keys until one is found with an acceptable workload distribution.
+
+\subsubsection{NUMA considerations}
+In a NUMA environment, each possible combination of NIC, memory, and CPU pinning influences throughput. Our machines (see \cref{section:evaluation}) have 100~Gbps NICs with 2 interfaces, thus both interfaces are pinned to the same NUMA node.
+Under these circumstances, pinning the packet buffers to the same NUMA node as the NIC is optimal~\cite{Emmerich2018}.
+
+Another important consideration is that the dominant contention factor in parallel packet processing applications is the cache, specifically for Intel Data Direct I/O (DDIO) resources~\cite{dobrescu2012toward,manousis2020contention}. Using DDIO, the packets coming from the NIC are directly placed in the last level cache (LLC) of the NUMA node.
+Contention happens when the number of concurrent packets exceeds the available reserved space for I/O in the LLC, at which point packets evict each other and performance suffers.
+\maestro allocates packet buffers close to the NIC, but keeps state local to each core's NUMA node. Deciding where to run each thread is, however, a deployment challenge, not an implementation one, and therefore out of scope for \maestro. Nevertheless, our experience has taught us a simple rule of thumb: if the LLC is large enough to hold all packet buffers at line-rate, then we should pin both the CPU and memory to the same NUMA node as the NIC. If, however, the LLC is too small, resulting in contention---as occurs with older processors---then it's better to distribute cores evenly across NUMA nodes, thus increasing the total available LLC.
+Though we have seen scenarios where using multiple NUMA nodes was best, in our testbed the LLC proved sufficiently large to justify using a single NUMA node, and all our experiments in this paper follow this guideline.
+
+\subsubsection{Traffic skew}
+\label{subsec:skew}
+{The expression "mice and elephants" is typically used to describe packet flow distributions on the Internet \cite{benson2010network,guo2001war,lan2006measurement}.
+These follow a Zipfian distribution, where a large fraction of packets relate to but a few flows, and the remaining ones share a small slice of traffic.}
+
+While traffic with a uniform distribution leads to packets being uniformly distributed to cores, traffic following a Zipfian distribution can overload a subset of cores, causing \emph{skew}. This performance difference is shown in \cref{fig:traffic}, which demonstrates how the parallel firewall throughput varies with the traffic distribution.
+The Zipfian traffic was generated with parameters from \cite{pedrosa2018automated}, which were found by analyzing a real-world traffic sample from a University network in \cite{benson2010network}. This generated traffic has 50k packets and 1k flows, 48 of which responsible for 80\% of the traffic.
+RSS was configured with five different random keys and the error bars represent the min/max performance.
+Performance is influenced by both the RSS key and the indirection table, as more hash collisions cause more packets being sent to the same core.
+Under uniform traffic, the indirection table's entries are expected to be equally accessed, and thus uniformily filling it leads to evenly spreading packets across cores.
+With Zipfian traffic, however, the higher density of certain flows leads to more accesses to some entries, overloading some cores.
+Note that when using a single core we see better performance under Zipfian traffic due to an increased cache hit-rate when accessing state~\cite{pedrosa2018automated}, though the effect is less prominent when more cores are used.
+
+RSS++~\cite{barbette2019rss++} fixes the distribution problem imposed by Zipfian traffic by dynamically adjusting the indirection table according to the traffic. It balances the indirection table by swapping entries associated with overloaded cores for ones associated with underloaded ones. 
+It also provides us with mechanisms for state migration across cores which avoid both blocking and packet reordering. We implemented static versions of these mechanisms in \maestro, but their dynamic versions could be used to handle changes in skew over time.
+
+\subsubsection{State sharding}
+\label{subsec:sharding}
+When applying shared-nothing parallelization, \maestro not only allocates each data structure instance on each core, but further adjusts each data-structure's capacity, keeping approximately constant the total amount of memory used for all cores by reducing the per-core amount.
+
+This raises an interesting question about the semantics of filling up state in a shared-nothing parallel version of an NF, which slightly differs from the sequential or lock-based parallel versions.
+As each core now has a reduced capacity, it is possible to exhaust the capacity of one core despite there being spare room in others.
+Ultimately, when a core becomes ``full'', it will behave in the same way locally as the sequential NF would globally (\eg by dropping packets from new flows).
+As the RSS++ mechanism redistributes flows across cores to counteract traffic skew, this also affects state distribution, making it harder to exhaust any one core.
+
+This state sharding has the desirable side-effect of optimizing the NF's cache utilization.
+If each core has a smaller working-set, more of it will fit in the local L1+L2 data caches.
+This provides an extra performance advantage to the shared-nothing approach on top of that of parallelization on its own.
+
+\subsubsection{Lock-based rejuvenation}
+When following a read-write lock-based parallelization approach, flow rejuvenation can be a challenge.
+As simply reading state requires updating the flow entry aging data, a naive implementation would require a write lock for all packets, with dire consequences for performance. \maestro circumvents this issue by implementing an optimized rejuvenation algorithm that operates locally in each core for most cases.
+We first modify the data-structures to hold multiple cache-aligned copies of the entry aging data, one per core.
+Each core then manages state aging locally for each entry, allowing the age of the entries to deviate from core to core as packets from the same flow arrive at different cores at different times.
+When eventually one core believes it should expire an entry, only then does it acquire a write lock.
+At this point, the core inspects the aging data for that entry on all cores. If the flow indeed expired on all cores, it is cleared out globally. If, however, another core is found where the entry has not yet expired, the local timestamp is re-synced with the newest one. Ultimately, if packets from the same flow regularly hit all cores, no write-locks are ever needed.
+
+\subsubsection{Implementation}
+\maestro uses the KLEE symbolic execution engine, extending it with 14,859 lines of C++ code. We also implemented \librs in 3,964 lines of C code, independently from \maestro\protect\footnote{Our code is openly available at~\cite{maestro-repo}.}.
+
+% Figure environment removed

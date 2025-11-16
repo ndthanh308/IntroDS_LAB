@@ -1,0 +1,633 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{textcomp}
+\usepackage[ruled]{algorithm2e}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{chngpage}
+\usepackage{hhline}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor,graphicx,float}
+\usepackage{hyperref}
+\newtheorem{corollary}{Corollary}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Duet: efficient and scalable hybriD neUral rElation undersTanding*\\
+%\thanks{Identify applicable funding agency here. If none, delete this.}
+}
+
+
+\author{
+    \IEEEauthorblockN{1\textsuperscript{st} Kaixin Zhang, 2\textsuperscript{nd} Hongzhi Wang, 3\textsuperscript{rd} Yabin Lu, 4\textsuperscript{th} Ziqi Li, 5\textsuperscript{th} Chang Shu, 6\textsuperscript{th} Yu Yan, 7\textsuperscript{th} Donghua Yang}
+
+    \IEEEauthorblockA{\textit{Massive Data Computing Lab, Harbin Institute of Technology}
+    \\\ 21B903037@stu.hit.edu.cn, wangzh@hit.edu.cn, {22S003043,7203610517,21S103176}@stu.hit.edu.cn, {yuyan, yang.dh}@hit.edu.cn}
+}
+
+
+
+\maketitle
+
+\begin{abstract}
+Learned cardinality estimation methods have achieved high precision compared to traditional methods. Among learned methods, query-driven approaches face the data and workload drift problem for a long time. Although both query-driven and hybrid methods are proposed to avoid this problem, even the state-of-the-art of them suffer from high training and estimation costs, limited scalability, instability, and long-tailed distribution problem on high cardinality and high-dimensional tables, which seriously affects the practical application of learned cardinality estimators. In this paper, we prove that most of these problems are directly caused by the widely used progressive sampling. We solve this problem by introducing predicates information into the autoregressive model and propose Duet, a stable, efficient, and scalable hybrid method to estimate cardinality directly without sampling or any non-differentiable process, which can not only reduces the inference complexity from $O(n)$ to $O(1)$ compared to Naru and UAE but also achieve higher accuracy on high cardinality and high-dimensional tables. Experimental results show that Duet can achieve all the design goals above and be much more practical and even has a lower inference cost on CPU than that of most learned methods on GPU.
+\end{abstract}
+%%这段摘要还需深入思考，不够吸引人
+%done
+\begin{IEEEkeywords}
+cardinality estimation, AI4DB, machine learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{section: introduction}
+Cardinality estimation is a classical problem in the database system since most RDBMS's query optimizers evaluate the query plan according to the cardinality~\cite{AreWeReady}, so the query optimizer's effectiveness depends on accurate cardinality estimation. Also, during the optimization, the estimator is called for many times to evaluate the candidate query plan, so the estimator must be accurate and efficient. Even though a lot of traditional cardinality estimation methods have been proposed~\cite{TradCE1, SortingCE, BloomFilterCE, SamplingCE1, SamplingCE2, SamplingCE3, SamplingCE4, SamplingCE5, SamplingCE6, HistogramCE1, HistogramCE2, HistogramCE3, HistogramCE4, HistogramCE5, HistogramCE6, HistogramCE7, HistogramCE8}, these methods' error is as high as $2e^5$ when facing the complex query workloads and data distribution~\cite{AreWeReady}. Since cardinality estimation directly infects the effectiveness of query optimization, a more accurate cardinality estimation method is urgently needed.
+
+In recent years, AI-driven cardinality estimation methods~\cite{Naru, NeuroCard} have made great progress in accuracy. These methods can be divided into three classes: \textbf{query-driven}, \textbf{data-driven}, and \textbf{hybrid} methods since the first two methods learn from query and data respectively, and the latter performs hybrid learning from both query and data. However, all these three kinds of methods have their shortcomings, we summarize them into the following five problems and discuss them by each kind of method.
+
+\begin{enumerate}[label={(\arabic*)}]
+    \item \label{Prob.1}High computation complexity and high memory requirement for complex range queries during inference.
+    \item \label{Prob.2}Long-tailed distribution problem on high cardinality and high-dimensional tables.
+    \item \label{Prob.3}High computation and memory cost for hybrid training.
+    \item \label{Prob.4}Instability that gives uncertain results.
+    \item \label{Prob.5}Hard to adapt the workload drift problem.
+\end{enumerate}
+
+The query-driven methods are end-to-end models, such as MSCN~\cite{MSCN}, LW-XGB~\cite{LW}, and LW-NN~\cite{LW}, they learn to estimate cardinality from the labeled query directly. Such methods are regression models essentially~\cite{AreWeReady}, and must be re-trained or fine-tuned when the workloads drift to maintain accuracy due to the i.i.d. (independent and identically distributed) assumption of machine learning, which leads to the Problem (5). Although some works~\cite{Warper} try to improve such end-to-end methods and make them generalize better to the changed workloads since learning from queries requires the future incoming queries to have independent and identically distribution with the training queries, which cannot be guaranteed. This problem is a fundamental flaw of the query-driven method and can be hardly completely avoided by designing more advanced models. 
+
+The data-driven methods~\cite{Naru, NeuroCard, DeepDB} learn the tables' joint distribution, so it is irrelevant to query workloads and can adapt to any query workload. However, such methods suffer from the problem of prediction efficiency as we prove in \autoref{fig:scalability}. Yang et al. proposed Naru~\cite{Naru}, first using autoregressive models such as MADE and transformer to solve this problem. This is a pioneering work and a cornerstone of many other data-driven and hybrid cardinality estimation methods. 
+
+However, the data-driven methods still have three major problems (Problems (1, 2, 4)). The first is \textbf{high computation and memory costs}. Data-driven methods such as Naru use progressive sampling to deal with range queries, which means the model needs to infer thousands of samples in one step, and the memory consumption is linear to the sample size. For some complex queries, the sample amount may reach over 2k, which requires that the database must have GPUs to accomplish cardinality estimation for each user since it indicates that the neural network has to infer 2k samples multiple times to estimate one query's cardinality and such computation can only be performed on GPU with limited latency. During one round of the cardinality estimation process, Naru has to infer for $n$ times, where $n$ denotes the number of columns constrained by predicates. Although the authors have performed much valuable work to optimize its inference speed, due to the time complexity of $O(n)$, it is still difficult to match the traditional methods' speed in real-world scenarios with hundreds of columns. The second problem is the \textbf{long-tailed distribution problem} for high cardinality and high-dimensional tables. Data-driven methods can predict cardinality accurately on most workloads but would have larger errors for a few specific query workloads according to the experimental results~\cite{AreWeReady, Naru, NeuroCard}. Finally, data-driven methods are \textbf{unstable}, which will give uncertain estimation results for the same queries since the sampling mechanism introduces randomness~\cite{AreWeReady}.
+
+All these three problems above are caused by the current data-driven methods simply learning from the original table with the autoregressive model. They collect a tuple $x=(c_1, ..., c_N)$ from the table as the input of the model and use the negative log-likelihood loss function to maximize the output probability $p(c_1), ..., p(c_N|c_{<N-1})$, where $N$ denotes the column number. This process's mathematical meaning is to maximize the probability of sampling to the input sample $x$ under the distribution of the model's output $P(C_1), ..., P(C_N|c_{<N-1})$, as known as the maximum likelihood estimation. Therefore, the fundamental problem is that the current data-driven methods train a pretty basic learned model that can only directly estimate conditional probability distribution with equivalence predicates inside the condition. To tackle the range queries, they have to use sampling to approximate the ground-truth distribution of range queries by equivalence predicates. Such sampling leads to multiple samples' multiple forward passes of the neural network which causes the high-cost problem. The sampling process is non-differentiable and makes it hard to introduce the query error information into the training process to reduce the error of queries on high cardinality tables. Also, the sampling errors can accumulate during sampling and leads to long-tailed distribution problem for high-dimensional tables. Finally, sampling introduces uncertainty into the estimation and makes the methods unstable.
+
+The hybrid methods~\cite{UAE} use both query-driven and data-driven methods to improve the estimation accuracy. Peizhi Wu and Gao Cong proposed a hybrid cardinality estimation method UAE~\cite{UAE} by using the Gumbel-Softmax Trick. They analyzed the gradient flow of Naru in detail and proved that the progressive sample hinders the back-propagation in training. The UAE is the first unified deep autoregressive model to use both data as unsupervised information and query workload as supervised information for learning joint data distribution. By backward propagating gradient on the estimation process, the predicted cardinality can be used as supervisory signals along with the predicted distribution to train the model. However, the Gumbel-Softmax Trick that it uses is still a sampling method, so it still suffers from the Problems (1, 2, 4) of data-driven methods. Besides, the most important problem is the high memory and computation cost of UAE's hybrid training (Problem (3)). Since the UAE still needs to sample for range predicates' cardinality estimation, and all the gradients of these samples have to be tracked, the actual batch size that UAE uses for query-driven training is $batch\ size\ \times$ $\#sample$. During our evaluation, for training with $2048\ batch\ size$ and 2000 $\#sample$ on the DMV dataset, which is the parameter that Naru used, it cannot be trained on a 48 GB GPU memory environment due to the out-of-memory exception. This method used a much smaller $\#sample$. However, small $batch\ size$ will significantly slow the training process, and small $\#sample$ will lower the precision of cardinality estimation for range queries and further affect the model accuracy via $\mathcal{L}_{query}$.
+
+In summary, Problems (1-4) are caused by the sampling method used in the current data-driven and hybrid methods such as Naru~\cite{Naru} and UAE~\cite{UAE}, and Problem (5) is caused by the query-driven methods only learning from specific queries.
+
+Thus, in this paper, we propose a novel methodology that introduces the predicates information into the autoregressive model by learning from virtual tables and a hybrid approach (\textbf{Duet}\footnote{Duet's code is available at: \url{https://github.com/GIS-PuppetMaster/Duet}}) for efficient and scalable cardinality estimation to simultaneously address the five problems by removing the sampling process for autoregressive-based data-driven and hybrid approaches. Specifically, our approach enables accurate and deterministic cardinality estimation for various range query workloads, high cardinality, and high-dimensional tables, with much lower time and memory costs since no sampling is needed. Furthermore, since Duet's estimation process is differentiable and considering the temporal locality of queries, users can further improve the long-tailed distribution problem by applying hybrid training on historical queries.
+
+% 前面五个问题的顺序调整过，这里忘记调整了
+
+Firstly, to reduce the inference cost, we introduce predicate information into the autoregressive model that estimates $P(C_N|c_{<N-1})$, and learn from a virtual table that contains range predicate information by adding predicate operators including but not limited to $=, >, <, \geq, \leq$ into the model's input. This process is not a just simple change of the model's input but completely changes the problem modeling of the autoregressive learning process. %We explain this roughly in the next paragraph and more detailed information can be found in section \autoref{}.
+
+What Duet does is to model with predicate operators' information by maximizing the probability of sampling the input sample $x'$, such as $(=v_1,<v_2 ..., >v_{N-1}, \geq v_N)$ under the distribution of the model output $P(C_1), P(C_2|C_1=v_1), ..., P(C_N|C_{N-1}>v_{N-1}, ..., C_1=v_1)$. And the virtual table mentioned above is composed of the tuples like $x'$ that include various predicate operators including range queries. Compared to Naru, taking a neural network inference as a basic operation, Duet reduces the time complexity of range queries from $O(n)$ to $O(1)$ and reduces $s$ times memory, since no sampling process is needed for range queries. Here $n$ and $s$ denote the number of columns constrained by the predicate and the progressive sampling amount in Naru, respectively.
+
+However, generating such a virtual table is expensive since it would contain up to $\prod_{i=1}^{N} k*d_i$ tuples, where $N$ is the column number, $k$ is the number of predicate types, and $d_i$ is the number of distinct value of column $i$. The search for the tuples in the original tables that conform to the constraints of these predicates during training is an even more complex job. Therefore, instead of generating such a virtual table, we develop a sampling method to generate the tuple $x'$ from $x$ to move the sampling process from the inference phase to the training phase. 
+
+Secondly, by removing the sampling processing, the sampling error accumulation is removed accordingly. Thus, the long-tailed distribution problem caused by the high-dimensional table is alleviated. For the long-tailed distribution problem caused by the high-cardinality table, since range queries' cardinality can be predicted without any non-differentiable process, we introduce the QError as a feedback signal to the loss function to achieve hybrid training. Considering the temporal locality of real-world workloads, users can use historical queries for hybrid training to significantly improve model accuracy.
+
+% 第三个问题对应的解决方法之前没提到
+Thirdly, since the sampling processing is removed, the estimation now is differentiable so Duet can naturally achieve hybrid training at a low cost.
+
+%We can also pre-generate some query workloads to make a more efficient convergence during the first time of hybrid training.
+
+Fourthly, as for stability, Duet is stable since no randomness exists during estimation. For a given query, Duet will provide a deterministic result that could help the query optimizer work better and help the DBA to find problems easier.
+
+Finally, to adapt to various query workloads, Duet is a hybrid method improved based on Naru, which is a data-driven method. Therefore, Duet can adapt to any query workload distribution, rather than being limited to a fixed query workload distribution. 
+
+Our contribution can be summarized as follows.
+\begin{itemize}
+    \item We proposed a novel methodology for modeling data-driven cardinality estimation which can deal with range queries without sampling and any non-differentiable process during inference. Taking a neural network inference as a basic operation, Duet can achieve O(1) time complexity during inference with only a single network forward pass for each estimation. This feature makes Duet can even be inferred on the CPU with less time cost than that of most learned methods on GPU. Also, by removing the sampling process, Duet achieves higher accuracy on high-dimensional tables significantly.
+    
+    \item Duet is a differentiable cardinality estimation method and naturally supports hybrid training. By combining data-driven and query-driven training, Duet can improve the model's accuracy on high-cardinality tables.
+    
+    \item Benefiting from the sampling-free estimation design, Duet is a stable and practical cardinality estimation method that always gives a determinate result. And compared with other hybrid methods, Duet saves a massive amount of GPU memory and calculation during training.
+    
+    \item The experimental results demonstrate that Duet can achieve lower estimation error, less time cost of inference, lower memory cost, and higher accuracy compared to previous works.
+\end{itemize}
+
+\section{Related Works}
+Cardinality estimation is a hot-spot problem that has been studied for decades, the history of this study can be divided into two stages: the traditional method stage and the learned method stage.
+
+\textbf{Traditional Methods.} The traditional methods have been fully researched since the RDBMS is proposed, the common core idea of these methods is to build a sketch for the data. The most representative methods include Sampling~\cite{SamplingCE1, SamplingCE2, SamplingCE3, SamplingCE4, SamplingCE5, SamplingCE6}, Sorting~\cite{SortingCE}, Histograms~\cite{HistogramCE1, HistogramCE2, HistogramCE3, HistogramCE4, HistogramCE5, HistogramCE6, HistogramCE7, HistogramCE8}, and BloomFilter~\cite{BloomFilterCE} ~\cite{ExpCESurvey}. These methods usually have a low accuracy since introducing independent assumptions or losing too much information during sketching. But a significant advantage of these methods is they do not rely on the query workloads since they learn directly from the data. There are also traditional methods that learn from queries rather than data~\cite{Self-TuningHistograms}, however, such methods are not commonly used in existing DBMS.
+
+\textbf{Query-driven Methods.} As the field of machine learning evolves, the regression methodology of the learned method was used for estimating cardinality~\cite{AreWeReady}. These query-driven methods ~\cite{MSCN, QueryDriven1, QueryDriven2, QueryDriven3, QueryDriven4, QueryDriven5} model cardinality estimation as a regression problem and train machine learning models from certain query workloads. Compared to traditional methods, learning from queries can achieve higher accuracy. However, when the query workloads drift from the training workloads, the model's performance drops severely. Although there are some drift detection and updating algorithms are proposed~\cite{Warper}, this type of method still suffers from workload drift and high training costs.
+
+\textbf{Data-driven Methods.} To solve the workload drift problem, a few works use unsupervised machine learning to model the data. Probabilistic graphical models (PGM) ~\cite{BaysianNetwork} use Bayesian networks to model the joint data distribution, however, it also relies on conditional independence assumptions. Other works use kernel density estimation (KDE)~\cite{KDE} to avoid the conditional independence assumptions, but their performance is not satisfying enough. DeepDB~\cite{DeepDB} proposed Relational Sum Product Networks (RSPN) to model the data distribution. Although it still involves the conditional independent assumption, it can achieve better accuracy due to the RSPN design. The state-of-the-art work of data-driven methods is Naru~\cite{Naru}, which learns the joint data distribution with the autoregressive model and makes estimation through progressive sampling. But it has limited scalable ability and can't use the information of queries to enhance the training as discussed in \autoref{section: introduction}.
+
+\textbf{Hybrid Methods.} In Recent years, UAE~\cite{UAE} is proposed which modified the progressive sampling used by Naru into differentiable to achieve hybrid training. By doing so, UAE can outperform Naru in most scenarios. Since UAE still needs to do progressive sampling to deal with range queries, UAE not only suffers from the scalable problem, but it also costs much higher memory and computational cost during training.
+
+\section{Problem Definition}
+Consider a relation table $T$ that consists of $N$ columns $\{C_1, C_2, ..., C_N\}$. The number of tuples is $|T|$, the domain region of column $C_i$ is $R_i$, and the number of $C_i$'s distinct values is $d_i$.
+
+\textbf{Query.}
+A query is a conjunction of several predicates, and each predicate contains three parts: column $C_i$, predicate operator (a function) $pred_i$, and predicate values $v_i$. Let $pred_i \in \{=, >, <, \geq, \leq\}$, $v_i \in R_i$. 
+
+\textbf{Cardinality.}
+Given a query $q$, $Card(q)$ is defined as how many tuples in $T$ satisfy the constraints of the given predicates in $q$. The selectivity of $q$ is defined as $Sel(q) = Card(q)/|T|$.
+
+\textbf{Supported Queries.}
+As the definition above shows, Duet can support both equalization predicate and range predicates including but not limited to $>, <, >=, <=$. Since Duet shares the framework of Naru, it also supports joins just like NeuroCard does~\cite{NeuroCard}, which is also based on Naru and learns from the full-out join table to estimate cardinality for join queries. As for disjunction between predicates, its estimation can be performed by converting disjunction into conjunction.
+
+\textbf{Cardinality Estimation.}
+Given a query $q$ on table $T$ with columns $\{C_1, C_2, ..., C_N\}$, the selectivity of $q$ can be defined as $$\scriptsize Sel(q)=\sum_{x=(c_1,...,c_N)\in C_1 \times ... \times C_N}{I(x)p(x)}$$, where $p(x)$ is the occurrences frequency of tuple $x$, and $I(x)$ is an indicator function which returns 1 if tuple $x$ is subject to the predicate constraints of query $q$, and returns 0 otherwise. 
+
+\section{Methodology}
+The basic idea of our approach is to learn the joint distribution with a virtual table containing predicates conditions rather than the original table, which gives Duet the ability to deal with range queries without sampling. To achieve this goal, we solve the main challenges of the expensive cost of generating or sampling from the virtual table, and the difficulty of dealing with multiple predicates for a single column. In this section, we first overview our approach and then introduce the techniques to address the challenges in the following parts.  
+
+
+\subsection{Overview} 
+
+% Figure environment removed
+
+\textbf{Challenge.} Current hybrid methods are based on data-driven approaches. The cornerstone of data-driven methods is Naru's autoregressive model of the joint distribution of data, which inevitably involves sampling to estimate range queries, leading to Problem (1-4). One feasible method to address Problem (2) is to perform targeted fine-tuning to workloads with higher errors, but the non-differentiable sampling process hinders such training. Therefore, the fundamental challenge in solving these four issues of existing methods is how to move beyond Naru's autoregressive model of the dataset and develop a novel method to learn the conditional probability distribution that includes predicates to avoid sampling during prediction.
+
+\textbf{Core Idea.} To avoid sampling during inference, we can directly estimate the selectivity of a query by utilizing the predicted conditional probability distribution. As shown in \autoref{fig:Overview}, instead of estimating $p(x)$ as Naru, we directly estimate the selectivity $Sel(q)$ under given predicates. Let $(pred_i, v_i)$ denote that column $i$ is subject to the constraint of predicates operator $pred_i$ and the predicates value $v_i$. For example, $(>=, 1.23)$ represents the event that $column_i>=1.23$. With the autoregressive decomposition, we can estimate the selectivity with the following formulation:
+%\footnote{We organize the input in $(v_i, pred_i)$ order in our code.}
+\begin{align}
+\scriptsize
+Sel(q) &= p((pred_{1}, v_{1}), ..., (pred_N, v_N))\\
+&=\prod_{i=1}^{n}{p((pred_{i},v_{i})|(pred,v)_{<i})}\\
+&=\prod_{i=1}^{n}{\sum {Pred_i(R_i, v_i)P(C_i|(pred,v)_{<i})}}
+\end{align}
+, where $Pred_i(\cdot)$ is the predicate operator in the query's predicates, it returns a vector to indicate the distinct values that obey the $i$th predicate's constraint. We would like to emphasize that the learning target of previous works such as Naru and UAE is $P(C_i|v_{<i})$, which does not contain the predicate operator's information like Duet and causes that they can only estimate equivalent predicate through the model and have to use the sampling method to deal with range queries. By introducing predicate information into the autoregressive model, the methodology used by Naru and UAE can be regarded as a special case where the predicate operator in Duet can only take the value '='.
+
+%$E(\cdot)$ is an encoding function that can encode the $pred_i$ and $v_i$ into a vector,
+To accomplish such an estimation, Duet learns from a virtual table's tuples that contain predicate information by sampling during training as shown in \autoref{section: Learn From Virtual Table with Predicates} and \autoref{section: Training on Virtual Table Efficiently}. As \autoref{fig:Overview} shows, for a given query, Duet only requires a single forward pass of the neural network with a single input, followed by a few simple vector multiplications to obtain the estimated selectivity. This makes Duet faster than existing data-driven methods and gives a deterministic result for a given query. Moreover, since no sampling is involved in this process, gradient information can be backpropagated from the QError. We leverage this property to integrate query-driven methods by simultaneously using unsupervised loss from the data distribution and supervised loss from the query workload during training, as discussed in \autoref{section: Hybrid Training with Query Workloads}, which enables higher accuracy. Additionally, for queries with large estimation errors during actual use, we can collect them and perform targeted fine-tuning of the model to improve the long-tailed distribution problem. Also, we propose MPSN for Duet to support multiple conjunction predicates as introduced in \autoref{section: Support Multiple Predicates on A Single Column}.
+%%s上一段要说哪部分在哪个小写详细写
+%% done
+
+
+\subsection{Learn From Virtual Table with Predicates}
+\label{section: Learn From Virtual Table with Predicates}
+In this subsection, we introduce Duet to directly estimate range queries' selectivity by learning from the virtual table.
+
+We know that for an input tuple $x=(x_1,...,x_N)$ and a model output $\hat{P}(C_1), ...,P(C_N|x_{<N})$, Naru maximizes the likelihood estimation to learn the output distribution. This motives us to add the range predicate's information into the input sample $x'=((pred_1, v_1), ..., (pred_N, v_N))$, where $x_i$ is subject to the constraints of $(pred_i, v_i)$ and directly estimate the conditional probability distribution $$\hat{P}(C_i|(pred_{i-1}, v_{i-1}),..., (pred_1, v_1))$$ through an autoregressive model, denoted as $\hat{P}(C_i|(pred, v)_{<i})$. Then we can train Duet with cross-entropy loss and then directly estimate the conditional probability distribution from $\hat{P}(C_i|(pred, v)_{<i})$. Such a training process can be understood from two perspectives.
+
+\begin{itemize}
+    \item From the meaning of the cross-entropy loss, given a query $x'$, Duet outputs the estimated distribution $\hat{P}(C_i|(pred, v)_{<i})$ (denoted by $\hat{p}(x')$), and the ground-truth distribution is $P(C_i|(pred, v)_{<i})$ (denoted by $p(x')$). The cross-entropy loss can be written as: $H(\hat{p},p)=-\sum p(x')\log \hat{p}(x')$. Also, since the KL divergence $D_{KL}(p||\hat{p})=\sum_{i=1}^{n}P_i \log \frac{P_i}{\hat{P}_i}=\sum p(x') \log {\frac{p(x')}{\hat{p}(x')}}=H(p,\hat{p})-H(p)$ and $H(p)$ is the data's entropy which is a fixed value, minimizing the cross-entropy equals to minimize the KL divergence between $p(x')$ and $\hat{p}(x')$. And minimizing KL divergence will shrink the distance between the two distributions.
+
+    \item From the meaning of maximum likelihood estimation, the maximum likelihood estimation of Duet aims to find a $\hat{p(x')}$ that fits the ground-truth distribution $p(x')$ best. Therefore, Duet performs maximum likelihood estimation whose target is maximizing $loss(x')=\sum{\log{\hat{p}(x')}}$. Since the $p(x')$ is a determined value for a given dataset and predicates, the maximum likelihood estimation equals minimizing the cross-entropy and the KL divergence.
+\end{itemize}
+
+In summary, as shown in \autoref{fig:VirtualTable}, for a tuple $x=(x_1,...,x_N)$ of table $T$, a set of virtual tuples $Set(x')$ contains range predicates that make tuple $x$ satisfy their predicate constraints. These virtual tuples make up a virtual table $T'$. Duet draws a sample $x'$ as input from $T'$ and outputs a probability distribution of each column's distinct values in Table $T$. Therefore, the learning target of Duet is to give a virtual tuple $x'$, the model learns a conditional probability distribution matching the actual data distribution under the constraint of predicates in the input virtual tuple $x'$. This is achieved by the KL divergence loss function that can be simplified to the cross-entropy loss. 
+
+% Figure environment removed
+
+
+
+\subsection{Training on Virtual Table Efficiently}
+\label{section: Training on Virtual Table Efficiently}
+In this subsection, we introduce how to train Duet efficiently by dynamically generating virtual tuples during training.
+
+As \autoref{section: Learn From Virtual Table with Predicates} discussed, the virtual table $T'$ is generated from the original table $T$ with the following rule satisfied. For a tuple $x=(x_1,...,x_N)$ of table $T$, all virtual tuples $Set(x')$ that make tuple $x$ satisfy their predicate constraints can be generated. However, if the column $col_i$ is in categorical type with a massive amount of distinct values, the cost of generating such a virtual table is unacceptable since the cardinality of the virtual table can reach up to $\prod_N{k*d_i}$, where $k$ is the number of predicate types and $d_i$ is the number of distinct values of column $i$. Also, since we require the label $x$ to satisfy the predicates of the model's input virtual tuple $x'$, even if we can pre-generate the virtual table, finding the corresponding $x$ of a given $x'$ would also cost much computation resource and time. Therefore, instead of generating the virtual table and searching for the corresponding $x$, we use a uniform sampling method to dynamically generate the virtual tuple $x'$ with the randomly selected tuple $x$ during stochastic gradient descent.
+
+Intuitively, since $x$ is sampled from table $T$, we only need to generate a predicate $(pred_i, v_i)$ for each column of $x$ that makes $x_i$ satisfies it, then the $x'$ that consists of these predicates would be satisfied by at least one tuple in the original table $T$. For example, as shown in \autoref{fig:Overview}, for the target value $col_1=1$, we can draw a sample $(pred_i='\leq', v_i=1.3)$, $v_i$ can take any values larger or equal to 1.3 within $R_i$. For the component $x_i$ of each column $i$ in $x$, we randomly select a predicate operator for this column. Assuming that $r_i$ is the range that makes $x_i$ satisfy the predicate operator, we use uniform sampling to select a $x'_i$ from $r_i$ as the predicate value.
+
+We observe that such tuple-by-tuple sampling is too expensive. To reduce the sampling process overhead furthermore, we implement a vectorized GPU version based on the \textit{collect\_fn} of Torch's Dataloader, it can process a batch of $x_i$ at one time. Our sampling algorithm is shown in \autoref{algorithm: Virtual Tuple Sampling Method}. Specifically, we take all column values $tuples\_i$ within a batch as a vector and assign a predicate operator for each value as shown in $Line\ 26$. Since the advanced indexing of PyTorch makes a deep copy of data and leads to high costs compared to the slice operator which does no copy, we shuffle the training data at each epoch, divide the data batch into slices, and assign different predicate operators for each slice in $Line\ 8$ instead of randomly assigning predicate operators. Then, for each slice, we calculate the lower and upper sampling boundary of the index of this column's $dvs$ in $Line\ 14-17$. Finally, we generate a batch of float numbers $r$ belonging to $[0,1)$ and calculate each sample value with the formula: $(upper-lower)*r+lower$ in $Line\ 20$. Since the sampling process is independent for each column, we can sample in parallel with a high speedup ratio. We implement this algorithm with Cpp-Extension and use multi-threading to parallelize it to avoid the Python GIL limitation. During the implementation, we observed that the $Tensor.put\_index\_$ function of $LibTorch\ 2.0.1$ on GPU is $1000\times$ slower than its CPU version, so the whole sampling algorithm runs on CPU with calling of $Tensor.put\_index\_$ as less as possible since this function is the performance bottle-neck of this algorithm.
+
+To accelerate the convergence of training, we replicate the data batch of $tuples\_i$ for $\mu$ times (usually takes value of 4) and sample the corresponding virtual tuples independently as shown in $Line\ 24$. Thus, each tuple can be trained for $\mu$ times with different predicates within a gradient descent step, and the model's performance won't suffer from a large batch size.
+
+\vspace{-0.3cm}
+\begin{algorithm}[htbp]
+    \caption{Parallel Vectorized Virtual Tuple Sampling}%算法名字
+    \label{algorithm: Virtual Tuple Sampling Method}
+    \LinesNumbered %要求显示行号
+    \scriptsize
+    \KwIn{data batch $tuples$, batch size $bs$, column number $N$, number of involved predicates' kinds $k$, expand coefficient $\mu$}%输入参数
+    \KwOut{$new\_tuples, new\_preds$}%输出
+    \SetKwFunction{FMain}{SamplingPerColumn}
+    \SetKwProg{Fn}{Function}{:}{}
+    \Fn{\FMain{tuples\_i}}{
+        slices $\longleftarrow$ DivideDataBatch(tuples, k);\\
+        new\_tuples\_i $\longleftarrow$ Initialize tensor with value -1;\\
+        new\_pred\_i $\longleftarrow$ Initialize tensor with value 0;\\
+        masks, lower, upper $\longleftarrow$ Initialize tensors with value 0;\\
+        \ForEach{$s, e$ in $slices$}{
+            // 0:$=$, 1:$>$, 2:$<$, 3:$>=$, 4:$<=$\\
+            pred $\longleftarrow$ Randomly assign predicates for slices without repetition;\\
+            \uIf{pred==0}{
+                new\_tuple\_i[s:e] $\longleftarrow$ tuples\_i[s:e];\\
+                new\_pred\_i[s:e, pred] $\longleftarrow$ 1;\\
+            }
+            \uElse{
+                Calculate $lower\_bound$, $upper\_bound$;\\
+                mask $\longleftarrow$ lower\_bound $<$ upper\_bound;\\
+                masks[s:e] $\longleftarrow$ mask;\\
+                lower[s:e] $\longleftarrow$ lower\_bound;\\
+                upper[s:e] $\longleftarrow$ upper\_bound;\\            
+                new\_pred\_i[s:e, pred][mask] $\longleftarrow$ 1;\\
+            }
+        }
+        samples = (upper - lower) * \textit{rand}(bs*f) + lower;\\
+        new\_tuple\_i[s:e][masks] $\longleftarrow$ samples[masks];\\
+        res = concatenate([new\_tuple\_i, new\_pred\_i], dim=-1);\\
+        \Return res;\\
+    }
+    Replicate $tuples$ for $\mu$ times, so we sample $\mu \ (pred_i, v_i)$ from the virtual table within one epoch for each tuple;\\
+    \For{$i\in [0, N)$}{
+        Launch threads to run $SamplingPerColumn(tuples[...,i]);$\\
+    }
+    new\_tuples, new\_preds $\longleftarrow$ Collect results from threads;\\
+    \Return concatenate(new\_tuples,dim=-1), concatenate(new\_preds,dim=-1);\\    
+\end{algorithm}
+\vspace{-0.3cm}
+
+\textbf{Encoding.} We use binary encoding for the predicate value $v_i$ and one-hot encoding for the predicate operator $pred_i$. For each column's predicate, we concatenate $(v_i, pred_i)$ as its encoding. And for the column without predicates, we use the wild-card skipping techniques proposed by Naru~\cite{Naru} to fill the $v_i$ and set the $pred_i$ vector as zero vector. For large distinct value columns, we also use embedding to encode $v_i$. These techniques are consistent during training and inference.
+
+\subsection{Hybrid Training with Query Workloads}
+\label{section: Hybrid Training with Query Workloads}
+
+In this subsection, we introduce our solution to the long-tailed distribution problem under high cardinality tables by hybrid training.
+
+Since methods such as Naru and UAE suffer from the long-tailed distribution problem caused by the sampling error, especially for high-dimensional tables, we aim to propose a method that combines query-driven and data-driven approaches, so we can use the queries with large estimation errors to fine-tune the model and reduce the max QError. The existing techniques such as UAE~\cite{UAE} use Gumbel-Softmax Trick to improve the sampling process and make the gradient can be backward passed through the estimation process. Benefiting from the direct modeling and estimation, Duet does not involve any non-differentiable sampling and can perform hybrid training naturally. This allows us to use the supervised signal of queries to improve the model's accuracy, especially in the worst-case scenarios (long-tailed workload distribution problem). Also, such a mechanism allows users to fine-tune the model based on history query workloads after it is deployed.
+
+Since hybrid training can utilize both types of information to learn the joint data distribution in a single model~\cite{UAE}, we pre-generating a few training workloads and use these workloads for hybrid training to improve the model's accuracy. Note that these training workloads can be real-world history query workloads in real work scenarios. Our loss function consists of two parts: the unsupervised loss $\mathcal{L}_{data}$ and the supervised loss $\mathcal{L}_{query}$. We use Cross-Entropy for $\mathcal{L}_{data}$ and a mapped QError for $\mathcal{L}_{query}$.
+
+How to combine these two parts of loss is critical to the model's accuracy. On the one hand, as we learned from the previous works~\cite{Naru, NeuroCard}, the $\mathcal{L}_{data}$ is workload-independent so minimizing it with higher weights can improve the model in generalization ability. On the other hand, $\mathcal{L}_{query}$ is an effective supplement to help the model achieve higher accuracy. However, it is workload-related, so its application to high weight on $\mathcal{L}_{query}$ will cause the model to degenerate into a query-driven approach and damage its generalization ability. Therefore, we attempt to design a hybrid loss function to make the hybrid training both effective and generalizable.
+
+% Figure environment removed
+
+We observe that $\mathcal{L}_{query}$ takes a huge maximum value and decreases significantly faster than $\mathcal{L}_{data}$ as shown in \autoref{fig:loss_convergence}. Therefore, we use a $log_{2}$ function to map the QError into a much smaller and smooth space to prevent the gradient explosion and unstable training. Since the $log_{2}$ function has a steep gradient in range $[0,1)$, we plus one with the QError to help the training converge stably. As shown in \autoref{fig:loss_convergence}, the improved $\mathcal{L}_{query}$ has similar order and convergence rate with $\mathcal{L}_{data}$. Then, we multiply it by a trade-off coefficient $\lambda$ so that its value is scaled to an appropriate scale, which can improve the model accuracy without affecting the model generalization performance. According to the hyper-parameter study in \autoref{subsection: Hyper-Parameter Studies}, the $\lambda$ can take a value of $0.1$ in most cases, and it can be adjusted flexibly if this method is used in scenarios where the query workload is relatively stable or extremely unstable to further improve the accuracy. The hybrid loss proposed is shown as follows: $$\mathcal{L}=\mathcal{L}_{data}+ \lambda  \mathcal{L}_{query}=\mathcal{L}_{data}+ \lambda  log_{2}(QError+1)$$
+
+The detailed hybrid training algorithm is given in \autoref{algorithm: Hybrid Training Process}. During the training iteration of the mini-batch SGD, we first use the \autoref{algorithm: Virtual Tuple Sampling Method} to sample a batch of virtual tuples in $Line\ 3$. Then we collect $bs$ queries from training workload $\mathcal{Q}$ in $Line\ 4$. After calculate the loss of both data and queries in $Line\ 5-7$, we perform SGD on $\mathcal{L}=\mathcal{L}_{data}+ \lambda  log_{2}(QError+1)$ in $Line\ 8$.
+
+\begin{algorithm}[htbp]
+    \caption{Hybrid Training Process}%算法名字
+    \label{algorithm: Hybrid Training Process}
+    \LinesNumbered %要求显示行号
+    \scriptsize
+    \KwIn{dataset $\mathcal{D}$, training workload $\mathcal{Q}$, batch size $bs$, expand coefficient $\mu$, trade-off coefficient $\lambda$}%输入参数
+    \KwOut{Trained Model parameters $\theta$}%输出
+    Randomly initialize model weights $\theta$;\\
+    \ForEach{$batch$ in $\mathcal{D}$}{
+        $tuples \longleftarrow $ Sampling through \autoref{algorithm: Virtual Tuple Sampling Method} with expand coefficient $\mu$;\\ 
+        $workloads \longleftarrow$ Collecting $bs$ queries from $\mathcal{Q}$;\\
+        $\mathcal{L}_{data} \longleftarrow$ Run unsupervised training on $tuples$;\\
+        $QError \longleftarrow$ Run estimation directly on $workloads$;\\
+        $\mathcal{L}_{query} \longleftarrow log_{2}(QError+1)$;\\
+        Perform SGD via backpropagation for $\mathcal{L}=\mathcal{L}_{data} + \lambda  \mathcal{L}_{query}$ to update $\theta$;\\
+    }
+    \Return $\theta$;\\
+\end{algorithm}
+\vspace{-0.5cm}
+
+\subsection{Efficient And Scalable Estimation without Sampling}
+\label{Efficient And Scalable Estimation without Sampling}
+In this section, we introduce how Duet estimates cardinality for queries (especially for range queries) and discuss the complexity of Duet.
+
+Existing data-driven and hybrid methods such as Naru, NeuroCard, and UAE learn from the original table which is equivalent to only learning with queries with equalized predicates. To deal with range queries, they all use progressive sampling to approximate the result. Such a solution leads to three major problems: \textbf{(1)very limited scalability, (2)high computation cost, and (3)low accuracy}.
+
+First of all, real-world datasets and workloads usually involve multiple columns and predicates. We denote the number of columns that involve at least one predicate to be $n$. The progressive sampling process will cause $n$ times non-parallelizable model inference (forward pass). This makes those works unavailable in most OLTP scenarios~\cite{AreWeReady, CEBenchMark}. To alleviate this problem, Naru uses a technique called Wild-Card Skipping. By learning an embedding vector for each column that represents there are no predicates on the corresponding column during training, all the unnecessary inferences are skipped. However, some complex queries have even hundreds of columns that involve at least one predicate, for instance, survey~\cite{AreWeReady} evaluates existing learned cardinality estimation methods using queries involving up to 100 columns, so the problem is still unsolved completely.
+
+Second, progressive sampling requires inferences with more than 2k samples for one round of estimation~\cite{Naru}, such a calculation has to be accomplished by GPU within a limited time. Clearly, the cost of building a GPU database server cluster is much higher than the ordinary cluster.
+
+Finally, range queries' cardinality estimation by sampling is a lossy estimation process. Although the authors of Naru prove that progressive sampling is an unbiased sampling and has higher efficiency than uniform sampling, it is still not as good as direct estimation by the learned model for high-dimensional tables, which is demonstrated in the \autoref{subsection: Accuracy Comparison}.
+
+Duet solves these three problems by learning from the virtual table with predicate information. For the first problem of scalability, as \autoref{algorithm: Inference for Estimation} shows, Duet estimates the range queries' cardinality with only one time of inference. We first encode the predicates in $Line\ 1$. Then we obtain the conditional probability distributions through a single forward pass of the model in $Line\ 2$. After zero-out each probability with the $Pred_i(R_i, v_i)$ masks in $Line\ 3$ (where $R_i$ is the domain range of column $i$), we finally perform a multiplication of the summary of these probability distributions in $Line\ 4$. Let one forward pass be a basic computation of estimation, Duet's computation complexity is $O(1)$ rather than previous works' $O(n)$. And in terms of computation cost, each inference of Duet only requires one single input. Thus, the inference stage can be applied to the CPU. At last, since Duet directly estimates each column's probability distribution under the given range predicates' condition, it achieves higher accuracy than previous work, especially for the long-tailed distribution of errors corresponding to the worst cases.
+
+\begin{algorithm}[htbp]
+    \caption{Inference for Estimation}%算法名字
+    \label{algorithm: Inference for Estimation}
+    \LinesNumbered %要求显示行号
+    \scriptsize
+    \KwIn{Query predicates $preds$, Zero-out mask $Pred_i(R_i, v_i)$, model $\mathcal{M}(\theta)$ with parameter $\theta$ }%输入参数
+    \KwOut{Selectivity $\hat{p}$}%输出
+    $inp \longleftarrow$ Encoding predicates $preds$;\\
+    $\hat{P}(C_0), ...,\hat{P}(C_N|(pred, v)_{<N})) \longleftarrow$ Forward pass through $\mathcal{M}(\theta)$;\\
+    Zero-out each probability in $\hat{P}$ which doesn't satisfy the predicate with $Pred_i(R_i, v_i)$;\\
+    $\hat{p} = \prod{\sum{\hat{P}(C_i|(pred, v)_{<i})}}$;\\
+    \Return $\hat{p}$;\\
+\end{algorithm}
+\vspace{-0.5cm}
+
+\subsection{Support Multiple Predicates on A Single Column}
+\label{section: Support Multiple Predicates on A Single Column}
+We focus on the situation that each column has one single predicate at most in previous subsections. In this subsection, we generalize Duet to support multiple predicates on a single column by introducing Multiple Predicates Supporting Networks (\textbf{MPSN}) into Duet to embed multiple predicates.
+
+Benefit from the flexible methodology of Duet, we could achieve this goal by expanding the input of Duet from a series of $(pred_i,v_i)$ to a series of $((pred^{1}_i,v^{1}_i),...,(pred^{j}_i,v^{j}_i))$. And the conditional part of the conditional probability distribution output by the model has also changed accordingly. During sampling $x'$, we randomly choose the number of the predicates for column $i$.
+
+The key problem is how to combine the variable-length predicates' information to fit the input size of the autoregressive network, which is a problem that Naru does not need to deal with since it uses progressive sampling and deals with multiple predicates' information at the batch dimension. Due to the limited number of predicates, we encode the predicate operator with the one-hot encoder and provide binary, one-hot, and embedding strategies for the predicate values just like Naru. To integrate such variable-length information before inputting them into the autoregressive model, we propose three MPSN candidates to embed the predicates into a fixed-length dummy vector space and evaluate their performance with experiments, as are introduced follows. Note that each column corresponds to an independent MPSN. 
+
+\textbf{MLP \& Vector Sum.} Since the number of predicates on a single column may not be too large in most queries, we use a simple MLP network to embed each pair of $(pred^{j}_i,v^{j}_i)$ into vectors in parallel, then we sum these vectors up and obtain the final embedding result with a fixed length.
+
+\textbf{Recurrent Network.} The RNN network is a common method for processing variable-length information. We use a simple and shallow LSTM network to embed the predicates. The output of the LSTM is processed by a Full-Connected layer, and the outputs of different predicates are summed together as the final result.
+
+\textbf{Recursive Network.} We also evaluate the recursive network's performance for embedding. We build a recursive network whose forward pass formulae is $out = MLP(E(pred^{j}_i,v^{j}_i) || out)$, where $E$ is the encoding function, and the default value of $out$ takes zero for the single predicate situation. Compared to the RNN network, the recursive network does not have the long-distance information forgetting problem. However, with the increasing number of predicates, the calculation costs increase fast. 
+
+Note that only MLP MPSN is order-irrelevant thus we believe that it is the most hopeful structure of MPSN. Thus, we develop a strategy to accelerate the multiple MLP MPSNs without accuracy loss.
+
+\textbf{Parallel Acceleration for MLP MPSN.} Although Duet does not require to predict column-by-column like Naru and UAE, it needs to embed the predicates and process them with MPSN column-by-column. One straightforward solution is to infer in parallel with multi-threading. Since the encoding and MPSNs are independent of each other, the parallelism and speedup would be high. Furthermore, considering the thread-creating cost, we develop a more efficient method to accelerate the MLP MPSN inferring process by merging all MPSNs of all columns into one MLP model with masked weight. Specifically, we set all MLP MPSNs with the same number of layers and the same activation functions, then we merge each fully-connection layer by mapping their weight matrix on the main diagonal of a bigger zero matrix and mergering their bias vector together as a new ensemble layer. We have tested this method on tables with 100 columns, and it can finish the computation of MPSN much faster. For some extremely high-dimensional tables, this method can reduce the number of inferences of MPSNs by $100\times$ at least.
+
+
+\section{Experiment Results}
+
+\subsection{Expeimental Settings}
+
+\subsubsection{\textbf{Datasets}} Followed by Naru~\cite{Naru} and UAE~\cite{UAE}, we take the DMV, Kddcup98, and Census datasets to evaluate Duet's performance.
+%on high cardinality tables, high-dimensional tables, and high NDV (number of distinct values) tables separately.
+\begin{itemize}
+    \item \textbf{DMV.}~\cite{DMV} This dataset is real-world vehicle registration information in New York. We follow the preprocessing of Naru~\cite{Naru} and obtain a table with 12,370,355 tuples and 11 columns. These columns include the categorical type and date type. The NDV's (Number of Distinct Values) range is from 2 to 2,774. We use it to evaluate Duet's performance on high cardinality and large NDV tables.
+    
+    \item \textbf{Kddcup98.}~\cite{Cpu98AndCensus} This dataset is from the KDD Cup 98 Challenge and contains 100 columns and 95,412 tuples with NDV ranging from 2 to 57. This dataset is obtained from UAE~\cite{UAE} and is mainly used to evaluate the scalability of Duet in large column number scenarios. This dataset is used to evaluate Duet's performance on high-dimensional tables.
+    \item \textbf{Census.}~\cite{Cpu98AndCensus} Same as UAE~\cite{UAE}, this dataset is extracted from the 1,994 Census database, which contains 48,842 tuples and 14 columns with NDV ranging from 2 to 123. This dataset is used to evaluate Duet's performance on small tables.
+\end{itemize}
+
+\subsubsection{\textbf{Query Workloads}}
+\label{subsubsection: Query Workloads}
+We followed previous works~\cite{Naru, AreWeReady} to generate workloads. Specifically, we sample a tuple $(x_1, ..., x_N)$ from the table and then generate predicates based on them. This method can generate a uniform distribution of query workload~\cite{AreWeReady} that includes a wide range of selectivity.
+
+\textbf{Training Workloads.} We use a random seed 42 to generate a workload that contains $1e^5$ queries as the training workload. For the Duet model that is trained without workloads, we denote it by \textbf{Duet$_{\mathcal{D}}$}.
+
+\textbf{Testing Workloads.} We generate two testing workloads and each contains 2k queries for each dataset with the random seeds 1,234 and 42 (the same as training workloads), denoted by \textbf{$Rand-Q$} (Random Queries) and \textbf{$In-Q$} (In-workload Queries), respectively. The former is used to assess the performance of random queries which reflects the worst-case model performance that the incoming queries are irrelevant to training workloads. The latter is used to evaluate in-workload performance which reflects model performance under realistic queries with temporal locality. The generating method is the same as the training workload. With these two different workloads, we can evaluate the influence of whether the training workload are overlap with the testing workload.
+
+\textbf{Workload Cardinality Distribution.} \autoref{fig:workload_dist} plots the cardinality distribution of all these generated workloads.
+
+% Figure environment removed
+\subsubsection{\textbf{Metric}} We use QError to evaluate the cardinality estimation accuracy as most cardinality methods. It is defined as follows: 
+\begin{equation}
+    \label{equation:qerror}
+    QError = \frac{\max{(estimate, actual)}}{\min{(estimate, actual)}}
+\end{equation}
+For the time and space cost, we measure the model size, convergence speed, inference memory cost, and the inference time cost of different parts.
+
+\subsubsection{\textbf{Model Architectures}} We follow Naru and use a MADE with hidden units: 512, 256, 512, 128, 1,024 for DMV. For Kddcup98 and Census, we follow UAE and use 2 layers of ResMADE with hidden units 128 as our autoregressive models. Since the time efficiency of cardinality estimation in real-world scenarios is critical, our evaluations focus on the MADE's performance. However, it is reasonable to expect that Duet can achieve much higher speed and scalability improvement on Transformer since its cost is higher for a single forward pass.
+
+\subsubsection{\textbf{Baselines}} We compare Duet to 7 previous cardinality estimation methods, including various methods.
+
+\textbf{Non-learning Methods.} Although traditional non-learning methods are much less accurate, they are widely used due to their high efficiency. We compare Duet with them to evaluate Duet's time efficiency.
+
+\begin{enumerate}[label={\arabic*.}]
+    \item \textbf{Sampling.} This estimator uniformly samples $p\%$ tuples from all tuples into the memory and applies estimation on those samples. We use the implementation from \cite{Naru, NaruCode}.
+    \item \textbf{Independent (Indep).} This estimator assumes that each column is independent and uses the multiplication of each column's predicates' selectivity to estimate cardinality. We use the implementation in \cite{Naru, NaruCode}.
+    \item \textbf{MHist~\cite{MHist1, MHist2}.} MHist is an $n$-dimensional histogram estimator which is widely used in most databases. We use the implementation in \cite{AreWeReady, AreCELearnedYet}.
+\end{enumerate}
+\textbf{Query-driven Models.} Query-driven models are the first kind of learned cardinality estimators. They can achieve high accuracy when the evaluation queries have the same distribution as the training data. We choose the most representative and widely used methods as competitors.
+\begin{enumerate}[label={\arabic*.}]
+    \setcounter{enumi}{2}
+    \item \textbf{MSCN~\cite{MSCN}.} This query-driven estimator uses a multi-set convolutional neural network to deal with multiple tables, joins, and predicates. The convolutional results are average pooled, concatenated, and processed with an MLP network for the final estimation result. We use MSCN (bitmaps) as the baseline, which is the most accurate MSCN type~\cite{MSCN} and the implementation is in~\cite{AreWeReady, AreCELearnedYet}.
+\end{enumerate}
+\textbf{Data-driven Models.} Data-driven models include the most advanced estimation models. They are not limited to query distribution. We compare both Duet's procession and the cost with them.
+\begin{enumerate}[label={\arabic*.}]
+    \setcounter{enumi}{4}
+    \item \textbf{DeepDB~\cite{DeepDB, AreCELearnedYet}.} This model learns sum-product networks (SPN) to represent the joint data distribution. This is a novel method that uses SPN, a non-neural deep model, to solve the cardinality estimation problem.
+    \item \textbf{Naru~\cite{Naru}.} Naru is the first method that learns the dataset's distribution with a deep autoregressive neural network. Duet is implemented based on Naru's code. We also extend its code to support two-sided queries. Therefore, we can compare Duet with it on both single-sided and two-sided queries. We used the recommended hyper-parameter setting described in its documentation~\cite{NaruCode}. We use the same network architecture as Duet.
+\end{enumerate}
+\textbf{Hybrid Models}
+\begin{enumerate}[label={\arabic*.}]
+    \setcounter{enumi}{6}
+    \item \textbf{UAE~\cite{UAECode}.} UAE is the first method that expands Naru into hybrid training. It revamps the progressive sampling process with the Gumbel-Softmax trick to make Naru's estimation process become differentiable so they can apply backpropagation to it and improve the model's accuracy. We modify its code slightly to adapt our test workload. We use the same network architecture as Duet.
+\end{enumerate}
+
+\subsubsection{\textbf{Hardware}} We run our experiments on a server with 4 RTX A6000 (48GB memory) GPUs, Intel(R) Xeon(R) Silver 4210R CPU, and 504GB RAM if there is no special instruction in the corresponding subsection.
+
+\subsubsection{\textbf{Ablation Study}} To evaluate the effectiveness of the hybrid training of Duet, we also run Duet$_{\mathcal{D}}$ which is training with data-driven only. 
+
+\subsection{Hyper-Parameter Studies}
+\label{subsection: Hyper-Parameter Studies}
+We first report the experimental results of the impact of the most important hyper-parameter during Duet's training, since the rest of the experiments are performed based on this hyper-parameter. We run experiments on the Kddcup98 dataset by training Duet with both data and training workloads, then evaluate its performance on the testing workload of \textit{Rand-Q}.
+
+\textbf{Impact of trade-off coefficient $\lambda$.} The trade-off coefficient $\lambda$ affects Duet's accuracy on random queries and in-workload queries. Since we assume that Duet should be available in most hard scenarios where the users know nothing about the incoming query workload's distribution, we aim to find the $\lambda$ that makes Duet have the best generalization performance. For those scenarios where the incoming queries have similar distribution with the training workloads, the users can increase $\lambda$ appropriately to improve the estimation accuracy. We explore the values \{$1e^{-3}, 1e^{-2}, 1e^{-1}, 1$\} and report the result in \autoref{fig:hyper-parameter_study}. The result shows that $1e^{-1}$ is the best value for $\lambda$, and we take this value in the rest of the experiments.
+
+% Figure environment removed
+
+\subsection{Evaluation on Multiple Predicates Support}
+To decide which MPSN we should use for the rest experiments, we evaluate the three kinds of MPSN proposed in section \autoref{section: Support Multiple Predicates on A Single Column}. 
+
+We train Duet with dataset Census and the training workload introduced in section \autoref{subsubsection: Query Workloads}. Then we evaluate Duet with the $Rand-Q$ workloads and observe the best max QError, inference time cost, training time cost, and the epoch when we get the best model to evaluate each method's accuracy and efficiency.
+
+The networks of \textit{MLP} and \textit{REC} used have 2 hidden layers with 64 hidden units, activated by ReLU. The \textit{RNN} includes a network with a 2-layer LSTM followed by a Full-Connected layer (FC layer), both of which have 64 hidden units for each layer. The different predicates' outputs of the LSTM are processed by the FC layer and summed together. Each column has an independent MPSN. The results are shown in \autoref{table:Evaluation Result for Multiple Predicates Support}. The \textit{MLP} method out-perform other methods with the minimize max QError 7.750 and the lowest training and estimation. Although \textit{RNN} converges a little faster (34 epochs VS 48 epochs), we still choose \textit{MLP} as the default method to support multiple predicates situation for efficiency considerations.
+
+\begin{table}[htp]
+\caption{Evaluation Results for Multiple Predicates Support}
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+name & max QError     & est cost(ms)    & train cost(s)     & best epoch \\ \midrule
+MLP  & \textbf{7.750}  & \textbf{1.642}   & \textbf{28.454}               & 48          \\
+REC  & 8.333           & 4.029            & 33.405               & 49          \\
+RNN  & 9.000           & 5.188            & 40.906               & \textbf{34}     \\    
+\bottomrule
+\end{tabular}
+\label{table:Evaluation Result for Multiple Predicates Support}
+\end{center}
+\vspace{-0.8cm}
+\end{table}
+
+
+\subsection{\textbf{Scalability and Inference Cost Evaluation}}
+\label{subsection: Scalability and Inference Cost Evaluation}
+We evaluate the scalability and inference cost first since it is the most important contribution.
+
+As we have analyzed above, Duet is a sample-free cardinality estimation method that reduces the computation complexity from $O(n)$ to $O(1)$. Compared to the $O(n)$ complexity methods such as Naru and UAE, Duet only needs to infer the neural network one time per estimation. We compare Duet's scalability with them on Kddcup98. We use a model which is trained on all 100 columns and generates workloads that involve 2-100 columns. We apply evaluation on these workloads to compare these methods' scalability. 
+
+As \autoref{fig:scalability} shows, the time cost of Naru and UAE increases with the column number linearly (the X axis is in log scale), which proves the correctness of our analysis about their $O(n)$ complexity and limited scalability. We also notice that the major increase comes from inference and sampling overhead. And for Duet, it has the lowest time cost in all workloads and its increase is much slower than Naru and UAE. Also, the major increase comes from the encoding overhead. Since the encoding process is independent for each column, it can be further accelerated with a high speedup ratio by multi-threading. Besides, for the query optimization of a given query, the cardinality may be called for multiple times, but the encoding process only needs to be executed one time, and the results can also be cached. Overall, Duet is proven to have much better scalability which makes it practical and can actually help to improve the cardinality estimation accuracy for real-world scenarios.
+% Figure environment removed
+
+We also report the detailed inference cost of Duet and Duet$_{\mathcal{D}}$ and compare them with other learned methods. Note that we mainly compare Duet's cost with other learned methods since all traditional methods have too high errors. As \autoref{fig:EstimationCostComparison} shown, Duet's estimation cost is significantly lower than others, which proves that Duet's efficiency is improved by learning from the virtual table and estimating without sampling and multiple forward passes. By comparing Duet's cost on CPU with others in \autoref{fig:EstimationCostComparison}, we can draw the conclusion that \textbf{Duet even has a lower inference cost on CPU than that of both previous data-driven and hybrid methods on GPU}, so it is much cheaper to deploy Duet on real-world DBMS cluster than previous work. We also notice that MSCN has the lowest estimation cost among all learned methods, this is because that MSCN uses a simple network trained with regression learning. However, we prove that such query-driven method has much higher error than data-driven and hybrid methods in \autoref{subsection: Accuracy Comparison}.
+
+\textbf{Overall, all experiments significantly prove that we have achieved our design goal on efficiency and scalability and solved the Problem (1) introduced in \autoref{section: introduction}.}
+
+% Figure environment removed
+
+
+
+\subsection{\textbf{Accuracy Comparison}}
+\label{subsection: Accuracy Comparison}
+\begin{table*}[htbp]
+\caption{Accuracy Result Of All Methods on Three Datasets}
+\begin{center}
+\scalebox{0.85}{
+\begin{tabular}{|l|l|l|l|lllll|lllll|}
+\hline
+\multirow{2}{*}{Dataset}&\multirow{2}{*}{Estimator} & \multirow{2}{*}{Size(MB)} & \multirow{2}{*}{Cost(ms)} & \multicolumn{5}{c|}{In-Workload Queries}                                                          & \multicolumn{5}{c|}{Random Queries}        \\ \hhline{|~|~|~|~|-----|-----|}
+                        &                           &                           &                           & mean            & median          & 75th           & 99th           &  max           & mean           & median         & 75th          & 99th         & max  \\ \hhline{:=:=:=:=:=====:=====:}
+\multirow{9}{*}{DMV}    &Sampling                   & 9.8                       & 0.27                      & 39.73           & 1.080           & 1.551          & 828.2          & 2212           & 48.81          & 1.076          & 1.548         & 1099         & 3734\\ 
+                        &Indep                      & -                         & 260                       & 90.49           & 1.266           & 1.597          & 1775.1         & 21891          & 71.14          & 1.276          & 1.624         & 685.8        & 45437\\
+                        &MHist                      & 17.0                      & 221.1                     & 8.598           & 2.163           & 4.066          & 102.9          & 2961.6         & 8.905          & 2.181          & 4.142         & 102.8        & 2727.0 \\ \hhline{|~|=:=:=:=====:=====|}  
+                        &MSCN                       & 6.12                      & 0.46                      & 5.745           & 1.212           & 2.722          & 77.0           & 717.0          & 6.518          & 1.278          & 3.333         & 103.0        & 650.0    \\ \hhline{|~|=:=:=:=====:=====|}
+                        &DeepDB                     & 0.165                     & 4.35                      & 3.099           & 1.099           & 1.252          & 10.01          & 1096.8         & 2.619          & 1.100          & 1.254         & 20.06        & 414.0    \\
+                        &Naru                       & 15.5                      & 11.2                      & 1.048           & \textbf{1.013}  & 1.038          & 1.640          & 4.0            & \textbf{1.063} & \textbf{1.015} & \textbf{1.039}& \textbf{2.0} & \textbf{11.0}   \\ \hhline{|~|=:=:=:=====:=====|}
+                        &UAE                        & 2.5                       & 7.32                      & 1.092           & 1.030           & 1.074          & 2.0            & 14.0           & 1.108          & 1.031          & 1.079         & 2.484        & \textbf{11.0}    \\ \hhline{|~|=:=:=:=====:=====|}
+                        &Duet$_{\mathcal{D}}$       & 16.3                      & 1.55                      & 1.180           & 1.048           & 1.114          & 3.545          & 14.0           & 1.107          & 1.026          & 1.072         & 2.445        & \textbf{11.0}    \\
+                        &Duet                       & 16.3                      & 1.55                      & \textbf{1.042}  & \textbf{1.013}  & \textbf{1.032} & \textbf{1.623} & \textbf{2.312} & 1.105          & 1.018          & 1.058         & 2.670        & \textbf{11.0}    \\ \hhline{:=:=:=:=:=====:=====:}
+
+\multirow{9}{*}{Kddcup98}&Sampling                  & 3.2                       & 0.05                      & 9.534           & 1.212           & 2.324          & 164.0          & 349.0          & 8.206          & 1.195          & 2.130          & 138.0          & 432.0     \\
+                        &Indep                      & -                         & 1.90                      & 1.842           & 1.168           & 1.538          & 8.657          & 193.0          & 1.647          & 1.160          & 1.528          & 8.0            & 100.7   \\
+                        &MHist                      & 45.5                      & 323.1                     & 16.40           & 4.180           & 14.06          & 115.5          & 1939.0         & 19.93          & 4.002          & 15.31          & 151.8          & 2736.0  \\ \hhline{|~|=:=:=:=====:=====|}  
+                        &MSCN                       & 7.07                      & 0.46                      & 2.120           & 1.151           & 1.797          & 14.0           & 38.0           & 2.127          & 1.175          & 1.874          & 13.0           & 73.0     \\ \hhline{|~|=:=:=:=====:=====|}  
+                        &DeepDB                     & 2.7                       & 10.1                      & 1.304           & \textbf{1.086}  & 1.285          & 4.0            & 24.0           & 1.280          & 1.093          & 1.250          & \textbf{2.048} & 16.57   \\
+                        &Naru                       & 3.4                       & 12.3                      & 1.610           & 1.222           & 1.556          & 6.443          & 48.0           & 1.428          & 1.189          & 1.463          & 2.378          & 24.16     \\ \hhline{|~|=:=:=:=====:=====|}  
+                        &UAE                        & 3.4                       & 8.41                      & 1.573           & 1.231           & 1.599          & 6.564          & 29.69          & 1.490          & 1.233          & 1.542          & 5.576          & 17.77      \\ \hhline{|~|=:=:=:=====:=====|}  
+                        &Duet$_{\mathcal{D}}$       & 7.3                       & 3.10                      & \textbf{1.262}  & 1.101           & \textbf{1.258} & \textbf{3.753} & \textbf{9.0}   & \textbf{1.211} & \textbf{1.089} & \textbf{1.216} & 3.0            & \textbf{8.0}       \\
+                        &Duet                       & 7.3                       & 3.11                      & \textbf{1.282}  & 1.128           & \textbf{1.285} & \textbf{4.0}   & \textbf{8.0}   & \textbf{1.261} & 1.122          & 1.286          & 3.0            & \textbf{7.0}   \\ \hhline{:=:=:=:=:=====:=====:}
+
+\multirow{9}{*}{Census} &Sampling                   & 0.3                       & 0.05                      & 12.55           & 1.748             & 7.085          & 163.0          & 578.0          & 12.63          & 2.0            & 8.0            & 160.1          & 445.0      \\
+                        &Indep                      & -                         & 1.09                      & 4.841           & 2.0               & 4.443          & 41.85          & 247.0          & 5.139          & 2.0            & 4.500          & 49.0           & 275.0         \\
+                        &MHist                      & 3.5                       & 15.3                      & 5.141           & 2.101             & 4.375          & 48.0           & 471.0          & 5.576          & 2.186          & 4.574          & 49.0           & 584.0              \\ \hhline{|~|=:=:=:=====:=====|}
+                        &MSCN                       & 6.15                      & 0.46                      & 2.667           & 1.595             & 3.0            & 14.0           & 38.33          & 2.774          & 1.667          & 3.0            & 17.01          & 34.0   \\ \hhline{|~|=:=:=:=====:=====|}
+                        &DeepDB                     & 0.4                       & 9.60                      & 1.872           & 1.043             & 2.0            & 4.319          & 46.0           & 2.018          & 1.360          & 2.0            & 11.0           & 47.0     \\
+                        &Naru                       & 0.5                       & 9.95                      & \textbf{1.273}  & \textbf{1.109}    & \textbf{1.317} & \textbf{3.0}   & \textbf{6.0}   & \textbf{1.275} & \textbf{1.117} & \textbf{1.320} & \textbf{3.0}   & \textbf{5.0} \\ \hhline{|~|=:=:=:=====:=====|}
+                        &UAE                        & 0.5                       & 6.91                      & 1.312           & 1.125             & 1.373          & 3.500          & 7.0            & 1.311          & 1.137          & 1.385          & \textbf{3.0}   & \textbf{5.0} \\ \hhline{|~|=:=:=:=====:=====|}
+                        &Duet$_{\mathcal{D}}$       & 0.8                       & 1.58                      & 1.378           & 1.143             & 1.455          & 4.0            & 7.0            & 1.375          & 1.155          & 1.500          & 3.751          & 7.0      \\
+                        &Duet                       & 0.8                       & 1.59                      & 1.572           & 1.268             & 1.770          & 5.071          & 8.5            & 1.565          & 1.286          & 1.804          & 4.500          & 7.750    \\ \hline
+
+\end{tabular}
+}
+\end{center}
+\vspace{-0.5cm}
+\label{table:Multiple_Accuracy}
+\end{table*}
+
+We use the exactly same settings of Duet and baselines with \autoref{subsection: Scalability and Inference Cost Evaluation} to evaluate the estimation accuracy and compare it with the baselines. We modify the implementation of the previous works~\cite{Naru, AreWeReady, UAE} to support our workloads and run them with the best setting introduced within their documentation. All data-driven and hybrid methods learn from the same datasets, and all query-driven and hybrid methods use the same training workload introduced in \autoref{subsubsection: Query Workloads}. We evaluate Duet and Duet$_{\mathcal{D}}$ on both \textit{Rand-Q} and \textit{In-Q} workloads to compare their accuracy. The \autoref{table:Multiple_Accuracy} shows the results of all methods' accuracy on different workloads and settings, we can obtain a few conclusions from them.
+\begin{itemize}
+    \item \textbf{Duet outperforms all methods on the high cardinality table with in-workload queries.} We draw this conclusion from \autoref{table:Multiple_Accuracy}. As we have analyzed, cardinality estimation on high cardinality tables usually causes long-tailed distribution problems. Although other hybrid methods such as UAE can learn from queries to alleviate the problem, its performance cannot be improved in such a situation. The reason is that high cardinality tables require large batch size to finish the training in a limited time, but UAE trains with $batch\ size\ \times$ $\#sample$ samples, which is expensive and limits the value of $\#sample$, and eventually lead to the low accuracy of UAE. Since Duet's hybrid training is more lightweight and without sampling, it achieves the best performance on in-workload queries, and it can achieve better accuracy than other methods in real scenes with temporal locality queries.
+    % Since Duet learns from a much bigger virtual, the rational concern is whether Duet's accuracy would be affected by it. These results show that Duet 
+    \item \textbf{Duet outperforms all methods on the high-dimensional table with both test workloads.} We draw this conclusion from results of Kddcup98. Both Duet and Duet$_{\mathcal{D}}$ outperform all methods which show that we can obtain huge accuracy improvement by removing the progressive sampling.
+
+    % \item \textbf{Duet has the lowest estimated overhead of all data-driven and hybrid methods.} Benefiting from the sampling-free estimation design of Duet, its cost is lower than 4 ms in all three datasets. Among the three datasets, Duet's cost is higher on Kddcup98, which is because the Kddcup98 has 100 columns so the input of Duet has a higher dimension, and it takes more iterations to encode all predicates of each column into a tensor.
+
+    \item \textbf{Overall, Duet's accuracy is about the same as Naru and other hybrid methods represented by UAE in other experiments.} We observe from \autoref{table:Multiple_Accuracy} that Naru and UAE's accuracy is slightly higher than Duet's. This is because the Census table is the smallest, so the shortcomings of their progressive sampling are not significant. Also, since Duet learns from the samples of the virtual table, it is hard for it to be trained on every possible tuple.
+    
+    \item \textbf{Hybrid training alleviates the long-tail distribution problem for high cardinality and high-dimensional tables.} The ablation study of Duet's hybrid training and data-driven training helps us to draw this conclusion. Comparing the performance between Duet and Duet$_{\mathcal{D}}$ in DMV and Kddcup98, Duet that is trained with both data and workloads achieves better accuracy compared to Duet$_{\mathcal{D}}$ in both high cardinality and high-dimensional situations, especially on In-workload queries. Considering that hybrid training takes a higher cost, we suggest disabling it for small tables.    
+\end{itemize}
+
+\textbf{In general, the accuracy evaluation proves that we have solved the Problem (2) introduced in \autoref{section: introduction}.}
+
+
+\subsection{\textbf{Training Cost Comparison}}
+We use the same setting with \autoref{subsection: Accuracy Comparison} to train Duet and Duet$_{\mathcal{D}}$, and compare its convergence speed, throughput, and GPU memory cost with Naru and UAE.
+
+\autoref{fig:ConvergenceSpeedCompare} shows the convergence of the max QError as training progresses when evaluated on random queries. The results indicate that Duet converges significantly faster and better than Naru and UAE on the high-dimensional dataset (Kddcup98). Even on the biggest dataset DMV, Duet still takes less or the same epochs to achieve the same max QError compared with Naru. This is because such an autoregressive model can not only learn each data point's probability but also learns the actual semantics of predicates. Therefore, in the iterative training process, since the sampled virtual tuples used in training Duet are generated from all tuples, Duet can still converge at a fast speed. This also proves the effectiveness of our sampling approach~\autoref{algorithm: Virtual Tuple Sampling Method}. Also, we observe that the UAE converges much slower than others on the DMV dataset, The reason is that the DMV dataset has higher cardinality, and since UAE just scales $\mathcal{L}_{query}$ with a single factor, the initial high value of the $\mathcal{L}_{query}$ (shown in \autoref{fig:loss_convergence}) affects its convergence. This proves the effectiveness of our hybrid training loss.
+
+By comparing with Duet and Duet$_{\mathcal{D}}$ in \autoref{fig:ConvergenceSpeedCompareIn}, we draw a conclusion that the hybrid training slightly increases the convergence speed when evaluated on in-workload queries.
+
+% Figure environment removed
+% Figure environment removed
+
+Since Duet requires sampling from the virtual table during training, it is reasonable to question its training efficiency. We test its training throughput and compare it with the throughput of Naru and UAE. Since GPU devices like A6000 are too expensive to be ensembled with DBMS clusters, we use a PC with RTX3080(10GB) and AMD Ryzen9 5900X to evaluate the training throughput. The batch size is set to 2,048 for DMV and 100 for Kddcup98 and Census followed by UAE's setting.
+
+The result shown in \autoref{table:Throughput Comparison} indicates that Duet's throughput is $42.5\%$ lower than Naru and $556.9\%$ higher than UAE on DMV. For memory cost, Duet costs 3.5GB GPU memory for training DMV, Duet$_{\mathcal{D}}$ costs 2.2 GB, Naru costs 2.1 GB, and UAE costs 2.8 GB. As a hybrid method. We emphasize that the $\#sample$ of UAE and Naru during evaluation is 2,000, if we set it to 2,000 during training, the UAE will cost over 10GB GPU memory and trigger an OOM exception on RTX3080. Even with $\#sample$ set to 200, it still triggers the OOM exception on Kddcup98 dataset. The accuracy evaluation in \autoref{subsection: Accuracy Comparison} indicates that this is a part of the reasons why UAE achieves lower accuracy on in-workload queries than Duet. \textbf{Thus, Duet has much better time and memory efficiency for training than UAE in general, and Problem (3) is also solved.}
+
+\begin{table}[htbp]
+\caption{Throughput (tuples/s) of data-driven and hybrid methods.}
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Estimator            &  DMV    & Kddcup98 & Census\\
+\midrule
+Naru                 &188006.4 &  2963    & 14538  \\
+UAE                  &16445.4  &  OOM     & 532    \\
+Duet$_{\mathcal{D}}$ &160358.4 &  1404    & 8332   \\
+Duet                 &108032   &  1019    & 5516    \\
+\bottomrule
+\end{tabular}
+\label{table:Throughput Comparison}
+\end{center}
+\vspace{-0.5cm}
+\end{table}
+
+
+
+\section{Conclusion and Future Works}
+We propose a novel methodology for modeling data-driven cardinality estimation without sampling for range queries and any non-differentiable process during inference. Based on this methodology, we propose Duet, a stable, efficient, and scalable hybrid cardinality estimation method that reduces the inference complexity from $O(n)$ to $O(1)$ compared to UAE with higher accuracy on high cardinality and high-dimensional tables and less memory cost for training. The experimental results also show that Duet solves Problems (1-3) introduced in \autoref{section: introduction}. In terms of inference cost, Duet can even achieve fast estimation on CPU than that of most learned methods on GPU. And since Duet is a deterministic method and mainly learns from data, the instability problem and workload drift problem (Problems (4,5)) are avoided. In summary, we have proven that Duet is more practical for real-world scenarios compared to previous learned methods such as MSCN, DeepDB, Naru and UAE, and can help drive the practical implementation of learning-based cardinality estimators. We aim to improve the performance of Duet on tables with extremely large distinct values in our future work.%}.\footnote{one sentence for further work \textcolor{blue}{done}}
+
+
+\clearpage
+
+
+% \section*{Acknowledgment}
+
+% The preferred spelling of the word ``acknowledgment'' in America is without 
+% an ``e'' after the ``g''. Avoid the stilted expression ``one of us (R. B. 
+% G.) thanks $\ldots$''. Instead, try ``R. B. G. thanks$\ldots$''. Put sponsor 
+% acknowledgments in the unnumbered footnote on the first page.
+
+\begin{thebibliography}{00}
+
+\bibitem{DMV}Federico Zanettin, 2019. State of New York. Vehicle, snowmobile, and boat registrations. catalog.data.gov/dataset/vehicle-snowmobile-and-boat-registrations
+
+\bibitem{Cpu98AndCensus}[n.d.]. UCI machine learning repository. https://archive.ics.uci.edu/ml/index.php.
+
+\bibitem{NaruCode}[n.d.]. Naru-project. https://github.com/naru-project/naru/.
+
+\bibitem{AreCELearnedYet}[n.d.]. AreCELearnedYet. https://github.com/sfu-db/AreCELearnedYet/.
+
+\bibitem{UAECode}[n.d.]. UAE. https://github.com/pagegitss/UAE/tree/master/.
+
+\bibitem{Naru}Z.~Yang, E.~Liang, A.~Kamsetty, C.~Wu, Y.~Duan, X.~Chen, P.~Abbeel, J.~M.  Hellerstein, S.~Krishnan, and I.~Stoica, ``Deep unsupervised cardinality  estimation,'' \emph{Proc. VLDB Endow.}, vol.~13, no.~3, p. 279–292, nov  2019. [Online]. Available: \url{https://doi.org/10.14778/3368289.3368294}
+
+
+\bibitem{NeuroCard}Z.~Yang, A.~Kamsetty, S.~Luan, E.~Liang, Y.~Duan, X.~Chen, and I.~Stoica,  ``Neurocard: One cardinality estimator for all tables,'' \emph{Proc. VLDB  Endow.}, vol.~14, no.~1, p. 61–73, oct 2020. [Online]. Available:  \url{https://doi.org/10.14778/3421424.3421432}
+
+\bibitem{AreWeReady}X.~Wang, C.~Qu, W.~Wu, J.~Wang, and Q.~Zhou, ``Are we ready for learned  cardinality estimation?'' \emph{Proc. VLDB Endow.}, vol.~14, no.~9, p.  1640–1654, may 2021. [Online]. Available:  \url{https://doi.org/10.14778/3461535.3461552}
+
+\bibitem{Warper}B.~Li, Y.~Lu, and S.~Kandula, ``Warper: Efficiently adapting learned  cardinality estimators to data and workload drifts,'' in \emph{Proceedings of  the 2022 International Conference on Management of Data}, ser. SIGMOD  '22.\hskip 1em plus 0.5em minus 0.4em\relax New York, NY, USA: Association  for Computing Machinery, 2022, p. 1920–1933. [Online]. Available:  \url{https://doi.org/10.1145/3514221.3526179}
+
+\bibitem{MSCN}A.~Kipf, T.~Kipf, B.~Radke, V.~Leis, P.~A. Boncz, and A.~Kemper, ``Learned  cardinalities: Estimating correlated joins with deep learning,''  \emph{ArXiv}, vol. abs/1809.00677, 2018.
+
+\bibitem{LW}B.~Li, Y.~Lu, and S.~Kandula, ``Warper: Efficiently adapting learned  cardinality estimators to data and workload drifts,'' in \emph{Proceedings of  the 2022 International Conference on Management of Data}, ser. SIGMOD  '22.\hskip 1em plus 0.5em minus 0.4em\relax New York, NY, USA: Association  for Computing Machinery, 2022, p. 1920–1933. [Online]. Available:  \url{https://doi.org/10.1145/3514221.3526179}
+
+\bibitem{UAE}P.~Wu and G.~Cong, ``A unified deep model of learning from both data and  queries for cardinality estimation,'' in \emph{Proceedings of the 2021  International Conference on Management of Data}, ser. SIGMOD '21.\hskip 1em  plus 0.5em minus 0.4em\relax New York, NY, USA: Association for Computing  Machinery, 2021, p. 2009–2022. [Online]. Available:  \url{https://doi.org/10.1145/3448016.3452830}
+
+\bibitem{DeepDB}B.~Hilprecht, A.~Schmidt, M.~Kulessa, A.~Molina, K.~Kersting, and C.~Binnig,  ``Deepdb: Learn from data, not from queries!'' \emph{Proc. VLDB Endow.},  vol.~13, no.~7, p. 992–1005, mar 2020. [Online]. Available:  \url{https://doi.org/10.14778/3384345.3384349}
+
+\bibitem{MHist1}Poosala, Viswanath, Yannis E. Ioannidis, Peter J. Haas and Eugene J. Shekita. “Improved histograms for selectivity estimation of range predicates.” ACM SIGMOD Conference (1996).
+
+\bibitem{MHist2}Poosala, Viswanath and Yannis E. Ioannidis. “Selectivity Estimation Without the Attribute Value Independence Assumption.” Very Large Data Bases Conference (1997).
+
+\bibitem{TradCE1}P.-A. Larson, W.~Lehner, J.~Zhou, and P.~Zabback, ``Cardinality estimation  using sample views with quality assurance,'' in \emph{Proceedings of the 2007  ACM SIGMOD International Conference on Management of Data}, ser. SIGMOD  '07.\hskip 1em plus 0.5em minus 0.4em\relax New York, NY, USA: Association  for Computing Machinery, 2007, p. 175–186. [Online]. Available:  \url{https://doi.org/10.1145/1247480.1247502}
+
+\bibitem{ExpCESurvey}H.~Harmouch and F.~Naumann, ``Cardinality estimation: An experimental survey,''  \emph{Proc. VLDB Endow.}, vol.~11, no.~4, p. 499–512, dec 2017. [Online].  Available: \url{https://doi.org/10.1145/3186728.3164145}
+
+\bibitem{SortingCE}K.-Y. Whang, B.~T. Vander-Zanden, and H.~M. Taylor, ``A linear-time  probabilistic counting algorithm for database applications,'' \emph{ACM  Trans. Database Syst.}, vol.~15, no.~2, p. 208–229, jun 1990. [Online].  Available: \url{https://doi.org/10.1145/78922.78925}
+
+\bibitem{BloomFilterCE}A.~Kumar, J.~Xu, and J.~Wang, ``Space-code bloom filter for efficient per-flow  traffic measurement,'' \emph{IEEE Journal on Selected Areas in  Communications}, vol.~24, no.~12, pp. 2327--2339, 2006.
+
+\bibitem{SamplingCE1}M.~Charikar, S.~Chaudhuri, R.~Motwani, and V.~R. Narasayya, ``Towards  estimation error guarantees for distinct values,'' in \emph{ACM  SIGACT-SIGMOD-SIGART Symposium on Principles of Database Systems}, 2000.
+
+\bibitem{SamplingCE2}P.~Gibbons, ``Distinct sampling for highly-accurate answers to distinct values  queries and event reports,'' \emph{VLDB}, 09 2001.
+
+\bibitem{SamplingCE3}J.~Li, Z.~Wei, B.~Ding, X.~Dai, L.~Lu, and J.~Zhou, ``Sampling-based estimation  of the number of distinct values in distributed environment,'' in  \emph{Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery  and Data Mining}, ser. KDD '22.\hskip 1em plus 0.5em minus 0.4em\relax New  York, NY, USA: Association for Computing Machinery, 2022, p. 893–903.  [Online]. Available: \url{https://doi.org/10.1145/3534678.3539390}
+
+\bibitem{SamplingCE4}P.~J. Haas, J.~F. Naughton, and A.~N. Swami, ``On the relative cost of sampling  for join selectivity estimation,'' in \emph{Proceedings of the Thirteenth ACM  SIGACT-SIGMOD-SIGART Symposium on Principles of Database Systems}, ser. PODS  '94.\hskip 1em plus 0.5em minus 0.4em\relax New York, NY, USA: Association  for Computing Machinery, 1994, p. 14–24. [Online]. Available:  \url{https://doi.org/10.1145/182591.182594}
+
+\bibitem{SamplingCE5}R.~J. Lipton, J.~F. Naughton, and D.~A. Schneider, ``Practical selectivity  estimation through adaptive sampling,'' \emph{SIGMOD Rec.}, vol.~19, no.~2,  p. 1–11, may 1990. [Online]. Available:  \url{https://doi.org/10.1145/93605.93611}
+
+\bibitem{SamplingCE6}M.~Riondato, M.~Akdere, U.~{\c{C}}etintemel, S.~B. Zdonik, and E.~Upfal, ``The  vc-dimension of sql queries and selectivity estimation through sampling,'' in  \emph{Machine Learning and Knowledge Discovery in Databases}, D.~Gunopulos,  T.~Hofmann, D.~Malerba, and M.~Vazirgiannis, Eds.\hskip 1em plus 0.5em minus  0.4em\relax Berlin, Heidelberg: Springer Berlin Heidelberg, 2011, pp.  661--676.
+
+\bibitem{HistogramCE1}A.~Deshpande, M.~Garofalakis, and R.~Rastogi, ``Independence is good:  Dependency-based histogram synopses for high-dimensional data,'' \emph{SIGMOD  Rec.}, vol.~30, no.~2, p. 199–210, may 2001. [Online]. Available:  \url{https://doi.org/10.1145/376284.375685}
+
+\bibitem{HistogramCE2}H.~V. Jagadish, H.~Jin, B.~C. Ooi, and K.-L. Tan, ``Global optimization of  histograms,'' \emph{SIGMOD Rec.}, vol.~30, no.~2, p. 223–234, may 2001.  [Online]. Available: \url{https://doi.org/10.1145/376284.375687}
+
+\bibitem{HistogramCE3}C.~A. Lynch, ``Selectivity estimation and query optimization in large databases  with highly skewed distribution of column values,'' in \emph{Proceedings of  the 14th International Conference on Very Large Data Bases}, ser. VLDB  '88.\hskip 1em plus 0.5em minus 0.4em\relax San Francisco, CA, USA: Morgan  Kaufmann Publishers Inc., 1988, p. 240–251.
+
+\bibitem{HistogramCE4}M.~Muralikrishna and D.~J. DeWitt, ``Equi-depth multidimensional histograms,''  in \emph{ACM SIGMOD Conference}, 1988.
+
+\bibitem{HistogramCE5}V.~Poosala, P.~J. Haas, Y.~E. Ioannidis, and E.~J. Shekita, ``Improved  histograms for selectivity estimation of range predicates,'' in  \emph{Proceedings of the 1996 ACM SIGMOD International Conference on  Management of Data}, ser. SIGMOD '96.\hskip 1em plus 0.5em minus 0.4em\relax  New York, NY, USA: Association for Computing Machinery, 1996, p. 294–305.  [Online]. Available: \url{https://doi.org/10.1145/233269.233342}
+
+\bibitem{HistogramCE6}N.~Thaper, S.~Guha, P.~Indyk, and N.~Koudas, ``Dynamic multidimensional  histograms,'' in \emph{Proceedings of the 2002 ACM SIGMOD International  Conference on Management of Data}, ser. SIGMOD '02.\hskip 1em plus 0.5em  minus 0.4em\relax New York, NY, USA: Association for Computing Machinery,  2002, p. 428–439. [Online]. Available:  \url{https://doi.org/10.1145/564691.564741}
+
+\bibitem{HistogramCE7}H.~To, K.~Chiang, and C.~Shahabi, ``Entropy-based histograms for selectivity  estimation,'' in \emph{Proceedings of the 22nd ACM International Conference  on Information \& Knowledge Management}, ser. CIKM '13.\hskip 1em plus 0.5em  minus 0.4em\relax New York, NY, USA: Association for Computing Machinery,  2013, p. 1939–1948. [Online]. Available:  \url{https://doi.org/10.1145/2505515.2505756}
+
+\bibitem{HistogramCE8}A.~Van~Gelder, ``Multiple join size estimation by virtual domains (extended  abstract),'' in \emph{Proceedings of the Twelfth ACM SIGACT-SIGMOD-SIGART  Symposium on Principles of Database Systems}, ser. PODS '93.\hskip 1em plus  0.5em minus 0.4em\relax New York, NY, USA: Association for Computing  Machinery, 1993, p. 180–189. [Online]. Available:  \url{https://doi.org/10.1145/153850.153872}
+
+\bibitem{Self-TuningHistograms}A.~Aboulnaga and S.~Chaudhuri, ``Self-tuning histograms: Building histograms  without looking at data,'' \emph{SIGMOD Rec.}, vol.~28, no.~2, p. 181–192,  jun 1999. [Online]. Available: \url{https://doi.org/10.1145/304181.304198}
+
+\bibitem{QueryDriven1}S.~Hasan, S.~Thirumuruganathan, J.~Augustine, N.~Koudas, and G.~Das, ``Deep  learning models for selectivity estimation of multi-attribute queries,'' in  \emph{Proceedings of the 2020 ACM SIGMOD International Conference on  Management of Data}, ser. SIGMOD '20.\hskip 1em plus 0.5em minus 0.4em\relax  New York, NY, USA: Association for Computing Machinery, 2020, p. 1035–1050.  [Online]. Available: \url{https://doi.org/10.1145/3318464.3389741}
+
+\bibitem{QueryDriven2}A.~Kipf, T.~Kipf, B.~Radke, V.~Leis, P.~A. Boncz, and A.~Kemper, ``Learned  cardinalities: Estimating correlated joins with deep learning,''  \emph{ArXiv}, vol. abs/1809.00677, 2018.
+
+\bibitem{QueryDriven3}J.~Ortiz, M.~Balazinska, J.~Gehrke, and S.~S. Keerthi, ``An empirical analysis  of deep learning for cardinality estimation,'' \emph{ArXiv}, vol.  abs/1905.06425, 2019.
+
+\bibitem{QueryDriven4}J.~Sun and G.~Li, ``An end-to-end learning-based cost estimator,'' \emph{Proc.  VLDB Endow.}, vol.~13, no.~3, p. 307–319, nov 2019. [Online]. Available:  \url{https://doi.org/10.14778/3368289.3368296}
+
+\bibitem{QueryDriven5}C.~Wu, A.~Jindal, S.~Amizadeh, H.~Patel, W.~Le, S.~Qiao, and S.~Rao, ``Towards  a learning optimizer for shared clouds,'' \emph{Proc. VLDB Endow.}, vol.~12,  no.~3, p. 210–222, nov 2018. [Online]. Available:  \url{https://doi.org/10.14778/3291264.3291267}
+
+\bibitem{BaysianNetwork}C.~Chow and C.~Liu, ``Approximating discrete probability distributions with  dependence trees,'' \emph{IEEE Transactions on Information Theory}, vol.~14,  no.~3, pp. 462--467, 1968.
+
+\bibitem{KDE}D.~Gunopulos, G.~Kollios, V.~J. Tsotras, and C.~Domeniconi, ``Approximating  multi-dimensional aggregate range queries over real attributes,''  \emph{SIGMOD Rec.}, vol.~29, no.~2, p. 463–474, may 2000. [Online].  Available: \url{https://doi.org/10.1145/335191.335448}
+
+\bibitem{CEBenchMark}Y.~Han, Z.~Wu, P.~Wu, R.~Zhu, J.~Yang, L.~W. Tan, K.~Zeng, G.~Cong, Y.~Qin,  A.~Pfadler, Z.~Qian, J.~Zhou, J.~Li, and B.~Cui, ``Cardinality estimation in  dbms: A comprehensive benchmark evaluation,'' \emph{Proc. VLDB Endow.},  vol.~15, no.~4, p. 752–765, dec 2021. [Online]. Available:  \url{https://doi.org/10.14778/3503585.3503586}
+\end{thebibliography}
+\vspace{12pt}
+% \color{red}
+% IEEE conference templates contain guidance text for composing and formatting conference papers. Please ensure that all template text is removed from your conference paper prior to submission to the conference. Failure to remove the template text from your paper may result in your paper not being published.
+
+\end{document}

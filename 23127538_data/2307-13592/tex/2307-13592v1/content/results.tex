@@ -1,0 +1,229 @@
+\section{Results}
+In this chapter the proposed distributed training method is first applied on a two-dimensional cylinderflow dataset. This pre-study is used to validate the approach and compare the accuracy to the single \ac{gpu} implementation.
+Afterwards, a turbomachine flow field is used to test the method on meshes with relevant mesh sizes.
+The proposed method is compared to a traditional training approach and the capabilities of the superior model are further examined.
+Finally, an extensive performance study is presented, which analyses the introduced communication overhead as well as the device imbalance due to the synchronized halo exchange.
+\subsection{Validation on Cylinderflow}\label{subsec:CYL}
+The cylinderflow dataset from \cite{pfaff2021learning} is used to validate the proposed distributed learning approach.
+Hence, a \ac{mgn} is trained on a single \ac{gpu} and a second model is trained using the proposed approach.
+The dataset is compiled from geometric variation of a cylinder in \ac{2d} incompressible crossflow. 
+Variations include diameter of the cylinder and position in the fluid domain. 
+The dataset consists of 1000 training, 100 test and 100 validation trajectory of which each features 600 frames of a developing flow around the cylinder.
+As the cylinder dataset consists of samples with only 1885 points in average, the full \ac{mgn} with 15 message passing steps and a latent vector size of 128 could be trained.
+
+
+The input node features $\mathbf{f}_\text{i,t}$ are compiled from velocity in $x$ direction $u$, velocity in $y$ direction $v$ and the one-hot node type vector.
+Output node features $\mathbf{p}_\text{i,t}$ are $\Delta u$ and $\Delta v$ as well as pressure $p$ of the next timestep. 
+This choice of target features was made according to \cite{pfaff2021learning}.
+
+In a first attempt to reproduce the results, the demo code that is provided by \cite{pfaff2021learning} and implemented in TensorFlow~\cite{TensorFlow} was adapted to fit the learning task of the cylinderflow. 
+In the following, this version is denoted \textsc{MGN-demo}.
+Table~\ref{tab:CompCYL} shows that its \ac{rmse} on the validation set is very close to the original work.
+Furthermore, it even outperformed the results published in the paper for all extrapolation step widths.
+Here, and throughout this paper the \ac{rmse} is used to be comparable to the original work \cite{pfaff2021learning}. A more sophisticated and \ac{cfd} specific error measure is part of future improvements.
+In this work, the \ac{ml} framework of choice is PyTorch \cite{pytorch2019}, which is why a torch version of \ac{mgn} was implemented. 
+The results are slightly worse (cf. \textsc{MGN-torch} in Table \ref{tab:CompCYL}) than the original paper but comparable. 
+Other than the obvious difference in the framework that was used, a root cause investigation did not gave any hints on why the results are different.
+
+\begin{table}[b!]
+	\begin{center}
+		\caption{Comparison of mean and standard error of \ac{rmse} over the cylinderflow validation set}
+		\label{tab:CompCYL} 
+		\begin{tabularx}{1\textwidth}{lcP{1.5cm}P{1.5cm}P{1.5cm}P{1.5cm}P{1.7cm}P{1.7cm}}
+			\toprule
+			\textbf{Model} &\textbf{\#~devices} &\textbf{\#~samples per batch per device}& \textbf{\#~batches presented} $\times 10^{6}$ & \textbf{\#~steps optimizer} $\times 10^{6}$ & \textbf{RMSE 1-step} $\times 10^{-3}$ & \textbf{RMSE 50-step} $\times 10^{-3}$ & \textbf{RMSE 600-steps} $\times 10^{-3}$\\
+			\midrule
+			{\protect\NoHyper\citeauthor{pfaff2021learning}\protect\endNoHyper} \cite{pfaff2021learning} &1&2&$10$&$10$&$2.34\pm0.12$&$6.30\pm0.70$&$40.88\pm7.20$\\
+			\textsc{MGN-demo}                    &1&2&$10$&$10$&$1.90\pm0.06$&$5.69\pm0.35$& $36.65\pm2.79$\\
+			\textsc{MGN-torch}                   &1&2&$10$&$10$&$3.40\pm0.12$&$11.61\pm0.66$&$40.02\pm3.38$\\
+			\textsc{MGN-gradAcc}			   &1&1&$20$&$10$&$4.39\pm0.14$&$11.83\pm0.58$&$36.51\pm3.21$\\
+ 			\textsc{MGN-Halo} 		               &8&1&$20$&$10$&$4.23\pm0.11$&$15.30\pm0.75$&$58.95\pm3.58$\\
+		\end{tabularx}	
+	    
+	\end{center}
+	\renewcommand*\footnoterule{}
+
+\end{table}
+Now, another batching strategy called gradient accumulation is employed because large numerical meshes with up to and over $10^6$ points already exhaust device memory when partitioned onto eight \acp{gpu}.
+So only a single sample per batch can be processed and the gradients are accumulated over two consecutive samples.
+In order to have a fair comparison and explore the impacts of this batching strategy on the problem at hand, a single \ac{gpu} version with gradient accumulation called \textsc{MGN-gradAcc} was trained additionally.
+Surprisingly, it showed a significant deterioration of the \ac{rmse} on the validation set.
+
+Finally, a model called \textsc{MGN-Halo} employing the proposed learning approach was trained on the cylinder dataset using eight \acp{gpu}. 
+The \ac{rmse} for the single step is slightly worse and for the 50-step rollout slightly better than for the comparable single GPU version \textsc{MGN-gradAcc}.
+The overall validation of the approach is therefor regarded successful, even though the \ac{rmse} for the 600-step rollout deviates significantly (cf. Table \ref{tab:CompCYL})).
+
+% Figure environment removed
+In order to give an idea of what a rollout looks like, Fig.~\ref{fig:compCYL} presents 5 snapshots of a 200-step rollout. The sample depicted was chosen as its predicted rollout has the highest \ac{rmse} of the testset.
+Each row pictures from left to right the predicted flow field, the corresponding target and the absolute error between them.
+One can observe that the model successfully predicts (left column) a flow field that regards the object placed at some random position in the left half of the domain and also learned that for certain combinations of diameter and position vortex shedding occurs.
+But it is noticeable that the prediction of the model increasingly misaligns with its target over multiple rollout steps.
+%However, it is noticeable that the model fails to predict the correct vortex shedding frequency, which results in an increasing misalignment between target and predicted flow field over multiple rollout steps.
+
+This pre-study showed that the proposed approach produces comparable results with one sample distributed over eight \acp{gpu} to a similar single \ac{gpu} implementation.
+However, the significant difference in the 600-step rollout errors might be an indication that the halo exchange is not passing all required information.
+
+\subsection{Application to 3D Turbine}\label{subsec:H01S}
+A second dataset of a representative state-of-the-art turbine stage of an aircraft engine is now used to apply the proposed approach to a flow field with about $10^6$ points.
+This turbine dataset consists of 100 geometry variations of a turbine stator from simulations of a complete turbine stage.
+An isometric view on the numerical setup is presented in Fig.~\ref{fig:H01S_Isoview}.
+The dataset consists of turbine stator domains with $0.75\times10^6$ points in average and $0.97\times10^6$ points maximal.
+Rolls-Royce's HYDRA \cite{HYDRA} was employed as a \ac{cfd} solver to solve the \ac{urans} equations.
+The one equation turbulence model from Spalart-Allmaras~\cite{spalart} is used for resolving eddy viscosity.
+A revolution or period is resolved with 50 timesteps and in average 5 to 6 periods were needed to reach a converged time varying cyclic solution.
+% Figure environment removed
+The numerical grid and all timesteps of the last period are saved and then analogue to \cite{pfaff2021learning} preprocessed into a \ac{ml} dataset.
+A small subset (5 trajectories) of the dataset will be used as validation set and is not provided during training.
+In Fig.~\ref{fig:H01S_EvalPlanes} the evaluation planes that are used here for visual inspection are pictured. As these cuts on a fixed relative span do not regard mesh cells, cutting artifacts may occur in the pictures.
+According to the approach presented in the previous section \ref{ch:method} the flow domain is partitioned in eight parts. 
+Fig.~\ref{fig:H01S_Partitions} presents an isometric view colored by partitions.
+
+All previously introduced input node features $\mathbf{f}_\text{i,t}$ are included in the turbine dataset input.
+Additionally, the velocity in $z$ direction $w$ is used, as a \ac{3d} flow field is considered now.
+Output node features $\mathbf{p}_\text{i,t}$ are analogously defined with an additional $\Delta w$ accounting for the difference in the third velocity component and $\Delta \rho$ which regards the difference in the density field of the compressible flow.
+Training noise levels were set according to \cite{pfaff2021learning} and not varied throughout this work.
+
+In contrast to the previous section, no single \ac{gpu} application is possible as this would exceed the device memory using the current implementation of \ac{mgn}.
+In order to be able to train the model on samples of this size, adjustments regarding the model size had to be made.
+While exploring the proposed distribution approach, one overall intention of this work is to limit the training to a single node with eight devices.
+On the one hand this limits the amount of resources that each model configuration requires and on the other hand multi-node training with hard synchronisation between devices is not efficient in parallel. 
+Section \ref{subsec:perf} further elaborates on this topic.
+Hence, the model size is reduced to either $8$ or $10$ GraphNet blocks and a lowered latent vector size of $96$ or $64$.
+
+\begin{table}[b!]
+	\begin{center}
+		\caption{Comparison of of mean and standard error of \ac{rmse} over the turbine validation set after $5\times10^6$ optimizer steps}
+		\label{tab:CompH01S} 
+		\begin{tabular}{lccP{2.1cm}P{2.1cm}P{2.1cm}}
+			\toprule
+			\textbf{Model} & $K$ & $l$ &  \textbf{RMSE \hspace{10pt} 1-step}\hspace{10pt} $\times 10^{-3}$ & \textbf{RMSE 50-step}\hspace{10pt} $\times 10^{-3}$ & \textbf{RMSE Nextstep} $\times 10^{-3}$\\
+			\midrule
+			\textsc{MGN-Halo} & 8 &	96 &$271.80\pm14.34$&$456.38\pm12.52$&$270.24\pm1.93$\\
+			\textsc{MGN-Halo} & 10 & 64 &$244.79\pm11.08$&$424.95\pm11.56$&$243.08\pm1.53$\\
+			\textsc{MGN-NoComm} & 8 & 96 &$100.27\pm4.93$&$101.04\pm4.92$&$98.22\pm0.64$\\
+			\textsc{MGN-NoComm} & 10 & 64 &$96.76\pm4.28$&$99.51\pm3.9$&$94.10\pm0.53$\\
+			%			\bottomrule
+		\end{tabular}	
+	\end{center}
+\end{table}
+Table~\ref{tab:CompH01S} presents all model configurations that were trained on the turbine dataset. Two different training approaches are compared to each other. 
+One is denoted with \textsc{MGN-Halo} and employs the proposed halo exchanging multi-device learning method. 
+Through gradient accumulation a batchsize of two is achieved with two consecutive samples.
+The other is denoted \textsc{MGN-NoComm} and trains on the same number of devices but in traditional fashion, e.g. without halo exchange. 
+Additionally, the second approach does not use gradient accumulation so that one sample per batch per device is used.
+The gradients of each model replica are synchronized after a loss backward pass in both approaches.
+To draw a direct comparison, the same parameter variation for the message passing steps and latent vector size is used.
+For inference, a single \ac{gpu} memory is large enough to hold a complete turbine stator domain with up to and over $10^6$ points.
+% Figure environment removed
+
+The comparison between 1-step and 50-step rollout \ac{rmse} already shows that both \textsc{MGN-NoComm} models are superior to the \textsc{MGN-Halo} versions as the error is nearly a factor of 3 lower.
+Because the overall goal is to employ this model in a numerical solver, a \textit{Nextstep} error, which is a 1-step rollout starting from each step $t$ in the trajectory is evaluated. The results are in all four versions close to the 1-step rollout starting from the first timestep.
+A temporal resolved distribution of the error is not presented as the error does not vary significantly throughout the trajectory for all models.
+
+Figure~\ref{fig:compH01S} presents a 1-step rollout prediction of the sample with the lowest \ac{rmse} in the validation set for the superior \textsc{MGN-NoComm-10-64} model.
+The three previously introduced evaluation planes (cf. Fig.~\ref{fig:H01S_EvalPlanes}) are used to visualize the flow field.
+The corresponding version with halo exchange \textsc{MGN-Halo-10-64} is pictured in the appendix in Fig.~\ref{fig:compH01S_Halo}.
+The prediction of the velocity in $x$-direction is compared to the corresponding target distribution and the resulting normalized error between both.
+The normalized error for a prediction $\tilde{\varphi}$ is determined from $E(\varphi) = \mathrm{abs}(\tilde{\varphi} - \varphi) / (\mathrm{max}(\varphi) - \mathrm{min}(\varphi))$.
+It becomes apparent from the right column of Fig.~\ref{fig:compH01S} that the model is able to predict the overall flowfield of the next timestep with an error of mostly below $10\%$. 
+For the flow close to the casing or hub region in the first and third row of the figure the error is mostly around the trailing edge of the airfoil. 
+For the mid section at $50\%$ span the error concentrates around the suction side in towards the leading edge.
+Here, areas where the error is up to $25\%$ are visible as well as behind the trailing edge on all spans.
+Instead the prediction of \textsc{MGN-Halo-10-64} in Fig.~\ref{fig:compH01S_Halo} shows large artifacts and prediction noise as well as significantly more areas with high error values.
+
+
+% Figure environment removed
+From validation set statistics in Table~\ref{tab:CompH01S} and visual inspection of the validation set trajectory predicted best in Fig.~\ref{fig:compH01S} and \ref{fig:compH01S_Halo} it becomes apparent that model \textsc{MGN-NoComm} is superior to the current implementation of the proposed method.
+Therefore, the following part focuses on limitations of \textsc{MGN-NoComm}.
+
+In order to evaluate the capability of the model to learn temporal variability of the target, the mean and standard deviation over all timesteps $T$ of a trajectory are computed.
+Then, the values are averaged over the $O$ output features and afterwards over all $N$ points of the domain.
+For easier notation, the averaged temporal mean is denoted $\mu_{\tau}$ and the averaged temporal standard deviation $\sigma_{\tau}$.
+For the target flow field $\mathbf{q}$ they are calculated as follows
+\begin{align}
+	\mu_{\tau}(\mathbf{q}) &= \frac{1}{N\cdot O \cdot T} \sum_{i=1}^{N} \sum_{g=1}^{O} \sum_{t=1}^{T} \mathbf{q}_\mathrm{i,g,t} & &\mathrm{, and} \\
+	\sigma_{\tau}(\mathbf{q}) &= \frac{1}{N\cdot O } \sum_{i=1}^{N} \sum_{g=1}^{O}  \sqrt{\frac{1}{T} \sum_{t=1}^{T} \left( \mathbf{q}_\mathrm{i,g,t} - \mu \right)^2} & &\mathrm{, with}~ \mu =  \sum_{t=1}^{T} \mathbf{q}_\mathrm{i,g,t} \mathrm{~.}
+\end{align}
+These calculations were executed separately for training and validation set and repeated for the predicted flow fields $\tilde{\mathbf{q}}$.
+To compare temporal mean of prediction and target, the relative error $e$ of $\mu_{\tau}$ is calculated as follows
+\begin{align}
+	e(\mu_{\tau}) = \frac{\mu_{\tau}(\tilde{\mathbf{q}}) - \mu_{\tau}(\mathbf{q})}{\mu_{\tau}(\mathbf{q})}.
+\end{align}
+The relative error for the temporal deviation $\sigma_{\tau}$ is calculated analogously.
+
+In Fig.~\ref{fig:meanstd} the distribution of the relative error $e$ of the temporal mean and temporal deviation for the training and validation set is presented.
+It becomes apparent from Fig.~\ref{fig:tempmean} that the model learned the mean flow field with a minimal and maximal relative error of below $1\%$.
+The mean relative error as well as the $25\%$ and $75\%$ quantiles are very close to zero.
+The distribution of the relative error for the test set is because of the low sample size presented as a scatter plot in the same figure.
+For the validation set the spread of the values is higher than for the training set but $e(\mu_{\tau}(\mathbf{q})) \in [-1.94,0.52]$ so that one can argue that quantitatively the mean flow field is predicted correctly even for the testset.
+However, Fig.~\ref{fig:tempstd} reveales the inability of \textsc{MGN-NoComm-10-64} to reflect the temporal variability. The relative error of the temporal deviation $\sigma_{\tau}$ is around $91\%$ in average for the training set which corresponds to a nearly stationary prediction without any temporal variation.
+The model fails similarly for the validation set.
+
+% Figure environment removed
+In the following, a possible explanation why the partitioned flow field of the turbine stator was not learned completely with it's temporal variability is outlined.
+Before a conjecture is drawn and in order to evaluate how significant the temporal variability especially in the main flow $u$ is, the temporal standard deviation of $u$ of the target flow field of the nominal stator sample is presented in Fig.~\ref{fig:compH01S_StdVeloX_a}. 
+It becomes apparent that on all three spans pictured, the main variations occur in the area of the trailing edge. 
+The rest of the domain does not vary at all over the complete trajectory.
+For turbine simulations with stationary inflow conditions this is common for the turbine stator which is why this poses a challenge that needs to be addressed in future work.
+In Fig.~\ref{fig:compH01S_StdVeloX_b} the partitioning of the stator domain is pictured. 
+It is assumed that in gradient synchronization during training, the model replicas that do not see any temporal variations (partitions towards the inlet of the domain) dominate the weight updates so that the variability that happens in only three of the eight partitions is not learned.
+
+\subsection{Performance Study}\label{subsec:perf}
+Distributed training of \acp{dnn} and the outlined distribution strategy in particular require a deeper look at the runtime and communication intensive parts of the code. 
+All results in this work were produced using nodes with a NVIDIA HGX A100 8-GPU platform with \SI{400}{\watt} GPU TDP. A single node was used if not stated otherwise. 
+Nvidia NCCL~\cite{NvidiaNCCL} was chosen as communication backend in the distributed PyTorch setup~\cite{DDPDesignNote}.
+
+The initial \textsc{MGN-Halo} implementation needs $~0.4s/\mathrm{step}$ to process a turbine stator sample.
+Leveraging TorchScript~\cite{torchscript} and \ac{amp}~\cite{torchAMP} leads to a $35\%$ runtime reduction and a runtime of $~0.26s/\mathrm{step}$.
+We observed diverging behavior when choosing high learning rate values which is why the usage of \ac{amp}~\cite{torchAMP} for model parameter studies might be considered carefully.
+
+The performance measurements are conducted on the accelerated \textsc{MGN-Halo} model.
+The CUDA streams are synchronized with the host to enable host site time measurement of the forward pass.
+This introduces an overhead of $1.4\%$.
+The PyTorch model is traced with Score-P \cite{Knuepfer2012} and the Score-P Python Bindings \cite{Gocht2020}.
+Tracing introduces additional $9.2\%$ overhead resulting in a total measurement overhead of $10.7\%$.
+Vampir \cite{vampir} is used afterwards to visualize and explore the trace.
+
+The parallel execution of the \ac{dnn} introduces two types of parallelization overhead.
+First, the potential load imbalance introduced by unbalanced computational work due to mesh partitions of different sizes per GPU.
+Second, communication overhead which includes the cost of packing and unpacking the send and receive buffer respectively and sending the data to all neighbors.
+
+The load imbalance is described with the fraction of device idle time $fr_\text{idle}$ which occurs when waiting for other processes to finish.
+It can be calculated with the formula
+\begin{align}
+fr_\text{idle} = 1 - \frac{\sum_{i=1}^N{t_\text{active,i}} } {N \cdot t_\text{active,max}}
+\end{align}
+with ($N$), the number of GPUs, $t_\text{active,i}$, the individual compute time of each GPU and $t_\text{active,max}$, the longest compute time of all GPUs.
+
+The maximum device idle time is $19\%$.
+This correlates with the time needed for send mask and recv mask creation and packing and unpacking of the buffer.
+Using TorchScript and \ac{amp} amplifies this problem by disproportionately accelerating the computational tasks in contrast to  the buffer packing and unpacking tasks.
+
+Figure~\ref{fig:MGN_runtime_distribution} visualizes the temporal composition of 90 forward passes of \textsc{MGN-Halo-8-96}.
+$80.9\%$ are spent in computational tasks, $13.6\%$ are spent in communication tasks and $5.5\%$ are spent idling due to load imbalance.
+The communication overhead of parallelization is to be divided between the actual communication and its preparation. 
+The latter includes the creation of sender and receiver mask, which happens once per timestep, and the buffer pack and unpack tasks, which happens every message passing step (compare with algorithm \ref{alg:distr_meshgn_training}). 
+Altogether, this preparation needs $84.4\%$ of the time spend in communication tasks.
+The halo exchange itself is implemented with a collective \textit{all\_to\_all} operation provided by PyTorch's Distributed Data Parallel class and accounts for only $15.6\%$ of the communication overhead.
+% Figure environment removed
+Furthermore it becomes apparent from Fig.~\ref{fig:MGN_runtime_distribution} that $92.2\%$ of computational tasks within the forward pass are spent within the GraphNetBlock. 
+The remaining $7.8\%$ are used for normalization, encoding and decoding tasks.
+
+
+Finally, a strong scaling analysis is performed to assess whether the proposed halo approach benefits from parallelization to more than the devices required in terms of memory.
+Figure~\ref{fig:Scaling} presents the time-per-optimizer step normalized by the smallest possible configuration for each model.
+
+This can be denoted as speedup which ideally scales linearly with the hardware available.
+For the smaller models with $8$ and $10$ message-passing steps this ideal speedup line is shown as a dashed line.
+However, using 16 \acp{gpu} which is a duplication of the hardware, to train a single domain (constant problem size) leads to a speedup of only $50\%-60\%$.
+With two nodes or 16 \acp{gpu} one can train additionally the original model configuration with 15 message-passing steps and a latent size of 128.
+
+For all model configurations the relative speedup to each duplication of hardware decreases with more \acp{gpu} used.
+For the large model it even declines from $48$ to $64$ \acp{gpu}.
+As a quintessence one can argue that the smallest number of \acp{gpu} that are able to train a certain domain size should be used as every larger device count decreases the runtime but lavishes precious resources.
+
+This analysis outlines possible future improvements.
+This includes the preparation of send and receive mask beforehand or asynchronously to reduce the overhead and the overall device idle time.
+Furthermore, a more efficient method of buffer packing and unpacking may be employed as well as overlapping communication with computation. %using another algorithm
+
+% Figure environment removed

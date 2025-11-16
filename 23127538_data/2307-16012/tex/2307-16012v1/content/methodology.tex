@@ -1,0 +1,121 @@
+\section{Proposed Method} \label{sec:model}
+% Figure environment removed
+\subsection{Model Architecture} \label{sec:modelarchitecture}
+The framework of MSStyleTTS is presented in Fig.\ref{fig:architecture}.
+It consists of a modified FastSpeech 2 \cite{fastspeech2} as acoustic model 
+to generate mel-spectrogram from phoneme sequence,
+a multi-scale style extractor and a multi-scale style predictor to learn the style information at global level, sentence level, and subword level.
+The extractor is utilized to respectively extract the three levels of style embedding from the corresponding ranges of mel-spectrogram.
+The predictor is utilized to model the style embedding at above three levels from a wider range of context beyond a sentence.
+The multi-scale style embedding obtained from either the extractor or the predictor is then added to the output of the phoneme encoder and fed to the variance adaptor for predicting speech variations more accurately and for generating speech with expressive style.
+The details of each component are as follows.
+
+\subsubsection{Multi-Scale Style Extractor} \label{sec:modelextractor}
+% Figure environment removed
+The multi-scale style extractor is specifically designed to derive three levels of style embedding from a wider range of mel-spectrogram rather than a sentence.
+As shown in Fig.\ref{fig:extractor}, the extractor is made up of three reference encoders and three style token layers corresponding to the global-level, sentence-level, and subword-level.
+The structure and hyperparameters of each of these modules remain the same as those of the original GST \cite{gst} model.
+
+The reference encoder contains 6 convolution layers followed by a gated recurrent unit (GRU) \cite{gru} layer to extract high-level representation from the mel-spectrogram. 
+In addition to the current sentence, the mel-spectrograms of $L$ past sentences and $L$ future sentences are also considered to obtain the global-level style in our method.
+The ground-truth mel-spectrograms of all $2L+1$ sentences are concatenated before passing through the global reference encoder.
+The output of this encoder is denoted as global-level reference embedding $E_g$.
+The mel-spectrogram of the current sentence is then passed to the sentence reference encoder, whose output is denoted as sentence-level reference embedding $E_s$.
+Meanwhile, the mel-spectrogram corresponding to the current sentence is split by the subword boundaries and fed to the subword reference encoder.
+The subword reference encoder extracts the subword-level reference embedding $E_w$ for each subword from the corresponding mel-spectrogram.
+In our practice, the subword boundaries are derived from the subword-to-phoneme alignments and forced-alignment phoneme boundaries.
+
+The information from the extracted reference embeddings of different levels may be overlapped since the wider range mel-spectrogram covers the smaller range mel-spectrogram.
+More specifically, the finer-grained reference embedding $E_w$ may contain redundant style information that has already been covered in the coarser-grained reference embedding $E_s$, and likewise for $E_s$ and $E_g$. 
+To address this issue, instead of using the extracted reference embeddings directly, the residual embeddings are proposed to represent effective style variations at different levels.
+The residual embeddings at different levels can be obtained from the following functions:
+\begin{align}
+    R_g &= E_g, \\
+    R_s &= E_s-E_g, \\
+    R_w &= E_w-E_s,
+\end{align}
+where $R_g$, $R_s$, and $R_w$ are the residual embeddings corresponding to global-level, sentence-level, and subword-level, respectively.
+Then the residual embedding of each level goes through the style token layer of the corresponding level and is decomposed into a set of style tokens.
+These tokens are trained to learn the stylistic or prosodic information at different levels and help to predict the style.
+Here, we regard the output of the style token layer of each level as the style embedding of the corresponding level, denoted as the global-level style embedding $S_g$, sentence-level style embedding $S_s$, and subword-level style embedding $S_w$, respectively.
+
+\subsubsection{Multi-Scale Style Predictor} \label{sec:modelpredictor}
+% Figure environment removed
+During inference, instead of extracting multi-scale style embedding from manually-selected reference audio, we propose a multi-scale style predictor to predict the style embedding at different levels from a fixed size sliding window containing past, current and future sentences.
+The architecture of the multi-scale style predictor is illustrated in Fig.\ref{fig:predictor}, which comprises a hierarchical context encoder and two optional hierarchical style predictors.
+
+To derive better text representation as predictor input, we introduce a pre-trained BERT to further encode the raw text sequence for Chinese.
+Together with the current sentence, the predictor also take into account past and future $L$ sentences, which is consistent with the extractor.
+Let $U_0$ denote the text sequence of the current sentence.
+$U_{-L}$, $U_{1-L}$, ..., $U_{-1}$ and $U_{1}$, $U_{2}$, ..., $U_{L}$ are the text sequences of past and future sentences, respectively.
+The text sequences of all $2L+1$ sentences are concatenated to form a longer sequence $U$, which is then fed to BERT to obtain a subword-level semantic embedding sequence. 
+It is calculated as follows:
+\begin{gather}
+    U = Concat(U_{-L},U_{1-L},\cdots,U_{L}), \\
+    W_{-L,1},W_{-L,2},\cdots,W_{L,length(U_L)} = BERT(U),
+\end{gather}
+where $Concat(\bigcdot)$ is the concatenation operation, $length(U_i)$ is the number of subwords in $U_i$, and $W_{i,j}$ is the 768-dim subword-level semantic embedding corresponding to the $j$th subword of sentence $U_i$ in BERT outputs.
+
+Inspired by \cite{han}, we design a hierarchical context encoder to derive three levels of context information.
+The hierarchical context encoder has two layers of attention modules, i.e., the inter-subword module and inter-sentence module, to explicitly exploit the structural relationship of the context.
+These two modules share the same architecture consisting of a bidirectional GRU \cite{gru} and a scaled dot-product attention \cite{vaswani2017attention}.
+The inter-subword module is utilized to derive the sentence-level representation based on the semantic of each subword and the inter-subword relationships in a sentence.
+Specifically, for each sentence, the semantic embedding sequence derived from BERT is fed into the bidirectional GRU to consider the temporal relationship, and the output is regarded as subword context embedding $C_w$.
+Since that not all subwords contribute equally to the meaning of their sentence, we introduce the attention module to derive the weight of each subword and then aggregate them into a sentence-level embedding. 
+Likewise, the inter-sentence module is utilized to derive the global-level representation based on each sentence-level embedding and inter-sentence relationships in the context.
+We denote the output of bidirectional GRU in the inter-sentence module as sentence context embedding $C_s$ and the output of attention module in the same module as global context embedding $C_g$.
+It is noteworthy that this hierarchical structure encodes inter-subword and inter-sentence relationships in a wide range of context, which contributes to be a hierarchical information aware model.
+
+Considering the top-down hierarchical structure of speech style, we design a hierarchical style predictor to infer the style embedding at the three levels from corresponding context information in a top-down manner.
+It consists of three style predictors with residual connections, where each style predictor consists of a linear layer activated by Tanh function.
+The coarser-grained style embedding that is closer to the global-level is predicted by the corresponding level of style predictor, and then fed into the finer-grained style predictor as the conditional input, which is symmetrical with the residual strategy in the multi-scale style extractor.
+In this way, the style embedding at three levels are sequentially generated from the three style predictors by considering both context information and stylistic information.
+This can be formulated as:
+\begin{align}
+    \hat{S_g} &= f_g(C_g), \\
+    \hat{S_s} &= f_s(C_s,\hat{S_g}), \\
+    \hat{S_w} &= f_w(C_w,\hat{S_g}+\hat{S_s}),
+\end{align}
+where $f_g$, $f_s$, and $f_w$ are the style predictors corresponding to global-level, sentence-level, and subword-level, respectively. $\hat{S_g}$, $\hat{S_s}$, and $\hat{S_w}$ are the predicted style embeddings corresponding to global-level, sentence-level, and subword-level. 
+In this way, the style embeddings at above three levels are predicted to reconstruct the multi-scale style in human recordings by considering different levels of context information.
+
+To synthesize speech directly for paragraph-level text input, we propose an optional extension of the hierarchical style predictor. 
+Since the style coherence among sentences is equally important for paragraph-level speech in addition to expressiveness, this predictor utilizes previous style embedding in an autoregressive manner to help the prediction of the current style embedding, denoted as AR.
+Different from the hierarchical style predictor, the hierarchical style predictor (AR) utilizes GRU-based sentence style predictor (AR) and subword style predictor (AR) to sequentially predict the style of sentences in the whole paragraph.
+In the sentence style predictor (AR), the sentence-level style embedding of each sentence is predicted autoregressively, using the corresponding sentence context embedding and the predicted global-level style embedding as the conditions.
+Similarly, the subword-level style embedding of each subword is predicted autoregressively in subword style predictor (AR), which uses corresponding subword context embedding and the coarser-grained style embedding corresponding to its sentence as the conditions.
+Finally, the style embeddings corresponding to each sentence are fed into the acoustic model to generate the speech of this sentence.
+\subsubsection{Acoustic Model}
+As illustrate in Fig.\ref{fig:architecture}, our proposed MSStyleTTS adopts a modified FastSpeech 2 \cite{fastspeech2} as the acoustic model.
+First, the extracted or predicted multi-scale style embeddings are replicated to the phoneme-level using subword-to-phoneme alignment.
+After replication, the embeddings of the phonemes are added to the outputs of the phoneme encoder and fed into the variance adaptor to predict variations more accurately. % in speech.
+Moreover, the duration predictor and length regulator are moved to the back of the variance adaptor.
+This indicates that the variance adaptor predicts phoneme-level variations rather than frame-level, which has been demonstrated to enhance the naturalness of synthesized speech \cite{fastpitch}.
+Here, FastSpeech 2 is only utilized to combine our proposed predictor and extractor to generate acoustic features.
+Our proposed method can be easily extended to
+other TTS models, such as Tacotron2 \cite{tacotron2}.
+
+\subsection{Model Training} \label{sec:modeltraining}
+In general, it is difficult for the predictor to implicitly predict different levels of styles from the context under the situation of limited TTS data.
+The parameters of MSStyleTTS are trained in three steps using the knowledge distillation strategy, in order to encourage the model learn style representation better.
+
+At first, the extractor is jointly trained with the acoustic model to learn the latent style representations at different levels in an unsupervised manner.
+For each training utterance, the phoneme sequence of the current sentence and a wider range of mel-spectrogram containing adjacent sentences are sent into the acoustic model and the extractor, respectively.
+We conduct the same training criteria as FastSpeech 2, which includes a mel-spectrogram loss and the mean square error (MSE) loss of pitch, energy, and duration.
+Moreover, we train the reference encoders and style token layers corresponding to global-level, sentence-level, and subword-level sequentially and independently, in order to avoid the leaning of style representations at different levels interfering with one another. 
+That is, while training any of these three level modules, the others are frozen, so that the reference encoder and style token layer of the current level are trained without disturbance. 
+
+Second, we transfer the knowledge from the extractor to the predictor by leveraging knowledge distillation strategy.
+Thus, the extracted style embeddings for each level are used as the target outputs to guide the predictor's training.
+For each training utterance, its context, which contains current and adjacent sentences, is employed to predict the styles at different levels by the predictor.
+The predictor is trained by minimizing the sum of the MSE losses between the extracted and predicted style embeddings of the three levels.
+
+In the end, the acoustic model is jointly trained with the predictor at a lower learning rate by considering both the losses of the predicted mel-spectrogram and style to improve the naturalness of synthesized speech further.
+In particular, for the hierarchical style predictor (AR), we generate the mel-spectrogram for each sentence in the paragraph and calculate the corresponding losses of mel-spectrogram and style.
+
+\subsection{Inference}
+During the inference for the current sentence, the proposed method automatically derives the multi-scale style embedding from the context and generates mel-spectrograms based on the phoneme sequence of the current sentence with the help of the style embedding.
+During the inference for the paragraph-based synthesis, we prefer to use the hierarchical style predictor (AR) which directly predicts the multi-scale style embedding for the entire paragraph.
+Then we send the multi-scale style embedding and phoneme sequence corresponding to each sentence into the acoustic model to generate mel-spectrograms of each sentence, and then combine them in order.
+The predicted mel-spectrogram goes through the HiFi-GAN \cite{kong2020hifi} vocoder to obtain the speech waveform.
+In this way, expressive speech can be synthesized without the dependency on additional inputs besides text.

@@ -1,0 +1,63 @@
+\section{METHODOLOGY}
+
+\subsection{\tool Overview}
+\label{sec:overview}
+
+% Figure environment removed
+
+Fig.~\ref{fig:framework} illustrates an overview of the on-device MIMO inference framework. First, we train a deep neural network with multiple inputs and multiple outputs (MIMO) as our baseline model (as shown in the first block). One forward prediction of this network requires multiple inputs (image and speech) and generates multiple prediction outputs (emotion and gender) simultaneously. 
+
+However, directly deploying such baseline MIMO models to embedded devices remains challenging. Specifically, embedded devices including most robots have \textit{limited memory} and require \textit{real-time performance} for many real-scenario requirements. For instance, handling streaming data (e.g. high-speed cameras sampling 60 times per second) and to ensure robustness in safe-critical scenarios (e.g., autonomous driving robots~\cite{Duckiebot(DB-J),zhouhush,kong2019physgan}). In addition, \textit{energy savings} are particularly needed for embedded devices because of limited battery capacity and heat dissipation.
+
+To address these challenges, employing model compression is an intuitive and effective direction. First, we perform single-model compression by adopting the idea of VIB~\cite{VIB} to perform channel-wise hard masking (the masked channel generates zero output while the unmasked channel's output remains the same). Then, the pruned MIMO model can maintain the original structure in the forward direction.
+However, VIB is designed for the SISO model and thus reduces the intra-model redundancy. However, it does not consider the characteristics of the MIMO framework, for instance, the MIMO framework is naturally multi-branching and exists inter-model redundancy. Therefore, aiming to reduce such redundancy intuitively can boost model compression performance. Furthermore, inspired by the idea from one cross-model compression work MTZ~\cite{MTZ}, we perform weights merging between multiple independent branches to improve model compression efficacy further. 
+In summary, in \tool we focus on both intra-model redundancy and inter-model redundancy, and thus can theoretically further improve the compression effectiveness and achieve efficient on-device deployment.
+
+\subsection{Reduce Intra-model Redundancy}
+
+We aim to reduce intra-model redundancy by performing single-model compression. Specifically, we adopt and extend the idea from VIB~\cite{VIB} that reduces the redundant mutual information between adjacent layers within the model. The vanilla VIB only applies to feedforward neural networks such as VGG~\cite{VGG}. However, for a non-feedforward neural network, e.g., ResNet~\cite{ResNet} used in our baseline MIMO model, vanilla VIB is not directly applicable.
+
+Intuitively, we implement VIB by inserting a learnable mask (information bottleneck) between each layer with learnable parameters (convolution layer or fully connected layer). As shown in the left part of Fig.~\ref{fig:framework}, neurons with gray color are masked.
+Furthermore, combining the characteristics of ResNet, we designed the following adaption scheme: (1) Module-level design: we add the information bottleneck layer as in the original VIB design for the layers not in the residual block. However, we keep the input/output channel number unchanged for each residual block, i.e., we do not insert an information bottleneck layer between two residual blocks. (2) Block-level design: After the second information bottleneck layer, we insert a \textit{channel-recover} operation. This operation restores the channel to the pre-pruning mask based on the pruning mask by filling pruned channels with zeros, which ensures that the input channel is matched during the concatenation operation between the main branch and the bypass. Inspired by the design idea of ResNet~\cite{ResNet}, we intuitively assume the major information throughout the network is concentrated in the bypass (consisting of direct input or input after downsampling). Therefore, we do not set the mask in the bypass section.
+
+For illustration, we show an example of a basic block of ResNet in Fig.~\ref{fig:residual_block}. Surprisingly, as shown in Tab.~\ref{tab:layer_compression_statistics}, we find that with our design, certain information bottlenecks within the residual block even naturally masked all the output channels (100.0\% layer-wise compression rate) from the previous layers when a high compression rate was achieved. This finding verifies our assumption that the main information of ResNet is concentrated in bypass, thus validating the effectiveness of our method.
+
+% Figure environment removed
+
+\begin{table}[htbp]
+    \centering
+    \renewcommand\arraystretch{0.9}
+    \caption{An example of top-5 layer-wise compression statistics for VIB extension for the baseline MIMO model.}
+    \begin{tabular}{l|ccccc}
+    \toprule
+        \textbf{Image} & 100.0 & 98.4 & 97.9 & 96.1 & 87.1 \\
+    \midrule
+        \textbf{Speech} & 100.0 & 100.0 & 99.4 & 92.2 & 86.7 \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:layer_compression_statistics}
+    \vspace{-5mm}
+\end{table}
+
+Furthermore, we add performance optimization in the residual block to collapse each convolutional (Conv2d) layer and the subsequent batch normalization (BatchNorm2d) layer into a biased convolutional (BiasedConv2d) layer, as shown in the blue box in Fig.~\ref{fig:residual_block}. Since the on-device deployed models mainly only require forward inference, i.e., all parameters are fixed. Therefore, we could treat the BN layer as an affine transformation and replace it with multiplication and addition. Specifically, the output of the BN layer applied on the $i$-th channel of layer $l$ is:
+\begin{equation}
+    \vspace{-2mm}
+	BN(y_{l,i}) =  \gamma_{l,i} \cdot \frac{y_{l,i}-\mu_{l,i}}{\sqrt{\sigma_{l,i}^2 + \epsilon}} + \beta_{l,i}
+\end{equation}
+where $y_{l,i}$ is the pre-activation output of the CONV layer, $\gamma_{l,i}$ and $\beta_{l,i}$ are the two learnable parameters (scaling and shifting) for the BN layer, $\mu_{l,i}$ and $\sigma_{l,i}$ are the pre-calculated mean and standard deviation. The effect of the BN layer can be replaced by multiplying the incoming weight of convolutional layer $\mathbf{w}_{l,i}$ by a scalar $\frac{\gamma_{l,i}}{\sigma_{l,i}}$ and adding $\beta_{l,i}-\frac{\gamma_{l,i}\cdot\mu_{l,i}}{\sigma_{l,i}}$ to the bias $b_{l,i}$.
+
+\subsection{Reduce Inter-model Redundancy}
+
+After reducing intra-model redundancy, we explore the possibility of decreasing the total number of parameters by reducing the inter-model redundancy through cross-model compression techniques. 
+In a MIMO model, it is not obvious that sharable knowledge exists between the network's branched parts, as they are processing inputs from an entirely different domain, e.g., one for audio and the other for video input.
+However, as shown in~\cite{MTZ2}, sharable knowledge still exists within models designed for different input domains, as long as their outputs are fused and serve the same output tasks.
+Specifically, we have observed a significant amount of sharable knowledge can be found within the later layers, as features are becoming more abstract at this stage, and these abstract features are used for the same tasks. 
+
+To this end, we extend the MTZ~\cite{MTZ,MTZ2} framework to merge model weights from multiple independent branches. 
+MTZ is a framework that automatically and adaptively merges deep neural networks for cross-model compression via neuron sharing.
+It calculates the optimal pairs of neurons for sharing in each layer and adjusts their incoming weights, inducing minimal errors. 
+Motivated by this principle, we treat each branch as independent computing sub-graphs in our MIMO model.
+As shown in the right part of Fig.~\ref{fig:framework}, neurons with green color are shared between different branches.
+The branches are aligned from the very first layer such that they can be merged and optimized by MTZ layer after layer.
+This design can also deal with branched layers with different widths, as long as they share the same underlying structure, such as convolutional layers or residual blocks.
+As proved by experiments, reducing inter-model redundancy effectively reduces the baseline MIMO model size for more efficient on-device deployment.

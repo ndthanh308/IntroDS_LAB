@@ -1,0 +1,114 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental setup}
+
+We perform all experiments in an altered version of the BabyAI environment 'BabyAI-PickUpDist-v0' \cite{Chevalier-Boisvert2018}. 
+This environment rewards an agent at each episode for picking up a specifically coloured and shaped object among other distracting objects, depending on an observed, natural(-like) language instruction, e.g. ``Pick up the blue ball''. 
+We altered the environment by adding a one-pickup-per-episode wrapper that makes it so that the episode ends when any object is picked up, meaning that there is no pick-up action happening in the rest of the episode but the very last experience, unless the episode times out after 40 available timesteps (similarly to \citet{cideron2020higher}). 
+In other words, the result of an episode can either be successful (the agent picked up the target object, as specified by the instruction), unsuccessful (the agent picked up a wrong object), or timed out (i.e. no object was picked-up within the limit of the 40 timesteps).
+
+\subsection{Agent Architecture}
+\label{app:model-architecture}
+
+The ETHER architecture is made up of three differentiable agents, the language-conditioned RL agent and the two RG agents (speaker and listener).
+Similarly, the HIGhER architecture is built around a language-conditioned RL agent and an Instruction Generator, which plays the same role as the speaker agent in a RG thus we equate them in the following architectural details. 
+Each agent consists of at least a language module and a visual module. 
+The \textit{listener} agent additionally incorporates a third decision module that combines the outputs of the other two modules.
+The RL agent similarly incorporates a third decision module with the addition that this third module contains a recurrent network, acting as core memory module for the agent. 
+Using the Straight-Through Gumbel-Softmax (STGS) approach in the communication channel of the RG, the \textit{speaker} agent is prompted to produce the output string of symbols with a \textit{Start-of-Sentence} symbol and the visual module's output as an initial hidden state while the \textit{listener} agent consumes the string of symbols with the null vector as the initial hidden state. 
+In the following subsections, we detail each module architecture in depth.
+
+\textbf{Visual Module.} The visual module $f(\cdot)$ consists of the \textit{Shared Observation Encoder}, which is shared between all the different agents, followed by some agent-specific adaptation layers, as shown in Figure~\ref{fig:ether-arch}.
+The former consists of three blocks of a $3\times3$ convolutional layer with stride $2$ followed by a $2$D batch normalization layer and a ReLU non-linear activation function. 
+The two first convolutional layers have $32$ filters, whilst the last one has $64$. 
+The bias parameters of the convolutional layers are not used, as it is common when using batch normalisation layers. 
+Inputs are stimuli consisting of $4$ stacked consecutive frames of the environment resized to $64\times64$. 
+The RL agent's adaptation layers consist of $2$ FiLM layers \citep{perez2018film} conditioned on the \textit{linguistic goal description} $g\in\mathcal{G}$ after it is processed by the RL agent's language module.
+Please refer to the appendix or the open-sourced code for the details on the other adaptation layers which consists of fully-connected networks.
+
+\textbf{Language Module.} The language module $g(\cdot)$ consists of some learned Embedding followed by either a one-layer GRU network~\citep{cho2014learning} in the case of the RL agent, or a one-layer LSTM network~\citep{hochreiter1997long} in the case of the RG agents. 
+In the context of the \textit{listener} agent, the input message $m=(m_i)_{i\in[1,L]}$ (produced by the \textit{speaker} agent) is represented as a string of one-hot encoded vectors of dimension $|V|$ and embedded in an embedding space of dimension $64$ via a learned Embedding. The output of the \textit{listener} agent's language module, $g^l(\cdot)$, is the last hidden state of the RNN layer, $h^l_L = g^L(m_L, h^l_{L-1})$.
+In the context of the \textit{speaker} agent's language module $g^S(\cdot)$, the output is the message $m=(m_i)_{i\in[1,L]}$ consisting of one-hot encoded vectors of dimension $|V|$, which are sampled using the STGS approach from a categorical distribution $Cat(p_i)$ where $p_i = Softmax(\nu(h^s_i))$, provided $\nu$ is an affine transformation and $h^s_i=g^s(m_{i-1}, h^s_{i-1})$. $h^s_0=f(s_t)$ is the output of the visual module, given the target stimulus $s_t$.
+
+\textbf{Decision Module.} From the RL agent to the RG's listener agent, the decision module are very different since their outputs are either, respectively, in the action space $\mathcal{A}$ or the space of distributions over $K+1$ stimuli. 
+For the RL agent, the decision module takes as input a concatenated vector comprising the output of the FiLM layers, after it has been procesed by a 3-layer fully-connected network with 256, 128 and 64 hidden units with ReLU non-linear activation functions, and some other information relevant to the RL context (e.g. previous reward and previous action selected, following the recipe in \citet{kapturowski2018recurrent}). 
+The resulting concatenated vector is then fed to the core memory module, a one-layer LSTM network~\citep{hochreiter1997long} with $1024$ hidden units, which feeds into the advantage and value heads of a 1-layer dueling network \citep{wang2016dueling}.
+
+In the case of the RG's listener agent, similarly to \citet{Havrylov2017}, the decision module builds a probability distribution over a set of $K+1$ stimuli/images $(s_0, ..., s_K)$, consisting of $K$ distractor stimuli and the target stimulus, provided in a random order (see Figure~\ref{fig:ether-rg}), given a message $m$ using the scalar product:
+\begin{equation}
+\label{eq:discr-stgs}
+    p((d_i)_{i\in[0,K]}| (s_i)_{i\in[0,K]} ; m) = Softmax \Bigr( ( h^l_L \cdot f(s_i)^T )_{i\in[0,K]} \Bigl).
+\end{equation}
+
+\begin{wraptable}{R}{0.4\textwidth}
+\vspace{-10pt}
+\caption{\textbf{Top:} Success ratios (percentage of mean and standard deviation) for agents with burn-in feature of R2D2 after 200k observations.
+\textbf{Bottom:} Accuracies (percentage of mean and standard deviation) for semantic grounding of the speaker agent after 200k observations. 
+}
+\label{tab:performance}
+%\centering
+%    \renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}lccc@{}} 
+%\begin{tabular}{c|c|c}
+\toprule
+    \textbf{Agent} & \textbf{Success Ratio} & \\
+    R2D2 & 16.54 $\pm$ 1.37 & \\ %1.372 
+    \midrule
+    HIGhER+ & 14.84 $\pm$ 1.40 & \\ %1.408 
+    HIGhER++ (n=1) & 15.89 $\pm$ 1.19 & \\ %1.193
+    HIGhER++ (n=2) & 16.80 $\pm$ 2.07 & \\ %2.067
+    HIGhER++ (n=4) & 18.10 $\pm$ 2.54 & \\ %2.542
+    \midrule 
+    ETHER & 27.63 $\pm$ 1.20 & \\
+    ETHER+ & 27.16 $\pm$ 2.57 & \\
+    \bottomrule
+%\caption{Accuracies (percentage of mean and standard deviation) for semantic grounding of the speaker agent after 200k observations.}
+%\label{tab:alignement-accuracy}
+    \toprule
+     & \textbf{Any-Colour} & \\ %\textbf{Any-Shape} \\
+    ETHER & 9.117 $\pm$ 1.676 & \\ %0.0 $\pm$ 0.0 \\
+    ETHER+ & 32.75 $\pm$ 6.29 & \\ %0.0 $\pm$ 0.0 \\
+    \bottomrule
+\end{tabular}
+\end{wraptable}
+
+%\todo[inline]{need to specify the number of random seeds in below tables}
+
+
+% \begin{wraptable}{R}{0.43\textwidth}
+% \caption{Accuracies (percentage of mean and standard deviation) for semantic grounding of the speaker agent after 200k observations.}
+% \label{tab:alignement-accuracy}
+% %\centering
+% %    \renewcommand{\arraystretch}{1.5}
+% \begin{tabular}{@{}lccc@{}} 
+% %\begin{tabular}{c|c|c}
+% \toprule
+%     \textbf{Agent} & \textbf{Any-Colour} & \textbf{Any-Shape} \\
+%     ETHER & 9.117 $\pm$ 1.676 & 0.0 $\pm$ 0.0 \\
+%     ETHER+ & 32.75 $\pm$ 6.29 & 0.0 $\pm$ 0.0 \\
+% \bottomrule
+% \end{tabular}
+% \end{wraptable}
+
+\subsection{Results}
+
+Table~\ref{tab:performance}(top) shows the success ratios for the different architectures.
+We can see that while the HIGhER++ extensions provide marginal improvements, the ETHER approach outperforms all approaches, thus cementing the usage of visual discriminative referential games as viable unsupervised auxiliary task for RL.  
+Table~\ref{tab:performance}(bottom) shows the extent to which the RG's speaker agent has been using any of the natural language colour words to describes stimuli containing said colour as a visual feature, as well as any of the natural language shape words to describes stimuli containing said shape as a visual feature. 
+The results show that constraining of the RG agents using the semantic co-occurrence grounding loss in ETHER+ does start to provide alignement between the emergent language and the benchmark's natural-like language regarding the colour semantic, while the shape semantic remains ungrounded.
+The latter possibly explains the current performance of the agents not exceeding $33\%$ of success ratio, which corresponds to the random success ratio if there was only the shape semantic to discriminate against. 
+Indeed, the task proposes only 3 different shape semantics: the ball, the key, and the box.
+
+
+% \begin{wraptable}[R]{0.5\textwidth}
+% \centering
+%     \renewcommand{\arraystretch}{1.5}
+%     \begin{tabular}{c|c|c}
+%     \textbf{Agent} & \textbf{Success Ratio} & \\ \hline
+%     ETHER & 27.63 $\pm$ 1.20 & \\ \hline
+%     ETHER+ & 27.16 $\pm$ 2.57 & \\ \hline
+%     \end{tabular}
+% \caption{Success ratios ( percentage mean and standard deviation) for agents with burnin feature of R2D2 after 200k steps in a modified version of the BabyAI PickUpDist task.}
+% \label{tab:Higher-PickUp}
+% \end{wraptable}

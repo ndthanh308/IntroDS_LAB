@@ -1,0 +1,349 @@
+%This section describes the system design and implementation of LtC. We start off with a brief discussion of the overall architecture of LtC, following by the details of the individual components.
+
+%\subsection{Overall Architecture of LtC}
+The overall architecture of LtC is presented in Figure ~\ref{fig:architecture}. %LtC utilizes separate source and server components that collaborate to achieve compression. 
+The source-side component is centered around a compact student neural network, which is able to identify the object regions in order to perform spatial compression. The student network also provides a tensor based feature vector extracted from its intermediate layers to be used for temporal filtering. As the camera captures the video, the source accumulates a fixed-size batch of frames to process at a time. %; this is advantageous if we plan to apply MPEG as a post-processing step to semantic compression. 
+The student network applies both spatial and temporal compression before it sends the batch over to the server. As the batch arrives at the server, the teacher network performs analytics and looks for concept drift. Notably, the student network is pretrained on historical data allowing itself to quickly adapt to the present scenario with only a few frames.
+
+% , and can catch up to the current scenario with minimal number of frames.
+
+% : (1)  generates the analytics results; and (2) evaluates using a concept drift module whether a student update is needed. % evaluates the need for an update. %A concept drift module is placed at the server, which is responsible for making the decision of sending the newly trained student network back to the source. 
+% Optionally, the server can use a offline pretrained module to initialize the parameters of the student network (steps A1 and A2 in the Figure). Alternatively, the first few batches of frames can be dedicated to train the student network.
+
+
+
+% The overall architecture of LtC and its constituent modules are presented in Figure ~\ref{fig:architecture}. LtC has separate source and server components that collaborate to perform compression. The source side component centers around a small student neural network trained by the full DNN at the server (the teacher network); the student aids in the performance of both spatial and then temporal compression.   %As it camptures video, the source-side component first applies spatial compression and then temporal compression.
+% Specifically, the teacher object detector DNN at the server trains the student network using a small number of frames and sends it over to the source. 
+% The student network's goal is to identify regions of the image that are likely to contain objects to send those at higher resolution.  It is also used in the temporal compression algorithm; we use tensor differencing at the output of an intermediate layer (the encoder) to drive whether a frame is kept or discarded.  After compression is performed, the source sends the reduced video frames to the server, where it is analyzed by the object detector network in order to generate results. We describe the different components of the framework in more details in the remainder of this section.
+%In addition, the server also trains the student network using the student-teacher training mechanism.  
+%This freshly trained student network is then compared with the previous network by the concept drift module to determine if an update is warranted. In the initial iteration, both the source and the server do not posses a student network. 
+%This cold start issue can be solved using one of the two ways: (1) the offline pertain module can prepare a student network using historical data beforehand, or (2) we dedicate the first few iterations to train a student network. 
+% Figure environment removed
+
+%Before going into the details of the individual modules of \emph{LtC}, we will first discuss about its overall workflow from a high level. 
+% Figure.~\ref{fig:architecture} shows the overall organization of \emph{LtC}.  The system uses a small student neural network at the source to carry out both spatial and temporal compression.  This student network is trained using a few frames sent to the server using the full model at the server that is the eventual consumer of the videos (also called the teacher model).   %It is a server-driven compression mechanism, i.e., the DNN at the server influences the compression logic at the client, providing feedback. The feedback is sent in the form of a lightweight neural network model, which is developed following a unique student-teacher framework. 
+% Specifically, the DNN plays the role of a teacher and distills its knowledge into a student neural network. As no compression logic is present in the camera at the beginning, it sends raw video frames to the server. Upon the arrival of the video frames at the server, the teacher DNN initiates the training procedure of the student network. Later this student network is sent back to the camera, where it is deployed to spatially and temporally compress the videos. 
+% This procedure is repeated on demand if the environment changes. Specifically, a concept drift module is situated on the server, which determines if the camera-side student network requires an update.\nael{Could separate out this into a different figure.} Optionally, the student network can be prepared offline with historical data and placed on the camera before the pipeline starts. Both the camera and the server maintain a cache of previously used student networks which can reduce the cost of transferring a model if it has been previously used. In the following, we present each component of the \emph{LtC} architecture.  
+
+
+\subsection{The student-teacher framework}
+
+The student-teacher framework is at the heart of LtC's system design. This method of training enables a large neural network to distill its knowledge into a smaller network \cite{hinton2015distilling, wang2021knowledge}. As the student network specializes only on a subset of the whole data, and tackles a much simpler task than the actual analytics, its size can be kept small. Moreover, initial pretraining and subsequent updating allows for fast retraining with only a small amount of new data.
+
+
+% The student can be kept compact, as it specializes only on a subset of the whole data, and solves a much simpler task. Moreover, it supports fast training with a small amount of new data as a result of pretraining and subsequent continual updates.
+
+% The student can be small as it specializes only on a subset of the whole data, and solves a simpler task. Its training can be quick and with few new data as a result of pretraining and subsequent continual learning.
+
+% The student is specialized to a subset of the data (the one used in its training), and it can also be solving a simpler task than the original teacher.  %It is particularly useful when we do not need the full capabilities of the larger neural network.   
+%Often, both the teacher and the student networks have the same goals; however, they can sometimes be different as is the case in our application, with the student solving a simpler problem that can be viewed as a subset of the original teacher problem. 
+In the context of LtC, the teacher DNN trains the student network to determine the objectness (likelihood of an object being present) in the regions within a frame.   In our approach, the video frames are divided into an array of non-overlapping equal-size regions. These regions are labeled using the results of the object detection from the teacher network $\mathcal{T}$, to be used in the training of the student network $\mathcal{S}$. 
+
+The training starts as the camera sends $\mathcal{N}$ video frames $F^\mathcal{I}=[f^\mathcal{I}_1, f^\mathcal{I}_2, ..., f^\mathcal{I}_{\mathcal{N}}]$ to the server in $\mathcal{I}$th iteration. 
+%We denote the posterior from the teacher network $\mathcal{T}$ as $P_\mathcal{T}(y | x^f_{ij})$ and the student work $\mathcal{S}$ as $P_\mathcal{S}(y | x^f_{ij})$, where $y$ is the measure of objectness. 
+Upon receiving the frames, the teacher network $\mathcal{T}$ generates $C_f$ bounding boxes $BB^f=[bb^f_1, bb^f_2, ..., bb^f_{C_f}]$ around objects in frame $f$. %We filter out the bounding boxes with low confidence scores to get rid of noisy samples. Also, 
+Each frame $f$ is split into a $\mathcal{L}\times\mathcal{L}$ array $X^f = [..., x^f_{ij}, ...]$ of non-overlapping same-sized regions, where $i$ and $j$ are 2D indices of a region in the frame. We denote the posterior from the teacher $\mathcal{T}$ and the student $\mathcal{S}$ networks as $P_\mathcal{T}(y | x^f_{ij})$ and $P_\mathcal{S}(y | x^f_{ij})$, respectively, where $y$ is the measure of objectness. We use \textit{Intersection over Union (IoU)} function to determine $P_\mathcal{T}(y | x^f_{ij})$ in the following manner:
+\begin{equation}
+    \mathcal{S}(x^f_{ij}) = P_\mathcal{T}(y | x^f_{ij}) = \begin{cases}
+			1, & \max^{C_f}_{k = 1} IoU(x^f_{ij}, bb^f_k) > 0.5\\
+            0, & \text{otherwise}
+		 \end{cases}    
+\end{equation}
+%\nael{We could evaluate how successful the student is at what it does, and also how much it saves in size/complexity relative to the teacher.  I know you presented these results before, but they can make this section more interesting.  Ignore for now if there is no time.}
+%\noindent 
+%We use $P_T$ from $\mathcal{T}$ to learn $P_S$ from $\mathcal{S}$ by minimizing the Kullback–Leibler (KL)-divergence between the two distributions in each iteration $\mathcal{I}$.  
+
+%\begin{equation} \label{eq:kl}
+%    \mathcal{KL}(P_\mathcal{T} || P_\mathcal{S}) = \sum^{\mathcal{N}}_{f = 1 } \sum^{\mathcal{L}}_{i = 1}\sum^{\mathcal{L}}_{j = 1} P_\mathcal{T}(y | x^f_{ij}) \log \dfrac{P_\mathcal{T}(y | x^f_{ij})}{P_\mathcal{S}(y | x^f_{ij})}
+%\end{equation}
+In order to train a student network that approximates a pretrained teacher network whose parameters are frozen, we only have to minimize the Kullback–Leibler (KL)-divergence between the two distributions with respect to the parameters of the student network, which is equivalent to minimizing the following loss function in each iteration $\mathcal{I}$:
+\begin{equation}
+    \mathcal{L}(\theta_S) = -\sum^{\mathcal{N}}_{f = 1 } \sum^{\mathcal{L}}_{i = 1}\sum^{\mathcal{L}}_{j = 1} P_\mathcal{T}(y | x^f_{ij}) \log{P_\mathcal{S}(y | x^f_{ij};\theta_S)},
+\end{equation}
+where $\theta_S$ are the parameters of the student network.
+\begin{table}[t]
+\centering
+\resizebox{0.8\linewidth}{!}{
+\begin{tabular}{l|ccc} 
+\hline
+\multicolumn{1}{l}{}                 & Layer type         & Output Shape & Param \#  \\ 
+\hline\hline
+\multirow{7}{*}{\rotatebox{90}{Encoder}}   & Input Layer          & 28x28x3  & 0         \\
+                                     & 2D Convolution Layer & 28x28x16 & 448      \\
+                                     & 2D Max Pooling       & 14x14x16 & 0         \\
+                                     & 2D Convolution Layer & 14x14x32 & 4640     \\
+                                     & 2D Max Pooling       & 7x7x32   & 0         \\
+                                     & Flatten Layer        & 1568         & 0         \\
+                                     & Dense Layer          & 128           & 200832    \\ 
+\hline\hline
+\multirow{5}{*}{\rotatebox{90}{\hspace{7pt}Extension}} & Input Layer          & 128           & 0         \\
+                                     & Dense Layer          & 32           & 4128      \\
+                                     & Dense Layer          & 16          & 528      \\
+                                     & Output Layer         & 1            & 17        \\
+\hline\hline
+\end{tabular}}
+\caption{Architecture of the student network} %\mishkat{Why using resnet, explained in methodology}}
+\label{tab:student_network_layers}
+\end{table}
+
+ \begin{table}[t]
+\centering
+\resizebox{0.8\linewidth}{!}{
+\begin{tabular}{ccc} 
+\hline
+Network type                                                        & Param \# & Size      \\ 
+\hline
+Faster R-CNN ResNet-101 (Teacher) & 44M      & 196.5 MB  \\
+Encoder (Student)                                                            & 205920   & 844.2 KB    \\
+Extension (Student)                                                          & 4673     & 36.5 KB     \\
+Student Total                                                             & 210593   & 880.7 KB    \\
+\hline
+\end{tabular}}
+\caption{Sizes of the teacher, and the student network (broken into the encoder, the extension)}
+\vspace{-0.2in}
+\label{tab:relative_sizes}
+\end{table}
+
+We use the Faster R-CNN ResNet-101 ~\cite{ren2015faster} as our teacher network. %We choose this network to be consistent with DDS\cite{du2020server}, a recent system that is the closest baseline to our spatial compression algorithm. 
+The student network (shown in Table \ref{tab:student_network_layers}) is inspired by the VGG-16 model~\cite{simonyan2014very}, which also uses alternating convolution and max pooling layers. % Other student network architectures are possible (we explore varying the number of layers in the evaluation section).    
+The parameters of the full network as well as the student can be seen in Table~\ref{tab:relative_sizes}. Notably, the teacher is over 200x larger than the student network. 
+% The training is bootstrapped either using some initial training on historical data (A1 and A2 on Figure~\ref{fig:architecture}), or alternatively by streaming the first few frames without compression to initiate the training of the first student network.  %The student network is occasionally updated after the initial deployment, if a concept drift module determines that its accuracy is dropping. %To further optimize this process, we constrain the update to the extension when only that part has changed.  
+
+
+
+%\subsection{The encoder-extension split}
+The student network $\mathcal{S}$ is divided into two sub-networks: (1) Encoder $\mathcal{U}$ and (2) Extension $\mathcal{V}$ (sizes in Figure \ref{tab:relative_sizes}). The encoder is responsible for converting the input frame-region into a feature vector. The extension is the later part, which translates the feature vector into an objectness score. In literature \cite{zhang2015design, pan2009survey}, this kind of split is most commonly performed to rapidly train a neural network for a task by reusing the features of a pretrained model on a similar task as a starting point. For related tasks, the encoder part of the network remains relatively unchanged, as it captures low-level features, such as, shapes, patterns, and other features, which do not drift significantly for similar objects. High-level features captured by the extension, such as objectness, tend to be more sensitive to environment changes. In the context of compression for video analytics, this encoder-extension split is a novel contribution of LtC. This split has two benefits: (1) it provides a vector of semantic features that is built implicitly during training, which we leverage for temporal filtering, and (2) it allows for efficient update of the student network by updating only the extension. 
+
+%The objectness score $y$ of a patch $x^f_{ij}$ of frame $f$ is:
+%\begin{equation}
+%    y = \mathcal{S}(x^f_{ij}) = \mathcal{V}(\mathcal{U}(x^f_{ij}))
+%\end{equation} 
+%where $\mathcal{U}(x^f_{ij})$ is the feature vector.
+
+\subsection{Temporal filtering using embedded features}
+
+Temporal filtering traditionally involves performing a comparison between frames to see if the new frame includes sufficient new information.   This comparison typically uses manually crafted low-level features that operate directly on the input image (e.g., SIFT and HOG)~\cite{li2020reducto}. Such features can be sensitive to small changes to the input resulting from the presence of wind or similar effects that do not substantially change the semantic features of the image.
+
+We propose a novel temporal filtering approach that uses directly embedding in the feature space of the student network to detect salient changes in the image.  Specifically, we use the differences in terms of the feature vector acquired from the encoder to judge whether a frame should be discarded.  %These features can be thought of as a collection of high-level abstract features that characterize frame-regions. 
+The main advantage using this feature vector is: it is highly contextual and up-to-date compared to other manually crafted features. Moreover, it is more robust against noises in the input caused by environmental factors such as illumination or weather.
+
+For temporal filtering, we calculate the sum of the differences between feature vectors in consecutive frames. If this difference is below a threshold value, then that pair is considered identical.  % Other distance metrics are also possible.  %Previous literature \cite{chen2015glimpse, li2020reducto} argue whether this threshold value should be static or be updated in each iteration, but that is out of the scope of this paper. 
+We define a difference function between frames $f_1$ and $f_2$ as follows:
+\begin{equation}
+    D(f_1, f_2) = \sum^{\mathcal{L}}_{i = 1}\sum^{\mathcal{L}}_{j = 1} {\lVert \mathcal{U}(x^{f_1}_{ij}) - \mathcal{U}(x^{f_2}_{ij}) \rVert}^2_2
+\end{equation}
+
+Instead of sending $\mathcal{N}$ frames $F^\mathcal{I}$ = $[f^\mathcal{I}_1, f^\mathcal{I}_2, ..., f^\mathcal{I}_{\mathcal{N}}]$ the camera uses the difference function to divide $F^\mathcal{I}$ into $\mathcal{M}$ partitions $[p^\mathcal{I}_1, p^\mathcal{I}_2, ..., p^\mathcal{I}_{\mathcal{M}}]$ of consecutive frames in the $\mathcal{I}$th iteration, where $1 \leq \mathcal{M} \leq \mathcal{N}$ and all frames in a partition $p$ satisfy: 
+\begin{equation}
+    \max D(f_1, f_2) < th; \forall f_1, f_2 \in p 
+\end{equation}
+
+Lastly, we construct the list of filtered frames $\hat{F}^\mathcal{I}$ by selecting a representative frame $f$ from a partition $p$ as follows:
+% one frame from each partition that minimizes the sum of the differences from all other frames in that partition. 
+\begin{equation}
+    f = \argmin_{x \in p} \sum_{\substack{x \neq y \\ y \in p}} D(x, y)
+\end{equation}
+
+\subsection{Spatial compression using objectness score}
+
+Spatial compression is performed after the temporal filtering. Based on the objectness score of a frame-region given by the student network, that region is either preserved in high-quality or degraded. %The main advantage of using the student network is that we do not have to run the full-sized teacher DNN at the source.  
+LtC uses the \emph{posterior} $\mathcal{V}(\mathcal{U}(x^f_{ij}))$ to define an identity function as follows:
+\begin{equation}
+        I(x_{ij})= \begin{cases}
+            1, & \mathcal{V}(\mathcal{U}(x^f_{ij})) > 0.5\\
+            0, & \text{otherwise}
+        \end{cases}
+\end{equation}
+We keep a region $x_{ij}$ if $I(x_{ij})$ is 1, or compress it otherwise. Each frame $f$ is converted into a $\mathcal{L}\times\mathcal{L}$ array $X^f = [..., I(x_{ij})x^f_{ij}, ...]$ of non-overlapping same-sized regions, where $i$ and $j$ are 2D indices of a region in the frame.
+
+\subsection{Updating the student network}
+The student network may become less effective following a significant change in the environment or scene dynamics, leading to a concept drift. When concept drift is detected at the server, an update of the student network is triggered. A copy of the currently operating student network is maintained at the server, which is evaluated by the teacher network in each iteration to check if indeed object regions yield high objectness score. If the percentage falls below a fixed threshold, the server initiates a student-teacher training, causing the student network to change partially (freezing all other parameters but the extension) or, in rare cases, wholly. Based on the degree of change, the server then sends either the extension or the new student network to the source as an update. We observe that 85\% of the updates consist only of the extension, which is approximately 25x smaller than the encoder as can be seen in Table \ref{tab:relative_sizes}.
+
+
+% as can be seen in Table \ref{tab:relative_sizes} the extension is approximately 25x smaller than the encoder.
+
+
+
+% The student network may become less effective following a significant change in the environment or scene dynamics, leading to concept drift.  When concept drift is detected at the server, an update of the student network is triggered. 
+%A concept drift module is situated at the server to determine if or when an update is warranted. 
+% These updates can be sent in one of two tiers:  (1) the full student network needs to be updated; or (2) only the extension is updated.  We observe that most updates require updating only the extension; as can be seen in Table \ref{tab:relative_sizes} the extension is approximately 25x smaller than the encoder.
+
+% For each incoming batch, the server uses the teacher network to label the regions in the frames, it uses a subset of the frames to detect concept-drift.  Based on the degree of the concept drift, the server can decide whether or not to update the student, and if so to update only the extension or the full network.%The server trains the student network and stores it in its memory in each iteration, but does not send it to the source every time. Rather, it tracks the last sent student network to the source, and compares it against the in-memory student network.
+%If the performance of the new network is comparable to the network at the source, then no update is sent.  If the accuracy drop is small, within a pred-determined tolerance range, then only the extension is updated.  Finally, if the accuracy drops beyond the tolerance, the full student network is updated.  %Otherwise, the in-memory student network is sent as an update to the source. 
+
+% \nael{Commented this out.  The concept of iteration not introduced so far.  Also, I think the formalism is unnecessary since the ideas is straightforward.}
+%Adding to the previous notations, we use $(\mathcal{U}_m$, $\mathcal{V}_m)$ to represent the in-memory networks, and $(\mathcal{U}_s$, $\mathcal{V}_s)$ to indicate the last sent networks. Moreover, we use $\hat{\mathcal{X}}$ to indicate that the parameters of network $\mathcal{X}$ are frozen, and therefore, untrainable. Lastly, the operators $\texttt{train(}\mathcal{X}\texttt{)}$ and $\texttt{eval(}\mathcal{X}\texttt{)}$ are used to indicate the training and the evaluation of network $\mathcal{X}$ respectively.
+
+%the subscript $m$ to indicate in-memory networks, and the subscript $s$ to indicate the last sent network. Moreover, we use a cap symbol ($\wedge$) over a network to indicate that the parameters of this network is frozen, and therefore, untrainable. Lastly, the operators  \texttt{train(X)} and \texttt{eval(X)} are used to indicate training and evaluation of network \texttt{X}. The mechanism of updating the student network is as follows:
+%\begin{itemize}
+%    \item In each iteration, $\mathcal{I}$, the server trains the in-memory networks $(\mathcal{U}_m$, $\mathcal{V}_m)$, and evaluates it to set up a baseline accuracy (\texttt{acc}).
+%    \begin{equation*}
+%        \ballnumber{1}\texttt{train(}\mathcal{U}_m\mathcal{V}_m\texttt{)} \hspace{10pt} \ballnumber{2}\texttt{acc} = \texttt{eval(}\mathcal{U}_m\mathcal{V}_m\texttt{)}
+%    \end{equation*}
+%    \item No update is sent if the last sent networks $(\mathcal{U}_s$, $\mathcal{V}_s)$ satisfy the following condition:
+%    \begin{equation*}
+%        \texttt{eval(}\mathcal{U}_s\mathcal{V}_s\texttt{)} \geq \texttt{acc} - \mathcal{E}
+%    \end{equation*}
+%    Where $\mathcal{E}$ used as a margin of tolerance.
+%    \item Otherwise, only the extension $\mathcal{V}_s$ of the last sent student network is trained by keeping the parameters of the encoder $\mathcal{U}_s$ frozen. After that, the previous step is tried again, but if true, the extension $\mathcal{V}_s$ is sent to the source.
+ %       \begin{equation*}
+  %      \texttt{train(}\hat{\mathcal{U}_s}\mathcal{V}_s\texttt{)}
+  %  \end{equation*}
+ %   \item If everything else fails, the in-memory networks $(\mathcal{U}_m$, $\mathcal{V}_m)$ are sent to the source.
+%\end{itemize}
+
+\subsection{Discussion and General Properties of LtC}
+
+A state-of-the-art spatial compression algorithm, DDS \cite{du2020server}, uses server-side feedback in order to identify the regions that require high-quality transmission. Specifically, a low-quality baseline transmission of the video is first sent to the server, which uses the full-sized DNN to identify the regions of interest that it requires in higher resolution.  It sends a request back to the source, which in turn resends those regions at a higher quality.  % the server initially performs analytics suing low-quality frames sent by the source, and incrementally refines the results by requesting high-quality patches for uncertain regions.
+Although this approach is able to achieve reasonably high F1-score, it results in significant delay in server response. This delay includes the network delay incurred during multiple requests and responses, as well as the server processing delay after each response. Moreover, the number of feedback used in the process adversely affects the response delay. These delays are shown in Figure \ref{fig:i_dds_suboptimality} as a function of the number of feedback rounds used for each batch of frames. LtC solves this problem by training the student network to identify the regions of interest, and the compressed video is sent in a single shot.  Although the student network is smaller than the teacher network, LtC has the advantage of operating on the full resolution video; this is in contrast to DDS which transmits a low resolution video to detect the areas with objects.
+
+% Figure environment removed
+
+A recently proposed temporal filtering algorithm, Reducto \cite{li2020reducto}, uses a profiling based approach, where the server profiles batches of frames against the optimal actions (what threshold to use for filtering). %These optimal actions are applied at the source to future batches fitting the profile. 
+This approach is also able to achieve a high F1-score, but has high bandwidth use as the source sends unfiltered batches to the server during the profiling, as presented in Figure \ref{fig:i_reducto_suboptimality}. This profiling happens once at the beginning and every time the environment changes, and requires a large number of frames for profiling. LtC solves this problem by using the student network for profiling, which is both long-lasting due to its generalization capabilities, and is able to quickly update itself with a few new frames by transferring knowledge from the previous environments.  Additionally, Reducto does not support spatial compression.
+% Figure environment removed
+
+In the case of moving cameras, such as, dash cam, drone, etc., the background regions are changing constantly. As a result, use of simple features (e.g., pixel values) will result in significant difference between consecutive frames, even if the objects did not move by much. The feature vector in LtC is robust to mobility related background changes, and therefore, can recognize background regions even in the presence of mobility. In Figure \ref{fig:i_features}, we observe that for a moving camera, difference values calculated using LtC's features has the highest Pearson correlation coefficient (0.92) compared to a number of other commonly used features.
+
+% Figure environment removed
+
+%Lastly, in Figure \ref{fig:spatial_temporal_opportunity} we use the optimal compression algorithm to showcase the relative performance of different compression strategies. We observed that across all the videos in our dataset the use of spatial and temporal compression together yields a better performance than any single strategy. 
+%% Figure environment removed
+
+
+
+
+
+
+
+
+
+
+
+% If we consider a setup where we could run a full-sized DNN at the source, it would be possible to exactly figure out where the object regions are, to achieve optimal compression without loss of accuracy. However, we assume it is infeasible to run a full-sized DNN at the source and approximation is necessary.  One option is to send low quality video to the server, and have the server determine which regions require additional resolution as in DDS~\cite{du2020server}. However, this results in loss of accuracy since the decisions are being made on low quality video, and with high delays since feedback is necessary from the server.  It also can be wasteful of bandwidth since: (1) It makes it impossible to carry out temporal semantic compression; and (2) even the baseline low quality transmission could use more bandwidth than necessary for background regions.  
+
+
+
+% %Independent heuristics perform poorly when the scene changes rapidly \cite{du2020server, li2020reducto, zhang2018awstream}. For example, the same heuristic that can successfully compress a video in a room may not work effectively when it is pointed towards a window facing a street. Also, depending on the query, some heuristics are proven to be more effective than others \cite{li2020reducto}. Therefore, it is imperative for the source-side heuristics to adapt itself according to the requirements of the server-side DNN. This can be achieved if the server sends periodic feedback to the source, so that the server-side DNN can be incorporated into the source-side compression logic without actually hosting it.
+
+% %\subsection{Overview of LtC}
+% LtC uses an alternative approach where we have a low complexity network to discriminate between regions that have objects and regions that do not.   We use this information to differentially compress the video.  %Although some loss of accuracy may result since the discriminator network is lower in complexity we show that the spatial compression performance is competitive with feedback-based compression.  
+% LtC offers a number of advantages: (1) Since the compression is at the source side, we are also able to carry out temporal compression, which we do using a novel feature based algorithm; (2) we are able to compress without feedback from the server improving response time; (3) We are potentially more bandwidth efficient because we do not need to send video at a baseline quality to the server to enable accurate decisions since our decisions are made at the source where the full video resolution is available.  LtC requires retraining when the scene dynamics change, but we introduce a lightweight retraining mechanism that makes this possible at low overhead.
+
+
+% \subsection{Updating the student network}
+% \nael{Could split up updating part into a separate section with a different figure.  Section 3 is massive.}
+
+% When the scene dynamics change, the student network may no longer be effective in identifying areas with objects and we need to update the student network. A concept-drift detector at the server determines when an update is required. The updates consist of the parameter values. As a result, the size of the updates is directly affected by the architecture of the student network, and is one of the factors in how we select the architecture of the student network. The student network is significantly smaller than the full-sized DNN.\nael{Can we mention some specifics or point to a result?} 
+
+% In selecting the student network architecture, we have to balance accuracy and overhead of updates.  At first, the analytics accuracy increases with adding layers to the student network, but eventually reaches a plateau.  In our experiments, we have observed that a student network of 4MB in size produced excellent accuracy at a reasonable size. Notably, this size is orders of magnitude smaller than the size of the video segments transferred over the duration of the operation of the model.  Moreover, our encoder-extension separation of the model further reduces the update size by updating only the extension.\nael{Removed iteration since this concept was not introduced before.} % However, considering the scenarios where the downstream bandwidth constrains the pipeline, we design the updates to be delivered in two discrete forms. 
+
+% The encoder part of the student network is more robust than the extension when the environment changes. Thus, when typical changes in the environment occur we can update only the extension to restore the accuracy of the student model. For major changes, however, the complete model is required to be updated.  Periodically, we send a set of training frames which are split into unevenly sized segments (we used a 90\%-10\% split). The larger segment is used for student-teacher training, while the smaller segment is used for concept-drift evaluation. \nael{Should be clear in evaluation that you take these overheads into account.  The breakdown figures dont show these kinds of overheads.}
+
+% A revoked student network due to an update might still be useful. For example, consider dashcam footage where a car moves from a city road onto a highway, then returns to the city roads. Therefore, we can cache previously used encoders and extensions at the camera and the server. %We can use the least recently used (LRU) strategy for model replacement. 
+% These cached models are primarily maintained at the server, and control messages are sent to the camera so that it can synchronize itself by executing the same operations. [\textcolor{purple}{this sentence is not clear to me --  Therefore, in future discussion, it is assumed that any operations executed on them reflect at both the camera and the server.}]\nael{Yes, caching is not explained well.  How do you recognize if a previous model is needed again?  What is the reconfiguration process in that case?  You say stored at server, but there is a model cache on the client in the figure as well.  Perhaps better to remove it from this version of the paper or improve the explanation.}
+
+% \begin{table}[t]
+% \centering
+% \begin{tabular}{ll} 
+% \hline
+% \texttt{train(N)} & Trains a network \texttt{N} using ST framework \\
+% \texttt{eval(N)} &  Evaluates a network \texttt{N} \\ 
+% \hline
+% \texttt{use(N)} & Set \texttt{N} as running network \\
+% \texttt{insert(N, C)} & Insert a network \texttt{N} in cache \texttt{C} \\
+% \texttt{update(N, C)} & Update a network \texttt{N} in cache \texttt{C} \\
+% \hline
+% \end{tabular}
+% \caption{Operators in the update routine.}
+% \label{tab:operators}
+% \end{table}
+
+% Let us consider two LRU caches $\sigma = [\mathcal{U}_1, \mathcal{U}_2, ...]$ and $\phi = [\mathcal{V}_1, \mathcal{V}_2, ...]$ of maximum size $K$ that hold previously used encoders and extensions, respectively. $\tilde{\mathcal{U}} and \tilde{\mathcal{V}}$) indicate that their parameters have been frozen and will not change during training. In addition, we define a few necessary operators in Table~\ref{tab:operators} to describe the model updating scheme. Finally, the sequence of the operations is indicated with circled numbers.
+
+% \begin{itemize}[leftmargin=10pt]
+%     \item In each iteration, $\mathcal{I}$, the server uses the larger segment of the incoming video frames to train a student network. We define the encoder and the extension of this network as $\hat{\mathcal{U}}$ and $\hat{\mathcal{V}}$, respectively. This network $\hat{\mathcal{U}}\hat{\mathcal{V}}$ is always kept up-to-date with the most recent information. After training, the concept drift evaluation module evaluates this network by using the smaller segment of the incoming video frames to set up a baseline accuracy (\texttt{acc}). 
+%     \begin{equation*}
+%         \hspace{0.3in}\ballnumber{1}\texttt{train(}\hat{\mathcal{U}}\hat{\mathcal{V}}\texttt{)} \hspace{10pt} \ballnumber{2}\texttt{acc} = \texttt{eval(}\hat{\mathcal{U}}\hat{\mathcal{V}}\texttt{)}
+%     \end{equation*}
+%     \item If there exists any previous student network comprising encoders and extensions in cache $\sigma$ and $\phi$ respectively can perform as good as the up-to-date network ($\hat{\mathcal{U}}\hat{\mathcal{V}}$), then that network is used as the running network.
+%     \begin{equation*}
+%         \hspace{0.3in}\ballnumber{1}\exists\limits_{1 \leq i \leq \lvert \sigma \rvert} \texttt{eval(}\mathcal{U}_i\mathcal{V}_i\texttt{) > acc} \Rightarrow \texttt{use(}\mathcal{U}_i\mathcal{V}_i\texttt{)}
+%     \end{equation*}
+%     \item Otherwise, the previous student networks are trained by freezing the parameters of the encoders in $\sigma$, and making only the parameters of the extensions in $\phi$ trainable. If there exists any previous student network is able to match the performance of the up-to-date network ($\hat{\mathcal{U}}\hat{\mathcal{V}}$) after the training, then an update for the extension is issued and that student network is used as the running network.
+%     \begin{equation*}
+%         \hspace{0.3in}\ballnumber{1}\texttt{train(}\tilde{\mathcal{U}_i}\mathcal{V}_i\texttt{)}
+%     \end{equation*}
+%     \begin{equation*}
+%         \hspace{0.3in}\ballnumber{2} \let\scriptstyle\textstyle\substack{\exists\limits_{1 \leq i \leq \lvert \sigma \rvert} \texttt{eval(}\mathcal{U}_i\mathcal{V}_i\texttt{) > acc} \\ \Rightarrow \texttt{update(}\mathcal{V}_i, \phi\texttt{)} \hspace{2pt}|\hspace{2pt} \texttt{use(}\mathcal{U}_i\mathcal{V}_i\texttt{)}}
+%     \end{equation*}
+%     \vspace{0.01in}
+%     \item Otherwise, we need to insert the constituent encoder ($\hat{\mathcal{U}}$) and extension ($\hat{\mathcal{V}}$) of the up-to-date network ($\hat{\mathcal{U}}\hat{\mathcal{V}}$) into $\sigma$ and $\phi$, respectively, and also set it as the running network. In case of cache overflow, the least recently used networks are evicted from $\sigma$ and $\phi$.
+%     \begin{equation*}
+%         \hspace{0.3in}\ballnumber{1}\texttt{insert(}\hat{\mathcal{U}}, \sigma\texttt{)} \hspace{2pt}|\hspace{2pt}
+%         \texttt{insert(}\hat{\mathcal{V}}, \phi\texttt{)} \hspace{2pt}|\hspace{2pt} \texttt{use(}\hat{\mathcal{U}}\hat{\mathcal{V}}\texttt{)}
+%     \end{equation*}
+% \end{itemize}
+% \nael{This description of the cache is a lot of details on how the models are cached but the intuition of how they are used is missing.}
+
+% Although, this is a magnitude smaller than the size of the video data, in some cases there might be shortage of available downstream bandwidth 
+% gain of increasing the number of layers reaches a plateau.  
+
+
+% The update can be delivered in two discrete levels: i) extension update, and ii) complete update.    
+
+% \resizebox{.99\hsize}{!} 
+% \begin{equation} 
+%     \begin{cases}
+%     <use, id, \square, \square>, & \argmax_i\hspace{5pt}eval(freeze(\phi^{i}_{\mathcal{E}}) + freeze(\phi^{i}_{\mathcal{X}})) > acc\\
+%     abcd, & otherwise
+%     \end{cases}
+%     % \resizebox{.98\hsize}{!}{\argmax_i\hspace{5pt}eval(freeze(\phi^{i}_{\mathcal{E}}) + freeze(\phi^{i}_{\mathcal{X}})) > acc \implies <use, id, \square, \square>}
+%     % eval(freeze(\phi^{i}_{\mathcal{E}}) + train(\phi^{i}_{\mathcal{X}})) > th     <update, i, \square, \mathcal{X}>
+%     % otherwise <insert, i, \mathcal{E}, \mathcal{X}>  
+% \end{equation}
+
+% Instead of $\mathcal{N}$ frames $F^\mathcal{I}=[f^\mathcal{I}_1, f^\mathcal{I}_2, ..., f^\mathcal{I}_{\mathcal{N}}]$
+% Let us say that the camera captures $\mathcal{N}_{org}$ video frames $F_{org}=[f_1, f_2, ..., f_{\mathcal{N}_{org}}]$.
+
+
+% $\mathbb{I}_{f_1f_2}$ like below:
+% \begin{equation}
+%     \mathbb{I}_{f_1f_2} = \begin{cases}
+% 			1, & \sum^{\mathcal{L}}_{i = 1}\sum^{\mathcal{L}}_{j = 1} (\mathcal{U}(x^{f_1}_{ij}) - \mathcal{U}(x^{f_2}_{ij})) > th_2 \\
+%             0, & \text{otherwise}
+% 		 \end{cases}    
+% \end{equation}
+
+% Let $F_{org}$ and $F_{fil}$ denote the list of frames before and after filtering respectively, and $\hat{f}$ be the last frame from $F_{org}$ that has been added to $F_{fil}$. Then, we determine the membership of a frame $f$ after $\hat{f}$ in the following manner:
+% \begin{equation}
+%     f \in F_{fil} \iff f \in F_{org}\hspace{5pt}\textrm{and}\hspace{5pt}\mathbb{I}_{\hat{f}f} 
+% \end{equation}
+
+
+% Let's say, out of $\mathcal{N}$ video frames $F^\mathcal{I}$ in iteration $\mathcal{I}$ only $\mathcal{M}$ frames are found to be unique
+
+% , and $F^\mathcal{I_filtered}=[f^\mathcal{I}_1, ..., f^\mathcal{I}_{m - 1}, f^\mathcal{I}_{m}, ...]$ are the filtered frames.
+
+
+% say out of $\mathcal{N}$ video frames $F^\mathcal{I}$ only $\mathcal{M}$ frames are found to be unique after temporal compression. 
+
+
+% The sum of the differences between all the feature vectors in successive frames are calculated, and one is omitted if it goes beyond a threshold value ().
+
+% Unlike specially crafted features (i.e. SIFT, HOG, etc.) that do not have context-specific knowledge, the feature vector captures up-to-date highly contextual information with the updates of the encoder network.  
+
+
+% We use the posterior  
+% , which allow us the run the extension network on only the feature vectors on the regions in the filtered frames. 
+% The spatial compression comes after temporal compression in our pipeline, where the filtered frames are further reduced by omitting unnecessary regions in them. This allows us to maximize the quality of the video frame with respect to the available bandwidth as we know
+
+% This procedure is repeated again if the environment changes beyond acceptable limit. There is a concept drift module situated at the server, which determines the need for    
+
+% there is not compression logic present in the camerasthe camera sends raw video frames to the server. Upon receiving the video frames, 
+
+% student nn is specific
+% don't need no high res
+
+%explain not so much update needed
+%explain queu

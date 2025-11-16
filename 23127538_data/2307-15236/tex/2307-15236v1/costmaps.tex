@@ -1,0 +1,133 @@
+\label{sec:costmap}
+\subsection{Overview}
+The key to achieving reactive behavior - where a robot intelligently navigates in a dynamic environment - is using the robot's sensors and semantic information to maintain a representation of the environment.
+ROS~2 employs \textit{cost} or \textit{risk maps} as the environmental model to consolidate the results of potentially many algorithms.
+A balance must be achieved to create a sufficiently high-fidelity representation of the environment and be able to maintain that representation efficiently.
+Perception algorithms, sensor data, or semantic information about the environment are populated into this world model for use in global path and local trajectory planning.
+
+Cost maps reduce the world model into a two-dimensional grid, with each grid cell having a cost associated with it.
+Cost maps evolved from the probability-based occupancy grids developed at Carnegie Mellon in the 1980s \cite{matthies1988,moravec:grids}.
+The modern cost map was first described by Marder-Eppstein et al \cite{nav}, where the cost associated with each cell was an integer in the range [0, 255]. 
+In general, planning algorithms will prefer paths with lower costs and avoid those with higher costs, but there are also special values for unknown and occupied cells (255 and 254, respectively) to provide hard constraints on robot behavior.
+These special values allow planning and collision checking algorithms to guarantee viable navigation in only free and known regions. 
+The cost map acts as the planning algorithms' configuration space \cite{lozano1983spatial}.
+Figure \ref{fig:Costmap} shows an example of the key values in a cost map.
+
+The cost map provides a reasonably balanced approach to the fidelity/efficiency trade-off on both low and high power compute platforms. 
+The grid data structure provides a simple correspondence with the real world and also provides constant time lookup. 
+One drawback is that the memory consumption required to maintain the cost map scales linearly with the number of cells. 
+The use of Quad-trees to represent occupancy grids has been proposed to alleviate this scaling via multi-resolution data storage \cite{quadtree}.
+However, these methods fail to recover substantial memory benefits when cost map convolution or inflation are applied, or when the density of obstacles in the environment leaves little open space to represent with coarser-resolution quantizations - while also introducing non-constant look-up times.
+While these are useful developments for some applications, it is most common for users in ROS~2 to apply a form of cost map inflation and operate in restricted spaces. 
+In practice, the size of the cells in the cost map is 0.05 meters by 0.05 meters, which typically is small enough to render the environment with sufficient fidelity, but also large enough to not require enormous amounts of computation. 
+
+While a two-dimensional cost grid discards a great deal of potentially useful information, it has been applied repeatedly to solve a great number of practical robotics challenges.
+Further, it is common for perception algorithms populating the cost map to maintain higher fidelity representations internally for modeling the environment, which are binned or reduced to two dimensions for consolidation with other algorithms.
+Maintaining a two-dimensional cost map enables the application of a broad number of highly-efficient planning, control, and collision checking techniques for arbitrary types of robot systems. 
+
+The process by which the cost map is updated and maintained in ROS~2 is the \textit{Layered Costmap} \cite{costmap}: an extensible, systematic way to update the cost map with many, configurable, and arbitrary perception algorithm results.
+The Layered Costmap comprises an ordered list of dynamically run-time loaded layers which each represent a different data source, algorithm, or result.
+Each update cycle, the main cost map is updated by polling each of these layers in turn to populate the grid with new information.
+
+Any developer may write a costmap layer and include it on their robot system for their specific applications.
+Common types of layers include: cost map inflation, sensor processing, semantic information, results from machine learning detection or segmentation algorithms, and multi-robot coordination. 
+However, a set of common layers are provided by ROS~2 applicable for a broad range of common applications. 
+
+% Figure environment removed
+
+\subsection{Costmap Layers}
+\textbf{Static}
+A map provides information about where obstacles are known to be a priori, often from an offline mapping algorithm or other data source like blueprints. 
+The static layer subscribes to an \texttt{OccupancyGrid} topic containing this information.
+It is common for the static layer to be the first costmap layer, providing the base information about the environment for later algorithms to modify.
+While the name implies non-changing, the static layer can have the map change over time as the result of map sharding over large spaces or updates to the environment due to continual mapping.
+There is a separate subscription to a \texttt{OccupancyGridUpdate} topic for efficient non-dimension changing updates to localized map information. 
+
+\textbf{Obstacle}
+The obstacle layer stores information from high accuracy sensors such as lasers and RGB-D cameras in a two dimensional grid. Each point in the sensor data is treated as a ray, originating from the sensor pose.
+That ray is ray-traced through the grid in two dimensions using Bresenham's algorithm, where the endpoint is marked as occupied and its path is marked as free space due to direct visibility.
+Fig. \ref{fig:raytracing} demonstrates this process visually.
+The 2D laser scanner produces measurements from obstacles which are marked in the grid in blue. 
+Breshenham's ray-casting algorithm is used to clear out the visible free-space from the sensor to the obstacle in white, while the remainder of the grid is still unknown (grey). 
+Due to the high accuracy of the sensors, these observations are treated as absolute, without the probabilistic calculations of occupancy seen in the 1980s. 
+The simplification of logic also assists in quicker computation.
+As a robot moves through the scene and/or more measurements are taken, it will dynamically generate an occupancy map of the environment around it based on depth sensing.
+
+The two dimensional nature of this layer makes it ideal for planar laser scanners, but may be overly constrained when using three-dimensional data.
+It may be necessary when working with low-accuracy or noisy sensors to pre-filter the data stream before processing in the obstacle layer to reduce noisy results in the cost map. 
+
+% Figure environment removed
+
+\textbf{Voxel}
+The voxel layer is similar to the obstacle layer, but tracks the environment and ray-traces measurements in three dimensions. It is most useful for RGB-D, 3D laser scanners, or other non-trivially two-dimensional sensor streams.
+Internally, it uses a voxel grid model the size of the cost map to represent the environment in a non-probabilistic way.
+This model scales linearly with cost map size, similar to the two-dimensional grid, by maintaining the height dimension through manipulating the bits of an unsigned 32 bit integer. 
+Thus, its maximum height is limited.
+It is recommended to only track heights to the limit of what is useful (e.g., a home vacuum robot need not maintain a voxel grid $> 1 m$ off the ground).
+The vertical resolution of the voxels is independent from their horizontal resolution, and is typically larger. 
+The three-dimensional data is projected down to two dimensions for writing into the main cost map.
+As it conducts three-dimensional raytracing, this layer is more computationally expensive than the obstacle layer.
+
+\textbf{Non-Persistent Voxel}
+The non-persistent voxel layer computes values in the same manner as the voxel layer, but does \textit{not} persist the data from one update to the next. 
+Thus, each iteration a new voxel grid is created to populate the cost map, then cleared.
+
+\textbf{Spatio-temporal Voxel}
+The Spatio-temporal voxel layer (STVL) use a more refined data structure than the voxel layer, Fig. \ref{fig:stvl}.
+It tracks obstacles in three-dimensions using OpenVDB, a sparse voxel grid library developed by Dreamworks Animation for movies such as \textit{How to Train Your Dragon} and \textit{Puss in Boots} \cite{openvdb}.
+Rather than ray-tracing to clear obstacles in the voxel grid, STVL uses a method called \textit{decay acceleration} to maintain a representation of the environment based on the sensor's measurement frustum and current measurements.
+As measurements are processed, the timestamp of the data is added to the voxel belonging to the reading.
+If an active (e.g. occupied) voxel is within the sensor frustum and seen by new data, the time is updated.
+If a voxel is not viewed by new data, a decay acceleration factor is applied to its time, quickening its removal due to lack of current visibility.
+The frustum models are configurable and currently support 3D lidar 'donut' models and RGB-D, depth, and similar sensors using a 6-plane bounding volume defined by the minimum and maximum range and horizontal and vertical field of views.
+
+For all voxels outside of the sensor's frustum, a global linear time decay is applied, usually 10-30 seconds.
+After voxels are expired due to either method, they are removed from the data structure.
+Thus, its storage size is only dependent on the number of currently active and occupied cells.
+The sparse voxel data structure is projected to two dimensions for inclusion in the main cost map.
+This layer is most appropriate for robots operating in highly dynamic environments with a high degree of sensor coverage.
+It was created to resolve issues with discrete cell ray-tracing which occasionally left uncleared obstacle cells in highly dynamic environments with many moving agents. 
+
+% Figure environment removed
+
+\textbf{Range}
+The range layer processes data from Infrared, Sonar, and Ultrasonic sensors.
+Due to the noise inherent to these types of sensors, the range layer tracks occupancy using a probabilistic model in which only cells with high confidence predictions are written into the main cost map. 
+It has support for both fixed reading (e.g. binary detection of obstacles) or variable reading sensors.
+% The calculations are performed in the individual range sensor's frame of reference, and then translated into the costmap's frame. 
+The probability of an obstacle in a cell is calculated using the static properties of the sensor (range of view, maximum reliable range and sensor variance), the sensor reading itself, and the angle and distance of the cell relative to the sensor origin \cite{oriolo1997fuzzy}.
+
+%The sensor model used to compute the probability of there being an obstacle with range distance $r$, at a point $\phi$ distance away at an angle of $\theta$ is given by the following equations.
+
+
+
+\textbf{Inflation}
+The inflation layer uses the occupancy information from the other layers to add an inflated exponential decay function around untraversable regions.
+It does this by iteratively expanding from known obstacles to a configurable distance, applying Eq. \ref{inflation}:
+
+\begin{equation} \label{inflation}
+  cost(x, y) = (cost_{lethal} - 1) \hspace{3pt} e^{-\omega_{scale} \hspace{2pt} (d_o - r)}
+\end{equation}
+
+where $\omega_{scale}$ is the cost scaling factor, $d_o$ is the distance to the obstacle, $cost_{lethal}$ is the lethal obstacle cost, and $r$ is the inscribed radius of the footprint.
+For circular robots, the cost map regions that are traversable after this is applied represent the configuration space of the robot.
+For non-circular robots, the cell cost for the largest distance between an edge of the robot and the center can be used with Eq. \ref{inflation} to recover the cost at the center where full footprint collision checking is required. 
+When the center cost is below that value, it is known that the robot cannot be in collision. 
+Thus when using non-circular robots, it is important to still use inflation to optimize collision checking used in such algorithms as found in the Smac Planner framework described in \ref{sec:planners_feasible}. 
+It is recommended to set a smooth inflation decay across the cost map, rather than maintaining only steep costs near obstacles, as shown in Fig. \ref{fig:Costmap}.
+
+\textbf{Keepout}
+The keepout layer (a.k.a. keepout filter) uses input masks to mark cells as obstacles.
+These masks are highly configurable to contain a great deal of semantic information and interpreted through {\tt CostmapFilterInfo} into cost values to apply to the grid.
+These need not be only binary obstacle information, but also setting a range of costs to weight certain regions over others.
+
+\textbf{Speed}
+The speed limiting layer uses the same filters API as the keepout zones, but embedding maximum speeds as either percentages or absolute values in the filter masks. 
+This layer allows users to specify zones at which a robot should slow down, such as when entering or exiting aisles.  
+
+\textbf{Binary}
+The binary layer uses the same filters API as previously introduced, but embeds binary behavioral triggers into a spatial mask.
+When the cost value crosses the threshold, a ROS message is sent to a client server to indicate a change in binary state.
+An illustrative example would be to set spatial bounds conveying locations where it is and is not appropriate to stream camera feeds to a robot operations center.
+There may be regions of homes (such as bathrooms) and other facilities where remote monitoring of camera data would breach legal or ethical bounds.
+This layer allows the native embedding of spatial constraints to trigger binary actions.

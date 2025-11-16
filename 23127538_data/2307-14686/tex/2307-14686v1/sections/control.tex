@@ -1,0 +1,97 @@
+\section{Control architecture}
+\label{sec:control_architecture}
+
+\subsection{Overview}
+The control requirements for an agile loco-manipulator have been discussed in \secref{sec:conditions-agile-robots}.
+These conditions can be summarized as whole-body, dynamics, torque-level, optimality, and predictiveness, using contacts and flight.
+Among other possible options, a good candidate for conceiving such controllers is the \gls{mpc}, a model-based paradigm that uses \gls{oc} at its core.
+Solving a torque-based, whole-body dynamics \gls{ocp} we are able to satisfy the requirements for dynamics, optimality, and maneuvering. 
+Incorporating contacts yields a capable architecture for controlling any agile loco-manipulator.
+The dynamics-level \gls{mpc} paradigm is well known and widely used by the legged robotics community \cite[and many others]{Carpentier_2018}, and also in agile flying \cite{foehn_AgiliciousOpensourceOpenhardware_2022}, but has been seldom explored for \glspl{uam} \cite{Ollero_2022}.
+We, therefore, find it relevant to provide a basic introduction in the form of a preliminary yet functional design.
+
+
+\subsection{Features and limitations}
+What we present here is a fairly simple \gls{mpc} approach to controlling Borinot, which serves two purposes.
+Firstly, as an illustration of a valid methodology for controlling such robots. 
+And secondly, as a means to experimentally demonstrate some of the abilities of Borinot as an agile flying platform.
+However, given the complexity and variety of the hybrid motion modes Borinot is designed to handle, the presented method lacks some features that will need to be developed in future improvements.
+First, it does not account for contacts. 
+This means that we cannot use it in the experiments section to demonstrate locomotion with contacts.
+And second, it does not consider the task specification inside the control loop (see \figref{fig:control_architecture}).
+This means that it suffers from some lack of accuracy, especially in positioning the arm's end effector, which is important for manipulation. 
+These two issues are not inherent to the \gls{mpc} paradigm but to our preliminary implementation, and should not represent a fundamental impediment to designing better \gls{mpc} controllers.
+
+\subsection{Architecture}
+The control architecture is depicted in \figref{fig:control_architecture}.
+It consists in the first place of a whole-body dynamics \gls{ocp} that is solved offline.
+The obtained optimal state and control trajectories already capture most of the conditions for agility: optimality, dynamics, maneuvering, and redundancy, and can provide accurate open-loop solutions for contact-less manipulation tasks.
+The state trajectory $\bfX^*$ is used as a reference by a whole-body dynamics \gls{mpc} controller, running at $100\si{\hertz}$.
+This controller is fed with state feedback $\hat\bfx$ from the state estimator in PX4 and produces new state and control trajectories.
+Next, we have a tracking controller to compensate for model mismatches, which runs at  $400\si{\hertz}$.
+Finally, the resulting limb torques, angles and velocities are sent to the \gls{odri} variable-impedance controller, and propeller thrusts are mapped to motor commands, which are sent to the \gls{esc}s.
+In the following, we give more details about each module in the architecture.
+
+% Figure environment removed
+%
+% Figure environment removed
+
+\subsubsection{From mission to \gls{mpc}}
+In  \figref{fig:control_mission_spec} we show the process of going from the specification of a mission to assembling the successive \glspl{ocp} to be solved by the \gls{mpc} controller.
+A robot mission is composed of phases that can be of \emph{task} type or of \emph{navigation} type.
+Tasks, which are colored in purple and red, can be for example to bring the robot to a specific location, place the end-effector at a precise position, or pass through a narrow window. 
+Navigation phases are placed before tasks and are used to prepare a feasible and optimal maneuver so that the task can be accomplished.
+
+The mission's timeline is discretized into a predefined set of nodes linked by control actions.  
+A residual is associated with each node: task nodes have strong residuals, and navigation nodes have weak regularization residuals.
+The set of all residuals forms the following \gls{ocp}, which is solved offline once:
+%
+\begin{align}
+  \begin{aligned}
+     \bfX^*,\bfU^* =~ 
+     & \underset{\bfX,\bfU}{\min} &  & \sum_{k=0}^{N-1}l^{\textrm{OCP}}_k(\bfx_k, \bfu_k) + L(\bfx_N)                                          \\
+     & \text{s.t.}                &  & \bfx_{k+1} = f(\bfx_k, \bfu_k) \,,                                    ~~k\in [0, N-1] \,, \\
+     &                            &  & \bfx_{0} =  \overline{\bfx}_0                                    \,,                     \\
+     &                            &  & \underline{\bfu} \leq \bfu_k \leq \overline{\bfu}  \,,                ~~~~~~~~~k\in [0, N-1] \,, \\
+  \end{aligned}
+  \label{eq:control_architecture_docp}
+\end{align}
+%
+Here, $\bfX=\{\bfx_k\}$ and $\bfU=\{\bfu_k\}$ are the state and control trajectories specified for $N$ nodes.
+States comprise the robot's configuration and its velocity, $\bfx_k\in SE(3)\times\bbR^{6+2n_\textrm{joints}}$, while controls consist of propeller thrusts and limb joint torques, $\bfu_k\in\bbR^{n_\textrm{props}+n_\textrm{joints}}$.
+The function $l^{\mathrm{OCP}}_k(\cdot)$ is the residual cost for the node $k$, and $L(\cdot)$ is the terminal cost.
+The function $f(\cdot)$ is the integration of the robot's forward dynamics over the discretization step assuming constant control forces and torques $\bfu(t)=\bfu_k$, $\overline{\bfx}_0$ is the initial state and $\{\underline\bfu,\overline\bfu\}$ are the actuation bounds.
+Non-actuation limits such as joint limits are incorporated as quadratic barriers in the cost function $l^{\mathrm{OCP}}_k(\cdot)$.
+We solve \eqref{eq:control_architecture_docp} using control-limited  \gls{fddp} techniques as in \cite{mastalli-20-crocoddyl,martisaumell-2020-squashbox}.
+
+The optimal state trajectory $\bfX^*$ of \eqref{eq:control_architecture_docp} is used as a reference $\bfX^{\textrm{ref}}$ for the \gls{mpc} controller.
+This controller successively solves \glspl{ocp} like \eqref{eq:control_architecture_docp}, of shorter horizon and initial condition $\bfx_0=\hat\bfx$ taken from the state estimator.
+These \gls{ocp}s consider, at each node $k$, a residual that follows the reference trajectory while minimizing actuation effort:
+%
+\begin{align}
+l^{\textrm{MPC}}_k(\bfx_k, \bfu_k) = \cfrac{1}{2} ||\bfx_k \ominus \bfx^{\textrm{ref}}_k ||_{\bfW_\bfx}^2 + \cfrac{1}{2} || \bfu_k ||_{\bfW_\bfu}^2 \,, \label{equ:mpc}
+\end{align}
+%
+where $\ominus$ produces an error vector in the tangent space of the manifold of $\bfx_k$ \cite{sola-18-Lie}.
+Here, $\bfW_\bfx$ and $\bfW_\bfu$ are constant pre-defined weights and, in consequence, the distinction between navigation and task phases is no longer present in the \gls{mpc} problems \eqref{equ:mpc}.
+These problems are solved with the same \gls{fddp} techniques \cite{martisaumell-2020-squashbox},  allowing on-board real-time execution.
+For further details we refer the reader to the \emph{Rail-MPC} controller in  \cite{martisaumell2021fullbody}, whose name comes from the fact that the offline trajectory $\bfX^{\textrm{ref}}$ serves as a rail in which the \gls{mpc} controller runs.
+
+\subsubsection{Tracking controller}
+The result of the \gls{mpc} is fed to the tracking controller.
+This controller receives two inputs from the \gls{mpc}: feed-forward control commands $\bfu^*$ (propeller thrusts and limb torques), and  whole-body state references $\bfx^*$, which are used in a proportional-derivative feedback loop.
+This is basically an adaptation of the controllers proposed in, \eg, \cite{lee_GeometricTrackingControl_2010} or \cite{tognon_dynamic_2017}, where we use a full-state reference trajectory from the \gls{mpc} instead of a flat outputs reference trajectory.
+
+\subsubsection{Final motor commands}
+The output $\bfu$ of the tracking controller is a vector of thrusts and limb torques. 
+Limb torques, desired angles, velocities, and impedance gains are sent directly to the \gls{odri} variable-impedance controllers. 
+
+Regarding thrusts, our \glspl{esc} implement open-loop trapezoidal control for sensorless \gls{bldc} motors, which provides no direct control over the motor's thrust or speed% 
+\footnote{There exist \glspl{esc} that implement closed-loop speed control. However, these are less common, more expensive, and do not always align with the desired specifications. See, \eg, \cite{franchi_AdaptiveClosedloopSpeed_2017}.}
+\cite{yedamale_AN885ApplicationNote_}.
+%
+To overcome this, the thrusts are fed to a mapping module that converts thrusts into motor commands. 
+We implement this mapping by fitting a 3rd-degree polynomial surface that takes into account battery voltage, input command, and produced thrust.
+Data for the fitting came from our motor-propeller calibration workbench \cite{thrust_stand}. 
+The performance of this mapping is evaluated in \secref{subsec:exp_motor_tests}.
+

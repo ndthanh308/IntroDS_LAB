@@ -1,0 +1,40 @@
+%--------------------------------------------------------------------------
+\section{Discussion}\label{dis}
+%--------------------------------------------------------------------------
+
+\parab{Coalescence of unicast and multicast}
+When we design \sys, there is a question in our mind: \textit{which is better, maintaining unicast and multicast transports separately at end-host, or utilizing the in-network support to enabling them to match the same transport?} Because of the long-standing resource limit in RNICs and the emeging trend of shifting appropriate computation task to programmability network, we believe the latter is the correct selection.
+
+%\add{more about resource limit and programmable network?}
+%SRAM in RNICs needs to maintain many structures. In particular, it needs to maintain queue pair context (QPC) for every QP (including DMA status and connection status) and QP-shared structures. These include memory transaction table (MTT) and receiving buffer, \etc{}. Operators must carefully utilize SRAM in RNICs as it's highly related to performance. The status volume per QP limits the maximum connections that the RNIC can support. Therefore, it's challenging to implement a separate multicast protocol for every multicast connection, as it will increase the unacceptable status amount per QP.
+
+\parab{Compatibility with P4 switch}
+After thoroughly evaluation, we believe that \sys design can be implemented on the Tofino switch. For the one-to-many data-forwarding, the Tofino is able to duplicate packets at the Traffic Manager (TM) according to the group information. The IP and QPN information in Figure \ref{fig:table} are stored in the egress pipeline and indexed by <groupID, egressPort>. Because the look-up key in Tofino is at most 32bits long, we can only use the least significant 24bits of the multicast IP as groupID. 
+
+For the many-to-one ACK aggregation, there are two challenges. First, the PSN is 24bits long and can be wrapped-around. At least three conditions needs to be judged in order to handle the wrapped-around case, which cannot be implemented in a single stage. To tackle this problem, we relax the PSN comparing conditions as in Algorithm.\ref{alg:psncomp}. Consequently, the PSN distance of in-flight packets cannot exceed $2^22-1$, which is fairly satisfied in normal cases. Secondly, when generating ACKs, we need find the lease ACK PSN recorded by the switch, which requires multiple comparison. We can spread the ACK PSN records of different ports to different ingress/egress pipeline stages. When the ACK which triggers ACK generation go through the pipeline, it compares its own PSN with those PSN records along the path. At the final stage, the comparison result is written back to the ACK packet and the packet is modified and forwarded. As a result, the number of ports in a each multicast group is limited by the number of stages in the Tofino switch. 
+ 
+Note that Tofino is unable to recalculate the Invariant Cyclic Redundancy Checksum (ICRC) of the packet after modification. Therefore, the host RNIC needs to shutdown ICRC check to avoid dropping packets. Previous work shows that the ICRC check can be bypassed on Mellanox CX-5\cite{switchML}.
+\begin{algorithm}[t]
+	\caption{Update PSN record and find PSN minimum in P4}\label{alg:psncomp}
+	\begin{algorithmic}[1]
+		%\Function{Generation}{}
+		\State $ack.psn, ack.port\gets $ the PSN and port of ACK packet
+		\State $rec.psn, rec.port\gets$ the PSN and port recorded
+		\State $isTrigger\gets$ whether the packet is a trigger packet
+		%\State $last\_ack\_psn\gets$ last aggregated ACK's psn
+		%\State $min\_port\gets$ port with minimum $ack\_psn$ last time
+		\State min.psn = ack.psn;
+		\State \textcolor{purple}{// every stage compare the PSN}
+		\If{$ack.psn > rec.psn$ or $(ack.psn <= 24'b3fffff$ and $rec.psn >= 24'b600000)$}
+			\State min.psn = rec.psn;
+			\If{rec.port == ack.port}
+				\State rec.psn = ack.psn;
+			\EndIf
+		\EndIf
+		\State \textcolor{purple}{// last stage write the min PSN back}
+		\If{isTrigger} 
+			\State ack.psn = min.psn;
+			\State Forward ACK.
+		\EndIf
+	\end{algorithmic}
+\end{algorithm}

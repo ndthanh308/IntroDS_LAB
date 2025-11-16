@@ -1,0 +1,241 @@
+\section{Slice-Shift UNet}
+\label{sec:method}
+We based our model design on the UNet architecture proposed by Isensee \etal in~\cite{Isensee_2021} and optimized by Futrega \etal in~\cite{futrega2022optimized}. SSH-UNet, whose detailed illustration is found in Figure~\ref{fig:sshunet}, is a CNN-based architecture designed to capture the global connections between multi-plane (axial, coronal, and sagittal) and multi-slice images. This is obtained through weight sharing and by shifting the feature maps along the slices' axis. The overall framework is characterized by: 1) 2D residual blocks used to extract spatial features from the slices of the input volume, 2) slice shifting to incorporate information between adjacent slices neglected by 2D convolutions, and 3) a multi-view fusion block to obtain the final segmentation predictions from the three orthogonal planes.
+\subsection{2D residual block}
+\label{subsec:2dconv}
+Let us assume that the input to the encoder is a sub-volume $\textbf{V}\in \mathbb{R}^{C_{in}\times S\times H\times W}$, with $C_{in}$ channels and patch resolution of $(S, H, W)$.
+$\textbf{V}$ lies in the Euclidean space, thus it has three mutually perpendicular coordinate axes $\textit{x}, \textit{y}$ and $\textit{z}$ and three mutually perpendicular coordinate planes: $\textit{xy-plane}, \textit{yz-plane}$ and $\textit{xz-plane}$. For clarity we use the following notation $\textbf{V}\in \mathbb{R}^{C_{in}\times X\times Y\times Z}$. 
+We modify the input tensor by placing the plane of interest on the last two dimensions. More precisely from $\textbf{V}$ we generate three volumes $\textbf{V}_{xy}$, $\textbf{V}_{yz}$ and $\textbf{V}_{xz}$, as below:
+\begin{align}
+     \textbf{V}_{xy}: \mathbb{R}^{C_{in}\times X\times Y\times Z} \rightarrow \mathbb{R}^{C_{in}\times Z\times X\times Y} \nonumber \label{eq:reshape} \\
+     \textbf{V}_{yz}: \mathbb{R}^{C_{in}\times X\times Y\times Z} \rightarrow \mathbb{R}^{C_{in}\times X\times Y\times Z}\\ \nonumber
+     \textbf{V}_{xz}: \mathbb{R}^{C_{in}\times X\times Y\times Z} \rightarrow \mathbb{R}^{C_{in}\times Y\times X\times Z} \nonumber 
+\end{align}
+The three volumes are stored in the batch dimension obtaining the final input $\textbf{I}$:
+\begin{equation}
+    \textbf{I}=[\textbf{V}_{xy}; \textbf{V}_{yz}; \textbf{V}_{xz}].
+\label{eq:input}
+\end{equation}
+We apply 2D convolution with a kernel size of $1\times k\times k$ extracting spatial features from the three orthogonal planes stored in $\textbf{I}$. Methods like~\cite{prasoon2013deep,roth2014new} treat images from $xy$, $yz$, and $xz$ planes as three channels of 2D images. This is empirically effective and memory efficient, but the weakness of the approach is that the three channels are not spatially aligned~\cite{jang2022m3t}, which is why we chose to concatenate the three views in the batch leaving the network to learn multi-view features through weights shearing.
+
+Overall, our residual block is composed of two convolutional layers with kernel size $1\times 3\times 3$ followed by instance normalization and LeakyReLu activation. A residual skip connects the input of the block with the output of the second convolution.
+
+\subsection{Slice shifting} 
+Given a volume $\textbf{V}\in \mathbb{R}^{C\times S\times H\times W}$ perceived as a sequence of $S$ images (or slices) with resolution $(H, W)$,  when applying 2D convolution, we do not extract features between adjacent slices. In SSH-UNet we apply a shift operation to re-integrate the third dimension and mingle the information in neighbouring slices.
+The intuition behind the shift operation adapted from \cite{Lin_2019} is the following: if we consider a 1-D convolution with kernel size 3 and weights $W=(w_1, w_2, w_3)$, and a 1D input tensor $X$, then the convolution operation can be written as $Y_i=w_1X_{i-1} + w_2X_i + w_3X_{i+1}$. The operation can be decoupled as a \textit{shift} and \textit{multiply-accumulate}, where $X$ is shifted by -1, 0, +1 and multiplied by $(w_1, w_2, w_3)$ respectively. The \textit{shift} operation is:
+\begin{equation}
+    X^{-1}_i=X_{i-1} ,\quad X^0_i=X_i, \quad X^{+1}_i=X_{i+1} 
+\end{equation}
+which can be conducted separately from multiplication.
+The \textit{multiply-accumulate} operation is:
+\begin{equation}
+    Y=w_1X^{-1} +  w_2X^{0} + w_3X^{+1}
+\end{equation}
+that in our case is computed by the previously mentioned 2D convolution. The shift operation does not introduce any extra computational cost to the 2D CNN model. The overall framework is described in Figure \ref{fig:pipeline} where an intermediate residual layer of SSH-Unet with $C_{in}$ input channels and $C_{out}$ output channels is depicted. The slices' axis $S$ change based on the plane we are considering: axis $X$, $Y$, $Z$ for the axial, sagittal, and coronal planes respectively. The feature maps of the different slices are denoted with different shades of colours in each row. Along the slices' axis, we shift part of the channels forward and backwards by +1 and -1 leaving the rest un-shifted. We shift a proportion of $1/4$ of the channels forward and $1/4$ backwards.
+
+\subsection{Multi-view fusion}
+The last Residual block of the decoder gives as output the tensor
+$\textbf{O}=[\textbf{O}_{xy}; \textbf{O}_{yz};\textbf{O}_{xz}]$. The final segmentation mask is obtained by fusing the three output tensors stored in the batch of $\textbf{O}$. In the first place, the operation computed in Eq. \ref{eq:reshape} is reversed
+\begin{align}
+    \textbf{O}_{xy}: \mathbb{R}^{C\times Z\times X\times Y} \rightarrow \mathbb{R}^{C\times X\times Y\times Z} \nonumber \\
+    \textbf{O}_{yz}: \mathbb{R}^{C\times X\times Y\times Z} \rightarrow \mathbb{R}^{C\times X\times Y\times Z} \nonumber \\
+    \textbf{O}_{xz}: \mathbb{R}^{C\times Y\times X\times Z} \rightarrow \mathbb{R}^{C\times X\times Y\times Z} \nonumber 
+\label{eq:reverse}
+\end{align}
+ensuring that information isn't wrongly mixed when tensors are fused. After, $\textbf{O}_{xy}, \textbf{O}_{xz},$ and $\textbf{O}_{yz}$ are summed followed by two convolutions with kernel size $1\times 1\times 1$ generating the final segmentation mask.
+
+% Figure environment removed
+
+\section{Experiments}
+\label{sec:experiments}
+\subsection{Datasets} 
+\textbf{AMOS:} the Multi-Modal Abdominal Multi-Organ Segmentation dataset~\cite{ji2022amos} was introduced as part of the MICCAI 2022 challenge. AMOS is a large-scale, diverse, clinical dataset for abdominal organ segmentation that provides 500 CT and 100 MRI scans accompanied by voxel-level annotations for 15 organs. The data were collected from Longgang District Central Hospital (SZ, China). With over 74k annotated slices AMOS is $\times20$ larger than BTCV~\cite{BTCV_orig} dataset (3.6K annotated slices). For our experiment, we use the AMOS-CT subset where all the 500 CT scans are interpolated into the isotropic voxel spacing of $1.0\times1.0\times1.0$ $mm^3$. Following~\cite{ji2022amos} we first truncate the HU values between $[-991, 362]$ and normalize to $[0,1]$. Data augmentation of random flip, rotation, intensities scaling, and shifting are used with probabilities set to 0.2, 0.2, 0.5, and 0.5 respectively. The multi-organ segmentation problem is formulated as a 16-class segmentation task with 1-channel input.
+
+\textbf{BTCV:} For the ablation analysis (Section \ref{sec:ablation}), we utilize the popular Multi-Atlas Labeling  Beyond the Cranial Vault dataset~\cite{BTCV_orig}. BTCV contains 30 subjects with abdominal CT scans where 13 organs are annotated by interpreters under the supervision of radiologists at Vanderbilt University Medical Center. All CT scans were interpolated into the isotropic voxel spacing of $1.0\times 1.0\times 1.0$ $mm^3$ as a pre-processing step. The intensity was truncated between $[-175, 250]$ and normalized to $[0,1]$. We used the same data augmentation implemented in AMOS.
+
+\subsection{Implementation details} 
+The network architecture was created using as baseline DynUNet class from MONAI\footnote {\url{https://monai.io/}}. We extended the original class by inserting the slice shifting in its building blocks and by adding our Multi-View Creation step and Multi-View Fusion Block. For a fair comparison the results in Table \ref{tab:amos} are obtained by training for 1000 epochs using SGD optimizer with a momentum of 0.99, warm-up cosine scheduler for 50 iterations, an initial learning rate of 0.01,  and a batch size of 2, recreating the same training condition of the benchmark created in~\cite{ji2022amos}. Following the official AMOC-CT challenge data split we used 200 CT scans for training and 100 CT scans for the validation set. With the BTCV dataset, we trained for 5000 epochs and stopped the training after 1000 epochs if the validation accuracy did not improve. An AdamW optimizer with a warm-up cosine scheduler was used for 50 iterations, batch size 2, an initial learning rate of 4$e$-4, momentum of 0.9, and decay rate of 1$e$-5. We used 24 CT for training and 6 CT for testing. 
+
+Each training was conducted with a patch resolution of $96\times 96\times 96$ on an NVIDIA A100.
+
+\subsection{Evaluation metric} 
+We used the Dice Similarity Coefficient (DSC) and the Normalized Surface Dice (NSD)~\cite{nikolov2018deep} metric to evaluate the segmentation accuracy in our experiments. While DSC measures the overlap between two volumes, the NSD score provides information on the segmentation quality for the boundaries. Given the ground truth $Y$ and the prediction $\hat{Y}$ for each voxel $i$ the Dice score is defined as:
+\begin{equation}
+    Dice=2\cdot \frac{\sum_{i=1}^IY_i\hat{Y_i}}{\sum_{i=1}^IY_i + \sum_{i=1}^I\hat{Y_i}}.
+\end{equation}
+Using the above two metrics, we calculate category-wise performance. The DSC used to gauge model performance, ranges from 0 to 1, where 1 corresponds to a pixel-perfect match between the deep learning model output $\hat{Y}$ and ground truth annotation $Y$. The NSD is used to determine which fraction of a segmentation boundary is correctly predicted with values ranging between 0 and 1.
+%-----------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+We compare our model with six state-of-the-art medical segmentation methods present in the benchmark in~\cite{ji2022amos} where Yuanfeng and his colleagues, for the training stage, randomly cropped sub-volumes of size $64\times 160\times 160$; we rather cropped sub-volumes of size $96\times 96\times 96$ as input for our network, due to the multi-view creation, described in Section \ref{subsec:2dconv}, that requires an isotropic volume size. The implementation of the state-of-the-art methods can be found in: UNet\footnote{\url{https://github.com/MIC-DKFZ/nnUNet/tree/master}},  VNet\footnote{\label{monai_nets}\url{https://github.com/Project-MONAI/MONAI/tree/dev/monai/networks/nets}}, CoTr\footnote{\url{https://github.com/YtongXie/CoTr/tree/main/CoTr_package/CoTr}}, nnFormer\footnote{\url{https://github.com/282857341/nnFormer/tree/main/nnformer}}, UNetr\footref{monai_nets}, Swin-UNetr\footref{monai_nets}. 
+
+The class-wise Dice scores on the AMOS-CT validation set are shown in Table \ref{tab:amos}. By training with $96\times 96\times 96$ patches, we achieve an overall accuracy of \textbf{87.28\%} gaining the second position in the benchmark right after UNet~\cite{Isensee_2021}, trained with $64\times 160\times 160$, that indeed outperforms SSH-UNet with +1.6\% gain in accuracy. However, our model has almost -80\% of parameters. Comparing SSH-UNet with Swin UNETR~\cite{Tang_2022} (previously ranked first on MSD~\cite{msd} and BTCV leaderboards) our model offers a substantial improvement in segmenting: right kidney +2.2\%, gallbladder +5.8\%, liver +1.7\%, stomach +3.4\%, and prostate/uterus +4.2\%. In Table \ref{tab:amos_test} the overall results from the AMOS-CT test benchmark are shown. SSH-UNet also confirmed its second position in the test set with an average DSC of \textbf{87.75\%} and NSD of \textbf{77.16\%}. The class-wise DSC and NSD can be found in Table \ref{tab:class_test_amos}, while Figure \ref{fig:amos_results} shows some representative samples of our predictions.
+
+\begin{table*}[t]
+  \begin{center}
+  \begin{adjustbox}{max width=\textwidth}   
+\begin{tabular}{l|rrrrrrrrrrrrrrr|r}
+\hline
+\multirow{2}{*}{Models} &
+      \multicolumn{16}{c}{Categorical DSC(\%) $\uparrow$} \\
+ & SPL& RKI &LKI &GBL &ESO &LIV &STO &AOR& IVC &PAN &RAG &LAG &DUO& BLA &PRO/UTE & \textbf{Avg.} \\
+\hline
+UNet~\cite{Isensee_2021}& \textbf{96.31}& 95.29 & \textbf{96.28}& 81.53& \textbf{85.72} & 97.05 & 90.77 & \textbf{95.37} & \textbf{91.53} & \textbf{87.39} & \textbf{79.83} & \textbf{81.12} & \textbf{82.56} & \textbf{88.42} & \textbf{83.81} & \textbf{88.87} \\
+ VNet~\cite{milletari2016v}&  94.21 &91.86 & 92.65 &70.25 & 79.04 & 94.65 & 84.79 & 92.96 & 87.4 & 80.5 & 72.62 &73.19 &71.69 & 77.02 & 66.62& 81.96\\
+ CoTr~\cite{Xie_2021}&  91.09 & 87.18& 86.36& 60.47&80.9 &91.61 & 80.09& 93.66& 87.72 & 76.32 & 73.68& 71.74&67.98& 67.38& 40.84 & 77.13\\
+nnFormer~\cite{zhou2021nnformer}& 95.91& 93.51& 94.8& 78.47& 81.09& 95.89& 89.4& 94.16& 88.25& 85.0& 75.04 &75.92& 78.45& 83.91& 74.58& 85.63\\
+UNETR~\cite{Hatamizadeh_2022}&  92.68& 88.46& 90.57& 66.5& 73.31& 94.11& 78.73& 91.37& 83.99& 74.49& 68.15& 65.28& 62.35& 77.44 &67.52& 78.33\\
+Swin-UNETR~\cite{Tang_2022}& 95.49 &93.82 &94.47 &77.34 &83.05 &95.95 &88.94 &94.66 &89.58 &84.91 &77.2 &78.35 &78.59 &85.79 &77.39& 86.37\\
+\hline
+SSH-UNet & 95.77 & \textbf{96.01} & 94.29 & \textbf{83.12} & 81.81 & \textbf{97.60} & \textbf{92.32} & 94.34& 88.42& 85.36& 76.43& 76.36& 77.79& 87.99& 81.54 & 87.28 \\
+\hline
+\end{tabular}
+\end{adjustbox}
+\end{center}
+\caption{The class-wise Dice score on the validation set of AMOS-CT. We compare SSH-UNet with the official benchmark on~\cite{ji2022amos}. Note: spleen (SPL), right kidney (RKI), left kidney (LKI), gallbladder (gbl), esophagus (ESO), liver (LIV), stomach (STO), aorta (AOR), inferior vena cava (IVC), pancreas (PAN), right adrenal gland (RAG), left adrenal gland (LAG), duodenum (DUO), bladder (BLA), prostate/uterus (PRO/UTE). The best results are highlighted in bold. SSH-UNet outperforms UNet on four organs and has an average segmentation accuracy 1.6\% inferior with respect to 3D UNet, but has 20\% of UNet's parameters, as shown in Figure~\ref{fig:complexity}.}
+\label{tab:amos}
+\end{table*}
+
+\begin{table*}[t]
+  \begin{center}
+  \begin{adjustbox}{max width=\textwidth}   
+\begin{tabular}{l|rrrrrrrrrrrrrrr|r}
+    \hline
+\multirow{2}{*}{SSH-UNet} &
+      \multicolumn{15}{c}{CT-Test} \\
+    & SPL& RKI &LKI &GBL &ESO &LIV &STO &AOR& IVC &PAN &RAG &LAG &DUO& BLA &PRO/UTE & \textbf{Avg.} \\
+    \hline
+    DSC & 95.41 & 96.17 & 94.63 & 82.65 & 83.09 & 97.80 & 92.45 & 94.26 & 90.12 & 85.29 & 77.35 & 79.40 & 78.60 & 89.12 & 79.98 & 87.75 \\
+    NSD & 88.97 & 89.06 & 86.54 & 72.55 & 73.39 & 85.01 & 76.86 & 87.77 & 75.70 & 68.30 & 81.01 & 80.63 & 62.24 & 75.15 & 54.29 & 77.16\\ 
+    \hline
+\end{tabular}
+\end{adjustbox}
+\end{center}
+\caption{The class-wise Dice score (DSC) and the Normalized Surface Distance (NSD) of SSH-UNet on the AMOS-CT test.}
+\label{tab:class_test_amos}
+\end{table*}
+
+\begin{table}[t]
+  \begin{center}
+    {\small{
+\begin{tabular}{l|rr}
+\hline
+\multirow{2}{*}{Models} &
+      \multicolumn{2}{c}{CT-Test} \\
+       &mDSC(\%)& mNSD(\%) \\
+\hline
+UNet~\cite{Isensee_2021}& \textbf{89.04} & \textbf{78.32} \\
+ VNet~\cite{milletari2016v}& 82.92 & 67.56  \\
+ CoTr~\cite{Xie_2021}&  80.86 & 66.31\\
+nnFormer~\cite{zhou2021nnformer}& 85.61 & 72.48\\
+UNETR~\cite{Hatamizadeh_2022}& 79.43 & 60.84 \\
+Swin-UNETR~\cite{Tang_2022}& 86.32 & 73.83 \\
+\hline
+SSH-UNet & 87.75 & 77.16 \\
+\hline
+\end{tabular}
+}}
+\end{center}
+\caption{Overall results of six state-of-the-art methods taken from the official AMOS-CT test benchmark in~\cite{ji2022amos} and SSH-UNet.}
+\label{tab:amos_test}
+\end{table}
+
+% Figure environment removed
+ 
+In Table \ref{tab:per_organ_kfold} we can see the results of 5-fold cross-validation on the BTCV dataset. On average our model is able to reach \textbf{84.35\%} of accuracy without the help of any ensemble. From the table, we can observe that the fourth-fold segmentation of the spleen shows a significant drop in performance. The gallbladder and adrenal glands are segmented poorly by the first and second folds compared to the others. The first fold also led to a bad segmentation mask for the esophagus, liver, and stomach. We want to highlight that the official BTCV webpage emphasizes that some patients may not have the right kidney or gallbladder and thus are not labelled; however, our network is capable of segmenting the right kidney independently of the folds, while the drop in performance in the second fold in the gallbladder may be related to the lack of annotated data.
+
+
+\begin{table*}[t]
+  \begin{center}
+  \begin{adjustbox}{max width=1.0\textwidth}   
+\begin{tabular}{l|rrrrrrrrrrrr|r}
+\hline
+Folds & SPL & RKI & LKI & GBL & ESO & LIV & STO & AOR & IVC & Veins & PAN & AG & \textbf{Avg.} \\
+\hline
+1 & 94.02 & 93.79 & 88.18 & 77.36 & 67.57 & 64.59 & 63.22 & 90.20 & 87.19 & 75.20 & 78.73 & 69.47 & 79.13 \\
+2 & 96.42 & 92.90 & 94.60 & 54.10 & 76.13 & 97.02 & 81.59 & 93.39 & 86.04 & 76.75 & 71.81 & 69.08 & 82.49 \\
+3 & 97.02 & 95.25 & 95.70 & 86.04 & 80.17 & 97.72 & 95.47 & 88.78 & 89.73 & 84.94 & 87.30 & 75.4 & 89.46 \\
+4 & 48.38 & 88.81 & 92.57 & 91.69 & 79.01 & 95.06 & 91.35 & 89.43 & 86.65 & 70.76 & 78.05 & 75.89 & 82.3 \\
+5 & 96.97 & 95.35 & 95.31 & 84.96 & 82.57 & 97.46 & 88.85 & 87.49 & 87.44 & 83.02 & 83.82 & 77.19 & 88.36 \\
+\hline
+\textbf{Avg} & 86.56 & 93.22 & 93.27 & 78.83 & 77.09 & 90.37 & 84.10 & 89.86 & 87.41 & 78.13 &79.94 &73.41 & 84.35 \\
+\hline
+\end{tabular}
+\end{adjustbox}
+\end{center}
+\caption{The class-wise Dice scores, expressed in percentages, for each fold of SSH-UNet trained on the BTCV dataset using 5-fold cross-validation. Note: spleen (SPL), right kidney (RKI), left kidney (LKI), gallbladder (GBL), esophagus (ESO), liver (LIV), stomach (STO), aorta (AOR), inferior vena cava (IVC), portal and splenic veins (Venis), pancreas (PAN), left and right adrenal glands (AG).}
+\label{tab:per_organ_kfold}
+\end{table*}
+%-------------------------------------------------------------------------
+\section{Ablation study}
+\label{sec:ablation}
+\subsection{Model components}
+We perform an ablation study to validate the effectiveness of the individual components of our model. As shown in Tables \ref{tab:ablation}, we can see the results of the different configurations trained with the BTCV and AMOS datasets. A UNet with only 2D convolution resulted in the lowest mDSC score. By introducing only the shift operation, referred to as "shift" in the table,  performance improved compared to the simple 2D case. With less than half of the parameters by combining multi-view with the shift operation (m.v. + shift) we are able to achieve comparable results of fully 3D UNet with the same architecture. In Figure \ref{fig:ablation_results} we can see qualitative results on the BTCV validation set.
+\begin{table}[t]
+  \begin{center}
+    {\small{
+\begin{tabular}{rrrr}
+\hline
+Components & Params & mDSC$_{BTCV}$ & mDSC$_{AMOS}$ \\
+\hline
+3D & 16.54 M & 0.842 & 0.882\\
+2D & 6.18 M & 0.801 & 0.811\\
+2D$+$shift &  6.48 M &  0.822 & 0.871\\
+\hline
+2D$+$shift$+$m.v.&  6.48 M &  0.838 & 0.873\\
+\hline
+\end{tabular}
+}}
+\end{center}
+\caption{Ablation analysis of the introduced components. The term \textit{shift} stands for the slice shift operation, while the term \textit{m.v.} stands for multi-view fusion. In the last two columns, we can see the average Dice score on the validation set for BTCV and AMOS datasets.}
+\label{tab:ablation}
+\end{table}
+
+% Figure environment removed
+
+\subsection{Shift operation}
+We investigate the impact on the performance of the proportion of shifted channels. In Table \ref{tab:shifting_ablation} we can see that by shifting $1/4$ of the feature maps forwards and $1/4$ backwards (meaning we are shifting in total half of the channels) we have the best result. In the last column, we have the 2D case without shifting.
+\begin{table}[t]
+  \begin{center}
+    {\small{
+\begin{tabular}{r|rrrrr}
+\hline
+Shifted channels &$1/2$ & $1/4$ & $1/8$ & $1/16$ & $0$\\
+\hline
+mDSC & 0.866 & \textbf{0.871} & 0.868 & 0.865 & 0.811 \\
+\hline
+\end{tabular}
+}}
+\end{center}
+\caption{Performance comparison on the proportion of channels shifted forward and backwards on the AMOS-CT validation set. Proportion $0$ is the fully 2D case without shift. The proportion $1/2$ is the case where all the channels are shifted, half forward and half backwards.}
+\label{tab:shifting_ablation}
+\end{table}
+
+%-------------------------------------------------------------------------
+\subsection{Model complexity}
+In this section, we examine the model complexity. In Table \ref{tab:complexity} the floating-point operations per second (FLOPs) and the number of parameters are presented for SSH-UNet and other baselines. A graphical representation of the Table can be seen in Figure \ref{fig:complexity}, where the efficiency plot shows that SSH-UNet is computationally more efficient compared with other state-of-the-art models (on average less than $1/5$ of parameters) while maintaining the second-highest DSC score of \textbf{87.28\%}.
+\begin{table}[t]
+  \begin{center}
+    {\small{
+\begin{tabular}{l|rr|rr}
+\hline
+Models & mDSC(\%)& Params(M) &Flops(G) \\
+\hline
+UNet & 88.87  & 31.18 & 680.31\\
+VNet & 81.96  & 45.65 & 849.96\\
+CoTr &  77.13 & 41.87 & 668.15\\
+nnFormer & 85.63 & 150.14 & 425.78\\
+UNETR &  78.33 & 93.02 & 177.51\\
+Swin.UNETR & 86.37 & 62.83 &668.15\\
+\hline
+SSH-UNet (Ours) & 87.28 & 6.48 & 288.99 \\
+\hline
+\end{tabular}
+}}
+\end{center}
+\caption{Overall results of six state-of-the-art methods taken from the official AMOS-CT validation benchmark in~\cite{ji2022amos} and SSH-UNet.}
+\label{tab:complexity}
+\end{table}
+
+% Figure environment removed
+%-------------------------------------------------------------------------

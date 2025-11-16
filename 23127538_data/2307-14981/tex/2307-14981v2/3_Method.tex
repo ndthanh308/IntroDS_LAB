@@ -1,0 +1,89 @@
+\section{Preliminary and Problem Definition}
+
+NeRF uses a differentiable model of volume rendering to represent a scene as a volumetric field. 
+It can be built upon multilayer perceptrons (MLPs), neural graphic primitive (NGP) or voxel grid, \etc, to encode the scene, which can be represented as a 5D function that takes a 3D location ${\rm x}=(x, y, z)$ and 2D viewing direction ${\rm d} = (\theta, \Phi)$ as inputs:
+\begin{equation}
+    \sigma, {\rm \bf c} = F({\rm d}, {\rm x}).
+\end{equation} 
+
+% \noindent 
+Given a set of images $\{{I}_i\}$ and corresponding camera poses $\{P_i\}$, NeRF casts each pixel from $I_i$ as a ray defined by the camera intrinsics, and sample particles to describe how much it blocks or emits lights along the ray. The color $\widehat{\mathcal{C}}({\rm{\bf r}})$ and depth $\widehat{\mathcal{D}}({\rm{\bf r}})$ of a ray $\rm \bf r$ can be approximated by integrating the sampled particles along the ray as follows,
+\begin{equation}
+    \widehat{\mathcal{C}}({\rm{\bf r}}) = \sum_{i=1}^N T_i (1-{\rm exp}(-\sigma_i\delta_i)) \rm {\bf c}_i ,
+    \label{nerf:color}
+\end{equation}
+\begin{equation}
+    \widehat{\mathcal{D}}({\rm{\bf r}}) = \sum_{i=1}^N T_i (1-{\rm exp}(-\sigma_i\delta_i)) \sum_{j=1}^i\delta_j,
+    \label{nerf:depth}
+\end{equation}
+\noindent where $T_i\!=\!{\rm exp}(-\sum_{j=1}^{i-1}\sigma_i\delta_i)$ denotes the accumulated transmittance along the ray from the first sample to $i$-th sample, which is short for transmittance. $(1-{\rm exp}(-\sigma_i \delta_i))$ denotes the alpha value of the current sample contributed to the rendered color and depth, and $\sigma_i$ is the density of sample $i$, $c_i$ is the predicted color of sample $i$, and $\delta_i$ is the distance from sample $i$ to its next sample $i+1$. We denote the probability of ray termination as $h_i = T_i (1-{\rm exp}(-\sigma_i\delta_i))$. To supervise the training of $F$, an L2 photometric reconstruction loss is used:
+\begin{equation}
+    \mathcal{L}_{rgb}= \sum_i {\mathop{\mathbb{E}}_{{\rm \bf r}\in I_i} {|| \widehat{\mathcal{C}}({\rm{\bf r}}) - \mathcal{C}^{gt}_i({\rm{\bf r}}) ||_2^2}},
+\end{equation}
+\noindent where $\mathcal{C}^{gt}_i({\rm{\bf r}})$ is the ground truth color of $\rm \bf r$ from image $I_i$.
+%This paper targets on designing a large-scale novel view synthesis model that supports faster rendering and training. To this end, we build our model on top of Plenoxels~\cite{yu2021plenoxels}, which is a view-dependent plenoptic volume rendering method that encodes sparse voxel grid with density and spherical harmonic coefficients. The essential difference between it and conventional NeRF models is that Plenoxels explicitly stores data for rendering on voxel grids instead of MLPs. Sampling along a ray becomes marching along rays on plenoptic voxel grids, and $\sigma_i$ and spherical harmonic coefficients can be trilinearly interpolated by its nearest eight voxel grids. The view-dependence of $c_i$ can be simulated by the sum of harmonic basis functions for each color channel.
+
+% To achieve the goal of synthesizing 
+%To synthesize novel views of scalable street scenes, we need to optimize a very large voxel grid using a large number of posed images. However, it is technically difficult to load the whole grid into GPU due to its memory limitation, unless we adopt a very coarse resolution to build the grid. In our approach, we first partition the target space into a set of smaller spherical grids that balance the quality of NVS and memory footprint. Then we train each spherical grid following the protocol of optimizing sparse strucutre encoded with spherical harmonic coefficients, and propose novel training strategies on street scenes, such as LiDAR initialization, spherical grid fusion and depth supervision on sparse grids. 
+
+% An effective AD simulator is expected to rapidly simulate sensor outputs given inputs different from the original ones in log files. Since this paper aims to tackle the problem of rapidly simulating environment using visual log data and map information, the input data is limited compared to the one used in other work such as~\cite{tancik2022block}.
+\vspace{4pt} \noindent \textbf{Problem Definition.} In our problem of using the neural radiance field $F$ for driving view synthesis, we are given $\{{I}_i\}$ and $\{P_i\}$, along with a semantic map $\mathcal{M}$. We define view interpolation as the use of a continuous function $\mathcal{F}_{in}$ to interpolate the orientations and translations of $\{P_i\}$, and synthesize novel views at any point on $\mathcal{F}_{in}$. Similarly, view extrapolation is defined as synthesizing a novel view at a point outside of $\mathcal{F}_{in}$, but near its nearest point on $\mathcal{F}_{in}$, typically to simulate a lane change in driving scenarios. In this setting, most existing NeRF methods exhibit decent performance on view interpolation but fail on view extrapolation.
+To be more specific, we constrain $\mathcal{M}$ only to contain ground height and lane vectors, which are the fundamental entities that exist in most map formats. Our goal is to improve the quality of view extrapolation by incorporating $\mathcal{M}$ into the training of $F$ while ensuring that the performance of view interpolation is still maintained.
+
+
+\section{Method}
+% This section first introduces two supervision methods, and then elaborates how to incorporate map priors by using them to supervise the neural radiance field.
+In this section, we first introduce two supervision methods, \ie, ground density and multi-view consistency supervision. Then, we elaborate on how to incorporate map priors into them. After that, an uncertainty term with an uncertainty tempering strategy is explicitly modeled to weakly supervise the training and avoid introducing errors from the semantic-level map that might harm the neural radiance field.
+
+% \subsection{Overview}
+% In AD simulation and test, map information usually contains high-level information such as ground, lane information, etc., to provide a base for planning and control. For example, Argoverse2~\cite{wilson2023argoverse} provides HD maps consist of lane graph, driveable area, ground surface height and area of local maps. Our method incorporates those high-level but not pixelwise
+
+\subsection{Ground Density Supervision}
+\label{sec:ground_density}
+
+The coarse geometry of HD map, in the format of the ground height field, motivates us to take it as an uncertain signal to guide the reconstruction process of the density field. We first analyze the formulation of ray termination (\ie \equref{nerf:depth}), which is a continuous probability distribution over the sampling region. As shown in~\figref{figRayDist}, we partition the ray termination distribution into three regions:
+\begin{itemize}
+    \item \textbf{Uncertain region}, where we are not confident if the ray should terminate in this region or not, due to the possible existence of obstacles or constructions on the road ground, which are not encoded in the map;
+    \item \textbf{Ground region}, where the ground surface exists within an error tolerance (a typical average error is around $30cm$);
+    \item  \textbf{Certain region}, or called as unconcern region, where the existence of any object beneath the ground is not related to our task of view synthesis.
+\end{itemize}
+
+Because a ray cast from images might terminate at the surface of obstacles or constructions on the road surface, we must not apply any supervision on the uncertain region. Therefore, we define the ideal distribution of ray termination as a multi-modal distribution instead of the unimodal distribution used in~\cite{deng2022depth}. Given the ground height map of $\mathcal{M}$, we first generate a dense triangle mesh $\widehat{\mathcal{M}}$ using Delaunay triangulation. Then, we use the camera intrinsic and extrinsic parameters to render $\widehat{\mathcal{M}}$ to the dense depth map $\mathcal{D}^{pgt}$ for each camera pose. Note that the term `\textit{pgt}' means pseudo ground truth. We use the KL divergence~\cite{deng2022depth} and the distant line-of-sight priors~\cite{rematas2022urban} to formulate our ground density supervision function:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_{gd} = &\mathop{\mathbb{E}}_{{\rm \bf r}\in I_i} \int_{\mathcal{D}^{pgt}_{ij}-\epsilon} \log h(t) \exp\left(-\frac{(t - \mathcal{D}^{pgt}_{ij})^2}{2\epsilon^2}\right) dt \\
+    & + {\mathop{\mathbb{E}}_{{\rm \bf r}\in I_i} \int_{{\mathcal{D}^{pgt}_{ij}+\epsilon}} h(t)^2 dt},
+    \label{eq:ground}
+\end{aligned}
+\end{equation}
+where $\epsilon$ is the uncertainty that measures the upper bound of error between the map and the ground truth data. This integral can be easily approximated using a discrete set of samples.
+To improve the smoothness of the learned depth images, we adopt the depth smooth regularization by sampling $2\times2$ patches rather than pixels to compute the gradients. 
+
+
+% Figure environment removed
+
+
+\subsection{Multi-view Consistency Supervision}
+The ground density supervision enables the model to improve further the multi-view semantic consistency based on ray terminations. The key insight is ``\textit{a lane on the road should be a lane no matter where we look at it}''. We use a similar random ray casting method in~\cite{zhang2022ray} to generate rays from unseen views. However, the online pseudo labels generated by~\cite{zhang2022ray} are not suitable for our problem: the ray termination is not precise enough to be directly used for generating pseudo labels, though it has been explicitly supervised with uncertainty. In contrast, we define an uncertainty function to measure the confidence that a ray is terminated on the surface of the ground as:
+\begin{equation}
+    \Gamma({\rm \bf r_i}, \mathcal{D}^{pgt}_i) = \exp\left(\frac{-||\widehat{\mathcal{D}}({\rm \bf r_i}) - \mathcal{D}^{pgt}_i||_1}{2\epsilon}\right),
+\end{equation}
+\noindent where $\epsilon$ is the same uncertainty used in~\secref{sec:ground_density}. To stabilize the training process, we use ground depth $\mathcal{D}^{gt}_i$ provided by map priors to generate pseudo labels and use $\Gamma({\rm \bf r_i}, \mathcal{D}_i)$ to weight the gradients of rays. Concretely, for a ray cast ${\rm \bf r_i} = {\rm \bf o_i} + t \cdot {\rm \bf d_i}$ from $I$ and a sampled position ${\rm \bf o'_i} = {\rm \bf o_i} + \delta$, we use $\mathcal{D}^{pgt}_i$ to obtain a 3D point $p_i$ in global coordinate, and connect $p_i$ to $\rm \bf o'$ to obtain a sampled ray ${\rm \bf r'_i} = {\rm \bf o'_i} + t\cdot(({p_i-\rm \bf o'_i})/||{p_i-\rm \bf o'_i}||_2)$, where $\delta$ is a randomly sampled 3D vector with a norm of $0.1$ in our experiments. Optionally, we can use DPT~\cite{ranftl2021vision} to filter occluded regions on $\mathcal{D}^{pgt}_i$ out using least square fitting similar to~\cite{yu2022monosdf}. As a result, the ground truth of color $\mathcal{C}^{gt}_i$ can be used for supervising $\rm \bf r'_i$ with a weighting term $\Gamma({\rm \bf r_i}, \mathcal{D}^{pgt}_i)$. Additionally, if ${\rm \bf r_i}$ is passing through a pixel that is near rendered vector lanes, it can be enlarged according to the minimal distance. The loss of multi-view consistency can be written as:
+\begin{equation}
+    \mathcal{L}_{v} = \sum_i {\mathop{\mathbb{E}}_{{\rm \bf r'}\in I_i} { \Gamma({\rm \bf r_i}, \mathcal{D}^{pgt}_i)  || \widehat{\mathcal{C}}({\rm{\bf r'}}) - \mathcal{C}^{gt}_i({\rm{\bf r}})  ||_2^2}}.
+    \label{eq:view}
+\end{equation}
+
+
+\subsection{Uncertainty Tempering}
+The goal of our method is to use map priors to guide the training of neural radiance fields, formulating a weak supervision paradigm. The term $\epsilon$ used in the definitions of $\mathcal{L}_{gd}$ and $\mathcal{L}_{v}$ describes the uncertainty that we leave the radiance fields to explore, mainly using $\mathcal{L}_{rgb}$. In this section, we propose a strategy to enlarge uncertainty $\epsilon$ gradually, opposite to the simulated annealing of the learning rate frequently used in deep learning. This strategy provides more freedom for the radiance field as the training proceeds. We use the exponential tempering strategy to define the update equation for uncertainty tempering as follows.
+\begin{equation}
+    \epsilon' = \gamma \epsilon,
+    \label{eq:ut}
+\end{equation}
+\noindent where $\epsilon'$ is the updated uncertainty, and $\gamma$ is the exponential growth rate (opposite to the decay rate), we set $\gamma =1.0005$ in our experiments.
+The overall loss for training our semantic-consistency neural radiance field is:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{rgb} + \lambda_d \mathcal{L}_{gd} + \lambda_v \mathcal{L}_{v}.
+\end{equation}
+where $\lambda$ is used to balance each loss, $\lambda_d = 0.2$ and $\lambda_v = 0.5$.

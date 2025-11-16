@@ -1,0 +1,536 @@
+%!TEX root = ../../main.tex
+
+\section{A BST with Rotations}
+\label{app:bst-rot}
+\label{app:bst-rotate}
+
+We present a BST with rotations and prove it correct using contextualization.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Specification}
+\label{app:bst-rot:specification}
+
+To specify the operations of our BST implementation, we define the predicate $\bst{\abscontent}$ denoting a binary search tree with logical contents $\abscontent$. (We assume a global root pointer that is left implicit.)
+The logical contents are a subset of the keys, a totally ordered set $\keyspace$ that has minimal and maximal elements $-\infty$ and $\infty$, respectively.
+With this understanding, an implementation is a binary search tree if its \code{contains}, \code{insert}, and \code{delete} operations adhere to the following specification:
+\begin{align*}
+  \annot{\bst{\abscontent} \mstar -\infty\neq\key\neq\infty}~~\mcode{contains($\key$)}&~~\annot{\res.~\bst{\abscontent} \mstar \res\Leftrightarrow\key\in\abscontent}
+  \\
+  \annot{\bst{\abscontent} \mstar -\infty\neq\key\neq\infty}~~\mcode{~~insert($\key$)}&~~\annot{\res.~\bst{\abscontent\cup\set{\key}} \mstar \res\Leftrightarrow\key\notin\abscontent}
+  \\
+  \annot{\bst{\abscontent} \mstar -\infty\neq\key\neq\infty}~~\mcode{~~delete($\key$)}&~~\annot{\res.~\bst{\abscontent\setminus\set{\key}} \mstar \res\Leftrightarrow\key\in\abscontent}\ .
+\end{align*}
+The specification of \code{contains} requires that the logical contents $\abscontent$ of the tree remain unchanged.
+Moreover, the Boolean return value $\res$ must indicate whether or not the given $\key$ is contained in $\abscontent$.
+Operation \code{insert} adds the given $\key$ to the contents of the tree.
+Its return value indicates whether the $\key$ was successfully inserted ($\res=\true$) or if it was already present ($\res=\false$).
+Similarly, \code{delete} removes the given $\key$ from the tree and indicates whether an actual deletion took place.
+As is usual, all operations expect $-\infty\neq\key\neq\infty$; values $-\infty,\infty$ are for internal purposes.
+
+Besides the above user-facing API, virtually all (concurrent) binary trees come with maintenance operations that restructure the tree.
+Restructuring operations do not alter the logical contents but may rotate or remove nodes in order to speed up future accesses.
+We assume a single \code{maintenance} operation which performs the desired restructuring periodically.
+Its specification is as expected:
+\begin{align*}
+  \annot{\bst{\abscontent}}~~\mcode{maintenance()}&~~\annot{\bst{\abscontent}}\ .
+\end{align*}
+Interestingly, concurrent tree implementations tend to have fairly simple implementations for \code{insert} and \code{delete} but much more intricate \code{maintenance} operations.
+Our implementation will mimic this: \code{delete} will simply mark nodes as logically deleted but does not attempt to remove them from the tree, the removal is performed later by the \code{maintenance} operation.
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Implementation}
+\label{app:bst-rot:implementation}
+
+Our sequential BST implementation is given in \cref{app:fig:api-impl} (ignore the \textcolor{colorAnnotation}{annotations} for a moment).
+The nodes of the tree are of type \code{Node}.
+They contain \code{left} and \code{right} pointers for their left and right subtrees, respectively, a \code{key} from $\keyspace$ that they represent, and a \code{del} flag indicating whether the node is logically deleted.
+We say that a node is marked if the \code{del} flag is raised, and unmarked otherwise.
+Additionally, \code{Node}s contain a ghost field \code{dup} that we use in our proofs to distinguish temporary duplicates that are inserted by rotations.
+That it is a ghost field means that the implementation does not react on its value, only the ghost state may.
+The shared variable $\Root$ is the entry point to the tree.
+It is an unmarked sentinel node containing key $-\infty$.
+
+\input{appendix/ex_rot/fig_api}
+
+All operations of the tree rely on the helper \code{find}.
+It takes a $\key\in\keyspace$ and searches it in a standard BST fashion: upon reaching a node $\anode$, the search terminates at $\anode$ if $\anode$ is $\pnull$ or if $\key$ equals $\selof{\anode}{key}$, continues to $\selof{\anode}{left}$ if $\key$ is less than $\selof{\anode}{key}$, and continues to $\selof{\anode}{right}$ if $\key$ is greater than $\selof{\anode}{key}$.
+The helper then returns the last two nodes $\anode$, $\anodep$ on the search path, such that $\anode$ is guaranteed to be non-null and $\anodep$ is the potentially-null left or right child of $\anode$.
+If $\anodep$ is non-null, then it is guarantee to contain $\key$.
+Node $\anode$ never contains $\key$ (otherwise the search path would not extend to $\anodep$).
+
+Operation \code{delete($\key$)} uses \code{find} to obtain nodes $\x$ and $\y$ with the above properties.
+If $\y$ is null or marked, then $\key$ is not logically contained in the tree (because $\x$ does not contain $\key$) and $\false$ is returned, \cref{app:code:delete:false}.
+Otherwise, $\y$ is unmarked.
+In this case, \cref{app:code:delete:mark} marks it to purge it from the logical contents of the tree and \cref{app:code:delete:true} subsequently returns $\true$.
+Note that $\y$ remains physically present in the tree.
+The physical removal is deferred to the \code{maintenance} operation.
+
+Operation \code{insert($\key$)} proceeds similarly.
+It uses \code{find} to obtain nodes $\x$ and $\y$.
+If $\y$ is null, a new node containing $\key$ is created and added as a child of $\x$, \cref{app:code:insert:less,app:code:insert:greater}.
+If $\y$ is non-null, it is guaranteed to contain $\key$.
+If it is marked, it is simply unmarked, \cref{app:code:insert:unmark}.
+In both cases, $\key$ is successfully added to the contents of the tree and $\true$ is returned.
+Otherwise, $\y$ is unmarked, i.e., $\key$ is already present in the tree.
+Hence, the ongoing insertion fails and returns $\false$, \cref{app:code:insert:false}.
+
+Operation \code{contains($\key$)} simply returns whether the node $\y$ returned by \code{find} is non-null and unmarked.
+The arguments for \code{delete}/\code{insert} already cover why this is an appropriate result.
+
+The \code{maintenance} operation non-deterministically invokes the helper functions \code{removeSimple}, \code{removeComplex}, and \code{rotate}.
+Operations \code{removeSimple} and \code{removeComplex} perform the physical removal (unlinking) of marked nodes.
+We discuss them in detail in \cref{app:bst-rot:remove-simple,app:bst-rot:remove-complex}, respectively.
+Operation \code{rotate} performs standard right rotations.
+We discuss it in detail in \cref{app:bst-rot:rotation}.
+We ignore left rotations, they are symmetrical.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Proof Methodology}
+\label{app:bst-rot:invariant}
+
+Towards verifying our implementation against the BST specification, we first develop the predicate $\bst{\abscontent}$.
+We define it by \[ \bst{\abscontent} \defeq \exists\setnodes.~\inv{\abscontent,\setnodes} \ .\]
+Predicate $\invraw$ is the structural invariant of our implementation that ties its physical state to the logical contents $\abscontent$ of the specification.
+We use the flow framework to devise $\invraw$.
+
+\smartparagraph{Flow Domain}
+As the underlying flow monoid, we choose
+\[
+  \bigl( \powerset{\keyspace}\uplus\set{\bot,\top},\, \oplus,\, \bot \bigr)
+  \qquad\text{with}\qquad
+  \amonval\oplus\amonvalp ~\defeq~ \begin{cases}
+    \amonval &\text{if }~ \amonvalp=\bot \\
+    \amonvalp &\text{if }~ \amonval=\bot \\
+    \top &\text{otherwise}
+  \ .
+  \end{cases}
+\]
+The flow values propagated by this flow are sets of keys $\amonval,\amonvalp\subseteq\keyspace$, or dedicated sentinel values $\bot,\top$.
+Intuitively, if $\akey\in\amonval$ for the flow $\amonval$ of a node $\anode$, then \code{find} will traverse $\anode$ when searching for $\akey$, as alluded to in \cref{app:bst-rot:implementation}.
+Value $\bot$ denotes that a node is unreachable from $\Root$.
+Note that $\bot$ and $\emptyset$ differ: $\emptyset$ means that the node is still reachable from $\Root$, but \code{find} will not traverse it.
+Value $\top$ denotes that a node has multiple reachable parents, that is, the heap graph is not a tree.
+To establish this intuition, $\bot$ is neutral with respect to $\oplus$ and in all other cases $\oplus$ yields $\top$.
+
+\smartparagraph{Physical State}
+The physical state is comprised of a collection of nodes (of type \code{Node}).
+We capture the resources associated with such nodes $\anode$ in a predicate $\nodeof{\anode}$.
+To simplify the notation, assume that proofs are existentially closed.
+This way, we can use the naming convention $f(\anode)$ to refer to the logical variable that holds the value of field $\selof{\anode}{f}$.
+Then define: \[
+  \nodeof{\anode} ~\defeq~ \begin{aligned}[t]
+    &\selof{\anode}{left}\pto\leftof{\anode} \MSTAR
+    \selof{\anode}{right}\pto\rightof{\anode} \MSTAR
+    \selof{\anode}{key}\pto\keyof{\anode}  \\\!\!\!\MSTAR
+    &\selof{\anode}{del}\pto\delof{\anode} \MSTAR
+    \selof{\anode}{in}\pto\inof{\anode} \MSTAR
+    \selof{\anode}{dup}\pto\dupof{\anode}\enspace.
+  \end{aligned}
+\]
+Fields $\leftof{\anode}$, $\rightof{\anode}$, $\keyof{\anode}$, and $\delof{\anode}$ are as expected, they capture the left child, right child, key, and deletion flag of node $\anode$, respectively.
+They give rise to the physical contents of node $\anode$:
+\[
+  \ctnof{\anode} ~\defeq~ \begin{cases}
+    \set{\keyof{\anode}} &\text{if } \neg\delof{\anode} \lor \anode\neq\Root \\
+    \emptyset &\text{otherwise}
+  \ .
+  \end{cases}
+\]
+Field $\inof{\anode}$ is the inflow of $\anode$.
+Most of the time we are interested in the \emph{inset} of $\anode$, which we define as \[\isof{\anode} ~\defeq~ \bigoplus_{\anodep \in \setnodes} \inof{\anode}(\anodep) \ .\]
+Field $\dupof{\anode}$ is the ghost field used for rotations.
+Its possible values are $\dupvalnone$ (not a duplicate), $\dupvalleft$ (duplicate due to a left rotation), and $\dupvalright$ (duplicate due to a right rotation).
+
+
+\smartparagraph{Edge Functions}
+We derive edge functions from the physical representation of nodes.
+That is, the edge functions $\edges$ of every flow graph are induced by the physical state of its nodes.
+Intuitively, the edge functions filter the incoming flow values (search paths) according to the BST search principle from \cref{app:bst-rot:implementation}.
+Formally, we define:
+\begin{align*}
+  \edgesatof{\anode}{\anodep}{\amonval} ~=~ \begin{cases}
+    \top  &\text{if }~ \leftof{\anode}=\anodep=\rightof{\anode} \\
+    \amonval\cap[-\infty,\keyof{\anode})  &\text{if }~ \anodep=\leftof{\anode} ~\land~ \dupof{\anode}\neq\dupvalleft \\
+    \amonval\cap(\keyof{\anode},\infty]  &\text{if }~ \anodep=\rightof{\anode} ~\land~ \dupof{\anode}\neq\dupvalright \\
+    \bot  &\text{otherwise}
+  \end{cases}
+\end{align*}
+where we use $\bot\cap\amonval=\bot$ and $\top\cap\amonval=\top$.
+The first case handles edges from a node $\anode$ to its left child $\anodep$.
+The edge forwards the portion of the given flow value $\amonval$ that is smaller than $\anode$'s key.
+The side condition $\dupof{\anode}\neq\dupvalleft$ prevents the edge function from forwarding flow if $\anode$ is a duplicate inserted by a left rotation. This is needed because $\anode$'s left child already receives flow from the node that $\anode$ duplicates.
+Similarly, the second case forwards the portion of $\amonval$ that is larger than $\anode$'s key to its right child, provided $\anode$ is not a duplicate during a right rotation.
+In all other cases, the edge function produces $\bot$.
+
+We refer to the \emph{left outset} of a node $\anode$ as the quantity produced by the edge function $\edgesat{\anode}{\leftof{\anode}}$ for the inflow of $\anode$.
+Formally, this is $\oslof{\anode} = \edgesatof{\anode}{\leftof{\anode}}{\isof{\anode}}$ if $\leftof{\anode}\neq\nullptr$ and $\oslof{\anode}=\emptyset$ otherwise.
+The \emph{right outset} $\osrof{\anode}$ is defined correspondingly.
+Subtracting $\anode$'s outsets from its inset yields the keys for which \code{find} terminates in $\anode$.
+That is, these are the keys that could be in $\anode$ while still satisfying the BST order property for the remaining graph.
+We refer to this quantity as the \emph{keyset} of $\anode$: \[
+  \ksof{\anode} ~=~ \begin{cases}
+    \emptyset  &\text{if }~ \isof{\anode}\in\set{\bot,\top} \\
+    \isof{\anode} \setminus \bigl( \oslof{\anode} \cup \osrof{\anode} \bigr)  &\text{otherwise}
+  \ .
+  \end{cases}
+\]
+
+\smartparagraph{Invariant}
+The structural invariant of our BST implementation is given by a predicate $\inv{\abscontent,\setnodesp,\setnodes}$, which denotes a subregion $\setnodesp\subseteq\setnodes$ of the entire structure $\setnodes$ with logical contents $\abscontent$.
+The invariant carries the resources for the nodes in $\setnodesp$ and describes their properties:
+\begin{align*}
+  \inv{\abscontent, \setnodesp, \setnodes} ~=~~&
+    \Root\in\setnodes \MSTAR \nullptr\notin\setnodes \MSTAR
+    \setnodesp\subseteq\setnodes \MSTAR \abscontent=\ctnof{\setnodesp} \MSTAR \bigmstar_{\anode\in\setnodesp} \nodeof{\anode} \mstar \inv{\anode,\setnodes}
+  \\
+  \inv{\anode,\setnodes} ~=~~&
+    \set{\leftof{\anode},\rightof{\anode}}\subseteq\setnodes\uplus\set{\nullptr} ~~\land~~
+    \dupof{\anode}=\dupvalnone ~~\land~~
+    \\&
+    \isof{\anode} \neq \top ~~\land~~
+    \ctnof{\anode}\subseteq\ksof{\anode} ~~\land~~
+    \bigl(\isof{\anode}\neq\bot \implies \keyof{\anode}\in\isof{\anode}\bigr) ~~\land~~
+    \\&\bigl(\anode = \Root \implies \isof{\anode} = [-\infty,\infty] \land \neg\delof{\anode} \land \keyof{\anode}=-\infty\bigr)
+\end{align*}
+The invariant has two main ingredients.
+First, it ties the expected logical contents $\abscontent$ to the physical contents $\ctnof{\setnodesp}$ of the region $\setnodesp$, as desired.
+Second, it carries the resources $\nodeof{\anode}$ for all nodes $\anode\in\setnodesp$ from the region and specifies their properties using the node-local invariant $\inv{\anode,\setnodes}$.
+The node-$\anode$-local invariant requires that
+\begin{inparaenum}
+  \item the overall structure $\setnodes$ is self-contained, i.e., $\anode$ cannot reach nodes outside of $\setnodes$,
+  \item $\anode$ is not a duplicate, i.e., duplicates are inserted only temporarily during rotation,
+  \item $\anode$ has at most one parent node that is reachable from $\Root$ (up to temporary duplicates), i.e., at most one node sends flow to $\anode$,
+  \item the physical contents of $\anode$ are contained in its keyset, i.e., the search paths for $\anode$'s contents reach and terminate in $\anode$,
+  \item if $\anode$ has inflow, then it receives at least its own key, and
+  \item $\Root$ is a sentinel node with key $-\infty$, it is never marked as deleted, and it is the entry point for all searches.
+\end{inparaenum}
+For brevity, we write $\inv{\abscontent,\setnodes}$ to mean $\inv{\abscontent,\setnodes,\setnodes}$.
+
+\smartparagraph{Compositionality}
+When framing or contextualizing a subregion of $\setnodes$, we employ the following compositionality of the invariant:
+\begin{align*}
+  \inv{\abscontent,\setnodesp_1\uplus\setnodesp_2,\setnodes}
+  ~~\iff~~
+  \exists\abscontent_1,\abscontent_2.~
+  \inv{\abscontent_1,\setnodesp_1,\setnodes} \mstar
+  \inv{\abscontent_2,\setnodesp_2,\setnodes} \mstar
+  \abscontent=\abscontent_1\cup\abscontent_2\enspace.
+  %
+  \tag{\textsc{comp}}
+  \label{app:weak-decomposition}
+\end{align*}
+That is, we decompose the invariant into two disjoint regions and recompose them.
+However, the decomposition does not localize the reasoning because it does not localize the logical contents.
+The invariant alone does not guarantee that the contents $\abscontent_1$ and $\abscontent_2$ are disjoint, despite $\setnodesp_1$ and $\setnodesp_2$ being disjoint.
+To overcome this, we strengthen the decomposition by requiring $\setnodes = \setnodesp_1 \cup \setnodesp_2$:
+\begin{align*}
+  \begin{aligned}
+    \inv{\abscontent,\setnodes,\setnodes} \mstar
+    \setnodes=\setnodesp_1\uplus\setnodesp_2
+    ~~\implies~~
+    \exists\abscontent_1,\abscontent_2.
+    \begin{aligned}[t]
+      &\inv{\abscontent_1,\setnodesp_1,\setnodes} \mstar
+      \inv{\abscontent_2,\setnodesp_2,\setnodes} \mstar
+      \\{}\mstar{}
+      &\ksof{\setnodesp_1}\cap\ksof{\setnodesp_2}=\emptyset \mstar
+      \abscontent=\abscontent_1\uplus\abscontent_2\enspace.
+    \end{aligned}
+  \end{aligned}
+  %
+  \tag{\textsc{decomp}}
+  \label{app:strong-decomposition}
+\end{align*}
+The implication only allows one to decompose the entire tree, but in return establishes that the keysets of the decomposed regions are disjoint.
+From this, we conclude that $\abscontent_1$ and $\abscontent_2$ are disjoint, because the invariant guarantees $\abscontent_1\subseteq\ksof{\setnodesp_1}$ and $\abscontent_2\subseteq\ksof{\setnodesp_2}$.
+That the keysets of $\setnodesp_1$ and $\setnodesp_2$ are disjoint follows from a result due to \citet{DBLP:journals/tods/ShashaG88}.
+Translated to flows, the result requires that
+\begin{inparaenum}
+  \item all edge functions are decreasing, i.e, $\edgesatof{\anode}{\anodep}{\amonval}\leq\amonval$,
+  \item the left and right outsets are disjoint, $\oslof{\anode}\cap\osrof{\anode}=\emptyset$, and
+  \item only the root node receives inflow from outside the full graph.
+\end{inparaenum}
+These properties are ensured by $\invraw$ and the definition of the edge functions. However, the result only applies if $\invraw$ is satisfied by the entire graph $\setnodes$.
+Hence, we apply the decomposition only if we are splitting the full graph.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Verifying the Implementation}
+
+We now show that the implementation from \cref{app:fig:api-impl} implements a BST along \cref{app:bst-rot:specification}.
+Proof outlines for \code{find} and \code{delete} are given in form of \textcolor{colorAnnotation}{colored annotations} in \cref{app:fig:api-impl}.
+
+The proof for \code{find($\key$)} follows our intuition from \cref{app:bst-rot:implementation}: the traversal, \crefrange{app:code:find:loop-begin}{app:code:find:loop-end}, \emph{goes with the flow} to locate the search key, $\key$.
+It maintains the invariant that it is still on right track, $\key\in\isof{\x}$, $\x$ does not contain the search key, $\key\neq\keyof{\x}$, and that $\y$ is the next node on the search path, $\y=\leftof{\x}$ or $\y=\rightof{\x}$ if $\key<\keyof{\x}$ or $\keyof{\x}<\key$, respectively.
+The traversal terminates at the end of the search path, if $\y$ is null ($\y\notin\setnodes$) or if $\key=\keyof{\y}$.
+
+The proof for \code{delete} relies on the above properties that \code{find} establishes for the nodes $\x$ and $\y$ it returns.
+There are three cases.
+\begin{asparaenum}[(1)]
+  \item
+    If $\y$ is null, then we have $\key\in\ksof{\x}$ because $\key\in\isof{\x}$ and there is no outset to null.
+    Moreover, $\key\notin\ctnof{\x}$ because $\key\neq\keyof{\x}$.
+    We now use the keyset disjointness of the strong decomposition \eqref{app:strong-decomposition} to conclude that $\x$ is the only node that has $\key$ in its keyset, $\key\notin\ksof{\setnodes\setminus\set{\x}}$.
+    Recall that $\ctnof{\setnodes\setminus\set{\x}}\subseteq\ksof{\setnodes\setminus\set{\x}}$ holds by the invariant.
+    Hence, $\key$ is not contained in the tree, $\key\notin\abscontent$.
+    This justifies returning $\false$ on \cref{app:code:delete:false}.
+  \item
+    If $\y$ is non-null and marked, we know that $\key$ flows from $\x$ to $\y$, $\key\in\isof{\y}$.
+    That the search terminates in $\y$ means $\key=\keyof{\y}$.
+    Together, $\key\in\ksof{\y}$.
+    That $\y$ is marked means $\ctnof{\y}=\emptyset$.
+    With a similar argument as before, we conclude $\key\notin\abscontent$.
+    Returning $\false$ on \cref{app:code:delete:false} is again correct.
+  \item
+    If $\y$ is non-null and unmarked, the reasoning is similar.
+    We have $\key\in\ksof{\y}\cap\ctnof{\y}$ and $\key\notin\ctnof{\setnodes\setminus\set{\y}}$.
+    From \eqref{app:strong-decomposition} we get that $\key$ is stored exclusively in $\y$, $\abscontent=\ctnof{\y}\uplus\ctnof{\setnodes\setminus\set{\y}}$.
+    Hence, marking $\y$ on \cref{app:code:delete:mark} effectively removes $\key$ from $\abscontent$.
+    That is, after \cref{app:code:delete:mark} the state of the tree is $\inv{\abscontent\setminus\set{\key},\setnodes,\setnodes}$.
+    This justifies returning $\true$ on \cref{app:code:delete:true}.
+    Note that the update does not change the flow, so its physical and ghost footprint is just $\y$.
+\end{asparaenum}
+
+The proofs for \code{insert} and \code{contains} follow a similar pattern.
+In the remainder of this section, we focus on \code{removeSimple}, \code{removeComplex}, and \code{rotate}.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Simple Removal}
+\label{app:bst-rot:remove-simple}
+
+The maintenance operation \code{removeSimple} unlinks nodes from the tree that have been marked as deleted.
+It is a ``simple'' removal because it unlinks nodes only if they have at most one child.
+We expect \code{removeSimple} to leave unchanged the logical contents of the tree.
+Concretely, we establish the following specification for it, as imposed by the specification of \code{maintenance}: \[
+  \annot{
+    \inv{\abscontent,\setnodes}
+  }
+  ~~
+  \mcode{removeSimple()}
+  ~~
+  \annot{
+    \inv{\abscontent,\setnodes}
+  }
+  \ .
+\]
+
+\input{appendix/ex_rot/fig_simple}
+
+The implementation and proof outline of \code{removeSimple} are given in \cref{app:fig:simple-removal:impl}.
+It proceeds as follows.
+Starting from some arbitrary node $\x$ currently linked into the tree, the left child $\y$ of $\x$ is read out.
+If $\y$ is a non-null marked node with at most one child, \code{removeSimple} tries to unlink $\y$.
+In the case where $\y$ has no left child, $\y$ is unlinked by making $\y$'s right child the left child of $\x$, i.e. by updating $\selof{\x}{left}$ to $\rightof{\y}$.
+The state of the tree before and after the unlinking is depicted in \cref{app:fig:simple-removal:prestate,app:fig:simple-removal:poststate} (ignore the annotations for a moment).
+The case where $\y$ has no right child is symmetric.
+Similarly, removing the marked right child of $\x$, \cref{app:code:simple-remove:symmetric}, is symmetric.
+We omit the symmetric cases.
+
+The interesting part of the proof is the moment where $\y$ is unlinked.
+The precondition of the unlinking is on \cref{app:code:simple-remove:pre}.
+It states that the tree currently represents the set $\abscontent$ and satisfies the invariant, $\inv{\abscontent,\setnodes}$.
+Moreover, the precondition captures our above intuition, stating that $\y$ is the marked left child of $\x$, $\delof{\y} \mstar \leftof{\x}=\y$, and has no left child itself, $\leftof{\y}=\nullptr$.
+The proof goal is to establish $\inv{\abscontent,\setnodes}$ on \cref{app:code:simple-remove:post}, that is, show the unlinking of $\y$ on \cref{app:code:simple-remove:unlink} maintains both the logical contents and the invariant.
+The main challenge with this update is its unbounded footprint.
+To see this, consider \cref{app:fig:simple-removal:prestate}.
+It depicts the part of the tree rooted in $\x$ prior to the update.
+Because $\x$ is linked into the tree, it has non-$\bot$ inflow, say $\ais\defeq\isof{\x}$.
+Node $\y$ receives the portion of $\ais$ that is smaller than $\x$' key, $\isof{\y}=\oslof{\x}=\ais\cap[-\infty,\keyof{x})$.
+From that inset, $\y$ forwards the portion that is larger than its key to is right child, subtree $A$ in the \cref{app:fig:simple-removal:prestate}.
+Overall, this means that the inset of $A$ before unlinking $\y$ is $\ais\cap(\keyof{\y},\keyof{\x})$.
+After unlinking $\y$, i.e., making subtree $A$ the left child of $\x$ as depicted in \cref{app:fig:simple-removal:poststate}, $A$ receives all the flow $\ais\cap[-\infty,\keyof{x})$ that $\y$ used to receive, not just the $\keyof{\y}$-larger portion of it.
+That is, the unlinking results in subtree $A$ receiving the additional flow $\aks\defeq\ais\cap[-\infty,\keyof{\y}]$.
+To see why this makes the footprint of unlinking $\y$ unbounded, observe that the nodes in $A$ all have keys larger than $\y$.
+That is, the additional flow $\aks$ is forwarded to the left-most leaf in $A$.
+Because $A$ can be an arbitrary tree, the footprint is unbounded.
+
+To overcome the unbounded footprint, we contextualize subtree $A$ (and the right child of $\x$ which is irrelevant here).
+To be precise, we decompose the tree described by $\inv{\abscontent,\setnodes}$ into the footprint $\inv{\abscontent_2,\set{\x,\y},\setnodes}$, consisting of nodes $\x$ and $\y$, and the context $\inv{\abscontent_1,\setnodes\setminus\set{\x,\y},\setnodes}$, consisting of the remainder of the tree, with $\abscontent=\abscontent_1\cup\abscontent_2$.
+In \cref{app:fig:simple-removal:impl}, the application of rule \ruleref{context} is between \cref{app:code:simple-remove:context,app:code:simple-remove:post-footprint}: \cref{app:code:simple-remove:context} states the \colorbg{backgroundContext}{context} and the following lines reason about the \colorbg{backgroundFootprint}{footprint}.
+
+Because the update changes the inflow of the context $\inv{\abscontent_1,\setnodes\setminus\set{\x,\y},\setnodes}$, we have to show that it tolerates the additional inflow it receives after the update.
+Towards this, we capture the change in inflow using the estimator $\simplerel$ defined by: \[
+  \amonval\simplerel\amonvalp
+  ~~\defifff~~
+  \amonval=\amonvalp
+  \,~\lor~
+  \bigl(\,\setc{\amonval,\amonvalp}\cap\setc{\bot,\top}=\emptyset
+  ~\land~
+  \amonval\subseteq\amonvalp\,\bigr)
+  \ .
+\]
+This reflects our intuition that flow values may increase, but it prevents previously unreachable nodes (those that have a flow of $\bot$) to receive flow and it also prevents nodes from receiving flow from more sources than before (the flow increase does not result in a flow of $\top$).
+The relation satisfies the requirements for an estimator.
+Note that the actual update produces a flow increase of at most $\aks$ in the context, however, our proof does not rely on this upper bound.
+It is readily checked that the context $\inv{\abscontent_1,\setnodes\setminus\set{\x,\y},\setnodes}$ is $\simplerel$-closed, because the keyset of a node only increases, unreachable nodes (flow of $\bot$) remain unreachable, and no node's inflow becomes $\top$.
+That $\simplerel$ satisfies the requirements of an estimator is left as an exercise to the reader.
+
+We turn to the actual update on \cref{app:code:simple-remove:unlink} within the footprint $\inv{\abscontent_2,\set{\x,\y},\setnodes}$.
+The physical update unlinking $\y$ is standard.
+Moreover, it is easy to see that the invariant for $\x$ is maintained.
+To see that the invariant for $\y$ is maintained as well, observe that $\delof{\y}$ on \cref{app:code:simple-remove:pre-footprint} means $\y\neq\Root$ and $\ctnof{\y}=\emptyset$.
+This is the annotation on \cref{app:code:simple-remove:post-footprint}, and it is $\simplerel$-closed following the same arguments as for the context.
+Lastly, it remains to show that the footprint's outflow after the update is $\simplerel$-larger than prior to the update.
+We already discussed that $\y$'s outflow to its right child is $\ais\cap(\keyof{\y},\keyof{\x})$ before the update and $\ais\cap[-\infty,\keyof{x})$ after it.
+Because $\ais=\isof{\x}\neq\bot$, we have the desired $\ais\cap(\keyof{\y},\keyof{\x}) \simplerel \ais\cap[-\infty,\keyof{x})$.
+(The outflow at $\x$'s right child does not change and $\simplerel$ is reflexive).
+This concludes the proof of \code{removeSimple} along the lines of the proof strategy from \cref{sec:instantiation}.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Complex Removal}
+\label{app:bst-rot:remove-complex}
+
+Operation \code{removeComplex} unlinks marked nodes from the tree that have two children and are thus not handled by \code{removeSimple}.
+The specification is as expected: \[
+  \annot{
+    \inv{\abscontent,\setnodes}
+  }
+  ~~
+  \mcode{removeComplex()}
+  ~~
+  \annot{
+    \inv{\abscontent,\setnodes}
+  }
+  \ .
+\]
+
+\input{appendix/ex_rot/fig_complex}
+
+\Cref{app:fig:complex-removal} gives the implementation and proof outline.
+There are four steps in \code{removeComplex}.
+First, it obtains an arbitrary marked node $\x$ that is reachable from $\Root$ and has two children.
+Second, it uses the helper function \code{findSucc} from \cref{app:fig:find-succ} to obtain the left-most leaf $\y$ and its parent $\p$ in the subtree $B$ rooted at $\x$'s right child.\footnote{%
+  To avoid distracting case distinctions, \code{findSucc} assumes $\p\neq\x$.
+  We omit the case $\p=\x$ because it is much simpler: its flow update is not unbounded, it affect only the nodes $\x$ and $\y$.
+}
+That $\y$ is the left-most leaf in $B$ means that $\keyof{\y}$ is the next larger key after $\keyof{\x}$ in $B$.
+Consequently, all search paths for keys from $(\keyof{\x},\keyof{\y})$ that reach $\x$ continue to $B$ and eventually reach $\y$.
+Moreover, they terminate in $\y$ because $\y$ has no left child.
+Formally, these search paths are for keys $\aks=\isof{\x}\cap(\keyof{\x},\keyof{\y})$ and they are part of $\y$'s keyset, $\aks\subseteq\ksof{\y}$.
+This is the annotation on \cref{app:code:complex-remove:pre}, depicted in \cref{app:fig:complex-removal:prestate}.
+Third, the contents of $\x$ and $\y$ are swapped, \crefrange{code:complex-remove:move}{code:complex-remove:del-y}.
+This is the most interesting part of the proof and we discuss it in detail below.
+Last, $\y$ is unlinked.
+The procedure, involving $\y$ and its parent $\p$, is the same as the unlinking in \code{removeSimple}.
+We will not reiterate it.
+
+A detailed discussion of the third step, swapping the contents of $\x$ and $\y$, is in order.
+To avoid confusion between the values of fields before and after the following updates, we record the values $\akey_\x=\keyof{\x}$, $\akey_\y=\keyof{\y}$, and $\ais=\isof{\x}$ from before the update, as on \cref{app:code:complex-remove:pre}.
+Note that $\akey_\x<\akey_\y$.
+Now, \cref{app:code:complex-remove:move} copies $\akey_\y$ into $\x$.
+This is challenging due to its intricate flow update, which is visualized in \cref{app:fig:complex-removal:prestate,fig:complex-removal:poststate}.
+The update 
+increases the inflow of $\x$'s left subtree $A$ from $\ais\cap[-\infty,\akey_\x)$ to $\ais\cap[-\infty,\akey_\y)$.
+The inflow of $\x$'s right subtree $B$, in turn, decreases from $\ais\cap(\akey_\x,\infty]$ to $\ais\cap(\akey_\y,\infty]$.
+That is, the portion $\aks=\ais\cap(\akey_\x,\akey_\y]$ is redirected from $B$ to $A$.
+We capture this change of inflow with the estimator $\complexrel$ defined by: \[
+  \amonval\complexrel\amonvalp
+  ~~\defifff~~
+    \amonval\simplerel\amonvalp
+    \,~\lor~
+    \bigl(\,
+      \setc{\amonval,\amonvalp}\cap\setc{\bot,\top}=\emptyset ~\land~ \akey_\x\notin\amonval ~\land~ \amonval\setminus\aks\subseteq\amonvalp
+    \,\bigr)
+  \ .
+\]
+The relation allows the inflow to increase arbitrarily.
+Moreover, it allows the inflow to decrease by up to $\aks$.
+However, decreasing the inflow may only occur for inflows that do not contain $\akey_\x$.
+The side condition localizes the decrease to the subtrees of $\x$, because $\akey_\x\in\isof{\x}$.
+As we will see, it prevents us from \emph{loosing} $\akey_\y$ from the inflow of $\x$ when performing the update.
+
+For handling the update, we choose nodes $\x$ and $\y$ as the footprint and contextualize everything else.
+Technically, the context is $\inv{\abscontent_1,\setnodes\setminus\set{\x,\y},\setnodes}$ and the footprint is $\inv{\abscontent_2,\set{\x,\y},\setnodes}$ with $\abscontent=\abscontent_1\cup\abscontent_2$.
+We now show that the context is $\complexrel$-closed, which is significantly more involved than showing $\simplerel$-closedness for \code{removeSimple}.
+Consider a contextualized node $\z\in\setnodes\setminus\set{\x,\y}$ with $\isof{\y}\neq\bot$.
+The invariant states $\keyof{\z}\in\isof{\z}$.
+To preserve this inclusion, despite reducing the inflow by up to $\aks$, requires $\keyof{\z}\notin\aks$.
+To see this, observe that $\keyof{\z}\in\ksof{\z}$ follows from $\keyof{\z}\in\isof{\z}$ prior to the update.
+Using \eqref{app:strong-decomposition} for the above context-footprint decomposition, yields $\ksof{\z}\cap\ksof{\y}=\emptyset$.
+Because we already argued for $\aks\subseteq\ksof{\y}$, we get $\keyof{\z}\notin\aks$ as desired.
+This line of reasoning also implies that the $\ctnof{\z}\subseteq\ksof{\z}$ part of the invariant is preserved.
+Note that $\Root$ does not loose flow due to $\akey_\x\in\isof{\Root}$.
+Overall, we conclude that the context $\inv{\abscontent_1,\setnodes\setminus\set{\x,\y},\setnodes}$ on \cref{app:code:complex-remove:ctx} is indeed $\complexrel$-closed.
+
+We turn to the footprint $\inv{\abscontent_2,\set{\x,\y},\setnodes}$, \cref{app:code:complex-remove:footprint-pre}.
+The physical update changing $\selof{\x}{key}$ from $\akey_\x$ to $\akey_\y$ is as expected.
+It remains to discuss how it affects the flow of $\x$ and $\y$.
+\Cref{thm:contextualization} prescribes that the footprint be $\complexrel$-closed after the update.
+Because $\akey_\x,\akey_\y\in\ais$ prior to the update, $\complexrel$ guarantees that $\akey_\y$ remains in the inset of $\x$ after the update.
+That is, we have $\inv{\emptyset,\set{\x},\setnodes}$ after the update, because $\x$ is still marked.
+The inflow of $\y$, in turn, may decrease by up to $\aks$.
+This is expected because $\y$'s inflow is solely due to $\x$'s outflow.
+Note that relation $\complexrel$ does not remove \emph{exactly} $\aks$---we simply do not know the exact loss in inflow, and we do not care.
+As a consequence, the invariant of $\y$ breaks, because it no longer receive its key $\akey_\y$ as inflow.
+The subsequent actions will re-establish the invariant for $\y$.
+Overall, we arrive at the postcondition on \cref{app:code:complex-remove:footprint-post-move}.
+
+Next, \code{removeComplex} finalizes swapping the contents of $\x$ and $\y$ by swapping their \code{del} flags, \cref{app:code:complex-remove:del-x,app:code:complex-remove:del-y}.
+This results in $\ctnof{\x}$ being updated to $\abscontent_2$.
+Because $\abscontent_2\subseteq\set{\akey_\y}\subseteq\ksof{\x}$, we obtain the invariant $\inv{\abscontent_2,\set{\x},\setnodes}$.
+The content of $\y$, on the other hand, is deleted, $\ctnof{\y}=\emptyset$.
+This is the annotation on \cref{app:code:complex-remove:footprint-post}.
+Note that these updates do not change the flow.
+At this point, we can recompose $\x$ with context and obtain $\inv{\abscontent,\setnodes\setminus\set{\y},\setnodes}$, \cref{app:code:complex-remove:intermediate}.
+It remains to incorporate $\y$.
+
+Finally, \cref{app:code:complex-remove:unlink} unlinks $\y$.
+As stated earlier, we do not present the details of the unlinking here as it is similar to \code{removeSimple}.
+Overall, the unlinking results in the inflow of $\y$ to be $\bot$.
+Together with $\delof{\y}$, this reestablished the invariant, $\inv{\emptyset,\set{\y},\setnodes}$.
+Recomposing it with $\inv{\abscontent,\setnodes\setminus\set{\y},\setnodes}$, we arrive at the desired $\inv{\abscontent,\setnodes}$, \cref{app:code:complex-remove:post}.
+
+
+%=============================================================================%
+%=============================================================================%
+\subsection{Rotations}
+\label{app:bst-rot:rotation}
+
+\input{appendix/ex_rot/fig_rot_code}
+
+Operation \code{rotate} performs a standard right rotation.
+We expect it not to change the logical contents of the tree.
+The specification is: \[
+  \annot{
+    \bst{\abscontent}
+  }
+  ~~
+  \mcode{rotate()}
+  ~~
+  \annot{
+    \bst{\abscontent}
+  }
+  \ .
+\]
+Unlike for the previous maintenance operations, we use $\bst{\abscontent}$ instead of $\inv{\abscontent,\setnodes}$.
+This is because \code{rotate} creates a new node to the heap graph that we \emph{hide} in the existential quantifier of $\bst{\abscontent}$.
+
+\input{appendix/ex_rot/fig_rot_heap}
+
+\Cref{app:fig:rotate} gives the implementation and proof outline for \code{rotate}.
+Given nodes $\y$ and $\z$ with $\selof{\y}{left}=\z$, the goal is to move $\y$ into $\z$'s right subtree.
+In line with concurrent BST implementations, \code{rotate} does not perform this update in-place, but inserts a duplicate $\dup$ of $\y$ in $\z$'s right subtree and subsequently unlinks $\y$.
+This breaks the tree shape temporarily, until $\y$ is unlinked.
+To handle this in the proofs we set $\dup$'s \code{dup} field to $\dupvalright$ before inserting it and then to $\dupvalnone$ at the moment when $\y$ is unlinked.
+Node $\y$ is unlinked by replacing in $\y$'s parent $\x$ the child pointer to $\y$ by $\z$.
+Consult \cref{app:fig:rotate-fig} for an illustration.
+The figure shows that all updates are contained within the footprint $\set{\x,\y,\z,\dup}$---the subtrees $A,B,C$ are not aware of the changes.
+In particular, there is no unbounded flow update.
+Hence, \code{rotate} can be verified using standard arguments.
+In particular, the \ruleref{frame} rule is applicable.
+
+
+%%% Local Variables:
+%%% mode: latex
+%%% TeX-master: "../../main"
+%%% End:

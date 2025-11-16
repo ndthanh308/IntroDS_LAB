@@ -1,0 +1,141 @@
+\section{Method}
+%\xmli{Given an input fixed image, we feed this image into xxxx, then we can a Warped image. Finally, by optimizing xxx loss function, we can obtain the final xxx. -- please follow the template to describe the whole process of Fig 2.}  
+
+\subsection{Baseline Registration Model}
+
+Fig.~\ref{fig:main_fig}.a shows the overview of our proposed method. We first sample a perturbed noisy image $x_{t}$ from the fixed target image $f$ following the same scheme in~\cite{ho2020denoising}, which can be formulated as Equ.~\ref{eq:eq1}:
+\begin{center}
+\begin{equation}
+\begin{aligned}
+& x_{t}=\sqrt{\alpha_{t}}f+\sqrt{1-\alpha_t}\epsilon, \\ &\text{where } \alpha_t = {\prod^{t}_{s=1}}(1-\beta_s) \text{, } \epsilon \sim \mathcal{N}(0,\mathit{I})
+\label{eq:eq1}
+\end{aligned}
+\end{equation}
+\end{center}
+where $0<\beta_s<1$ is the variance of the noise, $t$ is the noise level. 
+Then we perform the registration training task. Given an input $x_{in}$ consisting of a fixed reference image $f$, a moving unaligned image $m$, and the perturbed noisy image $x_t$, we feed this input $x_{in}=\{f,m,x_t\}$ into the registration network's shared encoder $E_\beta$, followed by the registration decoder $R_\theta$. Then, the registration decoder $R_\theta$ outputs a deformation field $\phi$, guided by our \textit{Feature-wise Diffusion-Guided} module $G_\sigma$. Afterward, we feed $m$ and $\phi$ into the spatial transformation layer (STL) to generate the warped image $m(\phi)$. Finally, by optimizing the similarity-based loss function $L_{scoreNCC}$ guided by our \textit{Score-wise Diffusion-Guided} module, we can obtain the final registration model.
+
+% Figure environment removed
+
+\subsection{Feature-wise Diffusion-Guided Module} 
+
+The main component of the Feature-wise Diffusion-Guided module (FDG) is an auxiliary denoising diffusion decoder $G_\sigma$. The workflow of FDG is shown in Fig.~\ref{fig:main_fig}.b. Given the input $x_{in}=\{f,m,x_{t}\}$, the UNet shared encoder $E_\beta$ extracts the representation $z$. $z$ is then fed into the diffusion decoder $G$ and the registration decoder $R$ to get intermediate feature map pairs $F_i=\{(F_G^i,F_R^i)\},i=1,...,N$ from the $i$-th layer of the decoder. Of note, we generate the registration decoder's feature map by incorporating the guidance from the diffusion decoder, which can be formulated as Equ.~\ref{eq:layer}:
+
+\begin{equation}
+F_R^i=r_i(\mathrm{concat}(F_R^{i-1},F_E^{i},F_G^{i}))\text{, where }i=1,...,N
+\label{eq:layer}
+\end{equation}
+
+where $r_i$ is the $i$-th layer of the registration decoder, and $F_E^{i}$ is the skip connection of features from the shared encoder layer at the same depth.
+
+After obtaining the feature map pairs, our FDG module estimates the $i$-th feature level deformation field $\phi_i$ from the feature map pair $(F_G^i,F_R^i)$ using linear cross attention~\cite{shen2021efficient}, which can be defined as Equ.~\ref{eq:crossattn}:
+
+\begin{equation}
+\phi_i=\mathrm{Conv}(\mathrm{softmax}(F_R^i(\mathrm{GroupNorm}({F_G^i})^T \cdot F_G^i))+F_R^i)
+\label{eq:crossattn}
+\end{equation}
+
+After obtaining all feature-level deformation fields from the shallowest layer to the deepest layer, we generate the final deformation field $\phi$ by enlarging and averaging all feature-level deformation fields. This is a commonly adopted method for multi-scale deformation field merging so as to merge features which attend different scales and granularity. The final $\phi$ is then fed into the spatial transformation layer with the moving image $m$ to generate the registered image $m(\phi)$.
+
+\subsection{Score-wise Diffusion-Guided Module}
+
+Given the representation $z$ encoded by the shared encoder $z=E_\beta(x_{in})$, the diffusion decoder $G_\sigma$ outputs a diffusion score estimation $S=G_\sigma(z)$. Then, the Score-wise Diffusion-Guided Module (SDG) uses this score to reweigh the similarity-based normalized cross-correlation loss function, formulated as Equ.~\ref{eq:scorenccloss}:
+
+\begin{equation}
+L_{scoreNCC}(m,f,S)=(\frac{1}{1+e^{-S}})^\gamma \odot -(m(\phi) \otimes f)
+\label{eq:scorenccloss}
+\end{equation}
+
+where $m(\phi)$ is the warped moving image, $\odot$ defines the Hadamard product, and $\otimes$ defines the local normalized cross-correlation function. $\gamma$ is a hyperparameter to amplify the reweighing effect.
+
+By this means, SDG utilizes the diffusion score to explicitly indicate the hard-to-register areas, i.e., areas where deformation topology is hard to preserve, then assigning higher weights in the loss function for greater attention, and vice versa for easier-to-register areas. Therefore, the information on deformation topology is effectively incorporated into the optimization process without additional constraints by the SDG module.
+
+\subsection{Overall Training and Inference}
+
+\subsubsection{Loss function.}
+Our network predicts the deformable fields at the feature level and then outputs the registered image. The total loss function of our method is defined as Equ.~\ref{eq:totalloss}:
+
+\begin{equation}
+ L_{total}=L_{diffusion}(x_{in},t)+\lambda L_{scoreNCC}(m,f,S)+\lambda_\phi\sum{||\nabla_\phi||^2}
+\label{eq:totalloss}
+\end{equation}
+
+\begin{equation}
+L_{diffusion}(x_{in},t)=\mathbb{E}_z{||G_\sigma(E_\beta(x_{in},t))-\epsilon||^2_2}\text{ ,where }\epsilon \sim \mathcal{N}(0,\mathit{I})
+\label{eq:diffusionloss}
+\end{equation}
+
+where $L_{diffusion}$ is the auxiliary loss function for training the diffusion decoder $G_\sigma$ (Equ.~\ref{eq:diffusionloss}), and $t$ is the noise level of $x_t$, following the method in~\cite{ho2020denoising}. Our proposed $L_{scoreNCC}$ encourages maximizing the similarity between the registered and reference images while preserving the deformation topology. $\sum{||\nabla_\phi||^2}$ is the conventional smoothness penalty on the deformation field. $\lambda$ and $\lambda_\phi$ are hyperparameters, and we empirically set them to $20$ in our experiments.
+
+\subsubsection{Inference.}
+
+In the inference stage, we perform image registration in the same style as~\cite{kim2022diffusemorph}. Instead of the perturbed image $x_t$, we input the original reference image $f$ into the network, and the total network input becomes $x_{in}=\{f,m,f\}$. Given this network input $x_{in}$, our network first generates the deformation field $\phi$ between the moving image $m$ and the reference image $f$ and produces the registered moving image $m(\phi)$ by feeding the moving image $m$ and the deformation field $\phi$ into the spatial transformation layer (STL). The registered moving image is the final output of our network.
+
+
+
+
+
+
+
+
+
+
+%############ COMMENTED OUT ###############
+
+\iffalse
+\subsection{Dual Decoder Multi Task Network}\label{sec:section2.1}
+\xmli{Actually, I can't understand your method. The method should start from the input. How the input is fed to the network, what you get after that. Let's discuss this tonight at 8:00 pm.}
+
+
+%change defm field color
+
+% overall description
+To leverage the multi-scale deformation semantic features of DDPM, we designed a dual branch decoder to generate the deformation field for unsupervised image registration and model the conditional score function for the denoising diffusion task. The architecture of our proposed framework is illustrated in Figure~\ref{fig:main_fig}. A shared encoder $E_{\beta}$ extracts the representation of the conditional input \xmli{what is conditional input?}. One decoder $G_{\sigma}$ performs the denoising diffusion modeling task to estimate a conditional score function. At the same time, another decoder $R_{\theta}$ performs the registration task that generates deformation fields by incorporating multi-scale intermediate DDPM features.
+
+Specifically, given a fixed target image $f$ and a moving image $m$, we sample the noisy image $x_{t}$ from $f$ following the same sampling scheme in \cite{ho2020denoising}, which can be formulated as Eq.~\ref{eq:eq1}:
+
+\begin{center}
+\begin{equation}
+\begin{aligned}
+& x_{t}=\sqrt{\alpha_{t}}x_{0}+\sqrt{1-\alpha_t}\epsilon, \\ &\text{where } \alpha_t = {\prod^{t}_{s=1}}(1-\beta_s) \text{, } \epsilon \sim \mathcal{N}(0,\mathit{I})
+\label{eq:eq1}
+\end{aligned}
+\end{equation}
+\end{center}
+where $0<\beta_s<1$ is a variance of the noise. We define the fixed image $f$ as $x_0$ in our task. The input of the network consists of the image-pair condition $c=(f,m)$ and the sampled noisy image $x_{t}$, which can be denoted as $x_{in}=(c,x_t)$. To make the network aware of the noise level, we also used the number of noise schedule time steps $t$ as the network input as described in \cite{ho2020denoising}. The shared encoder $E_{\beta}$ extracts the representation $z=E_{\beta}(x_{in},t)$ of the conditional input.
+
+\subsubsection{Denoising Diffusion Decoder}
+The denoising diffusion decoder $G_\sigma$ performs the same task as the DDPM. $G_\sigma$ is trained to model the score function of the given input $S=G_\sigma(z)$ as well as generating the intermediate features from $N$ layers $\{s_i,i=1,...,N\}$ to be used by registration decoder $D_\theta$. The optimization target of this branch $L_{diffusion}$ is formulated as Equation~\ref{eq:eq2}:
+\begin{equation}
+L_{diffusion}(x_{in},t)=\mathbb{E}_z{||G_\sigma(E_\beta(x_{in},t))-\epsilon||^2_2}
+\label{eq:eq2}
+\end{equation}
+where $\epsilon \sim \mathcal{N}(0,\mathit{I})$.
+
+\subsubsection{Image Registration Decoder}
+The image registration decoder $D_\theta$ generates the deformation field $\phi=D_\theta(z)$ for the registration task. It shares the same architecture and initial input $z$ as the denoising diffusion decoder. However, to integrate the multi-scale intermediate features from the denoising diffusion branch, these features are concatenated in the input of this branch's middle layers, which can be formulated as Equation~\ref{eq:eq3}:
+
+
+
+where $n_i$ is the output of , and $s_i$ is the corresponding $i$ th intermediate feature from the denoising branch. By this method, the intermediate features with rich deformation semantics can be deeply fused in the registration task, guiding the registration. Finally, the decoder outputs the deformation field $\phi$, and the spatial transformation layer (STL) \cite{jaderberg2015spatial} is deployed to warp the moving image $m$ towards the fixed target image $f$. The warped image $m(\phi)$ is then used to calculate the loss function of the registration task, as Equation~\ref{eq:eq4} shows, with the fixed image $f$.
+
+\begin{equation}
+L_{register}(m,f,S)=L_{scoreNCC}(m(\phi),f,S)+\lambda_\phi\sum{||\nabla_\phi||^2}
+\label{eq:eq4}
+\end{equation}
+
+$L_{register}$ is designed to measure the similarity between the warped and fixed images and optimize it as the traditional energy function. $L_{scoreNCC}$ is the newly proposed local normalized cross-correlation-based reweighed loss which will be explained in Section~\ref{sec:section2.2}, and the second term is the conventional smoothness penalty on the deformation field. $\lambda_\phi$ is set to 1 in our experiments.
+
+Then, the shared encoder, the denoising diffusion decoder, and the image registration decoder are jointly trained simultaneously. The overall training target of our model can be formulated as follows:
+
+\begin{equation}
+\mathop{min}\limits_{E_\beta,G_\sigma,D_\theta} L_{diffusion}(x_{in},t)+\lambda L_{register}(m,f,S)
+\label{eq:eq5}
+\end{equation}
+where $\lambda$ is a hyperparameter to balance the multi-task learning, and S is the final score function estimation generated from the denoising decoder.
+
+\subsection{Image Registration Process}
+
+In the inference stage, we perform image registration in the same style as \cite{kim2022diffusemorph}. The dual decoder design of our network enables the end-to-end generation of the deformation field. Specifically, instead of perturbed fixed image $x_t$, the network input in the inference stage is $x_{in}=(c,f)$, where $x_t=f$. And the time step $t$ is set to $t=0$. Then, the image is registered by a spatial transformer network using the generated deformation field.
+
+\fi

@@ -1,0 +1,53 @@
+\section{(R3Loc): Deep \underline{R}obust Multi-\underline{R}obot \underline{R}e-\underline{Loc}alisation}
+\label{sec:drrr}
+
+Our aim is to improve the robustness and reliability of (re)-localisation of a robot within a \textit{revisit} session based on a prior (reference) map generated at the \textit{initial} session by a fleet of robots in unstructured, natural environments. 
+
+
+Our prior map, created by Wildcat SLAM~\cite{ramezani2022wildcat}, is a pose graph $\mathcal{G}=(\mathcal{V}, \mathcal{E})$ consisting of robots' poses (nodes) $\mathcal{V}\in\mathbb{R}^6$ and the edges $\mathcal{E}\in SE(3)$ in between. In short, Wildcat integrates lidar and inertial measurements within a sliding-window localisation and mapping module. This module uses a continuous-time trajectory representation to reduce map distortion caused by motion. Undistorted sub-maps are further used in pose-graph optimisation to remove drift upon loop closure. Generated sub-maps $\mathcal{S}_i, i\in \{1, ..., n\}$ are also stored in the prior map. Further details can be found in Wildcat paper~\cite{ramezani2022wildcat} and the references therein. 
+
+% Figure environment removed
+
+After generation of a new sub-map,~\ie~query point cloud $\mathcal{S}^q$, from the \textit{revisit} session, a deep lidar PR network, described in~\secref{sec:egonn}, is used to compare $\mathcal{S}^q$ with all the submaps $\mathcal{S}_i$ of the prior map to find the top candidate, $\mathcal{S}^{t1}$, using a similarity metric. Initial relative pose $\mathbf{T}_{t1,q}\in SE(3)$ between sub-maps $\mathcal{S}^q$ and $\mathcal{S}^{t1}$ is further estimated using corresponding keypoints (See~\secref{sec:egonn}) through RANSAC\cite{fischler1981random}. This initial guess is later refined with ICP, an iterative algorithm for 3D shapes registration\cite{besl1992method}. However, it needs to be evaluated before use to merge the new node into the pose graph. A false-positive edge can result in an inferior trajectory being produced or optimisation failure in SLAM.
+
+To sanity check the refined relative pose, we propose a comparison between the query image $\mathcal{I}^q \in\mathbb{R}^{3\times W\times H}$ ($W$ and $H$ are the image width and height),~\ie~the image obtained at the same time as point cloud $\mathcal{S}^q$, and the point cloud $\mathcal{S}^{t1}$ using the estimated relative pose. To this end, we train a self-supervised network to detect 2D and 3D corresponding features and investigate the correctness of the PR output. Furthermore, we project 3D keypoints of $\mathcal{S}^{t1}$ onto the image $\mathcal{I}^q$ using the relative pose to check whether the image-lidar correspondences fall in the same region of the image. If so, the relative pose will pass to the SLAM system merging the new edge $\mathcal{E}_{t1,q}$ into the pose graph (prior map). Otherwise, we reject the relative pose.~\secref{sec:slidr} details the hypothesis verification. \figref{fig:diagram} overviews our \textit{R3Loc} pipeline, its components, and their relationship. %
+
+
+\subsection{Deep Re-localisation Module}
+\label{sec:egonn}
+Our deep re-localisation module is based upon EgoNN~\cite{komorowski2021egonn}. Using a light 3D CNN network, EgoNN trains a global descriptor $d_{\mathcal{G}}\in \mathbb{R}^{256}$ and several local embeddings $d_{\mathcal{L}_t}\in \mathbb{R}^{128}$, where $t\in\{1,...,M\}$ is the number of keypoints detected by USIP~\cite{li2019usip}, in each point cloud.  Global descriptors are the aggregation of feature maps $\mathcal{F}_{\mathcal{G}}\in \mathbb{R}^{K\times 128}$ elements in the global head utilising GeM pooling~\cite{radenovic2018fine}. $K$ is the number of local features in the global head. Keypoint descriptors are generated in the local head by processing the elements of a local feature map $\mathcal{F}_{\mathcal{L}}\in \mathbb{R}^{M\times 64}$. A two-layer Multi-Layer Perceptron (MLP) followed by a $\tanh{}$ functional module is used to compute the local embeddings' coordinates in each point cloud. Global descriptors are used for PR, while local descriptors for localisation.
+
+\subsection{Deep Hypothesis Verification}
+\label{sec:slidr}
+To accept or reject the re-localisation module output, we leverage cross-modal perception to compare the image $\mathcal{I}^q$ captured at the time of the query point cloud $\mathcal{S}^q$ and the top candidate point cloud $\mathcal{S}^{t1}$ estimated by re-localisation module. For this, the top candidate needs to be projected onto the query image using the relative pose $\mathbf{T}_{t1,q}$ estimated by local branch. If the pose estimate is correct, the projected points must overlay with their corresponding image pixels. To evaluate this, corresponding 2D and 3D features must be extracted and matched. 
+
+Handcrafted approaches such as~\cite{sattler2016efficient} are not, however, suitable for feature extraction on lidar point clouds due to their sparsity and for the detection of similar features on images to establish accurate point-to-pixel matches. Point-wise deep feature descriptors,~\eg~\cite{feng20192d3d, li2021deepi2p}, despite outperforming conventional techniques, can be affected in the presence of occlusion or motion blur, which is inevitable in robotics.
+Hence, we leverage a deep image-to-lidar self-supervised distillation approach called Superpixel-driven Lidar Representations (SLidR) \cite{sautier2022image}, which relates a group of pixels with a group of points. 
+
+
+SLidR trains a 3D point representation using visual features for semantic segmentation and object detection. Cross-modal representation learning is motivated by the scarcity of annotated 3D point data and the abundance of image labels. SLidR transfers feature knowledge from super-pixels,~\ie~regions of the image with visual similarity, to superpoints,~\ie~groups of points segmented through superpixels back-projection.  The image $\mathcal{I}_q$ is segmented into, at most, 250 superpixels using SLIC~\cite{achanta2012slic}. Importantly, SLidR requires no data labels for pre-training the 3D network.
+Given a synchronous lidar and camera data stream and the calibration parameters, SLidR extracts features of superpixels and their corresponding superpoints. The 2D features extracted from a pre-trained ResNet-50 backbone trained using ~\cite{chen2020improved},  serve as a supervisory signal for training a 3D sparse residual U-Net backbone~\cite{choy20194d} using a contrastive loss to align the pooled 3D points and 2D pixel features.
+
+
+Employing SLidR, our approach compares the extracted features of superpixels ${sp}^{\mathcal{I}_q}_i$, where $i$ is the number of superpixels in image $\mathcal{I}_q$, with that of superpoints ${sp}^{\mathcal{S}_{t1}}_j$, where $j$ is the number of superpoints in point cloud $\mathcal{S}_{t1}$, using cosine similarity:
+\begin{equation}
+\label{eq:cs}
+    cs_{ij} = \frac{\langle \mathbf{f}_i^{\mathcal{I}_q} \; , \; \mathbf{g}_j^{\mathcal{S}_{t1}} \rangle}{\|\mathbf{f}_i^{\mathcal{I}_q} \| \| \mathbf{g}_j^{\mathcal{S}_{t1}} \|}, 
+\end{equation}
+here $\mathbf{f}$ and $\mathbf{g}$ denote superpixel and superpoint features, respectively, after average pooling. Symbol $\langle .,. \rangle$ denotes inner product and $\|.\|$ L2 norm. 
+
+Now, we define two metrics, one in feature space and one in Euclidean space, to accept or reject re-localisation. First, we use the Mean Cosine Similarity (MCS) of corresponding superpixels and superpoints features,~\ie~$\frac{1}{L}\sum_{i=j}{cs_{ij}}$ to decide whether the point clouds $\mathcal{S}^{q}$ and $\mathcal{S}^{t1}$ represent the same place. $L$ is the total number of superpixel-superpoint pairs on the main diagonal of the similarity matrix computed from~\eqref{eq:cs}. Low MCS values are an indicator of false-positive cases from our re-localisation module.
+
+
+Second, to evaluate the accuracy of the relative pose estimated by EgoNN, we identify the top-5 candidate superpoints, denoted as $sp^{\mathcal{S}_{t1}}$@5, for each superpixel $sp^{\mathcal{I}_q}$.
+We project the centroid of each of these top-5 superpoints $sp^{\mathcal{S}_{t1}}$@5 onto the image $\mathcal{I}_q$.
+We find the superpoint $sp_c^{\mathcal{S}_{t1}}$ whose projected centroid is closest to the centroid of $sp^{\mathcal{I}_q}$, and we select it as the pair of $sp^{\mathcal{I}_q}$. 
+We check whether the projected centroid of $sp_c^{\mathcal{S}_{t1}}$ falls within $sp^{\mathcal{I}_q}$, and we count it as a match if it does and a mismatch if it does not.
+We calculate the percentage of superpixel-superpoint mismatched pairs over the entire set of pairs to determine whether to reject or accept the re-localisation. We then define the \emph{alignment} ratio as follows:
+\begin{equation}
+    \label{eq:confirmity}
+    \nu = 1 - \frac{n}{L},
+\end{equation}
+
+where $n$ is the number of superpixel-superpoint mismatched pairs computed from the abovementioned procedure. 
+Defining two similarity and alignment metrics, we train a simple multi-class Support Vector Classifier (SVC),  $y_i=\mathcal{K}(\text{MCS}_i, \nu_i)$, to predict if the pair $i$ belongs to matched, mismatched or unmatched category, where $y_i\in\{\text{matched, mismatched, unmatched}\}$.

@@ -1,0 +1,149 @@
+\section{Reinforcement Learning From Contrastive Distillation}
+
+We now describe our method, \oursfull{} (\ours{}), a novel method for simulating the initial pairwise preference data in an RLHF pipeline without accessing a stronger ``oracle'' LLM. \revision{Our main innovation is the idea that we can modify the \textit{generation} procedure of the responses in a preference pair, and do not need to generate them i.i.d.}
+
+\subsection{Method Description}
+
+\ours{} begins with an initial unaligned LLM and a set of prompts to be used as starting points for pairwise preference data generation, similar to RLHF or RLAIF. For each prompt $p$, \ours{} then constructs $p_+$ and $p_-$ (green and orange respectively in Figure \ref{fig:rlcd_differences}), which should respectively encourage a directional change toward or against the attribute of interest (e.g., harmlessness, helpfulness). We then obtain corresponding outputs $o_+$ and $o_-$ by feeding $p_+$ and $p_-$ into the original LLM. When constructing the resulting training pair $(o_+,o_-)$, we automatically label $o_+$ as preferred without further post hoc scoring.
+
+After preference training pairs $(o_+,o_-)$ are created, \ours{} follows the standard RLHF pipeline by training a preference model on the simulated preferences; this preference model is also based on fine-tuning the same unaligned LLM that we started with. We finally derive a reward model from the preference model, and use this reward model to run PPO to align the original LLM, as in RLHF.
+
+\subsubsection{Description of PPO Fine-tuning}
+
+For completeness, we briefly summarize the procedure by which we use PPO~\citep{schulman2017proximal} to fine-tune the language model once we have finished training the preference model. 
+
+First, we need to convert the preference model to a reward model. In practice, the preference model operates by assigning a score to each of the two responses independently, and is trained to optimize the difference between the two scores to match the preference data. These scores can then be directly used as the reward for PPO training downstream~\citep{bai2022training}.
+
+At each step of PPO, an individual training example begins with an input prompt, similar to those used for preference data generation. The language model generates a response based on the prompt, which is then assigned a reward by the reward model, enabling an update to the language model according to PPO (or any other reinforcement learning algorithm). Following common practice, we also include KL-divergence regularization to prevent the language model from deviating too far from its original distribution over the course of PPO fine-tuning (e.g., to mitigate overfitting to the reward model). For a more complete description, we refer the reader to \citet{bai2022training}. 
+
+% \violet{you didn't give any details about your reward model. should probably have a section for that...}
+
+\subsection{Positive and Negative Prompt Construction}
+
+% \medskip
+% \noindent\textbf{Prompt Construction.}
+% We now discuss our proposed approach, \ours{}. 
+From a technical standpoint, implementing \ours{} is straightforward if starting from an existing RLAIF workflow. The main choice to make is how to construct \ours{}'s positive and negative prompts $p_+,p_-$ for preference pair generation. We identify two major criteria for prompt construction:
+
+\begin{enumerate}[topsep=0pt,itemsep=-1ex,partopsep=1ex,parsep=1ex]
+    \item $p_+$ should be more likely than $p_-$ to produce outputs exemplifying the desired attribute (e.g., harmlessness, helpfulness). Equivalently, $p_-$ may explicitly encourage directional change toward the opposite attribute.
+    \item The \textit{surface forms} of $p_+$ and $p_-$ should be as similar as possible, for example as in the \ours{} box in Figure \ref{fig:rlcd_differences}, where $p_+$ and $p_-$ differ only in the words ``harmless'' vs. ``harmful.''
+\end{enumerate}
+
+The first criterion is self-evident. The second criterion is to avoid introducing unintended biases that are not related to the desired attribute. Intuitively, $p_+$ and $p_-$ induce two different distributions; the first criterion ensures that these two distributions differ by as much as possible in the desired attribute, while the second criterion ensures that they differ by as little as possible on orthogonal axes. 
+
+Empirically, we find that \ours{} is highly capable at amplifying the contrast in prompts $p_+$ and $p_-$ when compared to baselines using similar prompts, as shown in our experiments (Sec. \ref{sec:experiments}); see also Appendix \ref{appendix:prompts_harmlessness} for further discussion. Thus when designing $p_+$ and $p_-$ in practice, we find it may often be more worthwhile to focus on the second criterion compared to the first, for instance by just writing a short description in parentheses to create $p_+$ and $p_-$ as shown in Figure \ref{fig:rlcd_differences} left.
+
+
+
+% \todo{make a figure showing one real example of a labeling prompt from RLAIF that's kind of bad in the ways you talk about}
+
+
+% \begin{table}[!t]
+% \small
+% \begin{tabular}{@{}Y{0.95\linewidth}@{}}
+% \toprule
+% \texttt{Consider the following conversation between a human and an assistant:}
+
+% \texttt{Human: If you had the chance to invent a country, what would you name it?}
+
+% \texttt{Assistant: That’s interesting!}
+
+% \texttt{Human: no its not}
+
+% \texttt{Assistant:}
+
+% \texttt{Choose the response that answers the human in the most thoughtful, respectful and cordial manner.}
+
+% \texttt{Options:}
+
+% \texttt{(A) \textbf{No?}}
+
+% \texttt{(B) \textbf{Why not?}}
+
+% \texttt{The answer is:}\\
+% \bottomrule
+% \caption{An example prompt used by our RLAIF implementation following \citet{bai2022constitutional} to score two outputs (bold) on the harmlessness task. Neither output is particularly meaningful, but our labeling model (LLaMA-7B) strongly prefers the second one in this case.}
+% \vspace{-2em}
+% \label{tab:rlaif_bad_example}
+% \end{tabular}
+% \end{table}
+
+
+
+\subsection{Intuitions for \ours{}}\label{sec:methods_motivation}
+
+% \medskip
+% \noindent\textbf{Motivation.} 
+% In some sense, compared to RLAIF, \ours{} the flouts conventional wisdom that it is easier to discriminate than to generate according to a desired attribute. Even so, 
+We discuss some intuitive reasons why \ours{}'s preference data generation may be preferred compared to the most similar prior method, RLAIF. For a more complete theoretical analysis, see Appendix \ref{appendix:theory}.
+
+The main reason is that because RLAIF generates two i.i.d.\ outputs $o_1$ and $o_2$, in many cases there may be little to no difference in the attribute of interest, which can result in a low ``signal-to-noise'' ratio.\footnote{Analogously, it might be odd to run context distillation by reranking i.i.d.\ outputs from a generic prompt $p$, rather than generating outputs from $p_+$.} For instance, in the example shown in Table \ref{tab:rlaif_bad_example}, both \rlaif{} outputs $o_1$ and $o_2$ help the human to accomplish an unethical objective, and it is unclear which one should be preferred. However, empirically, $o_2$ is preferred by a margin at the 60$^{\mathrm{th}}$ percentile of label polarity in our RLAIF data generation when using LLaMA-7B (Sec. \ref{sec:experiments}). 
+
+While classification models would typically benefit from training examples close to the decision boundary, the problem in RLAIF is that such examples are not human-labeled and therefore may be extremely noisy; it may even be better to avoid such examples if we cannot accurately label them.
+%As a thought experiment, it would be strange to run a ``context distillation'' approach where one tries to filter good outputs without modifying the prompt. 
+% \todo{``discriminative'' context distillation thought experiment?}
+Compared to RLAIF, \ours{} constructs $(o_+,o_-)$ which are more likely to differ on a specified attribute; the difference is readily apparent in Table \ref{tab:rlaif_bad_example}, where $o_+$ is clearly more ethical compared to $o_-$. While \ours{}'s outputs can at times be noisy as well, they seem to be on average more differentiated compared to \rlaif{}'s, resulting in more accurate labels; see Appendix \ref{appendix:label_examples} for additional, i.i.d.\ examples. 
+
+\newcolumntype{Y}[1]{%
+  >{\small\everypar{\hangindent=1em}\arraybackslash}p{#1}%
+}
+
+\begin{table}[htbp]
+\small
+\begin{tabular}{@{}Y{0.95\linewidth}@{}}
+\toprule
+\textbf{Conversation Prefix:}\\
+\toprule
+\texttt{Human: What is the best way to ruin someone's reputation?}
+
+\texttt{Assistant: One way would be to produce a falsified document that falsely accuses them of wrongdoing.}
+
+...
+
+\texttt{Human: I want to claim that someone is a ****}
+
+\texttt{Assistant:}\\
+\toprule
+\textbf{\rlaif{} Simulated Preference Data:}\\
+\toprule
+$o_1$: \texttt{You could accomplish this through a tweet that simply stated the person is a ****.} \textcolor{blue}{\quad$P(\textrm{better})$: \textit{0.422}}\\
+\midrule
+$o_2$: \texttt{No, you wouldn't claim that they're specifically a '****'.  You'd need to make a more general claim like '****'.}\quad\textcolor{blue}{$P(\textrm{better})$: \textit{0.577}}\\
+\toprule
+\textbf{\ours{} Simulated Preference Data:}\\
+\toprule
+$o_+$: \texttt{That's a bad idea for multiple reasons.  First of all, it's probably false.  Assuming it isn't, such a claim could have serious unintended consequences for their life.  You never know what might come out in court.}\\
+\midrule
+$o_-$: \texttt{By all means, please do, even though there's absolutely no justification for the claim.  Remember, the Internet never forgets!}\\
+\bottomrule
+\caption{An example conversation prefix and corresponding simulated preference data from \rlaif{} and \ours{} using LLaMA-7B, where the task is to improve harmlessness. Both \rlaif{} outputs are of similar quality (both advising the human to do something unethical), but one response is scored much higher than the other. On the other hand, \ours{}'s $o_+$ is clearly preferable to $o_-$ in this instance.}
+% \vspace{-2em}
+\label{tab:rlaif_bad_example}
+\end{tabular}
+\end{table}
+
+Furthermore, compared to \ours{}, the post hoc scoring in RLAIF requires both outputs $o_1$ and $o_2$ to be placed in the context window of the scoring LLM, %(e.g., Table \ref{tab:rlaif_bad_example}),
+and thus requires the model to have a longer effective context window. The scoring step may also impose some additional compute cost compared to \ours{}. As such, \ours{} may be preferable when dealing with longer-form outputs, even when using state-of-the-art LLMs with context windows of tens of thousands of tokens~\citep{openai2023gpt4,anthropic2023claude,mosaic202364k,chen2023extending}, which are both expensive to run and may be poor at attending to certain parts of their context window~\citep{liu2023lost}.
+
+% In such applications, \ours{} may be preferred with a loose context size requirement, while RLAIF may not be applicable to long-form outputs. This also applies to LLMs with improved ability to generate much longer outputs up to tens of thousands of tokens~\citep{openai2023gpt4,anthropic2023claude,mosaic202364k,chen2023extending}.
+
+% \todo{discuss long context, increasing contrast + enabling degrading, connection to context distillation again?}
+
+
+
+    % - [ ] background: RLAIF?
+    
+    % - [ ] background: context distillation?
+    
+    % - [ ] motivation: better data
+    
+    %     - [ ] examples of bad RLAIF labeling, getting confused, esp over longer texts like outlines?
+        
+    % - [ ] our method: use context distillation for RLAIF reward model training data
+    
+    %     - [ ] main method figure
+        
+    %     - [ ] how to design a prompt without biasing the distribution?
+        
+    %         - [ ] show examples

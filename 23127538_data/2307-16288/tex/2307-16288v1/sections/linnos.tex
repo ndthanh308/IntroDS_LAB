@@ -1,0 +1,64 @@
+\documentclass{article}
+\begin{document}	
+    LinnOS is an operating system that leverages a light neural network for inferring SSD performance at a very fine--per I/O--granularity and helps parallel storage applications achieve performance predictability. LinnOS supports blackbox devices and real production traces without any extra input from users, while outperforming industrial mechanisms and other approaches.
+    
+    \subsection{Overview}
+    \label{sec:4.1}
+    \noindent {\textbf{Usage Scenario:} LinnOS is beneficial for parallel, redundant storage such as flash arrays (cluster-based or RAID) that maintain multiple replicas of the same block. When a storage application performs an I/O via OS system calls, it can add a one-bit flag, hinting to LinnOS that the I/O is latency critical, and thus triggering LinnOS to infer the I/O latency. Before submitting the I/O to the underlying SSD, LinnOS inputs the I/O information to the neural network that it has trained, which will make a binary inference: fast or slow. If the output is "fast", LinnOS submits the I/O down to the device. Otherwise, if it is "slow", LinnOS revokes the I/O (not entered to the device queue) and returns a "slow" error code. Upon receiving the error code, the storage application can failover the same I/O to another replica. In the worst case, where the application must failover to the last replica, this last retry will not be tagged as latency critical so that the I/O will eventually complete and not be revoked.} \\
+    
+    \noindent {\textbf{Architectural Overview:} Figure~\ref{fig:linnos architecture} shows LinnOS's overall architecture. At the center of LinnOS is the speedy neural network that lies in the kernel space and infers the speed of every incoming I/O individually. To train the model, LinnOS collects and uses the current live workload that the SSD is serving. The collected trace is then supplied to LinnApp, a supporting user-level application. LinnApp runs an algorithm that automatically labels the traced I/Os with either "fast" or "slow", and proceeds with the training phase. The training phase generates the weights for the neurons in the model that will be uploaded to LinnOS. The model is then activated, and LinnOS is ready to inferences and revoke "slow" I/Os. }
+
+    % Figure environment removed    
+    
+    \subsubsection{Data Collection}
+    \label{sec:4.1.1}
+    I/O systems inherently can collect a large amount of data with low-overhead tools, which is necessary for training. LinnApp collects traces for every load-SSD pair to model. For example, for inferring a production workload performance on a particular SSD in deployment, an online trace will be collected. For every I/O, five raw fields are collected: the submission time, block offset, block size, read/write, and the I/O completion time. In this phase, raw fields are also converted to the input feature format.
+
+    The main challenge here is to decide how long the trace should be. LinnOS takes a simple approach where it uses a busy-hour trace (e.g., midday). It is verified in the evaluation that for production workloads, as busy-hour trace well represents the others, i.e., the inflection point does not deviate significantly.
+    
+    \subsubsection{Labeling}
+    \label{sec:4.1.2}
+    % Figure environment removed   
+    
+    As LinnApp employs a supervised learning approach and does not require extra input from users, the training data must be automatically labeled. However, if every I/O is labeled with the actual us-level latency, the device behavior will be too hard to learn. Luckily, what users worry about is the tail behavior, not the precise latency: SSD latencies often form a high alpha Pareto distribution (as shown in Figure~\ref{fig:inflection point}a), where 90\% of the time, the latency is highly stable, but in the other 10\% of the time, it starts forming a long tail. Thus, LinnApp aims to automatically find the best inflection point (IP), and label each I/O as "fast" or "slow" accordingly. This binary labeling simplifies the problem, and therefore improves accuracy.
+
+    Due to the hardware heterogeneity and unbalanced user load across devices, the inflection point differs for each load-device pair. For this reason, LinnApp collects per-device traces, finds per-device inflection point, and trains the model for every load-device pair in the array. 
+    
+    Assume during data collection, $t$ workload traces ($T_1$ to $T_t$) running on $d$ devices ($D_1$ to $D_d$) are collected, where $t==d$. The following best-effort algorithm is adopted to find a semi-optimum inflection point for each $T_i-D_i$ pair: (1) For each $T_i-D_i$ pair, we pick a starting IP value where the slope of the CDF is one. (2) For the current device $D_1$, we run a simulation of one million I/Os, where each I/O request $r_i$ takes a random latency value from $T_1$'s real latency distribution. We then simulate LinnOS admission control and decide the new latency: if $r_i$'s latency is smaller than the current IP, the new latency is the same; if not, $r_i$ will be revoked and failover to another randomly selected node (e.g., $D_4$) where a random latency is picked from its trace, and the admission control is repeated. (3) These new, optimized latencies of $r_i$ form the new CDF. Using the original and new CDFs, we can calculate the area difference (the shaded "boost area" in Figure~\ref{fig:inflection point}d), which represents the latency gain if use this IP value. (4) Still for $D_1$, we repeat all the steps above by moving +/-0.1 percentile within the +/-10 percentile ranges from the initial IP value. Then, we pick the IP value that gives us the largest boost area. (5) We repeat all the steps for other devices. 
+    
+    \subsubsection{Light Neural Network Model}
+    \label{4.1.3}
+    % Figure environment removed  
+    
+    Figure~\ref{fig:lnn} depicts the light neural network used, along with the input features and format. To infer the speed of every I/O, the model takes three inputs: (1) the number of pending I/Os when an incoming I/O arrives, (2) the latency of the $R$ most recently completed I/Os, where $R$ is set as 4, (3) the number of pending I/Os at the time when each of the $R$ completed I/Os arrived. Here $R$ is tradeoff between accuracy and inference time. These input features are minimized (i.e., not including block offset, write/read flag, and a long history, etc.) so as to reduce the inference time.
+
+    To balance the model size and learning difficulty, the number of pending I/Os are formatted into three decimal digits. For example, the format for 15 pending I/Os is three integers {0,1,5}. Similarly, the us latencies of the recent completed I/Os are formatted into four digits.
+
+    The final model is a fully connected neural network with only three layers. The input layer is supplied with the 31 features described above. The hidden layer consists of 256 regular neurons and uses RELU activation functions. The output layer has two neurons with linear activation function. This light design is crucial for the live, fine-grained prediction task.
+    
+    \subsubsection{Improving Accuracy}
+    \label{sec:4.1.4}
+    To further improve the model accuracy, \textit{false submit reduction}, \textit{model recalibration}, \textit{inaccuracy masking} is performed. Since the wrong inference penalty (in terms of its effect for cutting tail latency) is small for false revokes but high for false submits, biased training is used for reducing false submits. Model recalibration is used to adapt to significant workload changes, where re-tracing and re-computation of inflection point is done periodically every few hours. Inaccuracy masking combines LinnOS with hedging, where it uses the false submit rate as an indicator for the hedging percentile value.
+    
+    \subsubsection{Improving Inference Time}
+    In addition to the 3-layer design that is fundamental for reducing inference time, LinnOS makes further optimizations. First, it adopts DNN quantization, where the trained floating-point weights are converted to integers with precision of three decimal points. Second, it can opportunistically use co-processors to reduce the average inference time with 2-threaded optimized matrix multiplication using one additional CPU core.
+    
+    \subsection{Evaluation}
+    LinnOS is a case study for Task 1. According to the taxonomy presented in Section~\ref{sec:taxonomy}, it adopts blackbox techniques for performance prediction. We summarize the strengths and limitations of LinnOS as follows:\\
+    
+    \noindent \textbf{Strengths:}
+    \begin{itemize}
+        \item LinnOS is the first operating system that successfully infers I/O speed in a fast, accurate, fine-grained, and general fashion. It helps storage applications cut high percentile latency, thus achieving predictable performance on flash arrays.
+        \item The auto-labeling algorithm exempts users from supplying an SLO value such as a deadline. Properly setting the SLO is not easy for users.
+        \item With the help of recalibration, LinnOS can adapt to the workload shift that happens slowly and continuously in modern datacenters.
+    \end{itemize}
+    
+    \noindent \textbf{Limitations:}
+    \begin{itemize}
+        \item In order to combat heterogeneity, LinnApp collects per-device traces and trains the model for every load-device pair in the array. However, this limits the scalability of LinnOS: a single host cannot be connected to a large RAID array, because a single host cannot hold the large training burden of multiple models, and the CPU overhead the models impose even during inference time.
+        \item Though LinnOS inference overhead is less noticeable compared with the access latency of current SSDs, it could become problematic as SSDs march to 10us latency range. Also, the consumption of computation resources can increase substantially as the IOPS grow.
+    \end{itemize}
+    
+    
+    \ifcsdef{mainfile}{}{\bibliography{../references/main}}
+\end{document}

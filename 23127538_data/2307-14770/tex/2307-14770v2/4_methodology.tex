@@ -1,0 +1,406 @@
+
+
+
+
+
+
+
+\section{Methodology}
+\label{sec: Methodology}
+We first present a comprehensive overview of %our proposed approach
+{this section}. 
+%\hbc{this is more like an overview of this section instead of the approach}.
+Firstly, we introduce the design of our body pose-aware discriminator in Sec. \ref{sec: Discriminator}, which is capable of extracting body poses and corresponding scores from the input images.
+%
+Subsequently, we elaborate on our 3DPortraitGAN in  Sec. \ref{sec: 3DPortraitGAN}, including the pose predictor in generator (Sec. \ref{sec: pose sampling}), the generator backbone (Sec. \ref{sec: EG3D Backbone}) and our deformation module (Sec. \ref{sec: Deformation Module}).
+%
+Finally, we discuss the losses utilized in our training process in  Sec. \ref{sec: Losses}, along with the details of the training in  Sec. \ref{sec: Training Details}.
+
+
+
+
+
+\subsection{Body Pose-aware Discriminator}
+\label{sec: Discriminator}
+In Sec. \ref{sec: Dataset}, we mentioned that the body poses in our dataset are inaccurate and cannot be directly used for training 
+{(see Sec. \ref{sec: ablation pose prediction})}. 
+%
+Inspired by the pose-free 3D-aware generator, Pof3D \cite{shi2023pof3d}, we propose employing the discriminator to predict more accurate body pose $\hat{p}$ from real/generated images.
+
+
+Taking a real image $I_{real}$ as an example, we denote its camera parameters in the \textit{$\it{360}^{\circ}$PHQ} dataset as $c_{real}$. 
+%
+{In EG3D \cite{DBLP:conf/cvpr/ChanLCNPMGGTKKW22}, the dual discrimination requires feeding low- and high-resolution images into the discriminator, resulting in $I_{real}$ consisting of two parts: low-resolution $I_{real}^{-}$ and high-resolution $I_{real}^{+}$ (the former is bilinearly upsampled to the same resolution as the latter). %$I_{real}^{+}$).
+%
+Similar to PanoHead \cite{An_2023_CVPR}, we further include the foreground mask $I_{real}^{seg}$ as an input to our discriminator, resulting in:
+\begin{equation}
+    \begin{split}
+    \label{eqn: I_real}
+    I_{real} = [I_{real}^{-}, I_{real}^{+}, I_{real}^{seg}],
+    \end{split}
+\end{equation}
+where $I_{real}^{+}$, $I_{real}^{-}$, and $I_{real}^{seg}$ are concatenated into a seven-channel image $I_{real}$. We obtain $I_{real}^{seg}$ using an off-the-shelf network as mentioned in Sec. \ref{sec: Dataset}.
+%
+We find that this mask-aware design not only disentangles the foreground from the background, but also helps eliminate the ``rear-view-face'' artifact, which is the presence of a face on the back of the head (as seen in Fig. \ref{fig: rear-view-reg} in ablation studies). This is due to the 3D prior provided by the foreground segmentation masks to some extent.}
+
+As shown in Fig. \ref{fig: discriminator}, the convolutional layers first extract features from $I_{real}$. Then the features and the camera parameters are fed into a pose predictor branch $\Gamma_D$, yielding a predicted body pose:
+\begin{equation}
+	\begin{split}
+    \label{eqn: pose_predict_D}
+     \hat{p}_{real} &= \Gamma_D (\mathrm{Conv}(I_{real}), c_{real}),
+     \end{split}
+\end{equation}
+where $\mathrm{Conv}$ denotes the convolutional layers.
+We observe that $\Gamma_D$ faces difficulty accurately predicting symmetry poses for symmetry images. To explicitly maintain the symmetry of $\Gamma_D$, we propose an explicit symmetry strategy for $\Gamma_D$.
+%
+Specifically, once fed into $\Gamma_D$, we flip the input image horizontally when the spherical coordinate $\mu$ of its camera position falls within the range of $[-\frac{1}{2}\pi,\frac{1}{2}\pi]$ (which indicates that the camera is on the right-hand side of the subject, see Fig. \ref{fig: data_distribution}). We also flip the resulting predicted body pose so as to obtain the final predicted body pose. This operation guarantees that two {horizontally} symmetrical images have the symmetry value of the predicted body pose.
+
+
+
+% Figure environment removed
+
+
+Next, we feed $c_{real}$ and $\hat{p}_{real}$ into a pose feature mapping network, and the image features are fed into an image feature mapping network. Then the outputs of the two feature mapping networks are multiplied to get the final score of the discriminator: 
+\begin{equation}
+	\begin{split}
+    \label{eqn: discriminator_real}
+     score_{real} & = \Phi_{image} (\mathrm{Conv}(I_{real})) \cdot \Phi_{pose} (c_{real}, \hat{p}_{real})   \\
+     & = D(I_{real}\vert c_{real}, \hat{p}_{real} ), 
+     \end{split}
+\end{equation}
+where $D$ denotes the discriminator, and $\Phi_{image}$ and $\Phi_{pose}$ denote the image feature mapping network and the pose feature mapping network, respectively.
+
+Likewise, $D$ estimates scores and body poses from generated images as:
+\begin{equation}
+	\begin{split}
+    \label{eqn: discriminator_gen}
+    I_{gen}  &= [I_{gen}^{-}, I_{gen}^{+}, I_{gen}^{seg}], \\
+    \hat{p}_{gen} &= \Gamma_D (\mathrm{Conv}(I_{gen}), c_{gen}), \\
+     score_{gen} & = D(I_{gen}\vert c_{gen}, \hat{p}_{gen} ),
+     \end{split}
+\end{equation}
+%where $I_{gen}$ refers to an image generated by our generator (which we will describe in Sec. \ref{sec: 3DPortraitGAN}) using camera parameters $c_{gen}$ and a specific body pose. 
+%
+{where $I_{gen}^{-}$ and $I_{gen}^{+}$ respectively refer to the low- and high-resolution images generated by our generator. Additionally, $I_{gen}^{seg}$ is rendered using volume rendering, as detailed in Sec. \ref{sec: EG3D Backbone}.}
+$c_{gen}$ is sampled from the \textit{$\it{360}^{\circ}$PHQ} dataset, while $\hat{p}_{gen}$ denotes the predicted body pose of $I_{gen}$.
+
+
+% Figure environment removed
+
+
+
+\subsection{3DPortraitGAN}
+\label{sec: 3DPortraitGAN}
+
+
+
+\subsubsection{Pose Sampling}
+\label{sec: pose sampling}
+In this paper, we propose to generate $I_{gen}$ using a latent code $z$, camera parameters $c_{gen}$ and a certain body pose $p_{gen}$ as :
+\begin{equation}
+	\begin{split}
+    \label{eqn: generate}
+     I_{gen} = G(z, c_{gen}, p_{gen}) \sim P(I_{gen} \vert z, c_{gen}, p_{gen}).
+     \end{split}
+\end{equation}
+To train our generator, we need to sample camera parameters and body poses from the pose distribution of the \textit{$\it{360}^{\circ}$PHQ} dataset. 
+
+
+However, in the \textit{$\it{360}^{\circ}$PHQ} dataset, while the camera parameters we extract from real images are somewhat precise (after our manual selection), the body poses are ``coarse'' and cannot be used as training data (Sec. \ref{sec: Dataset}).
+%
+Taking inspiration from Pof3D \cite{shi2023pof3d}, we employ a pose prediction network $\Gamma_G$ to estimate the conditional distribution of body poses based on randomly sampled latent codes and camera parameters drawn from the \textit{$\it{360}^{\circ}$PHQ} dataset. More specifically, we employ a predictor $\Gamma_G$  to predict a body pose from the %both 
+latent code and camera parameters as follow:
+\begin{equation}
+	\begin{split}
+    \label{eqn: pose_predict_G}
+     {p}_{gen} &= \Gamma_G (z, c_{gen})  \sim P({p}_{gen} \vert z, c_{gen}).
+     \end{split}
+\end{equation}
+Similarly to $\Gamma_D$, we want the predicted body poses that correspond to symmetry camera poses to have symmetry distribution. Thus we apply the explicit symmetry strategy to $\Gamma_G$.
+We horizontally flip the camera parameters $c_{gen}$ with $\mu \in [-\frac{1}{2}\pi,\frac{1}{2}\pi]$, and then flip the predicted ${p}_{gen}$ %is flipped 
+to obtain the final predicted body pose.  
+
+
+
+Then we can generate images from $z$ and $c_{gen}$ by:
+\begin{equation}
+	\begin{split}
+    \label{eqn: generate_new}
+     I_{gen} = G(z, c_{gen}, \Gamma_G (z, c_{gen})) \sim P(I_{gen} \vert z, c_{gen}, \Gamma_G (z, c_{gen})).
+     \end{split}
+\end{equation}
+%In the next section
+{In Sec. \ref{sec: EG3D Backbone}-\ref{sec: Deformation Module}}, 
+%\hbc{You mean Section 5?}, 
+we will introduce how our generator renders an image ${I}_{gen}$ with certain camera parameters ${c}_{gen}$ and a body pose ${p}_{gen}$ in detail.
+
+% % Figure environment removed
+
+
+
+
+
+
+\subsubsection{Backbone}
+\label{sec: EG3D Backbone}
+As shown in Fig. \ref{fig: pipeline},  we utilize EG3D \cite{DBLP:conf/cvpr/ChanLCNPMGGTKKW22} as our backbone. 
+After predicting body pose ${p}_{gen}$ from latent code $z$ and camera parameters $c_{gen}$, we input $z$ into the mapping network, where ${p}_{gen}$ and $c_{gen}$ serve as its conditional inputs.
+The resulting $w$ latent code is then used to modulate both a main generator and a background generator. 
+{The background generator synthesizes the background image $I_{gen}^{bg}$. The main generator synthesizes feature maps, which are then reshaped to certain 3D representations.}
+%\hbc{should the previous and next sentences be swapped?}\onethousand{[Yiqian: OK.]}
+In this paper, we use the ``tri-grid'' 3D representation proposed by PanoHead, which helps alleviate mirror feature artifacts.
+We assume that our tri-grids are ``normalized'' and canonical. 
+This indicates that if we directly render the results using the tri-grids, we will obtain a canonical human body geometry representation with a neutral body pose.
+
+{
+During volume rendering, given a ray $\mathrm{r}(t) = \mathrm{o} + t\mathrm{d}$ pointing from its origin $\mathrm{o}$ (camera center) into direction $\mathrm{d}$, we sample point $\bold{x} = \mathrm{r}(t) = (x,y,z)$ on the ray and project $\bold{x}$ onto the tri-grid as $(x,y),(y,z),(z,y)$. 
+These projections are used to sample features from the tri-grid, 
+which are then fed into a decoder to obtain the color $f(\mathrm{r}(t))$ and density $\sigma(\mathrm{r}(t))$ of point $\bold{x}$ and to perform volume rendering: 
+\begin{equation}
+	\begin{split}
+    \label{eqn: volume_rendering}
+      I_{gen}'^{-}(\mathrm{r}) &= \int^{t_f}_{t_n} w(t) f(\mathrm{r}(t)) dt, \\
+      I_{gen}^{seg} (\mathrm{r}) &= \int^{t_f}_{t_n} w(t)  dt, \\
+        w(t) &=  \mathrm{exp} \left (- \int^{t}_{t_n} \sigma(\mathrm{r}(s))ds \right )\sigma (\mathrm{r}(t)),
+     \end{split}
+\end{equation}
+where $t_n$ and $t_f$ {respectively denote} the near and far bounds along $\mathrm{r}$, $I_{gen}'^{-}$ is the rendered image, {and} $I_{gen}^{seg}$ is the rendered foreground mask.
+
+Similar to PanoHead, the rendered image $I_{gen}'^{-}$ and the background image $I_{gen}^{bg}$ are composed using the foreground mask $I_{gen}^{seg}$, getting a composed raw image:
+\begin{equation}
+	\begin{split}
+    \label{eqn: composed raw image}
+      I_{gen}^{-} = (1-I_{gen}^{seg})I_{gen}^{bg} + I_{gen}'^{-}.
+     \end{split}
+\end{equation}
+After that, %the composed raw image 
+$I_{gen}^{-}$ is fed to a super-resolution network to obtain the final high-resolution image $I_{gen}^{+}$.
+}
+
+
+\subsubsection{Deformation Module}
+\label{sec: Deformation Module}
+In Sec. \ref{sec: EG3D Backbone}, we assume that the tri-grids generated by our generator are canonical. 
+Given a body pose $p_{gen}$, to achieve a final portrait that conforms to $p_{gen}$, we utilize the deformed mesh $M(p_{gen})$ to produce a deformation field that maps each sampled point $\bold{x} = (x, y, z)$ in the observation space to a corresponding point $\bold{x}' = (x', y', z') = (x + \Delta x, y + \Delta y, z + \Delta z) $ in the canonical space, where $ \Delta \bold{x} =  (\Delta x, \Delta y,  \Delta z) $ denotes the deformation field value.
+
+
+%\hbc{It's abrupt to mention RigNeRF? Have we introduced how our work is relevant to RigNeRF? Has this been discussed in the related work section?}
+%\onethousand{[Yiqian: Have added a sentence in sec 2.3 (related work) to discuss.]}
+{We draw inspiration from RigNeRF \cite{DBLP:conf/cvpr/AtharXSSS22}, which uses a mesh-guided deformation field and a residual deformation network to achieve full control of neural 3D portraits. To improve the training efficiency of our model, we exclude the NN-based residual deformation training and directly use the readily available mesh-guided deformation field. Specifically, we use a canonical SMPL mesh $M(0)$, where the pose is neutral ($0$ refers to neutral body pose), and the deformed SMPL mesh $M(p_{gen})$ to compute a deformation field.
+}
+Similar to RigNeRF, the SMPL deformation field value at a point $\bold{x}$ on the ray is defined as follows:
+\begin{equation} 
+	\begin{split}
+    \label{eqn: original SMPLDef}
+    & \Delta \bold{x}  = SMPLDef(\bold{x}, p_{gen}) = \frac{SMPLDef(\hat{\bold{x}},p_{gen})}{\exp(\Vert\bold{x} , \hat{\bold{x}}\Vert^2)}, \\
+    & SMPLDef(\hat{\bold{x}},p_{gen}) = \hat{\bold{x}}_{M(0)} - \hat{\bold{x}}, \enspace
+     \end{split}
+\end{equation}
+where $\hat{\bold{x}}$ is the closest point on the deformed mesh $M(p_{gen})$ to $\bold{x}$, and  $\Vert\bold{x} , \hat{\bold{x}}\Vert^2$ is the Euclidean Distance between $\bold{x}$ and $\hat{\bold{x}}$. $\hat{\bold{x}}_{M(0)}$ is the position of point $\hat{\bold{x}}$ on $M(0)$.
+%As a result, the deformation direction of point $\bold{x}$ is the translation direction of its closest point on the deformed SMPL mesh. Moreover, the magnitude of the deformation is determined by the distance between $\bold{x}$ and $\hat{\bold{x}}$.
+
+However, the deformation field in RigNeRF may encounter issues when the NN-based non-rigid deformation is disabled and the body pose $p_{gen}$ is large. 
+% 
+The computation of RigNeRF's deformation field $\Delta \bold{x}$ depends only on the translation of the point, ignoring the relative positioning between the sample point and the mesh. This approach produces an ``offset face'' as depicted in Fig. \ref{fig: ablation_deform}.
+
+
+To tackle this issue, as shown in Fig. \ref{fig: pipeline}, we utilize a deformation field that accounts for the positional relationship between $\bold{x}$ and its nearest face on the mesh:
+%\hbc{there is a lot of empty space before and after the following equations} 
+\begin{equation}
+\begin{split}
+\label{eqn: new SMPLDef}
+& \Delta \bold{x}  = SMPLDef(\bold{x},p_{gen}) = \left\{
+\begin{aligned}
+&\check{\bold{x}} - \bold{x}, \enspace \quad  \Vert\bold{x}, \hat{f}\Vert^2<\alpha\\
+&0, \enspace \quad \Vert\bold{x}, \hat{f}\Vert^2 \geq \alpha \\
+\end{aligned}
+\right. \\
+&\bold{x}  = C_{\hat{f}}(u,v,h) ,\quad  \check{\bold{x}}  = C_{\hat{f}}^{M(0)}(u,v,h), \enspace 
+\end{split}
+\end{equation}
+where $\hat{f}$ is the face on $M(p_{gen})$ that is closest to $\bold{x}$, and  $ \Vert\bold{x}, \hat{f}\Vert^2$ denotes the Euclidean distance between $\bold{x}$ and  $\hat{f}$, $\alpha$ is a hyper-parameter that controls the ``thickness'' of the geometry beyond the mesh (we empirically set $\alpha$ as 0.25).
+
+We first obtain the local coordinate system $C_{\hat{f}}$ of $\hat{f}$ using its vertices, which yields the local coordinates $(u,v,h)$ of $\bold{x}$ in $C_{\hat{f}}$.  Next, we obtain the local coordinate system $C_{\hat{f}}^{M(0)}$ of the same face on the template mesh $M(0)$ and use $(u,v,h)$ to compute the new global coordinates $\check{\bold{x}}$. 
+In other words, if $\bold{x}$ is close to the mesh, its position relative to its closest face on the mesh remains unchanged.
+
+
+
+
+\subsection{Losses}
+\label{sec: Losses}
+
+\subsubsection{Discriminator Loss}
+We define the loss of the discriminator as:
+\begin{equation}
+\begin{split}
+    \label{eqn: D discriminator loss}
+    L_D = & -\mathbb{E} [\log(1-D(I_{gen}\vert c_{gen}, \hat{p}_{gen} ))] \\
+          & - \mathbb{E} [\log (D(I_{real}\vert c_{real}, \hat{p}_{real} ) ] \\
+          &  +  \lambda \mathbb{E} [ ||\nabla_{I_{real}} D(I_{real}\vert c_{real}, \hat{p}_{real} ) ||_2] + \lambda_p L_{p},
+    \end{split}
+\end{equation}
+where $\lambda \mathbb{E} [ ||\nabla_{I_r} D(I_{real}\vert c_{real}, \hat{p}_{real} ) ||_2]$ is the gradient penalty, $\lambda_{p}$ %\hbc{I assume its value will be given somewhere.}\onethousand{[Yiqian: Yes, will be given in training details.]} 
+represents the weight of body pose loss $L_{p}$. %\hbc{this sentence needs to be rephrased (too complicated structure)}
+{We use $L_p$ to optimize the pose predictor $\Gamma_D$ in the discriminator as:}
+\begin{equation}
+	\begin{split}
+    \label{eqn: body pose loss}
+    L_{p} & = L_2({p}_{gen}, \hat{p}_{gen}),
+     \end{split}
+\end{equation}
+where ${p}_{gen}$ could be regarded as the ground-truth body pose of $I_{gen}$ (since ${p}_{gen}$ is used to perform deformation), and $\hat{p}_{gen}$ is the body pose that is predicted by the discriminator from $I_{gen}$, $L_2$ denotes the $L_2$ distance.
+
+% v1
+% \begin{table*}[t]
+% \begin{tabular}{@{}ccccccc@{}}
+% \toprule
+%                          & Image            & $L_{preg}$                    & $L_{rear}$            & Neural Rendering Resolution     & $\Gamma_G$              \\ \midrule
+% \multirow{3}{*}{Stage 1} & 0$\sim$0.2M          & \CheckmarkBold & \CheckmarkBold  (w/o normalization)  & $64^2$                          & training          \\
+%                          & 0.2M$\sim$0.8M       & \XSolidBrush   & \CheckmarkBold  (w/ normalization)   & $64^2$                          & training        \\
+%                          & 0.8M$\sim$4M     & \XSolidBrush   & \CheckmarkBold  (w/ normalization)   & $64^2$                          & training         \\\midrule
+% Stage 2                  & 4M$\sim$10M  & \XSolidBrush   & \CheckmarkBold  (w/ normalization)   & $64^2$                          & freeze           \\ \midrule
+% \multirow{2}{*}{Stage 3} & 10M$\sim$11M & \XSolidBrush   & \CheckmarkBold  (w/ normalization)   & increase from $64^2$ to $128^2$ & freeze       \\ 
+%                          & 11M$\sim$14M & \XSolidBrush   & \CheckmarkBold  (w/ normalization)   & $128^2$                         & freeze       \\\bottomrule
+% \end{tabular}
+% \caption{The training details of our three-stage training. M means million images. \onethousand{\textbf{[Yiqian: Just skip this table as we are currently conducting a new experiment.]}}}
+%   \label{tab: training_details}
+% \end{table*}
+
+% v2 
+
+
+
+
+\subsubsection{Generator Loss}
+We define the generator's loss as follows:
+\begin{equation}
+\begin{split}
+    \label{eqn: G discriminator loss}
+    L_G = & - \mathbb{E} [\log (D(I_{gen}\vert c_{gen}, \hat{p}_{gen} )) ] \\
+    & + \lambda_{preg} L_{preg},
+    %+ \lambda_{rear} L_{rear},
+    \end{split}
+\end{equation}
+% where $L_{preg}$ represents the body pose regularization loss, and $L_{rear}$ represents the rear-view depth regularization loss, $\lambda_{preg}$ and $\lambda_{rear}$ represents the weights of the regularization losses.
+% The body pose regularization loss $L_{preg}$ will be only employed in the very early stage of our training process, we provide more details in Sec. \ref{sec: Training Details}.
+where $L_{preg}$ represents the body pose regularization loss, and $\lambda_{preg}$ represents the weight of the regularization loss.
+The body pose regularization loss $L_{preg}$ will be only employed in the very early stage of our training process see more details in Sec. \ref{sec: Training Details}).
+
+
+ \subsubsection{Body Pose Regularization Loss}
+ \label{sec: Body Pose Regularization Loss}
+Although our network can learn the relative body pose between different images, it struggles to predict the absolute body pose due to the lack of prior information. The predicted pose can be viewed as a ``deviated'' pose, which has an offset from the true value. Since the camera system can be globally rotated, this offset does not affect camera parameters prediction (as in Pof3D \cite{shi2023pof3d}). However, we use a
+SMPL model in the canonical space, which means a ``deviated'' body pose will result in an unnatural mesh deformation. To address this issue, we propose using $L_{preg}$ to constrain the value of the predicted pose as follows:
+\begin{equation}
+	\begin{split}
+    \label{eqn: body pose reg loss}
+    {p}_{gen} &= \Gamma_G (z, c_{gen}), \\
+     L_{preg} & =  L_2({p}_{gen}, p_{coarse}), 
+     \end{split}
+\end{equation}
+where $p_{coarse}$ represents the coarse body pose in the \textit{$\it{360}^{\circ}$PHQ} dataset, 
+and $c_{gen}$ and $p_{coarse}$ are from the same real image.
+
+
+
+
+
+% \onethousand{ \subsubsection{Rear-view Depth Regularization Loss}
+% \textbf{[Yiqian: The strategy in Sec. 4.3.4 should be improved. Just skip this section for the time being, as we are currently conducting a new experiment. ]}
+% We observe the presence of a face on the back of the head (refer to Fig. \ref{fig: rear-view-reg} in ablation studies). Despite the generator's ability to learn the texture of hair at the back of the head, the face geometry is apparent in the shape extracted by the marching cubes algorithm. Such an artifact also exists in the comparison results in Rodin \cite{DBLP:journals/corr/abs-2212-06135}, where they adapted the official implementation of EG3D to 360-degree generation and retrain EG3D using their rendered dataset.
+% %
+% We attribute this phenomenon to the geometric ambiguity when using single-view images as training data. The discriminator can only assess the rendered images, leading to an underdetermined problem in characterizing the geometry of the back of the head. In the absence of constraints, our model may converge to a suboptimal solution marked by front-back symmetric geometry.
+
+% To tackle this issue, we introduce a rear-view depth regularization loss, which is incorporated into the generator's training to prevent it from falling into suboptimal solutions. Specifically, we generate the depth image of $M(0)$'s occiput (the SMPL mesh with neutral body pose) from the camera parameters $c_{back}$, where $\mu = -\frac{1}{2} \pi$ and $\nu = \frac{1}{2} \pi$. We then apply depth image constraints to the image generated by the generator $G$ from $c_{back}$:
+% \begin{equation}
+% 	\begin{split}
+%     \label{eqn: rear-view depth regularization loss}
+%      L_{rear} & =  L_2(m \odot depth_{M(0)}, m \odot depth_{G}). \\ 
+%      \end{split}
+% \end{equation}
+% Here, $depth_{M(0)}$ represents $M(0)$'s depth image, $depth_{G}$ represents the depth image produced by the generator, $m$ represents the valid mask of $M(0)$'s depth image, and $\odot$ denotes element-wise multiplication. 
+% }
+
+
+
+\subsubsection{Overrall Loss}
+Our full objective function is:
+\begin{equation}
+\begin{split}
+    \label{eqn: full objective}
+    L =  L_D + L_G 
+    \end{split}.
+\end{equation}
+
+
+
+\begin{table}[t]
+\caption{The training details of our three-stage training. M means million images. 
+}
+
+\scalebox{0.9}{
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+                         & Image                & $L_{preg}$        & Neural Rendering Resolution     & $\Gamma_G$              \\ \midrule
+\multirow{2}{*}{Stage 1} & 0$\sim$0.2M          & \CheckmarkBold    & $64^2$                          & training          \\
+                         & 0.2M$\sim$6M       & \XSolidBrush        & $64^2$                            & training        \\  \midrule
+Stage 2                  & 6M$\sim$10M          & \XSolidBrush      & $64^2$                          & freeze           \\ \midrule
+\multirow{2}{*}{Stage 3} & 10M$\sim$11M         & \XSolidBrush      & increase from $64^2$ to $128^2$ & freeze       \\ 
+                         & 11M$\sim$13M         & \XSolidBrush      & $128^2$                         & freeze       \\\bottomrule
+\end{tabular}
+}
+  \label{tab: training_details}
+\end{table}
+
+
+{
+ \subsection{Training Details}
+\label{sec: Training Details}
+% \textbf{[Yiqian: Just skip Section 4.4 for the time being, as we are currently conducting a new experiment.]}
+Our model is trained on 8 NVIDIA A40 GPUs. It takes 7 days to train our full model.
+Taking into account the computational cost of the deformation field, we retain only the SMPL faces that fall within the bounding box of the volume rendering. 
+% We set \onethousand{the $\lambda$ in Eq. \ref{eqn: D discriminator loss}} \hbc{$\gamma$? which gamma?} as 0.5, and the resolution of the training dataset is $256^2$. 
+The resolution of the training dataset is $256^2$. 
+The body pose predictors $\Gamma_G$ and $\Gamma_D$ are composed of fully-connected layers with leaky ReLU as the activation functions. 
+
+The proposed training strategy for our 3DPortraitGAN is composed of three stages, as shown in Tab. \ref{tab: training_details}. 
+
+
+\paragraph{Stage 1 - Warm Up} 
+    The first stage is the warm-up period, from 0 to 6M images.
+    %
+    We employ the regularization loss $L_{preg}$ during the initial phase of this stage. 
+    Specifically, we employ %the 
+    $L_{preg}$ %regularization loss 
+    to the first 0.2M images while linearly decaying $\lambda_{preg}$ from 0.5 to 0 over the subsequent 0.2M images. This helps prevent the coarse body pose from negatively affecting the entire training process. 
+    %
+    % Meanwhile,  we compute $L_{rear}$ regularization loss by directly utilizing $depth_{M(0)}$ and $depth_{G}$ according to Eq. (\ref{eqn: rear-view depth regularization loss}) from 0 to 0.8M images. After generator $G$ has acquired a rudimentary understanding of portrait geometry, we normalize $depth_{M(0)}$ with $depth_{G}$ to match their mean depth values in order to enhance head depth diversity.
+    %
+    We utilize the swapping regularization method proposed by EG3D \cite{DBLP:conf/cvpr/ChanLCNPMGGTKKW22}. Specifically, we begin by randomly swapping the conditioning pose of $G$'s mapping network with another random pose with 100\% probability {and then linearly decay the swapping probability} %,  then the swapping probability is linearly decayed 
+    to 70\% over the first 1M images. For the remainder of this stage, we maintain a 70\% swapping probability. The neural rendering resolution remains fixed at $64^2$.
+     
+    
+    
+\paragraph{Stage 2 - Freeze $\Gamma_G$} 
+    From 6M to 10M images, we encounter issues with the collapse of $\Gamma_G$ during training. 
+    % %
+    Therefore, we freeze $\Gamma_G$ while continuing training 3DPortraitGAN for 10M images.
+    We randomly swap the conditioning pose of $G$'s mapping network with another random pose with 70\% probability during this stage, and {fix the} neural rendering resolution %remains fixed 
+    at $64^2$.
+    
+    
+\paragraph{Stage 3 - Increase Neural Rendering Resolution}  
+    This stage represents the training from 10M images to 13M images of our full training process.
+    %
+    In this stage, we gradually increase the neural rendering resolution of 3DPortraitGAN while {keeping the} other training settings %are 
+    identical to those of Stage 2.
+    %
+    Specifically, we linearly increase the neural rendering resolution from $64^2$ to $128^2$ from 10M to 11M images {and then} %, then we 
+    retain the neural rendering resolution as $128^2$ until finishing training.
+    We randomly swap the conditioning pose of $G$'s mapping network with another random pose with 70\% probability during this stage.
+
+}
+
+
+
+    

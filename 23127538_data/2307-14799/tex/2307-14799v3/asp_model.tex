@@ -1,0 +1,371 @@
+In the following, we present our hybrid ASP with difference logic encoding
+of SMSP supplying multi-objective optimization functionalities.
+We start by describing the fact format of problem instances
+(Section~\ref{subsec:instance}), followed by static preallocation strategies to
+limit the number of assignable machines for each operation
+(Section~\ref{subsec:partial}), then
+the main encoding part to generate schedules incorporating batches, setup and maintenance operations (Section~\ref{subsec:schedule}), 
+and finally optimization by multi-shot ASP solving
+(Section~\ref{subsec:optimization}).
+
+\subsection{Problem instance}\label{subsec:instance}
+
+% The input predicates used to specify lots, machines, setup and operations are utilized in Listing~\ref{prg:facts}, which presents a condensed portion of the SMT2020 HV/LM setting. The input facts are explained below:
+The example SMSP instance for which an (optimal) schedule is shown in
+Figure~\ref{fig:schedule} is represented by the facts in Listing~\ref{prg:facts}. The structure of the used predicates is as follows:
+%
+\begin{description}[font=\normalfont\ttfamily\footnotesize]
+\item[route($p$,$i$,$g$,$t$,$m$,$n$,$s$).]
+The $i$-th operation for lots of product $p$ takes the processing time $t$ on a machine in tool group $g$ equipped with the setup $s$, where $m$ and $n$ provide the minimum and maximum batch size.
+E.g., the fact in line~\ref{prg:facts:prd:begin} of Listing~\ref{prg:facts} states that the first operation for lots of product $1$ needs to be performed by a machine in the \emph{diffusion\_fe\_120} tool group, taking the processing time~$20$ for batches of (preferably) at least $2$ and at most $4$ lots with an arbitrary setup in view of $s=0$.
+%
+\item[setup($g$,$s$,$t$,$m$).]
+Changing to setup $s\neq 0$ takes time $t$ on machines of the tool group $g$,
+and at least $m$ operations should be processed in the setup $s$ before performing
+another setup change.
+The facts in lines~\ref{prg:facts:set:begin} and~\ref{prg:facts:set:mid} of Listing~\ref{prg:facts} express that the setups \emph{su128\_1} and \emph{su128\_2} need $20$ or $18$ time units, respectively, to be equipped on machines in the \emph{implant\_128} tool group,
+where each of them ought to be maintained for $4$ production operations at minimum before changing.
+Unlike that, the \emph{su450\_3} setup, taking $22$ units for equipping \emph{lithotrack\_fe\_95} machines with it, can be changed freely, as declared by the fact in line~\ref{prg:facts:set:end}.
+%
+\item[pm($g$,$l$,$e$,$m$,$n$,$t$).]
+Machines in the tool group $g$ need to undergo a periodic maintenance operation labeled $l$,
+whose type $e$ is either \lstinline{lots} or \lstinline{time}, the parameters $m$ and $n$
+specify a minimum and maximum amount of lots or processing time, respectively, after which the
+maintenance operation taking $t$ time units needs to repeated.
+The facts in lines \ref{prg:facts:pm:begin}-\ref{prg:facts:pm:end} of Listing~\ref{prg:facts}
+specify one maintenance operation per tool group, where \emph{implant\_128\_mn} is based on processed lots, while \emph{lithotrack\_fe\_95\_wk} and \emph{diffusion\_fe\_120\_mn}
+need to repeated according to accumulated processing times.
+%
+\item[tool($g$,$l$).]
+A machine labeled $l$ belongs to the tool group~$g$,
+where the facts in line~\ref{prg:facts:tool:begin} of Listing~\ref{prg:facts}
+introduce one machine per tool group.
+%
+\item[lot($l$,$p$).]
+A lot labeled~$l$ of product~$p$ needs to produced,
+and two lots of the (single) product~\lstinline{1} are
+declared by the facts in line~\ref{prg:facts:wip:begin} of Listing~\ref{prg:facts}.
+\end{description}%
+%
+\lstinputlisting[float=t,label=prg:facts,caption={Facts for an SMSP instance with two lots and three tool groups with one machine each},linerange={2-14}]{listing/facts.lp}
+%
+% \begin{itemize}
+% 	\item \emph{route($p,r,g,t,u,min,max,s$).}
+% 	This defines the route for a given product \emph{p} and its corresponding step number \emph{r}. The step can be processed on a machine group \emph{g} and takes a processing time of \emph{t} units. The processing unit representation is indicated by \emph{u}, which can be either "batch" or "wafer". In case of batch, the minimum and maximum batch sizes are specified by \emph{min} and \emph{max}, respectively, $0$ otherwise. Additionally, the setup required for the step is denoted by \emph{s}.
+	
+% 	\item \emph{setup($g,s,t,min\_r$).}
+% 	This defines the setup of a given tool group \emph{g} with setup name \emph{s}, which takes certain amount of time \emph{t} and minimum runs \emph{min\_r}. The parameter minimum runs indicates that the machine with a particular setup should perform a minimum of \emph{min\_r} operations before switching to a different setup. This parameter plays a crucial role in the optimization criteria. 
+	
+% 	\item \emph{pm($g,a,x,y,z,w$).}
+% 	This defines the maintenance procedures of type ${x \in \{lots, time\}}$ with duration \emph{w} applied to machines in the tool group \emph{g} after processing between \emph{y} and \emph{z} operations or accumulating as much processing time, respectively.
+	
+% 	\item \emph{tool($g,m$).}
+% 	This defines a machine \emph{m} belongs to tool group \emph{g}.
+	
+% 	\item \emph{lot($l,p$).}
+% 	This defines the scheduling of lot \emph{l} of product \emph{p}. The lot could range from $ 1 \dots n$.
+% \end{itemize}
+
+% % \input{schedule_example.tex}
+
+% An optimal schedule for example problem instance shown in Listing~\ref{prg:facts} is shown in Figure~\ref{fig:schedule}.
+
+\subsection{Partially flexible machine assignment}\label{subsec:partial}
+
+\lstinputlisting[float=t,label=prg:groups,caption={Encoding part for partitioning tool groups into subgroups and preallocation by setups},linerange={1-45,65-69}]{listing/encoding_labeled.lp}
+%
+Experiments with our prototypical SMSP encoding \cite{ali2023flexible} showed that fixing the machine assignment of operations upfront sacrifices optimality, while a fully flexible assignment leads to plenty ground rules slowing down the optimization when a tool group contains many machines.
+To enable trade-offs between the fixed and fully flexible machine allocation strategies, the novel encoding part in Listing~\ref{prg:groups} introduces a constant
+\lstinline{sub_size} that allows for limiting the number of assignable machines per operation.
+That is, when \lstinline{sub_size} is \lstinline{0},
+the machine assignment remains fully flexible, gets fixed if the value is~\lstinline{1},
+or is limited to some \emph{subgroup} of a tool group with at most \lstinline{sub_size} many machines for values greater than one.
+In the latter case, the rule in lines \ref{prg:encoding:10}-\ref{prg:encoding:12}
+partitions \lstinline{N} machines of a tool group \lstinline{G} into
+$\lceil\text{\lstinline{N}}\div\text{\lstinline{sub_size}}\rceil$ many subgroups,
+% with
+%$\left(\text{\lstinline{sub_size}} - (\text{\lstinline{N}} \mathbin{\scriptstyle{\%}} \text{\lstinline{sub_size}})\right)\mathbin{\scriptstyle{\%}}\text{\lstinline{sub_size}}$
+each gathering \lstinline{sub_size} or $\text{\lstinline{sub_size}}-1$ of the machines in \lstinline{G} when $\text{\lstinline{N}}\geq \text{\lstinline{sub_size}}$.
+For example, we derive the atoms
+\lstinline{subgroup(implant_128,1,1,3)},
+\lstinline{subgroup(implant_128,2,4,5)}, and
+\lstinline{subgroup(implant_128,}\linebreak[1]\lstinline{3,}\linebreak[1]\lstinline{6,7)}
+by the rule in lines~\ref{prg:encoding:13}-\ref{prg:encoding:14},
+giving the subgroups
+$\{\text{\lstinline{1}},\text{\lstinline{2}},\text{\lstinline{3}}\}$,
+$\{\text{\lstinline{4}},\text{\lstinline{5}}\}$, and
+$\{\text{\lstinline{6}},\text{\lstinline{7}}\}$
+when
+seven machines in the \emph{implant\_128} tool group are partitioned for
+the \lstinline{sub_size} value~\lstinline{3}.
+
+The rules in lines \ref{prg:encoding:18}-\ref{prg:encoding:24} determine the subgroup
+to which an operation is allocated, based on a lexicographical index
+for operations to be processed by machines in the same tool group.
+This allocation can be configured by the constant \lstinline{lot_step}: if its value is \lstinline{0}, all operations of a lot are mapped to a common index, or to successive indexes in case of value~\lstinline{1}.
+The rationale for these two strategies is that operations performed on the same lot
+succeed one another and will thus never compete for a machine.
+On the other hand, the operations may require different setups so that changes are needed when
+reusing the same machine.
+In fact, the latter indexing strategy is likely to map operations of a lot to separate subgroups,
+as the rule in lines \ref{prg:encoding:23}-\ref{prg:encoding:24} allocates them in a round robin fashion.
+
+As subordinate machine allocation criterion within each subgroup, the setups of operations can be inspected by means of the rules in lines \ref{prg:encoding:30}-\ref{prg:encoding:50} when the constant \lstinline{by_setup} is set to a value other than~\lstinline{0}.
+The idea of the rules in lines \ref{prg:encoding:30}-\ref{prg:encoding:38}
+is to order setups by the sum of processing times for their operations, where setups requiring more processing time come first.
+Then the rules in lines \ref{prg:encoding:40}-\ref{prg:encoding:50} follow this order to map setups and the respective operations to specific machines, always picking the machine with the least load so far for the next setup to allocate.
+The rules to determine the least loaded machine for a setup are omitted in Listing~\ref{prg:groups} to save space, and our full encoding is available online.%
+\footnote{\url{https://github.com/prosysscience/FJSP-SMT2020}\label{foo:online}}
+For example, if two machines of the \emph{implant\_128} tool group belong to the same subgroup for
+the lots specified by the facts in Listing~\ref{prg:facts}, the allocation by setups yields the atoms
+\lstinline{assignable((1,1,3,8,}\linebreak[1]\lstinline{su128_1),}\linebreak[1]\lstinline{implant_128,}\linebreak[1]\lstinline{1)},
+\lstinline{assignable((2,1,3,8,}\linebreak[1]\lstinline{su128_1),}\linebreak[1]\lstinline{implant_128,}\linebreak[1]\lstinline{1)},
+\lstinline{assignable((1,1,5,7,}\linebreak[1]\lstinline{su128_2),}\linebreak[1]\lstinline{implant_128,}\linebreak[1]\lstinline{2)}, and
+\lstinline{assignable((2,1,5,7,}\linebreak[1]\lstinline{su128_2),}\linebreak[1]\lstinline{implant_128,}\linebreak[1]\lstinline{2)},
+thus mapping the third operation in the route of both lots, requiring the setup \emph{su128\_1}, to the first 
+and the fifth operation for both with the setup \emph{su128\_2} to the second machine of the subgroup.
+
+\subsection{Schedule generation}\label{subsec:schedule}
+
+While the previous encoding part specifies preallocation strategies to
+statically limit the machines to which each operation may be assigned,
+Listing~\ref{prg:assign} describes the actual, combinatorial scheduling task,
+including the machine assignment, setup and maintenance operations, as well as
+the aggregation of \emph{batches}.
+The latter feature was not yet incorporated in our prototypical SMSP encoding
+\cite{ali2023flexible} and is newly introduced by the rules in lines
+\ref{prg:encoding:54}-\ref{prg:encoding:64}.
+To begin with, (ordered) pairs of operations processed by machines with a
+maximum batch size beyond one are determined in lines
+\ref{prg:encoding:54}-\ref{prg:encoding:58}.
+Then, batches are generated by applying the choice rule in line~\ref{prg:encoding:60}, which represents batch processing of the first operation
+for both lots given by the facts in Listing~\ref{prg:facts} in terms of the derivable atom
+\lstinline{batch(diffusion_fe_120,(1,1,1,20,0),(2,1,1,20,0))}.
+That is, a batch is identified by the operation on its lexicographically smallest lot, to which lots with greater identifiers are linked via the \lstinline{batch/3} predicate.
+Any such linked lots are indicated by \lstinline{batched/1},
+and \lstinline{batched/2} provides a symmetric version of \lstinline{batch/3},
+where both of the \lstinline{batched} predicates are derived by the rule in
+line~\ref{prg:encoding:63}.
+The integrity constraint in line~\ref{prg:encoding:64} makes sure that batches
+partition the lots of a product, as it rules out that the lot identifying a batch is itself linked to another (lexicographically smaller) lot.
+This unambiguous batch representation is exploited by the integrity constraint in line~\ref{prg:encoding:61}, where it suffices to count the linked lots to assert that the maximum batch size for an operation is not exceeded.
+%
+\lstinputlisting[float=t,label=prg:assign,caption={Encoding part to assign batches, machines, as well as setup and maintenance operations},linerange={71-109,120-129,150-156},firstnumber=52]{listing/encoding_labeled.lp}
+
+The choice rule in line~\ref{prg:encoding:68} continues with the \emph{machine assignment} by selecting exactly one machine, among those determined by a preallocation strategy from the previous subsection, for processing an operation.
+Operation pairs assigned to the same machine are brought into an ordered
+representation in terms of the \lstinline{step_assign/3} predicate via the rules in lines
+\ref{prg:encoding:70}-\ref{prg:encoding:71}.
+These pairs are filtered in lines \ref{prg:encoding:72}-\ref{prg:encoding:73} to
+indicate the operations on different lots by \lstinline{lots_assign/3}.
+Only for the latter an execution order needs to be guessed by applying the rules
+in lines \ref{prg:encoding:77}-\ref{prg:encoding:78},
+provided that the operations do not belong to the same batch,
+which is checked in line~\ref{prg:encoding:74}.
+However, the operations in a batch must share a common machine, as asserted by the integrity constraint in line~\ref{prg:encoding:75}.
+
+The execution order of operations sharing a machine must be inspected further to
+allocate required \emph{setup and maintenance} operations.
+As several kinds of periodic maintenance may need to be applied to machines of the same tool group and their durations add up when they are performed in sequence,
+the rules in lines \ref{prg:encoding:82}-\ref{prg:encoding:84} associate
+maintenance operations with (positive) indexes in decreasing order of their
+durations, with the additional index \lstinline{0} used for operation setups other
+than (don't care) setup~$0$.
+E.g., the facts in Listing~\ref{prg:facts} yield the atoms
+\lstinline{main_setup(implant_128,implant_128_mn,1,13)},
+\lstinline{main_setup(implant_128,su128_1,0,20)}, and
+\lstinline{main_setup(implant_128,su128_2,0,18)} in view of the
+periodic \emph{mn} maintenance along with the \emph{su128\_1} and
+\emph{su128\_2} setups of operations processed by machines in the
+\emph{implant\_128} tool group.
+For tracking the exact execution order of operations on a machine, also if they
+involve the same lot,
+the \lstinline{step_order/3} predicate determined by 
+the rules in lines \ref{prg:encoding:86}-\ref{prg:encoding:88} augments the
+guessed predicate \lstinline{lots_order/3} with atoms reflecting the production route of a lot revisiting the same machine.
+While we omit the details to save space,
+let us mention that the necessity of a setup change before performing an operation
+is a consequence of the execution sequence on a machine, i.e., the rule in lines
+\ref{prg:encoding:92}-\ref{prg:encoding:93} derives an atom of the
+\lstinline{equip/3} predicate whenever the setup required for an operation is not
+already in place.
+Unlike that, maintenance procedures are subject to a range, either in terms of
+processed lots or accumulated processing time, after which they have to be repeated.
+Hence, the rule in line~\ref{prg:encoding:95} introduces the choice to perform a
+specific maintenance before the next production operation, the integrity constraint in line~\ref{prg:encoding:96} distributes such a choice over all lots in a batch, and (auxiliary) maintenances before the first production operation on a machine are asserted in lines \ref{prg:encoding:97}-\ref{prg:encoding:98}.
+The resulting maintenance and setup times needed before the next
+production operation can be processed are then added up by the rules in
+lines \ref{prg:encoding:116}-107, where additional rules and constraints ensuring the compliance of maintenance procedures to the specified repetition ranges are part of our full encoding.%
+\footref{foo:online}
+For example, the \emph{mn} maintenance performed before the fifth operation for % in the route of 
+lot~$1$ in Figure~\ref{fig:schedule} %, identified by the tuple \lstinline{(1,1,5,7,su128_2)},
+is expressed by the atoms
+\lstinline{delay((1,1,5,7,su128_2),implant_128,1,13)} and
+\lstinline{delay((1,1,5,7,su128_2),implant_128,0,13)},
+the latter providing \lstinline{13} as the sum of
+all maintenance and setup times required before the production operation can be processed.
+
+\subsection{Multi-objective optimization}\label{subsec:optimization}
+
+Our multi-objective optimization approach combines minimization at the level of 
+difference logic variable values, as already used in \cite{ali2023flexible,el2022problem},
+with native ASP optimization capacities, as applied in \cite{abels2021train,eiter2022answer,francescutto2021solving} w.r.t.\ the satisfaction of difference logic constraints,
+by means of multi-shot solving functionalities~\cite{gekakasc17a}.
+To this end, the rules in lines \ref{prg:encoding:125}-\ref{prg:encoding:138} of Listing~\ref{prg:optimize} assert difference logic constraints on the completion times of operations,
+beginning with processing times of the first operations in production routes
+(lines \ref{prg:encoding:125}-\ref{prg:encoding:126}) or processing plus setup times 
+(lines \ref{prg:encoding:127}-\ref{prg:encoding:128}) for all operations to which the latter apply.
+These lower bounds are propagated along the production route of each lot
+(lines \ref{prg:encoding:131}-\ref{prg:encoding:132}) and
+the processing order of operations 
+on machines
+(lines \ref{prg:encoding:133}),
+where the times required for maintenance and setup are incorporated in addition
+(lines \ref{prg:encoding:134}-\ref{prg:encoding:135}).
+Notably, batches are handled by synchronizing the completion time between the
+operations on involved lots in line~\ref{prg:encoding:130},
+so that the predecessor operation (if any) finishing latest among all lots in the batch is decisive for
+the entire batch.
+The rule in lines
+\ref{prg:encoding:137}-\ref{prg:encoding:138}
+asserts the completion time of the last operation in each lot's production route as a
+lower bound on the difference logic variable \lstinline{makespan}, thus enabling plain
+\emph{makespan minimization} by supplying \lstinline{--minimize-variable=makespan} as an option to \clingodl.
+%
+\lstinputlisting[float=t,label=prg:optimize,caption={Encoding part for determining lot completion times and multi-objective optimization},linerange={158-191},firstnumber=109]{listing/encoding_labeled.lp}
+
+However, to incorporate the minimization of \emph{setup and batch violations} as additional optimization criteria beyond makespan,
+we utilize a custom control script on top of the Python interface of \clingodl.
+Its first stage concerns makespan minimization,
+where the \lstinline{opt(b)} subprogram in lines
+\ref{prg:encoding:142}-\ref{prg:encoding:145} of Listing~\ref{prg:optimize}
+is instantiated with the value $t-1$ for the parameter \lstinline{b} and then solved with the external atom \lstinline{bound(}$t-1$\lstinline{)} set to true
+whenever an answer set such that \lstinline{makespan}${}=t$ has been found.
+This makes sure that each answer set provides a schedule with strictly shorter
+makespan until an unsatisfiable solving attempt yields that the makespan~$t$ of the last schedule is optimal.
+In the latter case, the subprogram \lstinline{weak(b)} in lines
+\ref{prg:encoding:147}-\ref{prg:encoding:156} gets instantiated with the 
+value $t$ for \lstinline{b} (and possibly also \lstinline{opt(b)} if the value~$t$ has not been supplied for \lstinline{b} before),
+which fixes the makespan of any subsequently found schedule to the optimum~$t$.
+With the weak constraints in lines
+\ref{prg:encoding:152}-\ref{prg:encoding:156} as well as the rule in
+line~\ref{prg:encoding:150} at hand for indicating operations whose setup is
+reinstalled after some temporary change,
+the second stage consists of native ASP optimization for minimizing setup and batch violations.
+Here we take setup violations, where a setup gets changed before performing the intended minimum number of production operations using it, as strictly more
+significant (optimization level \lstinline{@2}) than violations of the minimum
+batch size (optimization level \lstinline{@1}), considering that equipping a machine with a setup takes extra time and effort.
+For example, the schedule in Figure~\ref{fig:schedule} involves one
+setup violation due to changing from the setup \emph{su128\_1} to \emph{su128\_2}
+before performing the intended minimum number of four operations with this setup
+on the \emph{implant\_128} machine.
+Since avoiding the setup violation would require a second machine in the \emph{implant\_128} tool group, the schedule is nevertheless optimal.
+
+% % Figure environment removed%
+
+% \subsection{Sub-group strategy}
+% \lstinputlisting[float=t,label=prg:subgroup,caption={Sub-group strategy},linerange={1-12}]{listing/subgroup.lp}
+
+% An SMSP model with fixed and flexible assignment is presented in \cite{ali2023flexible}. We extend our model by adopting different assignment strategies while incorporating the batch tool management. We aim to optimize weak constraints additionally to the main optimization.
+
+% Semiconductor manufacturing involves numerous machines within tool groups, which can make scheduling a complex task.
+% To address this challenge, this paper presents a novel, sub-group strategy that divides machines in each tool group into variable-sized subgroups. By adjusting the parameter $size$, the number of subgroups can be controlled, allowing for improved manageability and adaptability in the scheduling process. By breaking down large tool groups into smaller sub-groups, the scheduling problem becomes more manageable. This reduces the complexity of the scheduling process and allows for easier implementation of scheduling algorithms and heuristics.
+
+% The first section of base subprogram is presented in Listing~\ref{prg:subgroup} that describes the rules for sub-group strategy developed using own heuristics.
+% The rule in line~\ref{sub} states that if a tool group $G$ exists, then it has a subgroup of size $1$, with index $1$.
+% The rule from line~\ref{sub2:begin}--\ref{sub2:end} recursively defines the subgroups of tool group $G$, starting with a subgroup of size $M$ and index $I$. It uses the previously defined subgroups of smaller size $(M-1)$ to define the current subgroup, and ensures that the subgroup size is not evenly divisible by the $sub{\_}size{\_}grp$ variable.
+% The rule from line~\ref{sub3:begin}--\ref{sub3:end} is similar to the previous one, but it ensures that the subgroup size is evenly divisible by the $sub{\_}size{\_}grp$ variable.
+
+
+
+% \subsection{Assignment of steps to sub-group}
+% \lstinputlisting[float=t,label=assign,caption={Assigning steps to subgroups},linerange={1-14}]{listing/optosubgroup.lp}
+
+% We now propose an approach to assign operations to the subgroups to further enhance the scheduling process. 
+% Here we proposed two different assignment approaches, job-based and step-based, for allocating operations to subgroups.  
+% The effectiveness of the job-based and step-based assignment methods is evaluated through experiments with different instances. This approach is designed to optimize resource allocation. 
+
+% In the job-based assignment approach, the primary focus is on assigning entire jobs to appropriate subgroups within a tool group. This method considers the overall requirements of a job, including its operation sequence, processing times, and precedence constraints. The job-based approach takes a global view of all jobs, ensuring that all steps that belongs to a job are considered when making assignment decisions.  
+
+% In the step-based operation assignment approach, individual operations are assigned to subgroups within a tool group. This approach takes a local view of steps, considering only the current step requirements when making assignment decisions.
+
+% The assigning of steps to sub group makes the problem partially flexible which can be determined from rules in Listing~\ref{assign}. 
+% The rule from line~\ref{step:begin}--\ref{step:end} calculates the index $I$ for each lot $L$, product $P$, step $S$, tool group $G$, and processing time $Pro\_t$. It is calculated by counting the number of tuples (L, P, S) that belong to same tool group and meet the specified conditions such that $(R1, S1 * idx, Pro\_t1 * idx, P1, L1) < (R, S * idx, Pro\_t * idx, P, L)$. In this rule, the $step{\_}pro, step{\_}prio, and lot{\_}release$ predicates represent the process step information, step priority, and lot release time, respectively. The variable $idx$ is the controller for job-based and step-based approach with $0$ and $1$ values, respectively. 
+% The rule from line~\ref{asg0:begin}--\ref{asg0:end} calculates the subgroup $D$ in tool group $G$, to which a step with attributes $(L, P, S, Prio)$ should be assignment based on index $I$. The division operator $"\textbackslash"$ is used to obtain the integer quotient of $I$ divided by $N$, which gives the subgroup index, and one is added to adjust the sub group index to start from 1 instead of 0. 
+
+
+
+% \subsection{Setup-strategy within sub-group}
+% \input{setup.tex}
+
+% \subsection{Assigning steps to machines}
+% \lstinputlisting[float=t,label=assign_machine,caption={Assigning steps to machines},%
+% linerange={1-12}]{listing/optomachine.lp}
+
+% After implementing a flexible sub-group and setup strategy, the next step is to allocate steps to machines within these subgroups. 
+
+% The assignment of steps to machines are determined from rules in Listing~\ref{assign_machine}. 
+% The two rules from line~\ref{asg1:begin}--\ref{asg2:end} determine whether a tuple $(L, P, S, Prio)$ of operation can be assigned to a machine $M$ of sub group $D$ in a tool group $G$. Here the setup strategy is not applicable $(setup{\_}strg = 0)$. In the second rule, the assignment of a tuple of operation holds same as in the previous rule. However, this rule is valid for the setup strategy which is determined by atoms $setup{\_}to{\_}machines\slash4$ and $step{\_}setup\slash3$. The $setup{\_}to{\_}machines(G, M, D, Setup)$ rule maps machine $M$ in subgroup with index $D$ based on the setup strategy for tool group $G$. We aim to ensure that if number of machines in subgroup is greater then the number of setups, all machines are equipped with a setup.  
+% The $step{\_}setup(P, S, Setup)$ rule checks whether the $Setup$ can perform required for step $S$. These atoms are explained in setup-strategy section.  
+% The last rule in line~\ref{asg:begin}--\ref{asg:end} assigns an operation $(L, P, S, Prio)$ in tool group $G$ to a machine $M$ (mach{\_}assign) within a valid subgroup, given that its subgroup index is $D$ (which is calculated using the previous rule discussed in sub-group strategy) and the subgroup is assignable. The rule uses a constraint logic programming (CLP) language construct to choose one valid $mach{\_}assign\slash6$ predicate that satisfies the $assignable\slash3$ condition.
+
+% \subsection{Batching}
+% \input{batch.tex}
+
+% \subsection{Difference logic constraints}
+% \lstinputlisting[float=t,label=dl,caption={Difference Logic},linerange={1-24}]{listing/dl.lp}
+
+% The difference logic constraints are represented in Listing~\ref{dl} which determines the start time of steps. Due to space limitation the rules that define the sequencing of operation, maintenance and setup are not included in the paper. However the explanation of their predicates are as follows:
+
+% \begin{itemize}
+% 	\item $first\_step((L, P, Cur\_s, Prio), R)$. This states the first step $(L, P, Cur\_s, Prio)$ of job must be executed at the release time $R$. If there is a setup associated with the operation, then the start time of first step is the release time plus the setup time of the step. 
+	
+% 	\item $tool\_order(O, \_, Pro\_t)$. This defines the order of two operations $O$ and $O'$ that are executed on the same machine, and $Pro\_t$ is the processing time of the $O$ on that machine. In other words, this helps to establish a sequence of steps that use the same tool, then they must be executed in a certain order.
+	
+% 	\item $nofirst(O)$. The operation $O$ is not the first in the sequence of steps processing on its machine.
+	
+% 	\item $setup\_duration(O, G, Setup\_t)$. The setup duration $Setup\_t$ is calculated based on the changeover times between the current setup and the previous setup on the same machine group if required for operation $O$.
+	
+% 	\item $order(O1, O2, Pro_t1)$. This specifies the order of two steps $O1$ and $O2$ following the precedence constraint when belong to same job. 
+	
+% 	\item $pm\_and\_setup(O, Dur)$. This determines the total duration $Dur$ that sum up the setup and preventive maintenance time of a step $O$.   
+	
+% \end{itemize}
+
+
+% \subsection{Optimization}    
+% \lstinputlisting[float=t,label=prg:opt,caption={Optimization},linerange={1-17}]{listing/opt.lp}
+
+% Our main objective is to minimize the makespan of all jobs which is taken as an external bound while optimizing weak constraints, such as setup and batching. By prioritizing setup over batching, we aim to achieve a better balance of constraints, leading to improve overall scheduling performance. 
+
+% The optimization of makespan is represented in Listing~\ref{prg:opt}. Hence, we aim to optimize multi-objective criteria. Therefore the optimization consists of two parts: $\#program opt(b)$ and $\#program weak(b)$.
+
+% \begin{itemize}
+% 	\item $\#program opt(b)$ and $\#program weak(b)$:
+	
+% 	The line~\ref{opt} and line~\ref{weak} is the subprogram named $opt$ and $weak$ with parameter $b$. The $\#external bound(b)$ directive in both subprograms declares that $bound(b)$ is an external predicate, meaning that its truth value can be set from outside the program.
+	
+% 	\item $\&diff{makespan - 0} <= b :- bound(b).$:
+	
+% 	This rule in line~\ref{opt1} and line~\ref{weak1} is present in both the $opt$ and $weak$ subprograms. It states that the difference between the makespan (i.e., the total time taken for the manufacturing process) and 0 must be less than or equal to $b$ if $bound(b)$ is true. This difference logic constraint ensures that the makespan stays within the specified bound.
+	
+% 	\item Weak constraints:
+	
+% 	The rules from line~\ref{w:begin}--\ref{w:end} are soft constraints that the solver will try to minimize the violations of while still satisfying the hard constraints. In this case, there are two weak constraints:
+	
+% 	\begin{itemize}
+% 		\item Setup:
+		
+% 		The constraint from line line~\ref{asgsetup:begin}--line~\ref{asgsetup:end}
+% 		tries to minimize the number of setup changes that do not satisfy a certain minimum requirement $(Min_r1 - 1)$. The weight of this constraint is 1 and the priority is 2.
+		
+% 		\item Batch:
+		
+% 		The constraint from line~\ref{bat:begin}--line~\ref{bat:end} attempts to minimize the situations where the number of wafers $W$ in the $last\_step\_batch\slash5$ atom is less than the minimum batch size $(Min\_b)$ in the $batch\_info\slash4$ atom. The weight of this constraint is 1 and the priority is 1.
+% 	\end{itemize}
+	
+% \end{itemize}
+
+% In summary, these rules define optimization constraints for the makespan and two weak constraints to minimize setup changes and batch sizes that do not meet certain requirements.
+
+% % Figure environment removed%

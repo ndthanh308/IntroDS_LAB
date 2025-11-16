@@ -1,0 +1,358 @@
+% \enlargethispage{-\baselineskip}
+\section{Proposed Method}\label{sect:proposed}
+
+% The essentials of k-th percentiles: 1. definition 2. requirements: a) smaller $f''$ b) larger $abs(f')$
+% The essentials of noise injection-based training --> new requirements considering the k-th percentile
+% We designed PT-Gaussian to suit this requirement / Batch normalization
+% We designed ADPTrain to tune hyper-parameters: grid search that ADPTrain works
+
+\todo{In this section, we introduce a novel variant of the noise injection training method designed to improve the k-th percentile performance (\KPP) of a DNN model.
+\edd{The conventional noise injection training injects Gaussian noise in the training process simply because \todo{it mirrors the impact of device variations occurring in inference.} There is no theoretical proof that such practice would offer the most robust DNN models. In this section, we show through mathematical analysis that Gaussian noise injection training is far from optimal in improving \KPP.}} Specifically, this section begins with a formal definition of \KPP~and an analysis of its relationship with DNN weights. Next, we analyze the noise injection training framework and identify the requirements for the noise injected during training. We show that Gaussian noise does not satisfy all requirements.
+
+Thus, we propose several candidate noise types and select right-censored Gaussian noise through experimentation. Moreover, we develop an adaptive training method that automatically determines the optimal hyperparameters for the right-censored Gaussian noise injection. The resulting framework is called \underline{T}raining with \underline{RI}ght-\underline{C}ensored Gaussian Nois\underline{E} (TRICE).
+
+\subsection{K-th Percentile Performance}
+
+The \KPP~of a DNN model is derived from the k-th percentile of a distribution. The k-th percentile of a distribution can be defined as the value $z_{pk}$ that separates the lowest k\% of the observations from the highest (100-k)\% of the observations in a distribution. Formally speaking, given a random variable $Z$ following a distribution $\mathcal{D}ist$, there exists a value $z_{pk}$ that, if sampling a value $z_i$ from $Z$, there is a k\% probability that $z_i \leq z_{pk}$. It is equivalent to:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        k/100 = cdf_{\mathcal{D}ist}(z_{pk})
+    \end{aligned}
+\end{equation}
+where $cdf_{\mathcal{D}ist}$ is the cumulative distribution function of $\mathcal{D}ist$. 
+
+In the context of a DNN model's performance in the presence of device variations, the \KPP~represents the minimum performance level that the model achieves with a probability of at least (100-k)\%. For example, As shown in Fig.~\ref{fig:kthp}, the $5^{th}$ percentile performance in terms of top-1 accuracy (\emph{i.e.}, k-th percentile accuracy) of this DNN model in the presence of device variations is 0.4623 which means for 5\% of the cases the DNN accuracy will be lower than 0.4623, and for 95\% of the cases, the DNN accuracy is greater than 0.4623.
+
+
+% Figure environment removed
+
+\KPP~of a DNN model can be easily evaluated through Monte-Carlo simulation. Specifically, with $N_{sample}$ Monte Carlo runs, $N_{sample}$ performance values are collected. These performance values are then sorted in ascending order and the $(N_{sample} \times k\%)^{th}$ element of this sorted array is the estimation of \KPP. The overall process is shown in Algorithm~\ref{alg:qe}.
+
+\begin{algorithm}[t]
+\caption{QuantEval~($\mathcal{M}$, $\mathbf{w}$, $\sigma_d$ $q$, $\mathbf{D}$, $N_{sample}$)}
+\begin{algorithmic}[1]\label{alg:qe}
+
+\STATE \cmtColor{// INPUT: DNN topology $\mathcal{M}$, DNN weight $\mathbf{w}$, device value variation $\sigma_d$, $q = k/100$ for k-th percentile, evaluation dataset $\mathbf{D}$, number of samples $N_{sample}$;}
+\cmtColor{\STATE // OUTPUT: k-th percentile performance of  $\mathcal{M}(\mathbf{w})$;}
+\STATE initialize empty list perf$_l$;
+\FOR{($i=0$; $i < N_{sample}$; $i++$)}
+    \STATE Sample $\Delta\mathbf{w}_i$ from Gaussian($0$, $\sigma_d$);
+    \STATE perf$_i = $ performance of $\mathcal{M}(\mathbf{w} + \Delta\mathbf{w}_i)$ in dataset $\mathbf{D}$;
+    \STATE Add value perf$_i$ to list perf$_l$;
+\ENDFOR
+\STATE perf$_l$ = sort(perf$_l$);
+\STATE perf$_q$ = perf$_l[q\times len($perf$_l)]$
+\STATE return perf$_q$;
+\end{algorithmic}
+\end{algorithm}
+
+\vspace{-0.2cm}
+\subsection{Relationship Between Weights and k-th Percentile Performance}\label{sect:percentile}
+\todo{After establishing the definition of the \KPP, we proceed to analyze how it relates to the trained weights of the DNN model. We use the loss function as the metric for assessing the performance throughout this analysis.}
+
+Given a neural network model $\mathcal{M}$ and its trained weight vector $\mathbf{w}$, the output $\mathbf{out}$ of this model from the input $\mathbf{x}$ can be described as $\mathbf{out} = \mathcal{M}(\mathbf{w}, \mathbf{x})$. Further given the ground truth label $\mathbf{GT}$ and the loss function $f$, its loss can be described as $loss = f(\mathcal{M}(\mathbf{w}, \mathbf{x}), \mathbf{GT})$. Because the values of $\mathbf{x}$ and $\mathbf{GT}$ are fixed when inferencing on a given dataset, the loss expression can be simplified as a function of $\mathbf{w}$, \emph{i.e.}, $loss = f(\mathbf{w})$.
+
+Here we study the impact of perturbing one element $w_0$ in the weight vector $\mathbf{w}$. Specifically, because this weight value is subjected to the impact of device variations, it is perturbed to $w_0 + \Delta w$, where $\Delta{w}$ is the device variation-induced perturbation. We can then apply Taylor expansions to the loss function \emph{w.r.t.} the perturbed weight:
+\vspace{-0.1cm}
+{\small
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        f(w_0 + \Delta w) = & f(w_0) + f'(w_0)\Delta{w} + \frac{f''(w_0)}{2} (\Delta{w})^2 + o((\Delta{w})^3) \\
+        \approx & f(w_0) + f'(w_0) \Delta{w} + \frac{f''(w_0)}{2} (\Delta{w})^2
+    \end{aligned}\label{eq:loss_taylor}
+\end{equation}
+}
+% \vspace{-0.1cm}
+% \begin{equation}
+%     \vspace{-0.1cm}
+%     \begin{aligned}
+%         f(w_0 + \Delta w) \approx  f(w_0) + \Delta{w} f'(w_0) + \frac{(\Delta{w})^2}{2} f''(w_0)
+%     \end{aligned}\label{eq:loss_taylor}
+% \end{equation}
+
+We can observe in Eq.~\ref{eq:loss_taylor} that the loss function can be approximated by a quadratic function of $\Delta{w}$. Given that the weight perturbation $\Delta{w}$ follows the distribution of device variations ($\Delta{w}\sim\mathcal{D}ist$), we can calculate the k-th percentile of the loss as follows:
+
+First, let $q = k/100$ be the probability number of k-th percentile. We then let the unknown k-th percentile be $loss_q$. According to the property of quadratic functions, along with the fact that $f''(w) \geq 0$~\cite{yan2022swim} and $loss_q$ is greater than the minimum value of Eq.~\ref{eq:loss_taylor}, we know that there exist two real numbers $\Delta{w_1}$ and $\Delta{w_2}$, $\Delta{w_1} < \Delta{w_2}$, such that if $\Delta{w_1} < \Delta{w} < \Delta{w_2}$, then $f(\Delta{w}) < loss_q$.
+
+By the definition of \KPP~and the loss is the lower the better, we have $q$ as the probability of $f(\Delta{w}) \geq loss_q$, and then $1-q$ is the probability of $\Delta{w_1} \leq \Delta{w} \leq \Delta{w_2}$. Recalling that weight perturbation $\Delta{w}$ follows the device variation distribution ($\Delta{w}\sim\mathcal{D}ist$), we have:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \label{eq:quantile}
+    1 - q = cdf_{\mathcal{D}ist}(w_2) - cdf_{\mathcal{D}ist}(w_1)
+\end{equation}
+where $cdf_{\mathcal{D}ist}$ is the cumulative distribution function (CDF) of $\mathcal{D}ist$. Through the definition of $w_1$, $w_2$ and $loss_q$, we also know that:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        w_1 &= \frac{-f'(w_0) - \beta}{f''(w_0)}\\
+        w_2 &= \frac{-f'(w_0) + \beta}{f''(w_0)}\\
+        \beta &= \sqrt{f'(w_0)^2 - 2f''(w_0)(f(w_0)-loss_q)}
+    \end{aligned}\label{eq:quadra}
+\end{equation}
+
+Combining Eq.~\ref{eq:quantile} and Eq.~\ref{eq:quadra}, we can get an analytical relationship between $q$ and $loss_q$ and thus can calculate $loss_q$ given the device value deviation distribution $\mathcal{D}ist$ and the trained model weight $w_0$.
+
+% As the device value deviation of most devices follows Gaussian distribution $\mathcal{N}(0,\sigma)$, combining Eq.~\ref{eq:quantile} and Eq.~\ref{eq:quadra}, we have
+% \begin{equation}
+%     \begin{aligned}
+%         2 q &= Erf\left(\frac{(f''(w_0) + \sqrt{f'(w_0)^2 - 2 f''(w_0) (f(w_0)-loss_q)}}{ \sqrt{2} f''(w_0) \sigma}\right) \\
+%         &- Erf\left(\frac{(f''(w_0) - \sqrt{f'(w_0)^2 - 2 f''(w_0) (f(w_0)-loss_q)}}{ \sqrt{2} f''(w_0) \sigma}\right) 
+%     \end{aligned}\label{eq:Erf}
+% \end{equation}
+% where $Erf(x) = \frac{2}{\sqrt{\pi}}\int_0^x e^{-t^2} dt$ is the error function used to represent the cumulative distribution function of Gaussian distribution.
+
+In this work, we target a device model that the device value deviation follows Gaussian distribution $\mathcal{N}(0,\sigma_d)$, whose CDF is:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        cdf_{\mathcal{D}ist}(w) = \int_{-\infty}^w e^{-t^2} dt
+    \end{aligned}\label{eq:cdf}
+\end{equation}
+
+
+
+Combining Eq.~\ref{eq:quantile} and Eq.~\ref{eq:quadra} and the first-order approximation of Eq.~\ref{eq:cdf}, we obtain:
+% \begin{equation}
+%     \begin{aligned}
+%         loss_q = \frac{-f'(w_0)^2 + 4f''(w_0)f(w_0) + 2 f''(w_0)^2 p^2 \pi \sigma^2}{4 f''(w_0)}
+%     \end{aligned}\label{eq:lossq}
+% \end{equation}
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        loss_q = -\frac{f'(w_0)^2}{2f''(w_0)} + f(w_0) + \frac{f''(w_0)\pi q^2 \sigma_d^2}{4}
+    \end{aligned}\label{eq:lossq}
+\end{equation}
+
+Considering $f'(w_0)$ as a variable, it is clear that $loss_q$ is a quadratic function \emph{w.r.t.} $f'(w_0)$. Extensive research works~\cite{dangel2020backpack, yan2022swim} have shown that when using cross-entropy loss with softmax as the loss function, the second derivatives of weights \emph{w.r.t.} the loss is positive, \emph{i.e.}, $f''(w_0) > 0$. Thus, it is clear that Eq.~\ref{eq:lossq} reaches its maximum value when $f'(w_0)=0$ and decreases when $f'(w_0)$ diverges from $0$. Therefore, by observing the first term of~\ref{eq:lossq}, to gain a low enough $loss_q$, hence high enough \KPP, a smaller $f''(w_0)$, and a $f'(w_0)$ with larger absolute values is required. Similarly, by observing the second and the third term of~\ref{eq:lossq}, a smaller $f(w_0)$, and a smaller $f''(w_0)$ is required. Thus, to improve the \KPP~of a DNN model, the DNN training process needs to simultaneously minimize $f(w_0)$ and $f''(w_0)$, and maximize $|f'(w_0)|$.
+
+\subsection{The Effect of Noise Injection Training}\label{sect:train_ana}
+\todo{According to the conclusion in Section~\ref{sect:percentile}, the DNN training process needs to minimize $f(w_0)$ and $f''(w_0)$, then maximize $|f'(w_0)|$ at the same time. We now analyze the noise injection training process to see how to satisfy these requirements.}
+
+% For a neural network model $\mathcal{M}$, at the $t^{th}$ iteration of its training process, denote its currently trained weight as $\mathbf{w}_t$.
+% % the output $\mathbf{out}_t$ of this model from the input $\mathbf{x}_t$ can be described as $\mathbf{out}_t = \mathcal{M}(\mathbf{w}_t, \mathbf{x}_t)$. 
+% Further given the ground truth label $\mathbf{GT}_t$ and the loss function $f$,
+% % , its loss can be described as $loss_t = f(\mathcal{M}(\mathbf{w}_t, \mathbf{x}_t), \mathbf{GT}_t)$.
+% the noise-simulated training method can be depicted as:
+% \vspace{-0.1cm}
+% \begin{equation}
+%     \vspace{-0.1cm}
+%     \begin{aligned}
+%         loss_t & = f(\mathcal{M}(\mathbf{w}_t + \Delta{\mathbf{w}}, \mathbf{x}_t), \mathbf{GT}_t)\\
+%         \mathbf{w}_{t+1} & = \mathbf{w}_t - \alpha \frac{\partial loss_t}{\partial (\mathbf{w}_t + \Delta{\mathbf{w}})}
+%     \end{aligned}\label{eq:itoverview}
+% \end{equation}
+% where $\mathbf{w}_{t+1}$ is the updated weight and $\alpha$ is the learning rate.
+
+% Because $\mathbf{x}$ and $\mathbf{GT}$ are fixed values during training a model $\mathcal{M}$ for a given dataset, we can further simplify the loss expression as $loss = f(\mathbf{w}_t + \Delta\mathbf{w})$. And for each single weight value $w_t \in \mathbf{w}_t$, we have:
+Using similar denotations as Section~\ref{sect:percentile} and recall Alg.~\ref{alg:ni}, one iteration of the noise injection training process can be depicted as:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        w_{t+1} & = w_t - \alpha f'(w_t + \Delta{w})
+    \end{aligned}\label{eq:gdoverview}
+\end{equation}
+where $w_{t}$ is the current weight value, $w_{t+1}$ is the updated weight value after this iteration of training and $\alpha$ is the learning rate.
+By applying Taylor expansion on $f'(w_t + \Delta{w})$, we obtain:
+% \begin{equation}
+%     \begin{aligned}
+%         w_{t+1} & = w_t - \alpha \left(f'(w_t) + \Delta{w} f''(w_t) + \frac{(\Delta{w})^2}{2}f'''(w_t)) + o((\Delta{w})^3\right)\\
+%                 & \approx w_t - \alpha \left(f'(w_t) + \Delta{w} f''(w_t) + \frac{(\Delta{w})^2}{2}f'''(w_t)\right)
+%     \end{aligned}\label{eq:wu_overview}
+% \end{equation}
+
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        w_{t+1} & \approx w_t - \alpha \left(f'(w_t) + \Delta{w} f''(w_t) + \frac{(\Delta{w})^2}{2}f'''(w_t)\right)
+    \end{aligned}\label{eq:wu_overview}
+\end{equation}
+
+Considering a noise injection training process where in each iteration of training, the device variation-induced weight value perturbation $\Delta{w}$ is sampled for enough instances instead of only once, the statistical behavior for such noise injection training is:
+\vspace{-0.1cm}
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        & w_{t+1} = w_t - \alpha E_{ \Delta{w}}[f'(w_t + \Delta{w})]\\
+                & \approx w_t - \alpha \left(f'(w_t) + E[\Delta{w}] f''(w_t) + \frac{E[(\Delta{w})^2]}{2}f'''(w_t)\right)
+    \end{aligned}\label{eq:weight_update}
+\end{equation}
+where $E[\Delta{w}]$ is the expected value (\emph{i.e.}, mean) of $\Delta{w}$.
+
+By observing Eq.~\ref{eq:weight_update} and by recalling the requirements derived through Eq.~\ref{eq:lossq} that the DNN training process needs to (1) minimize $f(w_0)$, (2) minimize $f''(w_0)$, then (3) maximize $|f'(w_0)|$ at the same time. We can analyze the three terms after $\alpha$ in Eq.~\ref{eq:weight_update} to design the noise distribution to be injected.
+
+For the three terms after $\alpha$, the first term $f'(w_t)$ is the first-order gradient that is used in vanilla gradient descent that minimizes the value of $f(w_{t+1})$. This satisfies the first requirement gained in Section~\ref{sect:percentile}. Another side effect is that, when the training process is close to converging, this term would push the first-order gradient toward zero.
+
+The third term $\frac{E[(\Delta{w})^2]}{2}f'''(w_t)$ affects the second derivatives. Because $E[(\Delta{w})^2]$ is always positive, this term minimizes the value of $f''(w_{t+1})$. This satisfies the second requirement gained in Section~\ref{sect:percentile}.
+
+For the second term $E[\Delta{w}] f''(w_t)$, it affects the first derivatives. As $E[\Delta{w}]$ can be either positive, zero, or negative, this term would respectively minimize, not change, or maximize the first-order gradient. Combined with the first term that pushes the first-order gradient towards zero, injecting a noise with a negative mean would result in a maximized positive first-order gradient and vice versa. Because Eq.~\ref{eq:lossq} requires a first-order gradient of larger absolute value, a noise distribution with a non-zero mean value is required. The widely used Gaussian distribution, whose mean value is zero, however, does not meet this requirement. Therefore, a new type of noise needs to be utilized for noise injection training.
+
+\subsection{Candidate Noise Distributions}
+According to Section~\ref{sect:train_ana}, to improve the model robustness, the distribution injected in the training process needs to satisfy requirements that: $E[(\Delta{w})^2] > 0$ and $E[(\Delta{w})] \neq 0$. We also need this distribution to yield a model with high enough accuracy when noise-free, according to Section~\ref{sect:percentile}.
+% so the model is both robust and accurate, which would result in the highest k-th percentile accuracy. 
+We propose to consider four candidate noise distributions for our study, all of which are variations of the Gaussian distribution. These distributions include (a) Right-Censored Gaussian (RC-Gaussian), (b) Left-Censored Gaussian (LC-Gaussian), (c) Right-Truncated Gaussian (RT-Gaussian), and (d) Left-Truncated Gaussian (LT-Gaussian). In a Right-Censored Gaussian distribution, all values follow Gaussian distribution except that those greater than a certain threshold are set (censored) to be the threshold value. This applies similarly to the LC-Gaussian distribution except that the value smaller than the threshold is censored. The property of RC-Gaussian is shown in Eq.~\ref{eq:cr-gaussian}. Different from RC and LC-Gaussian, in the Right-Truncated Gaussian distribution, any value greater than a threshold is cut off, which means there is zero probability for the perturbation value to be greater than the threshold. This applies similarly to LT-Gaussian. The distribution histograms of the four candidates are shown in Fig.~\ref{fig:PT}.
+
+\vspace{-0.4cm}
+% {\small
+% \begin{equation}
+%     \vspace{-0.1cm}
+%     \begin{aligned}
+%         g &\sim \mathcal{N}(0, \sigma)   &g &\sim \mathcal{N}(0, \sigma)\\
+%         CRG(th) &= \begin{cases}
+%                 th,   &\emph{if} \  g \geq th \\
+%                 g,   &\emph{else}
+%             \end{cases}&
+%         \hspace{-0.1cm}CLG(th) &= \begin{cases}
+%                 -th,   &\emph{if} \  g \leq -th \\
+%                 g,   &\emph{else}
+%             \end{cases}
+%     \end{aligned}\label{eq:cr-gaussian}
+% \end{equation}
+% }
+\begin{equation}
+    \vspace{-0.1cm}
+    \begin{aligned}
+        \text{\emph{RC-Gaussian}}(th, \sigma_t) &= \begin{cases}
+                th \times \sigma_t,   &\emph{if} \  g \geq th \times \sigma_t \\
+                g,   &\emph{else}
+            \end{cases}& \\
+        g &\sim \mathcal{N}(0, \sigma_t) 
+    \end{aligned}\label{eq:cr-gaussian}
+\end{equation}
+
+
+% Figure environment removed
+
+With excessive experiments, we select to inject Right-Censored Gaussian distribution during noise injection training because it would result in the best \KPP. The results of this study are shown in the experiment section.
+
+% \begin{equation}
+%     \begin{aligned}
+%         g \sim \mathcal{N}(0, \sigma) \\
+%         BG = g - b
+%     \end{aligned}\label{eq:b-gaussian}
+% \end{equation}
+
+
+\subsection{Automated Hyperparameter Selection through Adaptive Training}
+
+Right-Censored Gaussian noise injection training requires massive hyperparameter tuning. \todo{Unlike traditional Gaussian noise injection training, which employs noise hyperparameters the same as the device variation-induced weight value deviation during training to accurately replicate the inference environment, injecting RC-Gaussian noise introduces different types of noise during training and inference.} Thus, the two hyperparameters, $\sigma_t$ and $th$, need to be calibrated for each different DNN model and $\sigma_d$ value.
+% The conventional Noise injection training using Gaussian noise requires little hyperparameter tuning. In the training process, Gaussian noise with the same magnitude as the device variation-induced weight value deviation is added to the DNN weights so that the training process can best simulate the inference environment. However, this approach is not suitable for injecting right-censored Gaussian noise because the noise injected in the training process is different from the noise induced by device variations. Moreover, injecting right-censored Gaussian requires determining an additional hyperparameter $th$. 
+The process of determining the optimal hyperparameters can be time-consuming and requires significant human effort. AutoML~\cite{yan2022radars}-based methods are possible solutions but they typically require multiple trials to determine the optimal hyperparameter. Therefore, we propose an adaptive training method to find the optimal noise hyperparameters during the training process. This method requires no hyperparameter tuning and takes only one single training run to train the optimal model. To develop this method, we first conduct a grid search of hyperparameters. As shown in Fig.~\ref{fig:Grid}, for both hyperparameters ($\sigma_t$ and $th$), as the value of the hyperparameter increases, the DNN performance initially increases and then decreases after reaching an optimal point. This property allows us to use a binary search-like method to find the optimal hyperparameter values.
+
+% Figure environment removed
+
+Specifically speaking, during the training process, three identical DNN models are initialized and trained simultaneously. Each DNN model is trained by injecting noises with different hyperparameters. The hyperparameters each model uses are determined by the binary search engine. After each epoch, the \KPP~of each model trained under noises with different hyperparameters is evaluated. The binary search engine then updates the hyperparameters of each model according to their performance rankings. The weight of each model is also reassigned by the model that has the highest \KPP. To stabilize training, the model is first trained by $warm$ warm-up epochs without updating the noise hyperparameters. Moreover, to accelerate training, when the binary search method converges, which means all three models are using the same noise hyperparameters, the three models are merged into one model, which means only one model needs to be trained.
+
+The binary search-like policy to identify the optimal value of one hyperparameter is as follows: 
+with the starting point $start$ and the ending point $end$, in each iteration, the three candidate values are the three quartiles of $start$ and $end$, \emph{i.e.},  $left = start + 1 \times (end - start)/4$, $mid = start + 2\times(end - start)/4$ and $right = start + 3\times(end - start)/4$. If the model trained with hyperparameter $mid$ has the highest \KPP, this means the optimal value is not in the range of $[start, left]$ and $[right, end]$, so we can perform $start \leftarrow left$ and $end \leftarrow right$. Similarly, if the model trained with hyperparameter $left$ has the highest \KPP, we only perform $end \leftarrow right$, and if the model trained with hyperparameter $right$ has the highest \KPP, we only perform $start \leftarrow left$. This process is performed iteratively until $|end - start|\leq 1e-4$.
+
+
+\setlength{\textfloatsep}{0.5\baselineskip plus  0.2\baselineskip minus 0.4\baselineskip}
+\begin{algorithm}[h]
+\caption{TRICE~($\mathcal{M}$, $start$, $end$, $th$, $ep$, $warm$, $N_{train}$, $\sigma_d$, $q$, $\mathbf{D}$, $\alpha$)}
+\begin{algorithmic}[1]\label{alg:adpt}
+\STATE \cmtColor{// INPUT: DNN topology $\mathcal{M}$, start and end perturbation magnitude $start$, $end$, RC-Gaussian threshold $th$, number of training epochs $ep$, number of warm up epochs $warm$, number of evaluation samples during training $N_{train}$, target device value variation $\sigma_d$, target percentile $q$, dataset $\mathbf{D}$ and learning rate $\alpha$;}
+
+\STATE Initialize three DNN models $\mathcal{M}(\mathbf{w_1})$, $\mathcal{M}(\mathbf{w_2})$, $\mathcal{M}(\mathbf{w_3})$ of topology $\mathcal{M}$;
+\FOR{($i=0$; $i < ep$; $i++$)}
+    \IF{$end - start < 1e-4$}
+        \STATE \cmtColor{// Train only one model when $start == end$.}
+        \STATE NoiseTrain($\mathcal{M}$, $\mathbf{w_1}$, RC-Gauss($th$, $start$), 1, $\mathbf{D}$, $\alpha$);
+    \ELSE
+        \STATE \cmtColor{// Train three models with three different hyperparameters.}
+        \STATE $left$ = $start + 1 \times (end - start)/4$;
+        \STATE $mid$ = $start + 2 \times (end - start)/4$;
+        \STATE $right$ = $start + 3 \times (end - start)/4$;
+        \STATE NoiseTrain($\mathcal{M}$, $\mathbf{w_1}$, RC-Gauss($th$, $left$), 1, $\mathbf{D}$, $\alpha$);
+        \STATE NoiseTrain($\mathcal{M}$, $\mathbf{w_2}$, RC-Gauss($th$, $mid$), 1, $\mathbf{D}$, $\alpha$);
+        \STATE NoiseTrain($\mathcal{M}$, $\mathbf{w_3}$, RC-Gauss($th$, $right$), 1, $\mathbf{D}$, $\alpha$);
+        \IF{$i \geq warm$}
+            \STATE \cmtColor{// Only evaluate performance and update hyperparameters after warmup.}
+            \STATE perf$_1$ = QuantileEval($\mathcal{M}$, $\mathbf{w_1}$, $\sigma_d$, $q$, $\mathbf{D}$, $N_{train}$);
+            \STATE perf$_2$ = QuantileEval($\mathcal{M}$, $\mathbf{w_2}$, $\sigma_d$, $q$, $\mathbf{D}$, $N_{train}$);
+            \STATE perf$_3$ = QuantileEval($\mathcal{M}$, $\mathbf{w_3}$, $\sigma_d$, $q$, $\mathbf{D}$, $N_{train}$);
+            \STATE \cmtColor{// use binary search to update hyperparameters}
+            \IF{$\max($perf$_1$, perf$_2$, perf$_3) ==$ perf$_2$}
+                \STATE $start, end, \mathbf{w_1}, \mathbf{w_3} = left, right, \mathbf{w_2}, \mathbf{w_2}$;
+                % \STATE $start = q_l$
+                % \STATE $end = q_r$;
+                % \STATE $\mathbf{w_1} = \mathbf{w_2}$;
+                % \STATE $\mathbf{w_3} = \mathbf{w_2}$;
+            % \ENDIF
+            \ELSIF{$\max($perf$_1$, perf$_2$, perf$_3) ==$ perf$_1$}
+                \STATE $end, \mathbf{w_2}, \mathbf{w_3} = right, \mathbf{w_1}, \mathbf{w_1}$
+                % \STATE $end = q_r$;
+                % \STATE $\mathbf{w_2} = \mathbf{w_1}$;
+                % \STATE $\mathbf{w_3} = \mathbf{w_1}$;
+            % \ENDIF
+            \ELSIF{$\max($perf$_1$, perf$_2$, perf$_3) ==$ perf$_3$}
+                \STATE $start, \mathbf{w_1}, \mathbf{w_2} = left, \mathbf{w_3}, \mathbf{w_3}$
+                % \STATE $start = q_l$;
+                % \STATE $\mathbf{w_1} = \mathbf{w_3}$;
+                % \STATE $\mathbf{w_2} = \mathbf{w_3}$;
+            \ENDIF
+        \ENDIF
+    \ENDIF
+    
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\todo{Note that there are more efficient hyperparameter tuning algorithms available compared to our method. The optimal solution requires training fewer models using different hyperparameters. However, our approach is better suited for noise injection training due to the following reasons. (1) It involves more estimations of model performances using different hyperparameters, thereby reducing the impact of imperfect \KPP~estimations obtained from a small number of Monte Carlo runs. (2) It continuously trains a model using a hyperparameter of $mid = (start + end)/2$, which is closer to the final optimal hyperparameter. This makes the training process easier to converge.}
+
+In our practice, we use adaptive search to automatically find perturbation scale $\sigma_t$ and manually determine $th$.
+
+The whole training framework with automated hyperparameter tuning is named \underline{T}raining with \underline{RI}ght-\underline{C}ensored Gaussian Nois\underline{E} (TRICE) and shown in Algorithm~\ref{alg:adpt}.
+
+\setlength{\textfloatsep}{1.55\baselineskip plus  0.2\baselineskip minus 0.4\baselineskip}
+
+% \begin{equation}
+%     \begin{aligned}
+%         \mathbf{w}_{t+1} & = \mathbf{w}_t - \alpha f'(\mathbf{w}_t + \Delta{\mathbf{w}})
+%     \end{aligned}\label{eq:weight_update}
+% \end{equation}
+% we do Taylor expansion on $f'(\mathbf{w}_t + \Delta{\mathbf{w}})$ we have:
+% \begin{equation}
+%     \begin{aligned}
+%         \mathbf{w}_{t+1} & = \mathbf{w}_t - \alpha (f'(\mathbf{w}_t) + \Delta{\mathbf{w}} f''(\mathbf{w}_t) + \frac{(\Delta{\mathbf{w}_t})^2}{2}f'''(\mathbf{w}_t)) + o((\Delta{\mathbf{w}_t})^3)\\
+%         \mathbf{w}_{t+1} & \approx \mathbf{w}_t - \alpha (f'(\mathbf{w}_t) + \Delta{\mathbf{w}} f''(\mathbf{w}_t) + \frac{(\Delta{\mathbf{w}_t})^2}{2}f'''(\mathbf{w}_t))
+%     \end{aligned}\label{eq:weight_update}
+% \end{equation}
+
+% If we sample enough instances of $\Delta{\mathbf{w}}$ in the same iteration, we have 
+% \begin{equation}
+%     \begin{aligned}
+%         \mathbf{w}_{t+1} & = \mathbf{w}_t - \alpha E_{ \Delta{\mathbf{w}}}[f'(\mathbf{w}_t + \Delta{\mathbf{w}})]\\
+%         \mathbf{w}_{t+1} & \approx \mathbf{w}_t - \alpha (f'(\mathbf{w}_t) + E[\Delta{\mathbf{w}}] f''(\mathbf{w}_t) + \frac{E[(\Delta{\mathbf{w}_t})^2]}{2}f'''(\mathbf{w}_t))
+%     \end{aligned}\label{eq:weight_update}
+% \end{equation}
+
+% For PT-Gaussian, $E[\Delta{\mathbf{w}}] < 0$: pushes first-order gradient out of local minimum, making it non-zero.
+% and $E[(\Delta{\mathbf{w}_t})^2]$ decreases second order derivative, making the model more robust.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

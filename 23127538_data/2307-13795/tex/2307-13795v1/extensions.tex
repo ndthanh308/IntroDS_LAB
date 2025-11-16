@@ -1,0 +1,674 @@
+% !TEX root = paper.tex
+
+\section{Higher-Order Extensions}
+\label{sec:higher-order-extensions}
+
+While \lambdaAEff, as introduced in our earlier work \cite{Ahman:POPL} and summarised in the previous
+two sections, can be used to naturally capture a wide range of asynchronous examples, 
+it also has many notable \emph{limitations}: interrupt handlers disappear immediately after being triggered by a 
+matching interrupt, payloads of signals and interrupts have to be ground values, and it is not possible to
+dynamically create new parallel processes. In this section we introduce and discuss a number of 
+\emph{higher-order extensions} of \lambdaAEff~that resolve these limitations. Below we discuss each of these 
+extensions individually, with the full extended calculus given in~\autoref{sec:appendix}.
+
+\subsection{Reinstallable Interrupt Handlers}
+\label{sec:extensions:reinstallable-interrupt-handlers}
+
+We recall from the reduction rules given in \autoref{fig:small-step-semantics-of-computations} that
+once an interrupt reaches a matching interrupt handler, the handling computation is executed
+and the handler is removed. However, the example from \autoref{sec:overview:runningexample}
+shows that we often want to keep the handler around, e.g., to handle further interrupts
+of the same kind. One option to achieve this is through (general) recursive functions~\cite{Ahman:POPL}.
+Unfortunately, this results in programmers defining many auxiliary functions, obfuscating the resulting code. 
+Furthermore, the heavy reliance on general recursion makes it difficult to justify leaving it out of the core 
+calculus, despite it being an orthogonal concern to modelling asynchrony.
+
+Instead, in this paper we propose extending \lambdaAEff's interrupt handlers with the ability to 
+\emph{reinstall} themselves, by extending the syntax for interrupt handlers given in~\autoref{sec:basic-calculus:computations}
+\[
+    \tmwith{op}{x}{M}{p}{N}
+\]
+with an additional variable $r$ bound to a function through which $M$ can reinstall the handler:\footnote{We 
+  highlight the parts of \lambdaAEff~that change in this section's extensions with a grey background.}
+\[
+    \tmwithre{op}{x}{\highlightgray{\vphantom{/}r}}{M}{p}{N}
+\]
+
+In contrast to the continuation/resumption variables of ordinary effect handlers, here the variable $r$ does not refer 
+to the continuation of the interrupt at the time triggering, but instead to the act of reinstalling the given interrupt handler.
+%
+Concretely, the triggering of reinstallable interrupt handlers is captured operationally with the following 
+reduction rule:
+\begin{multline*}
+  \tmopin{op}{V}{\tmwithre{op}{x}{r}{M}{p}{N}} \\
+  \reduces \tmlet{p}{M[V/x,\highlightgray{(\tmfun{}{\tmwithre{op}{x}{r}{M}{p}{\tmreturn p}})/r}]}{\tmopin{op}{V}{N}}
+\end{multline*}
+while all other reduction rules remain the same, except that interrupt handlers are extended with the additional variables $r$.
+Server-like processes can then be written more concisely, as
+\[
+\tmwithre{request}{x}{r}{\text{handle the 
+$\opsym{request}$}; \text{issue a $\opsym{response}$ signal}; \highlightgray{r\, ()}}{p}{\tmreturn ()}
+\]
+
+The typing rule for reinstallable interrupt handlers is also quite interesting:
+\[
+    \coopinfer{TyComp-RePromise}{
+      ({\o'} , {\i'}) \mathrel{\highlightgray{\order{O \times I}}} \i\, (\op) \\
+        \Gamma, x \of A_\op, \highlightgray{r \of \tyfun{\tyunit}{\tycomp{\typromise X}{\big(\emptyset, \{ \op \mapsto ({\o'} , {\i'}) \}\big)}}} \types M : \tycomp{\typromise X}{(\o',\i')} \\
+        \Gamma, p \of \typromise X \types N : \tycomp{Y}{(\o,\i)} 
+      }{
+        \Gamma \types \tmwithre{op}{x}{r}{M}{p}{N} : \tycomp{Y}{(\o,\i)}
+      }        
+\]
+First, observe that the context in which we type the interrupt handler code $M$ is now extended 
+with the variable $r$, which denotes a function triggered by application to the unit value 
+$\tmunit \of \tyunit$. The function does not emit any signals nor install any handlers apart from the one
+in question for $\opsym{op}$, 
+therefore its effect annotation is $\big(\emptyset, \{ \op \mapsto ({\o'} , {\i'}) \}\big)$, as expected.
+
+Second, we have relaxed the requirement $({\o'} , {\i'}) = \i\, (\op)$. We now only require the effect 
+annotation $({\o'} , {\i'})$ of the handler code $M$ to be contained in what the effect annotation $(\o, \i)$ of the continuation 
+$N$ assigns to $\op$, i.e.,  $({\o'} , {\i'}) \mathrel{\order{O \times I}} \i\, (\op)$. The reason lies in the 
+proof of type preservation (see \autoref{thm:preservation:extended}) when propagating unhandled 
+interrupts past handlers:
+\[
+  \tmopin{op'}{V}{\tmwithre{op}{x}{r}{M}{p}{N}}
+  \reduces \tmwithre{op}{x}{r}{M}{p}{\tmopin{op'}{V}{N}}
+\]
+On the left-hand side of this reduction rule, the effect annotation of the continuation of $\tmkw{promise}$ is $(\o, \i)$,
+while on the right-hand side it is $\opincomp {op'} ({\o} , {\i})$. This mismatch did not pose a problem 
+earlier~\cite{Ahman:POPL} as subtyping allowed us to increase the effect
+annotation of $M$ to $\pi_2\, (\opincomp {op'} ({\o} , {\i})) (\op)$. Now on the other hand, as $M$'s effect annotation 
+is also present in the type of $r$, it appears both co- and contravariantly, and is thus not safe to increase.
+However, the tight coupling of the effect annotations is not really essential, as for safety 
+it is enough that the annotation of the continuation simply encompasses any effects that $M$ may trigger.
+
+As noted in \autoref{sec:basic-calculus:effect-annotations}, assigning types to reinstallable handlers
+requires us to consider least fixed points of continuous maps on the $\omega$-cpo $(I,\order I)$ of interrupt handler annotations.
+%
+As an example, we recall the following fragment of the server code from \autoref{sec:overview:runningexample:server}:
+\begin{lstlisting}
+...
+promise (batchSizeReq () r |->
+    send batchSizeResp batchSize;
+    r ()
+)
+...
+\end{lstlisting}
+Here, the interrupt handler for $\opsym{batchSizeReq}$ reinstalls itself immediately 
+after issuing a $\opsym{batchSizeResp}$ signal. 
+Due to its recursive definition, 
+it should not be surprising that this handler's effect annotation is given recursively, in 
+particular, if we want to give it a more precise type-level specification than one which simply states that any effect is possible.
+
+To that end, we assign this interrupt handler the effect annotation $(\emptyset, \i_{\text{b}})$, where 
+\[
+\i_{\text{b}} = \big\{~ \opsym{batchSizeReq} \mapsto (\{\opsym{batchSizeResp}\} , \{~ \opsym{batchSizeReq} \mapsto (\{\opsym{batchSizeResp}\} , ~\ldots~) ~\}) ~\big\}
+\]
+More precisely, $\i_{\text{b}}$ is the least fixed point of the following continuous map on $I$:
+\[
+    \i \mapsto \{~ \opsym{batchSizeReq} \mapsto (\{\opsym{batchSizeResp}\} , \i) ~\} : I \to I
+\]
+This least fixed point exists because $I$ is an $\omega$-cpo and the map is continuous
+(see \autoref{sec:basic-calculus:effect-annotations}).
+
+Returning to the example above, the effect annotation $(\emptyset, \i_{\text{b}})$  
+specifies that at the top level the interrupt handler does not issue any signals,
+and that every $\opsym{batchSizeReq}$
+interrupt causes a $\opsym{batchSizeResp}$ signal to be issued and the interrupt handler 
+to be reinstalled.
+
+The examples of reinstallable interrupt handlers that we discuss in \autoref{sec:applications}
+have their effect annotations assigned analogously, also as least fixed points of 
+continuous maps on $I$.
+
+\subsection{Stateful Reinstallable Interrupt Handlers}
+\label{sec:extensions:stateful-reinstallable-interrupt-handlers}
+
+When working with reinstallable interrupt handlers, it is often useful and sometimes even 
+necessary to be able to pass data between subsequent reinstalls of a handler. For 
+example, in \autoref{sec:applications:runners} we use reinstallable interrupt handlers to 
+implement a pseudorandom number generator in which it is crucial to be able
+to pass and update a seed value between reinstalls of an interrupt handler. As
+another example, consider wanting to react to only the first $n$ interrupts of
+a particular kind---here it is useful if we could pass and decrease a counter between 
+handler reinstalls.
+ 
+In our previous work~\cite{Ahman:POPL}, such state-passing behaviour was achieved by
+passing the relevant state values as arguments to the general-recursive functions that implemented
+the reinstalling of interrupt handlers. However, with reinstallability of interrupt
+handlers being now a primitive feature of \lambdaAEff, we want a similarly primitive approach to 
+managing state.
+
+To this end, we extend the reinstallable interrupt handlers of last section with \emph{state}:
+\[
+    \tmwithrest[\highlightgray{S}]{op}{x}{r}{\highlightgray{\vphantom{/}s}}{M}{\highlightgray{V}}{p}{N}
+\]
+Here $S$ denotes the type of state associated with a particular interrupt handler 
+($S$ can be an arbitrary value type), $s$ is a variable bound in the interrupt handler code $M$, 
+giving it access to the handler's state at the time of triggering, and $V$ is the value of state
+that is used at the next triggering of the interrupt handler. The state can be updated between 
+subsequent reinstalls of the interrupt handler by calling the reinstallation function $r$ with the 
+new state value---$r$'s domain is now $S$ instead of $\tyunit$. This behaviour is summarised by the reduction rule
+\[
+\tmopin{op}{V}{\tmwithrest[S]{op}{x}{r}{s}{M}{W}{p}{N}} \reduces \tmlet{p}{M\big[V/x , R/r , \highlightgray{W/s}\big]}{\tmopin{op}{V}{N}}
+\]
+where $R$ denotes a function that reinstalls the interrupt handler
+with an updated state value:
+\[
+R ~\defeq~ \tmfun{\highlightgray{\vphantom{/}s' \of S}}{\tmwithrest[S]{op}{x}{r}{s}{M}{\highlightgray{\vphantom{/}{s'}}}{p}{\tmreturn p}}
+\]
+Needing to know $S$ for the function abstraction in $R$ necessitates the type annotation on 
+this variant of interrupt handlers.
+%
+All other reduction rules remain unchanged, except that interrupt handlers now include additional variables, type annotations, 
+and values for states.
+
+The typing rule for stateful reinstallable interrupt handlers is a straightforward
+extension of the typing rule for reinstallable interrupt handlers we presented in the previous section:
+\[
+  \coopinfer{TyComp-ReStPromise}{
+    ({\o'} , {\i'}) \mathrel{\order{O \times I}} \i\, (\op) \\
+    \Gamma, x \of A_\op, r \of \tyfun{\highlightgray{\vphantom{/}S}}{\tycomp{\typromise X}{\big(\emptyset, \{ \op \mapsto ({\o'} , {\i'}) \}\big)}}, \highlightgray{\vphantom{/}s \of S} \types M : \tycomp{\typromise X}{(\o',\i')} \\
+    \highlightgray{\vphantom{/}\Gamma \types V : S} \\
+    \Gamma, p \of \typromise X \types N : \tycomp{Y}{(\o,\i)} 
+  }{
+    \Gamma \types \tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{N} : \tycomp{Y}{(\o,\i)}
+  }        
+\]
+Observe that as noted above, the domain of $r$ is no longer fixed to the unit type $\tyunit$ 
+but it can now be any value type $S$. If we pick $S \defeq \tyunit$, we recover the 
+stateless reinstallable interrupt handlers of the previous section, with all the highlighted
+parts trivialising. Therefore, as a convention, when working with 
+reinstallable interrupt handlers with trivial state, we use the syntax introduced in the 
+previous section, i.e., $\tmwithre{op}{x}{r}{M}{p}{N}$. Further, in examples 
+we often omit the state type annotation $S$ when it is clear from the context.
+
+Finally, we illustrate the use of stateful reinstallable interrupt handlers via the example
+mentioned earlier, of a program reacting to only the first $n$ interrupts of a particular kind:
+%
+\begin{lstlisting}
+promise (op x r m |-> 
+    if (m > 0) then 
+        comp;
+        r (m - 1)
+    else
+        return <<()>>
+) @ n
+\end{lstlisting}
+%
+This interrupt handler carries a natural number counter as its state, which it  
+uses to determine whether the handler computation \ls{comp} should be run.
+The counter is originally set to the value \ls{n} and then decremented each time
+the interrupt handler is reinstalled (using \ls{r (m - 1)}). When the counter reaches $0$, 
+\ls{comp} is not run and the interrupt handler is no longer reinstalled.
+
+More examples of stateful interrupt handlers can be 
+found in \autoref{sec:overview:runningexample} and \ref{sec:applications}.
+
+\subsection{Fitch-Style Modal Types}
+\label{sec:extensions:fitch-style-modal-types}
+
+The next limitation of \lambdaAEff~we address is the restriction of signal and interrupt 
+payloads to ground types, i.e., finite sums and products of base types. The reason 
+behind this restriction lies in the propagation of signals past interrupt handlers:
+\[
+  \tmwithre{op}{x}{r}{M}{p}{\tmopout{op'}{V}{N}}
+  \reduces \tmopout{op'}{V}{\tmwithre{op}{x}{r}{M}{p}{N}}
+\]
+Here, we want to ensure that the value $V$ on the left-hand side does not refer to the
+promise-typed variable $p$, otherwise the right-hand side would be ill-scoped.
+Restricting $V$ to ground values is a simple way to ensure this~\cite{Ahman:POPL}, 
+but as a result, e.g., one can only send the arguments needed for the execution of 
+remote function calls but not the functions themselves.
+
+To address this limitation, we adopt a Fitch-style \emph{modal type system}~\cite{Clouston:FitchStyle}, 
+where the typing context $\Gamma$ can contain (lock) tokens $\ctxlock$,
+which delimit the extent to which variables are allowed to be used in terms.
+Specifically, we extend the grammar of typing contexts to
+\begin{align*}
+\Gamma
+\bnfis& \cdot \bnfor \Gamma, x \of X \bnfor \highlightgray{\,\Gamma, \ctxlock\,}
+\end{align*}
+and change the typing rule for variables to
+\[
+   \coopinfer{TyVal-Var}{
+    \highlightgray{X~\text{is mobile} \quad \text{or} \quad \ctxlock \not\in \Gamma'}
+  }{
+    \Gamma, x \of X, \Gamma' \types x : X
+  }
+\]
+This means that we can refer only to variables introduced after the last $\ctxlock$,
+or to variables with \emph{mobile types} $A$, defined as an extension of ground types with a \emph{modal (box) type}~$\tybox X$:
+%
+\[
+A, B
+\bnfis \tybase \,\bnfor\! \tyunit \,\bnfor\! \tyempty \,\bnfor\! \typrod{A}{B} \,\bnfor\! \tysum{A}{B} \,\bnfor\! \highlightgray{\tybox{X}}
+\]
+%
+As with ground types, every mobile type is automatically also a value type, 
+including $\tybox{X}$.
+
+Note that $\tybox X$ is a mobile type even if $X$ is not. Equally importantly, neither promise nor function types are mobile 
+on their own. When combined with how the context is delimited using $\ctxlock$ in the typing rule \textsc{TyVal-Box} 
+given below, these properties of mobile types ensure 
+that signal payloads, which are typed with mobile types, cannot use promise-typed variables bound by enveloping 
+interrupt handlers. Consequently, it is safe to propagate signals with mobile payloads past any enveloping interrupt handlers 
+and eventually to other processes. In its essence, this is similar to the use of modal types in distributed \cite{Murphy:PhDThesis} 
+and reactive programming \cite{Krishnaswami:HOFRP,Bahr:RATT}
+to classify values that can travel through space and time.
+
+The type $\tybox X$ has a value constructor and a corresponding computation for elimination:
+\begin{align*}
+  V, W
+  \bnfis& \cdots
+  \bnfor \highlightgray{\tmbox V}
+  \\
+  M, N
+  \bnfis& \cdots
+  \bnfor \highlightgray{\tmunbox{V}{x}{M}}
+\end{align*}
+with the evident reduction rule given by
+\[
+  \tmunbox{\tmbox V}{x}{M} \reduces M[V/x]
+\]
+and with no associated evaluation contexts. 
+More importantly, it is the typing rules that ensure one is allowed to box a value only when all the variables 
+used in it have mobile types:
+\[
+    \coopinfer{TyVal-Box}{
+    \Gamma, \ctxlock \types V : X
+  }{
+    \Gamma \types \tmbox V : \tybox X
+  }
+  \qquad
+  \coopinfer{TyComp-Unbox}{
+     \Gamma \types V : \tybox X \\
+     \Gamma, x \of X \types M : \tycomp{Y}{(\o, \i)}
+   }{
+     \Gamma \types \tmunbox{V}{x}{M} : \tycomp{Y}{(\o, \i)}
+   }
+\]
+Since this prevents us to construct boxed values that would refer to a promise-typed variable,
+we can safely extend operation payloads from ground to mobile types. Crucially however, when
+constructing a (payload) value of type $\tybox{\tyfun X {\tycomp{Y}{(\o, \i)}}}$,
+the boxed function can itself install additional interrupt handlers, it just cannot
+refer to the results of any enveloping ones.
+
+\subsection{Dynamic Process Creation}
+\label{sec:extensions:dynamic-process-creation}
+
+It turns out that the same Fitch-style modal typing mechanism can be reused to 
+extend \lambdaAEff's computations also with \emph{dynamic process creation}:
+\[
+ M, N
+  \bnfis \cdots
+  \bnfor \highlightgray{\tmspawn{M}{N}}
+\]
+Here, $M$ is the new computation to be spawned and $N$ is the continuation of the existing program. 
+Operationally, spawned computations propagate out of subcomputations as follows:
+\begin{align*}
+  \tmlet{x}{(\tmspawn{M_1}{M_2})}{N} &\reduces \tmspawn{M_1}{\tmlet{x}{M_2}{N}} \\[1ex]
+  \tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{\tmspawn{N_1}{N_2}} &\reduces \\[-0.5ex]
+      \tmspawn{N_1}{\tmwithrest[S]{op}{&x}{r}{s}{M}{V}{p}{N_2}} \\[1ex]
+  \tmopin{op}{V}{\tmspawn{M}{N}} &\reduces \tmspawn{M}{\tmopin{op}{V}{N}}
+\end{align*}
+This allows the newly spawned computation to reach the top-level of the program, where it 
+becomes a new parallel process, as expressed by the following reduction rule for processes:
+\[
+  \tmrun{(\tmspawn{M}{N})} \reduces \tmpar{\tmrun{M}}{\tmrun{N}}
+\]
+
+Analogously to signals, the natural semantics of $\tmkw{spawn}$ is non-blocking. Consequently, 
+we also include it in the definition of evaluation contexts of the sequential part of \lambdaAEff:
+\[
+\E \bnfis \cdots \bnfor \highlightgray{\tmspawn{M}{\E}}
+\]
+%
+The addition of $\tmkw{spawn}$ also requires us to extend the result forms of computations with
+\[
+  \coopinfer{}{
+    \CompResult {\Psi} {N}
+  }{
+    \CompResult {\Psi} {\tmspawn{M}{N}}
+  }
+\]
+
+Finally, the typing rule for $\tmkw{spawn}$ is defined as follows:
+\[
+   \coopinfer{TyComp-Spawn}{
+     \Gamma, \ctxlock \types M : \tycomp{X}{(\o, \i)} \\
+     \Gamma \types N : \tycomp{Y}{(\o', \i')}
+   }{
+     \Gamma \types \tmspawn{M}{N} : \tycomp{Y}{(\o', \i')}
+   }
+\]
+Here, we first use Fitch-style modal typing to ensure that $M$ cannot refer to promise-typed 
+variables bound by any enveloping interrupt handlers, making it safe to propagate it outwards past them.
+What is perhaps more surprising is that the type of the whole computation depends only
+on the type of the continuation $N$, and not on the type of the spawned computation $M$.
+This is because spawning $M$ impacts only the execution of enveloping processes 
+rather than of $N$ itself. In that sense, one can see the spawning of $M$ as a side-effect of $N$,
+and one possibility would be to extend effect annotations to a form $(\o, \i, \s)$, where
+\[
+  \s = \{ \tycomp{X_1}{(\o_1, \i_1, \s_1)}, \dots, \tycomp{X_n}{(\o_n, \i_n, \s_n)} \}
+\]
+tracks the types and effects of spawned processes (including any additional processes $\s_i$ they may further spawn).
+However, this makes the type system significantly more complicated and brings few additional assurances.
+Indeed, at the process level, where spawned processes begin executing, the effect information is already very coarse since 
+we need to account for actions of incoming interrupts.
+For that reason, we opt for a simpler, yet still type-sound solution (see \autoref{thm:procpreservation:extended}), 
+and instead extend the process type reduction relation with additional rules that allow spontaneously 
+adding an arbitrary process type in parallel:
+\[
+  \coopinfer{}{
+  }{
+    X \att {(\o , \i)} \tyreduces
+    \typar{(X \att {(\o , \i)})}{(Y \att {(\o' , \i')})}
+  }
+  \qquad
+  \coopinfer{}{
+  }{
+    Y \att {(\o' , \i')} \tyreduces
+    \typar{(X \att {(\o , \i)})}{(Y \att {(\o' , \i')})}
+  }
+\]
+
+\subsection{Type Safety}
+\label{sec:type-safety}
+
+With all the higher-order extensions in place, we now prove type safety
+for the full, final version of \lambdaAEff---first for computations and then for parallel 
+processes. 
+
+While for brevity we do not repeat them here, we note that the finality results 
+we proved about the result forms in \autoref{lem:results-are-final} and 
+\ref{lem:results-are-final:processes} also hold for this extended version of \lambdaAEff.
+
+\subsubsection{Computations}
+
+We recall that as standard, we split type safety into proofs of progress and preservation,
+with the former stated as follows (see also the discussion in \autoref{sec:basic-calculus:type-safety}):
+
+\begin{thm}[Progress for computations]
+\label{thm:progress:extended}
+Given a well-typed computation
+\[
+  p_1 \of \typromise {X_1}, \ldots, p_n \of \typromise {X_n} \types M : \tycomp{Y}{(\o,\i)}
+\]
+then either
+\begin{enumerate}[(a)]
+  \item there exists a computation $N$, such that $M \reduces N$, or
+  \item the computation $M$ is in a result form, i.e., we have $\CompResult {\{p_1, \ldots, p_n\}} {M}$.
+\end{enumerate}
+\end{thm}
+
+\begin{proof}
+The proof is standard and proceeds by induction 
+on the derivation of  $\Gamma \types M : \tycomp{Y}{(\o,\i)}$. For instance, 
+if the derivation ends with a typing rule for function application or pattern-matching, 
+we use an auxiliary canonical forms lemma to show that the value involved 
+is either a function abstraction or in constructor form---thus $M$ can $\beta$-reduce and we prove (a).
+Here we crucially rely on the context $\Gamma$ having the specific 
+form $p_1 \of \typromise {X_1}, \ldots, p_n \of \typromise {X_n}$, 
+with all the variables assigned promise types.
+If the derivation ends with \textsc{TyComp-Await}, we 
+use a canonical forms lemma to show that the promise value is either a variable in
+$\Gamma$, in which case we prove (b), or in constructor form, in which case we prove (a).
+If the derivation ends with a typing rule for any of the terms figuring in the 
+evaluation contexts $\E$, we proceed based on the outcome of using the induction hypothesis 
+on the corresponding continuation.
+\end{proof}
+    
+The results that we present in this section (and that we summarised in \autoref{sec:basic-calculus:type-safety}) 
+use standard \emph{substitution  
+lemmas}. For instance, given $\Gamma, x \of X , \Gamma' \types M : \tycomp{Y}{(\o,\i)}$
+and $\Gamma \types V : X$, then we can show that $\Gamma, \Gamma' \types M[V/x] : \tycomp{Y}{(\o,\i)}$.
+In addition, we use standard \emph{typing inversion lemmas}. For example, given 
+a computation $\Gamma \types \tmopin{op}{V}{M} : \tycomp{X}{(\o,\i)}$, then we can show that 
+$\Gamma \types V : A_\op$ and $\Gamma \types M : \tycomp{X}{\opincomp {op} (\o',\i')}$, 
+such that $\opincomp {op} (\o',\i') \order {O \times I} (\o,\i)$.
+Furthermore, we use \emph{strengthening lemmas} for promise-typed variables, 
+such as if we have $\Gamma, p : \typromise{X}, \Gamma' \types V : Y$, and if $\Gamma'$ 
+contains $\ctxlock$ or if $Y$ is a mobile type, then also $\Gamma, \Gamma' \types V : Y$.
+
+
+We also note that the action $\opincomp {op} {(-)}$ has various useful properties that we use below
+(where we write $\pi_1$ and $\pi_2$ for the projections associated with the Cartesian product $O \times I$):
+
+\begin{lem}
+\label{lem:action}
+\mbox{}
+\begin{enumerate}
+\item $\o \order O \pi_1\, (\opincomp {op} {(\o,\i)})$
+\item If $\i\, (\op) = (\o',\i')$, then $(\o',\i') \order {O \times I} \opincomp {op} {(\o,\i)}$
+\item If $\op \neq \op'$ and $(\o',\i') \order {O \times I} \i\, (\op')$, then $(\o',\i') \order {O \times I} (\pi_2\, (\opincomp {op} {(\o,\i)}))\, (\op')$
+\end{enumerate}
+\end{lem}
+
+Next, as the proof of type preservation proceeds by induction on reduction steps, 
+we find it useful to define an auxiliary \emph{typing judgement for evaluation contexts}, 
+written
+\[
+  \Gamma \types\!\![\, \Gamma' \,\vert\, \tycomp{X}{(\o,\i)} \,]~ \E : \tycomp{Y}{(\o',\i')}
+\]
+which we then use to prove the evaluation context rule case of the preservation proof.
+In this judgement, $\Gamma'$ is the context of variables bound by the interrupt handlers in $\E$, and 
+$\tycomp{X}{(\o,\i)}$ is the type of the hole $[~]$. This judgement is defined using rules 
+similar to those for typing computations, including subtyping, e.g., for interrupt handlers we have
+the following rule:
+\begin{mathpar}
+  \coopinfer{}{
+    (\o'',\i'') \order{O \times I} \i'\, (\op) \\
+    \begin{minipage}[c][5ex]{\textwidth}
+      \centering
+      $\Gamma, x \of A_\op, r \of \tyfun{S}{\tycomp{\typromise Y}{\big(\emptyset, \{ \op \mapsto ({\o''} , {\i''}) \}\big)}}, s \of S \types M : \tycomp{\typromise Y}{(\o'',\i'')}$ 
+    \end{minipage}\\
+    \Gamma \types V : S \\
+    \Gamma, p \of \langle Y \rangle \types\!\![\, \Gamma' \,\vert\, \tycomp{X}{(\o,\i)} \,]~ \E : \tycomp{Z}{(\o',\i')}
+  }{
+    \Gamma \types\!\![\, p \of \langle Y \rangle, \Gamma' \,\vert\, \tycomp{X}{(\o,\i)} \,]~ \tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{\E} : \tycomp{Z}{(\o',\i')}
+  }
+\end{mathpar}
+The typing of evaluation contexts is straightforwardly related to that of computations:
+
+\begin{lem}
+\label{lem:eval-ctx-typing}
+\[\Gamma \types \E[M] : \tycomp{Y}{(\o',\i')} 
+\,\Longleftrightarrow\, 
+\exists\, \Gamma', X, \o, \i .~ 
+\Gamma \types\!\![\, \Gamma' \,\vert\, \tycomp{X}{(\o,\i)} \,]~ \E : \tycomp{Y}{(\o',\i')}
+~\wedge~
+\Gamma,\Gamma' \types M : \tycomp{X}{(\o,\i)}
+\]
+\end{lem}
+
+We are now ready to prove the type preservation theorem for the sequential part of \lambdaAEff.
+
+\begin{thm}[Preservation for computations]
+\label{thm:preservation:extended}
+Given a well-typed computation $\Gamma \types M : \tycomp{X}{(\o,\i)}$, such that $M$
+can reduce as $M \reduces N$, then we have $\Gamma \types N : \tycomp{X}{(\o,\i)}$.
+\end{thm}
+
+\begin{proof}
+The proof is standard and proceeds by induction on the derivation of  
+$M \reduces N$, using typing inversion lemmas based on 
+the structure forced on $M$ by the last rule used in $M \reduces N$.
+
+
+There are four cases of interest in this proof. The first two concern
+the interaction of interrupts and interrupt handlers.
+On the one hand, if the derivation of $\reduces$ ends with 
+\[
+\tmopin{op}{V}{\tmwithrest{op}{x}{r}{s}{M}{W}{p}{N}} \reduces \tmlet{p}{M[V/x, R/r, W/s]}{\tmopin{op}{V}{N}}
+\]
+where $R$ is a function that reinstalls the interrupt handler,
+then in order to type the right-hand side of this rule, we use subtyping with  
+\srefcase{Lemma}{lem:action}{2} to show that $M$'s effect information is 
+included in that of $\tmopin{op}{V}{N}$, i.e., in $\opincomp {op} {(\o , \i)}$. On the other hand, given the rule 
+\[
+\begin{array}{l}
+\tmopin{op'}{V}{\tmwithrest[S]{op}{x}{r}{s}{M}{W}{p}{N}} \reduces 
+\\[0.5ex]
+\hfill \tmwithrest[S]{op}{x}{r}{s}{M}{W}{p}{\tmopin{op'}{V}{N}} 
+\quad
+\\[1ex]
+\hspace{13.25cm} {\color{rulenameColor}(\op \neq \op')}
+\end{array}
+\]
+then in order to type the right-hand side, we use subtyping with  
+\srefcase{Lemma}{lem:action}{3}, so as to show that 
+after acting on $(\o,\i)$ with $\op'$, $\op$ remains mapped to $M$'s effect information.
+
+The third case of interest concerns the commutativity of signals with interrupt handlers:
+\[
+\begin{array}{l}
+\tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{\tmopout{op'}{W}{N}} \reduces 
+\\[0.5ex]
+\hspace{6.5cm} \tmopout{op'}{W}{\tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{N}}
+\end{array}
+\]
+where in order to type the signal's payload $W$ in the right-hand side of this rule, 
+it is crucial that the promise-typed variable $p$ cannot appear in $W$---this is ensured by 
+our modal type system that restricts the signatures $\op : A_\op$ to mobile types. As a result, 
+we can strengthen the typing context of $W$ by removing the promise-typed variable $p$ 
+from it. We also use an analogous context strengthening argument for $N_1$ when given the 
+other commutativity rule 
+\begin{align*}
+  \tmwithrest[S]{op}{x}{r}{s}{M}{V}{p}{\tmspawn{N_1}{N_2}} &\reduces \\[-0.5ex]
+      \tmspawn{N_1}{\tmwithrest[S]{op}{&x}{r}{s}{M}{V}{p}{N_2}}
+\end{align*}
+
+Finally, in the evaluation context case, we use the induction hypothesis with 
+\sref{Lemma}{lem:eval-ctx-typing}.
+\end{proof}
+
+Interestingly, the proof of \autoref{thm:preservation:extended} tells us that if 
+one were to consider a variant of \lambdaAEff~in which the 
+\textsc{TyComp-Subsume} rule appeared as an explicit coercion term $\tmkw{coerce}_{(\o,\i) \order {O \times I} (\o',\i')}\, M$,
+which is the style we use in our Agda formalisation~\cite{ahman:AeffAgda}, then 
+the right-hand sides of the two interrupt propagation rules highlighted in the above proof 
+would also need to involve such coercions, corresponding to the two uses of \sref{Lemma}{lem:action}. 
+%
+This however means that other computations involved in these reduction rules would also 
+need to be type-annotated accordingly, so as to determine the data to be used in these coercions.
+
+\subsubsection{Processes}
+
+For the parallel part of \lambdaAEff, we again first prove the progress theorem.
+
+\begin{thm}[Progress for processes]
+  \label{thm:procprogress:extended}
+  Given a well-typed process $\types P : \tyC$, then either
+  \begin{enumerate}[(b)]
+    \item there exists a process $Q$, such that $P \reduces Q$, or
+    \item the process $P$ is already in a (top-level) result form, i.e., we have $\ProcResult {P}$.
+  \end{enumerate}
+\end{thm}
+
+\begin{proof}
+The proof is unsurprising and proceeds by induction on the derivation of $\types P : \tyC$. 
+In the base case, when the derivation ends with the \textsc{TyProc-Run} rule 
+and $P = \tmrun {M}$, we use \sref{Theorem}{thm:progress:extended}. In the other cases, 
+we simply use the induction hypothesis.
+\end{proof}
+
+To prove preservation, we first focus on properties of the process type reduction $\tyC \tyreduces \tyD$.
+
+\begin{lem}
+\label{lem:type-reduction} \mbox{}
+\begin{enumerate}
+\item Process types can remain unreduced, i.e., 
+  $\tyC \tyreduces \tyC$, for any process type $\tyC$.
+\item Process types can reduce by being acted upon, i.e., 
+  $\tyC \tyreduces \opincomp {op} \tyC$, for any $\op$ and $\tyC$.
+\item Process types can reduce under enveloping actions, i.e.,  
+  $\tyC \tyreduces \tyD$ implies $\opincomp {op} \tyC \tyreduces \opincomp {op} \tyD$.
+\item Process type reduction can introduce signals but does not erase them, i.e., 
+  $\tyC \tyreduces \tyD$ implies $\mathsf{signals\text{-}of} (\tyC) \order O \mathsf{signals\text{-}of} (\tyD)$.
+\end{enumerate}
+\end{lem}
+
+The interesting case in the proof of \srefcase{Lemma}{lem:type-reduction}{3} is when the enveloped reduction
+$\tyC \tyreduces \tyD$ introduces an interrupt $\op'$ under some sequence of interrupts $\opsym{ops}$, as follows:
+\[
+  X \att \opincompp {ops} {(\o , \i)} \tyreduces X \att \opincompp {ops} {(\opincomp {op'} {(\o , \i)})}
+\]
+To prove this case, we simply prepend $\op$ to the list $\opsym{ops}$ and reapply the same rule, as 
+\[
+\begin{array}{c c c}
+\opincomp {op} {(X \att \opincompp {ops} {(\o , \i)})}
+&&
+\opincomp {op} {(X \att \opincompp {ops} {(\opincomp {op'} {(\o , \i)})})}
+\\[1ex]
+\rotatebox{90}{$=$}
+&
+&
+\rotatebox{90}{$=$}
+\\[0.3ex]
+X \att \opincompp {(op :: ops)} {(\o , \i)}
+&
+\tyreduces
+&
+X \att \opincompp {(op :: ops)} {(\opincomp {op'} {(\o , \i)})}
+\end{array}
+\]
+Observe that defining $\tyC \tyreduces \tyD$ using 
+a simpler basic rule $X \att {(\o , \i)} \tyreduces X \att {(\opincomp {op'} {(\o , \i)})}$
+would not have been sufficient to prove this case, i.e., 
+$\opincomp {op} {(X \att {(\o , \i)})} \tyreduces \opincomp {op} {(X \att {(\opincomp {op'} {(\o , \i)})})}$.
+
+For the proof of \srefcase{Lemma}{lem:type-reduction}{4}, we generalise 
+\srefcase{Lemma}{lem:action}{1} to lists of actions.
+
+\begin{lem}
+\label{lem:signal-inclusion-lists-of-interrupts}
+$\pi_1\, (\opincompp {ops} {(\o,\i)}) \order O \pi_1\, (\opincompp {ops} {(\opincomp {op} {(\o,\i)})})$
+\end{lem}
+
+As with computations, it is useful 
+to define a separate \emph{typing judgement for evaluation contexts}, this time written 
+$\Gamma \types\!\![\, \tyC \,]~ \F : \tyD$, together with an 
+analogue of \sref{Lemma}{lem:eval-ctx-typing}, which we omit here. Instead, we 
+observe that this typing judgement preserves process type reduction.
+
+\begin{lem}
+\label{lem:hoisting-and-evaluation-context-types}
+Given $\Gamma \types\!\![\, \tyC \,]~ \F : \tyD$ and $\tyC \tyreduces \tyC'$, then there exists $\tyD'$ with 
+$\tyD \tyreduces \tyD'$, and we have $\Gamma \types\!\![\, \tyC' \,]~ \F : \tyD'$.
+\end{lem}
+
+Process types also satisfy an analogue of \srefcase{Lemma}{lem:action}{1}, which shows that 
+the action $\opincomp {op} (-)$ of interrupts on process types does not erase any already specified outgoing signals.
+
+\begin{lem}
+\label{lem:signals-of-interrupt-action}
+For any process type $\tyC$ and interrupt $\op$, we have $\mathsf{signals\text{-}of}(\tyC) \order O \pi_1\, (\opincomp{op}{\tyC})$.
+\end{lem}
+
+Finally, using the results above, we prove type preservation for the parallel part of \lambdaAEff.
+
+\begin{thm}[Preservation for processes]
+  \label{thm:procpreservation:extended}
+  Given a well-typed process $\Gamma \types P : \tyC$, such that $P$ can reduce as 
+  $P \reduces Q$, then there exists a process type $\tyD$, such 
+  that the process type $\tyC$ can reduce as $\tyC \tyreduces \tyD$, 
+  and we can type the resulting process as $\Gamma \types Q : \tyD$.
+\end{thm}
+
+\begin{proof}
+The proof proceeds by induction on the derivation of  
+$P \reduces Q$, using auxiliary typing inversion lemmas depending on 
+the structure forced upon $P$ by the last rule used in $P \reduces Q$.
+
+For all but the broadcast and evaluation context rules, we can pick $\tyD$ to be $\tyC$ and use 
+\srefcase{Lemma}{lem:type-reduction}{1}.
+For the broadcast rules, we define $\tyD$ by introducing the corresponding 
+interrupt, and build $\tyC \tyreduces \tyD$ using the parallel composition 
+rule together with \srefcase{Lemma}{lem:type-reduction}{2}.
+For the evaluation context rule, we use \sref{Lemma}{lem:hoisting-and-evaluation-context-types}
+in combination with the induction hypothesis. Finally, in order to discharge effect annotations-related side-conditions 
+when commuting incoming interrupts with outgoing signals, 
+we use \sref{Lemma}{lem:signals-of-interrupt-action}.
+\end{proof}

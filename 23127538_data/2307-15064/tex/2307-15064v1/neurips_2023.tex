@@ -1,0 +1,414 @@
+\documentclass{article}
+\PassOptionsToPackage{numbers, compress}{natbib}
+\usepackage[preprint]{neurips_2023}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{graphicx}
+\usepackage{placeins}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\floatstyle{plaintop}
+\restylefloat{table}
+\usepackage{amsmath}
+\usepackage{array}
+
+\newcommand{\KGnote}[1]{{\color{red}{\bf KG: }#1}}
+\newcommand{\CAnote}[1]{{\color{teal}{\bf CA: }#1}}
+\newcommand{\ASnote}[1]{{\color{purple}{\bf AS: }#1}}
+\newcommand\KG[1]{\textcolor{blue}{#1}}
+\newcommand\CA[1]{\textcolor{teal}{#1}}
+\newcommand\cc[1]{\textcolor{magenta}{#1}}
+
+\newcommand{\modelname}{LeMARA}  
+
+\title{Self-Supervised Visual Acoustic Matching}
+
+\author{%
+Arjun Somayazulu$^{1}$ \quad Changan Chen$^{1}$ \quad Kristen Grauman$^{1,2}$ \\
+$^1$University of Texas at Austin \quad $^2$FAIR \\
+}
+
+
+\begin{document}
+
+
+\maketitle
+
+
+\begin{abstract}
+Acoustic matching aims to re-synthesize an audio clip to sound as if it were recorded in a target acoustic environment. Existing methods assume access to paired training data, where the audio is observed in both source and target environments, but this limits the diversity of training data or requires the use of simulated data or heuristics to create paired samples. We propose a self-supervised approach to visual acoustic matching where training samples include only the target scene image and audio---without acoustically mismatched source audio for reference. Our approach jointly learns to disentangle room acoustics and re-synthesize audio into the target environment, via a conditional GAN framework and a novel metric that quantifies the level of residual acoustic information in the de-biased audio. Training with either in-the-wild web data or simulated data, we demonstrate it outperforms the state-of-the-art on multiple challenging datasets and a wide variety of real-world audio and environments.
+\end{abstract}
+
+\vspace{-0.05in}
+\section{Introduction}\label{sec:introduction}
+\vspace{-0.05in}
+
+The acoustic properties of the audio we hear are strongly influenced by the geometry of the room and the materials that make up its surfaces---large, empty rooms with hard surfaces like concrete and glass lead to longer reverberation times, while smaller, more cluttered rooms with soft materials like curtains and carpets will absorb sound waves quickly and produce audio that sounds dull and anechoic. Human perception exploits this acoustic-visual correspondence, and we rely on perceiving natural-sounding audio that is consistent with our environment as we navigate daily life.
+
+Likewise, this phenomenon is important in virtual environments, such as in AR/VR applications. When one hears audio that is acoustically consistent with the virtual environment they are seeing, their brain can better integrate audio and visual information, leading to a more immersive experience. Conversely, when one hears audio that does not match the expected acoustics of the virtual environment, the perceptual mismatch can be jarring. The problem of audio-visual acoustic correspondence extends well beyond AR/VR applications. Film and media production involve recording audio in diverse spaces, which can be expensive and logistically challenging. Similarly, interior designers and architects face the problem of previewing how a space will sound before it is built. 
+
+Today's approaches for modeling acoustic-visual coherence typically assume physical access to the target space~\cite{singh2021image2reverb,majumder2022fewshot,chen2023nvas,tan2022environment}, which can be impractical or impossible in some cases. In particular, in \emph{acoustic matching}, the audio captured in one environment is re-synthesized to sound as if it were recorded in another target environment, by matching the statistics (e.g. reverberation time) of audio samples recorded in that target environment~\cite{eaton20161ACE, gamper2018blind, klein2019real, mack2020single, murgai2017blind, xiong2018joint}.
+\emph{Visual acoustic matching} (VAM) instead takes an image of the target space as input, learning to transform the audio to match the likely acoustics in the depicted visual scene~\cite{chen2022visual} (see Figure~\ref{fig:concept}(a)). 
+In both cases, however, learned models ideally have access to \emph{paired} training data, where each training audio clip is recorded in two different environments. This permits a straightforward 
+supervised learning strategy, since a model can learn to transform one clip (source) to the other (target). 
+ See Figure~\ref{fig:concept}(b), left.  Unfortunately, this approach puts heavy demands on data collection that make large-scale collection of paired data from a variety of diverse environments impractical. 
+
+% Figure environment removed
+
+In-the-wild Web videos provide us with a large, readily available corpus of diverse acoustic environments and human speakers. However, this data is \textit{unpaired}---we only observe the sound recorded in the target space, without a second recording in a different environment for reference. Prior work attempts to turn unpaired data into paired data by using an off-the-shelf dereverberator model~\cite{chen2023learning} to produce pseudo-anechoic source 
+recordings from in-the-wild reverberant audio, which are then passed to a VAM model with the true reverberant audio as the target~\cite{chen2022visual}. While their approach is inspiring, it has a fundamental limitation.  The automatic dereverberation process is necessarily imperfect, which means that \emph{residual acoustic information indicative of the target environment's acoustics can remain in the (pseudo) source example}.  In turn, the acoustic matching model trained to produce the target audio can  learn to use those residual acoustic cues in the audio---instead of the target space's visual features. When evaluated at test-time on arbitrary source audio and unseen images, the residual acoustic clues exploited during training are no longer available, leading to poor acoustically matched audio.
+
+We propose a \emph{self-supervised visual acoustic matching} approach that accommodates training with unpaired data from in-the-wild videos (See Figure~\ref{fig:concept}(b), right). Our key insight is a training objective that explicitly removes residual acoustics in the audio, forcing reliance on the visual target. In particular, our approach jointly trains an audio-visual \textit{debiaser}---which is trained to adversarially minimize residual acoustic information in the dereverberated audio---alongside a reverberator that performs visual acoustic matching. To this end, we develop an \textit{acoustic residue} metric that quantifies the level of residual acoustic information in a waveform, based on the difference in performance between a) an acoustic matching model that conditions on the target image and b) a model that does not condition on any image. Intuitively, training on audio with low residual acoustic information frees the model from relying on that (unrealistic) information during training, allowing it to instead leverage the necessary visual cues.
+
+We use a time-domain conditional GAN as our debiaser, and continually update the integrated reverberator as the distribution of generated audio shifts during training.
+\footnotetext{\url{https://rulonco.com/features-modern-auditorium-design/}}
+Unlike prior work, our approach allows training directly on unpaired videos and speech.\footnote{We focus on human speech in indoor settings given its relevance to many of the applications cited above, and due to the fact that human listeners have strong prior knowledge about how room acoustics  should affect speech.  However, our model design is not specific to speech and could be applied to other audio sources.}
+
+Our proposed \modelname~model
+outperforms existing approaches ~\cite{chen2022visual,chen2023learning,fu2021metricganu} on challenging in-the-wild audio and environments from multiple datasets
+. Furthermore, to benchmark this task, we introduce a high audio-visual correspondence subset of the AVSpeech~\cite{Ephrat_2018} video dataset. 
+Though we focus on the task of visual-acoustic matching, our insight potentially has broader implications for other self-supervised multi-modal learning tasks in which one wants to control the impact of a dominating modality.
+
+\vspace{-0.05in}
+\section{Related work}
+\vspace{-0.05in}
+
+\paragraph{Room acoustics and spatial sound}
+Audio-visual acoustic matching has limited prior work, though there is growing interest from vision and audio communities.
+Image2Reverb~\cite{singh2021image2reverb} learns to map an input image to its corresponding Room Impulse Response (RIR)---the transfer function that characterizes acoustics at a particular listener/speaker location---which can then be convolved with an arbitrary source waveform.  Generalizing RIR inference to full 3D environments, Few-Shot RIR~\cite{majumder2022fewshot} and Neural Acoustic Fields~\cite{naf} sample impulse responses at multiple places in an environment in order to synthesize the RIR at novel locations with a transformer.  In related tasks, Novel View Acoustic Synthesis~\cite{chen2023nvas} directly synthesizes a source audio at a new camera pose in the room, while other methods binauralize monaural source audio~\cite{25d-visual-sound,richard2021neural}.  Unlike our model, which can train from arbitrary images, all of these methods require knowledge of the ground truth RIRs~\cite{singh2021image2reverb,naf,majumder2022fewshot} or paired source-target audio~\cite{chen2023nvas,25d-visual-sound,richard2021neural}.  Most relevant to our approach, AViTAR~\cite{chen2022visual} uses a cross-modal transformer to re-synthesize the audio; it relies on an off-the-shelf audio-visual dereverberator trained in simulation~\cite{chen2023learning} to produce a pseudo-clean source signal, and suffers from the acoustic residue issue discussed above. Our results illustrate how our model overcomes this shortcoming.
+\vspace{-0.1in}
+\paragraph{Speech synthesis and enhancement} 
+
+Recent work for speech re-synthesis treats acoustic properties as a "style" which can be disentangled from underlying speech and used to perform acoustic-style matching of audio~\cite{omran2022disentangling,qian2021unsupervised,polyak2021speech,wang2022oneshot}.
+ However, they require either paired data or speaker embeddings to be learned.  Web videos (our target domain) can consist of entirely unique speakers, making it difficult to learn a robust speaker embedding.  
+While environment-aware text-to-speech~\cite{tan2022environment} is applicable even in settings where each speaker in the dataset is unique, the model requires access to paired speech for supervised training. Supervised methods for speech enhancement and dereverberation assume access to paired training data, i.e., anechoic ``clean" reference waveforms alongside the altered waveforms~\cite{Tan_2020,chen2023learning,yu2020speech,richter2022speech,8683799,fu2019metricgan,fu2021metricgan}. Unsupervised speech enhancement approaches~\cite{lin2021unsupervised,irvin2022selfsupervised,fu2021metricganu} such as MetricGAN-U~\cite{fu2021metricganu} optimize generic perceptual speech quality scores, such as PESQ~\cite{Rix2001PerceptualEO} (which requires paired samples) and speech-to-reverberation modulation energy (SRMR)~\cite{5547575} (which does not). While we share the objective of relaxing supervision requirements, our overall goal is distinct: rather than optimize a generic quality metric, we aim to retarget the input sound to match a specific (pictured) environment. To achieve that goal, we introduce a novel debiasing objective applicable in a conditional GAN framework.
+\vspace{-0.1in}
+\section{Approach}
+ \vspace{-0.1in}
+
+We present \textbf{Le}arning to \textbf{M}atch \textbf{A}coustics by \textbf{R}emoving \textbf{A}coustics, \textbf{\modelname}, to address self-supervised visual acoustic matching (VAM).  
+Let $A \in \mathcal{A}$ denote an audio waveform and let $V \in \mathcal{V}$ denote an image frame.
+During training, we are given $N$ unlabeled examples of \emph{target} audio and scenes $\{(A_t, V_t)\}_{t=1}^N$, taken from frames and accompanying audio in YouTube videos (cf.~Sec.~\ref{sec:datasets} for dataset details).
+While the data is multi-modal, it is unpaired: it has both audio and visual features, but it lacks a paired sample of the audio in some other source domain (see Fig.~\ref{fig:concept}). With this data, we wish to learn a function $f(A_s, V_t) : \mathcal{A}, \mathcal{V} \rightarrow \mathcal{A}$ that takes \emph{source} audio $A_s$ (which may or may not be reverberant) and a \emph{target} image $V_t$, and produces the audio re-synthesized to sound like it was recorded in the target scene.
+
+To self-supervise $f$ using unpaired training data, we would like a model that (1) dereverberates $A_t$ to strip it of its room acoustics, yielding pseudo-source audio $\hat{A}^{(s)}_t$ and then (2) reverberates $\hat{A}^{(s)}_t$ by "adding" in the room acoustics of image $V_t$ to regenerate the target audio: $f(\hat{A}^{(s)}_t,V_t) \approx A_t$.  A naive joint training of two such modules---a dereverberator and reverberator---would collapse to a trivial solution of $f$ doing nothing.  A  better solution would pre-train the dereverberator with a well-trained audio-only model, yet as we show in experiments, this leaves signals of the target environment in the audio $\hat{A}^{(s)}_t$ that handicap the reverberator at inference time, when such signals will not exist.
+The key insight of our approach is to make the dereverberation stage a \emph{de-biasing} stage that is explicitly trained to remove room acoustics information not available in the target image $V_t$.  This forces reliance on the visual target and help our model $f$ generalize to unseen audio and scenes.
+
+
+Our model has two main components that are trained jointly: (1) a de-biaser model $G$ responsible for removing room acoustics from the target audio and (2) a visually-guided reverberator $R$ that injects acoustics from the target environment into the output waveform. We first introduce the de-biaser architecture (Sec.~\ref{sec:metricgan}), followed by our novel acoustic residue metric that is optimized during de-biaser training (Sec.~\ref{sec:metric}), and our training strategy that allows joint fine-tuning of the reverberator and de-biaser (Sec.~\ref{sec:updating}). Finally, we present our approach for training self-supervised VAM (Sec.~\ref{sec:training}).
+Figure~\ref{fig:model} overviews our model.
+
+\vspace{-0.05in}
+\subsection{De-biasing Conditional Generative Adversarial Network}
+\vspace{-0.05in}
+\label{sec:metricgan}
+The role of our de-biaser is to dereverberate audio samples in a way that minimizes any residual room acoustics information.  To that end, we devise an adversarial de-biaser based on MetricGANs~\cite{fu2019metricgan,fu2021metricganu}.
+MetricGANs are similar to conventional generative adversarial networks (GAN)~\cite{goodfellow2014generative}---with a generator that aims to enhance a speech waveform---except the discriminator's job is to mimic the behavior of some target \emph{quality function}.
+Our de-biaser module extends the basic MetricGAN, augmenting it with novel acoustic residue metric (Sec.~\ref{sec:metric}) and training procedure (Sec.~\ref{sec:updating}) that accounts for the evolving distribution of the de-biased audio.
+
+Our GAN consists of a generator $G$, a discriminator $D$, and an audio quality metric $\mathcal{M}$. $D$ is trained to approximate the quality metric $\mathcal{M}$, and $G$ is trained to maximize the metric score on generated data, using $D$ as a learned surrogate of the metric function $\mathcal{M}$. $G$ is a conditional generator: given an input waveform, it produces a modified waveform which optimizes the quality metric score. 
+
+Let $\{A_t,V_t\}$ be a dataset of target audio-image pairs, and let $\mathcal{M}(A_t,V_t) \in [0,1]$ be our quality metric $\mathcal{M}$ (defined below) that produces a scalar measure of the residual room acoustic information in speech. As in the conventional GAN framework, we alternate between discriminator and generator updates. During an epoch of discriminator training, $D$ trains to approximate the metric function $\mathcal{M}$'s scores on both raw audio $A_t$ and generated audio $G(A_t)$. The discriminator loss function is:
+\begin{equation}
+    \mathcal{L}_{D} = \| D(A_t) - \mathcal{M}(A_t,V_t)\|_2 + \| D(G(A_t)) - \mathcal{M}(G(A_t),V_t)\|_2 + \| D(A_{hist}) - s_{hist}\|_2, \label{eqn:dloss}
+\end{equation}
+where the first and second terms incentivize $D$ to produce score estimates that approximate the metric function when evaluated on raw input audio ($A_t$) and generated audio $G(A_t)$, respectively. Following~\cite{fu2019metricgan}, the third term trains the discriminator on samples from a historical replay buffer $\{(A_{hist},s_{hist})\}$, where $A_{hist} = G_{prev}(A_t)$ is a generated sample from a previous epoch, and $s_{hist} = \mathcal{M}_{prev}(G_{prev}(A_t),V_{t})$ is its associated metric score.
+
+Training on these historical samples helps improve stability and mitigates issues with catastrophic forgetting in the discriminator.
+
+The generator is trained with an adversarial loss, using the discriminator $D$ learned from the previous epoch of discriminator training  (which depends only on $A_t$) as a surrogate of the true metric $\mathcal{M}$ (which depends on both $A_t$ and $V_t$).  The generator loss is
+\begin{equation}
+    \mathcal{L}_{G} = \|D(G(A_t)) - 1\|_2. \label{eqn:gloss}
+\end{equation}
+Our metric is normalized to produce scores between 0 and 1 (1 being optimal), so this loss forces $G$ to generate audio that maximizes the estimated metric score. Next, we introduce our metric $\mathcal{M}$.
+
+\vspace{-0.05in}
+\subsection{Acoustic Residue Metric}
+\label{sec:metric}
+\vspace{-0.05in}
+
+Rather than train the de-biaser GAN to optimize a generic speech quality metric~\cite{fu2019metricgan,fu2021metricganu}, we wish to quantify the amount of \emph{residual room acoustics information} in an audio sample. Hence, we define a metric $\mathcal{M}$ that allows the downstream reverberator model $R$ itself to quantify the level of residual acoustic information in the waveform.  Specifically,  the metric consists of two models trained to perform reverberation on dereverberated speech. Importantly, one model $R_v$ has been trained to perform VAM (using the target image as conditioner), while the other, $R_b$, has been trained to perform blind acoustic matching (without the target image as conditioner). We next define the reverberator modules, and then return to their role in $\mathcal{M}$.
+
+Inspired by recent work in time-domain signal modeling~\cite{Oord2016wavnet,richard2021neural,chen2023nvas}, we use a WaveNet-like architecture for the reverberators consisting of multiple stacked blocks of 1D convolutional layers, with an optional gated fusion network to inject visual information for $R_v$.  Similar to~\cite{chen2023nvas}, the reverberators use a sinusoidal activation function followed by two separate 1D conv layers that produce residual and skip connections, the latter being mean pooled and fed to a decoder to produce reverberated audio.  We choose this model because it is parameter-efficient, consisting entirely of 1D convolutions, and because it allows time-domain conditional waveform generation. See Sec.~\ref{sec:implementation-details} for training details.
+
+We use these models to compute the acoustic residue metric. Given input audio $A$ and image $V$, our metric is defined as:
+\begin{equation}
+    \mathcal{M}(A,V) = \sigma\left(\frac{ |\mathcal{RT}(R_b(A)) - \mathcal{RT}(A_t)| - |\mathcal{RT}(R_v(A,V)) - \mathcal{RT}(A_t)|}{\textrm{max}(0.1, \mathcal{RT}(A_t))} \right),\label{eqn:score}
+\end{equation}
+where $A_t$ denotes the known target audio and $\mathcal{RT}$ is a scalar-output function characterizing the general reverberant properties of its input audio, which we define below.
+
+Eqn.~\ref{eqn:score} quantifies the level of acoustic residue---that is, how much greater the blind reverberator's error is compared to the visually-guided reverberator's error.  If de-biasing of $A$ has gone well, this value will be high. When evaluated on audio that contains a high level of residual acoustic information, the visual features will not provide additional useful information, resulting in similar performance by both visual and blind reverberation models. In other words, if the two errors are similar, visual is not adding much, and there is room acoustic information lingering in the audio $A$.  This pushes the $\mathcal{M}$ score to be smaller (poor quality under the metric). On the other hand, when a waveform contains very little residual acoustic information, the visual features will help the visual model $R_v$ produce a more accurate acoustically matched waveform model with lower error compared to the blind model $R_b$. This will result in a higher metric score. 
+
+Figure \ref{fig:combined_vis} (left) visualizes the effect of de-biasing. Reverberant audio (left) has been imperfectly dereverberated (middle), leaving residual reverberation trails which contain information about the original acoustic environment. De-biased audio (right) removes these residual artifacts. The waveform plots (right) show de-biased audio (green) significantly attenuates the long sound decay present in both reverberant (blue) and dereverberated (orange) audio. This forces the reverberator to learn acoustics from the target image. 
+
+For the function $\mathcal{RT}$ in Eqn.~\ref{eqn:score}, we leverage a classic content-invariant metric for characterizing room acoustics: the Reverberation Time at 60 or ``RT60".  RT60 is the amount of time after a sound source ceases that it takes for the sound pressure level to reduce by 60 dB---which depends directly on the geometry and materials of the space. For example, no matter the initial direct sound, a big cathedral will yield a high RT60, and a cozy living room will yield a low RT60.  While RT60 can be quantified by sensing when one has access to the physical environment, we use a learned estimator for RT60 to allow generalization (see~Sec.~\ref{sec:datasets} for details).  In Eqn.~\ref{eqn:score}, the normalization by the RT60 of the target audio improves stability of discriminator training. We use the clipping function $max(0.1, \cdot)$ here to prevent samples with extremely low RT60 from destabilizing training.
+
+Training with this acoustic residue metric allows the downstream reverberator models $R_v, R_b$ themselves to improve the performance of the de-biaser model $G$. Unlike SRMR, DNSMOS~\cite{reddy2021dnsmos}, or any existing off-the-shelf metric that quantifies dereverberation, our metric directly addresses the problem of \emph{residual} acoustic information in audio. Although $G$ may learn a function similar to that of dereverberation, we use the term de-biaser to describe the generator to highlight the novel training objective it is trained against, which distinguishes it from a conventional dereverberation model.
+
+
+% Figure environment removed
+
+\vspace{-0.1in}
+\subsection{Joint Training of the De-biaser and Reverberators}
+\label{sec:updating}
+\vspace{-0.1in}
+
+At initialization, $R_v$ and $R_b$ are trained on a certain distribution of speech. When training the de-biasing GAN with the acoustic residue metric, generated speech can eventually fall out of the distribution on which these reverberators were trained, causing $\mathcal{M}$ to produce unreliable metric scores that destabilize training. To address this, we introduce a strategy to update $R_v$ and $R_b$ during training of the de-biasing GAN. Updating these models ensures that $\mathcal{M}$ consistently produces reliable acoustic residue scores as the distribution of generated speech shifts over the course of GAN training.
+
+At the start of GAN training , we initialize the \textit{target networks} $R^t_v$  and $R^t_b$ as copies of $R_v$ and $R_b$ respectively. During discriminator training, each batch of $\{(G(A_i),V_i)\}$ samples are passed to $R_v$ and $R_b$ to compute metric scores under their current frozen state. This batch is also passed to the target networks, which compute the loss
+\begin{align}
+    {\mathcal{L}_{\text{visual}}} &= ||R^t_v(G(A),V) - A||_2 \\
+    {\mathcal{L}_{\text{blind}}} &= ||R^t_b(G(A)) - A||_2
+\end{align}
+and perform an update step. Every $E$ epochs, the target networks' weights are copied over into the metric networks. This update strategy allows $R_v$ and $R_b$ to be jointly fine-tuned with the de-biaser model $G$.
+Figure~\ref{fig:model} overviews the model components and data flow.
+
+\vspace{-0.05in}
+\subsection{Training and Inference}
+\label{sec:training}
+\vspace{-0.05in}
+
+Training proceeds in three steps.  (1) First we pretrain the de-biaser $G$.  This entails pretraining a MetricGAN-U~\cite{fu2021metricganu} with the Speech-to-Energy-Modulation-Ratio (SRMR) metric \cite{5547575} on speech pre-processed with our off-the-shelf dereverberator (see Sec. ~\ref{sec:implementation-details}).  By refining the dereverberated output with the MetricGAN-U, we improve its quality and intelligibility without introducing additional supervision requirements.  (2) Second, we pretrain the reverberators that perform (visual) acoustic matching.  Specifically, we train $R_v$ and $R_b$ with $\mathcal{L}_{visual}$ and $\mathcal{L}_{blind}$, respectively, using the dereverberated and SRMR-optimized outputs from the MetricGAN in step (1).  (3) Finally, we jointly fine-tune both the de-biaser $G$ and reverberators, using the acoustic residue metric (Eqn.~\ref{eqn:score}) for the GAN metric $\mathcal{M}$, the generator and discriminator losses given in Eqns.~\ref{eqn:gloss}, and~\ref{eqn:dloss} together with our alternating training scheme defined in Sec.~\ref{sec:updating}. To improve stability in training, since the discriminator $D$ starts with a good approximation of the SRMR metric, we continue training in step 3 using a weighted combination of SRMR and our residue metric: $\alpha \textrm{SRMR}(A) + (1-\alpha) \mathcal{M}(A,V)$.
+
+At test time, we use \modelname~for visual-acoustic matching as follows: given a source audio $A_s^{(q)}$ and target environment image $V_t^{(q)}$, we apply the trained de-biaser $G$ followed by the visual reverberator $R_v$:
+\begin{equation}
+    f(A_s^{(q)}, V_t^{(q)}) = R_v(G(A_s^{(q)}), V_t^{(q)}).
+\end{equation}
+Altogether, our approach adds the room acoustics depicted in $V_t^{(q)}$ to the input audio.  In the case that the source audio $A_s^{(q)}$ is known to be anechoic (e.g., a user is using \modelname~to re-synthesize stock anechoic sounds for a new scene(s)), then we simply bypass the de-biaser $G$ and directly apply $R_v$.
+
+\vspace{-0.05in}
+\section{Datasets}\label{sec:datasets}
+\vspace{-0.05in}
+
+We use two datasets: SoundSpaces-Speech~\cite{chen2023learning} and AVSpeech~\cite{Ephrat_2018}. See Figure~\ref{fig:datasets}. For all results, we test only on audio and environments that are not observed during training.
+
+\vspace{-0.1in}
+\paragraph{SoundSpaces-Speech}
+SoundSpaces-Speech~\cite{chen2023learning} is an audio-visual dataset created using the SoundSpaces audio simulation platform~\cite{chen2020soundspaces,chen2022soundspaces} together with
+82 3D home scans from Matterport3D~\cite{chang2017matterport3d}
+and anechoic speech samples from LibriSpeech~\cite{khudanpur2015}.
+SoundSpaces offers state-of-the-art generation of Room Impulse Responses (RIRs) computed at regular source-listener locations throughout the environment, 
+accounting for all major real-world acoustic phenomena (reverberation, early specular/diffuse reflections, etc.) See \cite{chen2023learning} for details.
+
+By convolving an anechoic sample with the appropriate RIR, it allows realistic simulation of audio reverberation at arbitrary locations in the pre-scanned real-world Matterport environments. A 3D humanoid is rendered at the source location in the Matterport home. SoundSpaces-Speech consists of anechoic speech samples from LibriSpeech paired with their acoustically-correct reverberated waveform (rendered using SoundSpaces) in any of 82 unique environments, together with an RGB-D image at the listener's position.
+To train on SoundSpaces-Speech in a self-supervised setting, we discard the source audio and only use the target audio (simulated reverberant audio). We use train/val/test splits of 28,853/280/1,489 samples.
+
+\vspace{-0.05in}
+\paragraph{AVSpeech-Rooms}
+AVSpeech \cite{Ephrat_2018} is a large-scale video dataset consisting of 3-10 second clips from YouTube videos, most of which feature a single speaker and little background noise. Not all of the clips have naturalistic audio-visual correpondence, due to video editing tricks, microphone locations, virtual backgrounds, etc.  Hence, we create a subset of AVSpeech, called AVSpeech-Rooms, that preserves samples with useful information about room geometry and material types (See Supp.~for details). A randomly selected frame from the video clip is used as the target image. Our final set consists of 72,615/1,911/1,911 train/val/test samples. See Figure~\ref{fig:datasets}(right).
+
+% Figure environment removed
+
+\vspace{-0.05in}
+\section{Experiments}
+
+\vspace{-0.1in}
+\paragraph{Implementation Details}
+\label{sec:implementation-details}
+We use the procedure outlined in Sec. \ref{sec:training} to train on SoundSpaces-Speech. For training on AVSpeech-Rooms, we proceed directly to step (2), pre-training $R_v$ and $R_b$ on audio that has been de-biased using the fine-tuned SoundSpaces-Speech de-biaser model (instead of an SRMR-optimized model trained on AVSpeech-Rooms). We then proceed to step (3) as in SoundSpaces-Speech. We refer to this setup as "shortcut training" to highlight our use of the SoundSpaces-Speech trained de-biaser to bypass step (1) when training on AVSpeech-Rooms. While AVSpeech can be trained with the full procedure outlined in Sec.~\ref{sec:training} (see ablations in Supp.), shortcut training allows us the advantage of the strong prior for de-biasing learned by the fine-tuned SoundSpaces de-biaser.
+
+We train \modelname~using the combined acoustic residue metric with $\alpha=0.7$. We train a WaveNet-based dereverberator \cite{richard2021neural} ("off-the-shelf") on paired SoundSpaces-Speech audio which is "reversed" (reverberant input audio, anechoic target audio). We use this dereverberator for both \modelname~and the ViGAS~\cite{chen2023nvas} baseline. Prior VAM work \cite{chen2022visual} used an audio-visual dereverberator \cite{chen2023learning} trained on both simulated and real-world data to pre-process reverberant audio. For fair evaluation, we train their model with their same original audio-visual dereverberator.\footnote{\url{https://github.com/facebookresearch/visual-acoustic-matching}}
+
+We adapt our code for the reverberator models and ViGAS from \cite{richard2021neural}.\footnote{\url{https://github.com/facebookresearch/BinauralSpeechSynthesis}}. We train ViGAS with the same hyperparameters and loss as our reverberators during pre-training. Our de-biaser is adapted from the speechbrain MetricGAN-U implementation \cite{SB2021}. Our RT60 estimator is trained on pairs of reverberant samples from a SoTA audio simulator~\cite{chen2022soundspaces} paired with the ground truth RT60 for the RIR used to produce the reverberant sample. We use a Resnet18 \cite{resnet18} model to encode our visual features on RGB images.
+The last feature map before the final pooling layer is flattened and used as the visual feature conditioner. See Supp. for training details and architecture for these models. We plan to release our code to facilitate further research.
+
+\vspace{-0.1in}
+\paragraph{Metrics}
+We rely on two metrics to evaluate quality of VAM models: \textbf{STFT Error}, which computes the MSE loss between the magnitude spectrograms of predicted and target speech, and
+\textbf{RT60 Error (RTE)}, which measures the MSE between RT60 estimates of predicted and target speech. The former applies only when we have ground truth re-synthesized audio (in simulation), while the latter is content-invariant and captures room acoustics signatures for any target.
+
+\vspace{-0.1in}
+\paragraph{Baselines} As baselines, we compare to state-of-the-art models for audio-visual re-targeting:
+(1) \textbf{AViTAR}~\cite{chen2022visual}, the only prior method that addresses the visual-acoustic matching task.
+It consists of a Transformer for audio-visual fusion, followed by a generator that synthesizes the reverberant waveform from the audio-visual latent feature. As discussed above, for self-supervised training, the authors use a pre-trained audio-visual dereverberation model~\cite{chen2023learning} to create pseudo-source audio, which is passed as input to the model.
+(2) \textbf{ViGAS}~\cite{chen2023nvas},
+a model designed for novel-view acoustic synthesis, conditioned on a camera pose. We adopt its Acoustic Synthesis module, a WaveNet model based on \cite{richard2021neural}, for our task. 
+To apply it for VAM, we replace the camera pose with the flattened feature from the ResNet.
+(3) \textbf{Non-visual \modelname}. We evaluate \modelname~with the blind reverberator $R_b$ fine-tuned during training. (4) \textbf{Input audio}. We copy the dereverberated audio to the output.  AViTAR and ViGAS are trained with the data augmentation strategy introduced in \cite{chen2022visual} (see Supp.~for details).
+
+\label{sec:soundspaces}
+
+\def\arraystretch{1.0}
+\begin{table}[t]
+\centering
+\caption{VAM results on two datasets.  Our approach improves the state of the art (see text). 
+} \
+\begin{tabular}{c|cc|ccc}
+\toprule
+Train & \multicolumn{2}{c|}{\textit{SoundSpaces-Speech}} & \multicolumn{3}{c}{\textit{AVSpeech-Rooms}} \\
+Test &
+\multicolumn{2}{c|}{\textit{SoundSpaces-Speech}} & \multicolumn{2}{c|}{\textit{AVSpeech-Rooms}} & \multicolumn{1}{c}{\textit{LibriSpeech}} \\
+Model &
+\multicolumn{1}{c|}{RTE (s)} & \multicolumn{1}{c|}{STFT} & \multicolumn{1}{c|}{RTE (s)} & \multicolumn{1}{c|}{STFT} & \multicolumn{1}{c}{RTE (s)}\\
+\midrule
+Input audio (naive) & 0.3204 & 1.4267 & 0.3101 & \textbf{1.3265} & 0.3582 \\
+AViTAR \cite{chen2022visual} & 0.0804 & 2.4110 & 0.1359 & 2.8944 & 0.2390\\
+ViGAS \cite{chen2023nvas} & 0.1079 & 4.3726 & 0.1086 & 7.0065 & 0.2539 \\
+\midrule
+\modelname \hspace{0.075cm} w/o visual & 0.1516 & 5.6124 & 0.1370 & 6.2560 & 0.2225 \\
+\modelname~(ours) & \textbf{0.0789} & \textbf{0.6905} & \textbf{0.0713} & 6.2982 & \textbf{0.2100} \\
+& $\scriptstyle\pm$\tiny{0.005} & $\scriptstyle\pm$\tiny{0.031} & $\scriptstyle\pm$\tiny{0.002} & $\scriptstyle\pm$\tiny{0.64} & $\scriptstyle\pm$\tiny{0.002}\\
+\bottomrule
+\end{tabular}\label{tab:results}
+\vspace{-0.15in}
+\end{table}
+
+\vspace{-0.1in}
+\paragraph{Results on SoundSpaces-Speech}
+
+Table~\ref{tab:results} (left two columns) shows results on SoundSpaces-Speech. \modelname~outperforms the baselines on all metrics. Non-visual \modelname~performs significantly worse, indicating \modelname~effectively utilizes visual features during acoustic matching. This shows the success of our acoustics de-biasing, which forces stronger learning from the visual stream. Notably, our model significantly outperforms ViGAS---which shares the same architecture as our reverberator ---indicating that our performance improvement over AViTAR can be attributed to our novel training objective, and not simply due to a shift in architecture from Transformer to WaveNet. 
+
+\vspace{-0.1in}
+\paragraph{Results on AVSpeech-Rooms}
+
+Table~\ref{tab:results} (right three columns) shows the results on AVSpeech-Rooms.  We test in two scenarios:
+(1) Where the source audio and target visual come from the same AVSpeech-Rooms sample (unobserved during training) and (2) where the source audio comes from LibriSpeech~\cite{librispeech}, a dataset of anechoic source samples of people reading passages in English. In both cases the target visual environment is a frame from an unseen AVSpeech video.
+
+% Figure environment removed
+
+\modelname~outperforms the baselines in both settings on RTE. We outperform ViGAS in the LibriSpeech scenario despite sharing the same reverberator architecture, highlighting the efficacy of our novel training objective.
+Figure \ref{fig:combined_vis} (right) shows the distribution of RT60 values for audio reverberated by our model (pink), the baselines, and the target RT60 distribution (orange). Our model best matches the target RT60 distribution.
+Although our model performs poorly on STFT error on AVSpeech-Rooms, the naive baseline achieves the lowest STFT error, indicating that here the dereverberated audio strongly resembles reverberant audio prior to acoustic matching. Models that use this dereverberator without further de-biasing will display artificially low STFT error when evaluated in-dataset (AVSpeech-Rooms $\rightarrow$ AVSpeech-Rooms). 
+Thus, it is important to balance the in-dataset evaluation with the LibriSpeech generalization case (far right in Table~\ref{tab:results}) to gain a complete picture of model performance. 
+
+An ablation study of our model analyzing the impact of varying the target metric during training shows the clear advantage of our residue metric compared to SRMR alone (see Supp.). In particular, training with an SRMR objective alone yields an RTE of 0.2308 on LibriSpeech, whereas training with a pure acoustic residue metric yields an RTE of 0.2156; our combined metric yields an RTE of 0.2123.  This reinforces the efficacy of our metric as a training objective: de-biasing is distinct from generic enhancement.
+
+Figure~\ref{fig:vam_vis} shows examples of our model's generated sounds for different target images, compared to the output of AViTAR~\cite{chen2022visual} (the best performing baseline). We display the RT60 of the source audio, the visual scene's ground truth RT60, and the RT60 of the two method's generated audio. In the majority of cases, our model produces audio that more closely matches the true acoustics of the visual scene, as measured by RT60. Our model learns to add little reverberation in enclosed environments with soft surfaces (top left), and to add more reverberation in open acoustic environments with hard surfaces (bottom right). We also highlight a failure mode in which our model does not inject proper acoustics (bottom left), likely due to the irregular shape of the room.
+
+\vspace{-0.1in}
+\paragraph{Human perception study}
+We augment these quantitative results with a human subject study, in order to gauge how listeners perceive our results as successfully retargeting the audio to the pictured environment. 
+We design a survey using 23 images $V_{t}^{(q)}$ selected from AVSpeech-Rooms that show room geometry and materials clearly, and are representative of  a diverse variety of acoustic environments. We couple those with 23 anechoic source samples $A_{s}^{(q)}$ from LibriSpeech~\cite{librispeech}.
+For each sample, we generate the acoustically matched audio with both \modelname~and AViTAR~\cite{chen2022visual}---the best performing baseline. We anonymize and shuffle the generated audio, and ask 10 subjects with normal hearing to identify which room matches best with the audio among three given rooms, one of which is the true room $V_{t}^{(q)}$.   Users correctly identified the target room with 46.1\% accuracy on speech generated by \modelname~versus 34.7\% accuracy with speech generated by AViTAR.  This shows our model achieves higher quality acoustic matching according to human perception.  That said, the subjects' accuracy rates are fairly low in the absolute sense, which suggests both the difficulty of the problem and subtlety of the perception task.  Our results have pushed the state of the art, both objectively and subjectively, but there remain challenges to fully mature visual acoustic matching. 
+
+% Figure environment removed
+
+\section{Conclusions and Future Work}
+We introduced a self-supervised approach to visual acoustic matching.  Built on a novel idea for disentangling room acoustics from audio with a GAN-debiaser, our model improves the state of the art on two datasets. Our acoustic residue metric and adversarial training concept has potential to generalize to other multi-modal learning settings where there is risk of unintentionally silencing a paired modality during training. For example, our framework could be explored for binauralization of mono sounds using video or audio-visual source separation.  In future work, we plan to explore generalizations to spatial dynamics that would account for movement of a speaker throughout 3D space. Please see our Supp.~video.
+
+\newpage
+
+\section{Supplementary}
+In this supplementary material we provide the following:
+\begin{enumerate}
+    \item A video for qualitative evaluation of our model's performance (\ref{sec:video}).
+    \item Details regarding AVSpeech-Rooms curation (\ref{sec:curation}) (referenced in Sec. 4 of main paper)
+    \item Details on our ablation study with different metric training objectives (\ref{sec:ablations}) (referenced in Sec. 5 --- "Results on AVSpeech-Rooms" of main paper)
+    \item A sample survey slide from our human perception study (Figure \ref{fig:human_perception_study_slide})
+    \item Model/training details for our RT60 estimator, de-biaser, discriminator, and reverberator (\ref{sec:details}) (referenced in Sec. 5 --- "Implementation Details" of main paper)
+    \item Details on our data augmentation strategy (\ref{sec:augmentation}) (referenced in Sec. 5 --- "Baselines" of main paper )
+    \item A brief discussion of our work's limitations and broader impact (\ref{sec:limitations} \ref{sec:broader_impact})
+\end{enumerate}
+
+\subsection{Supplementary Video}
+\label{sec:video}
+Our video contains several illustrative examples generated by \modelname~on both SoundSpaces-Speech and AVSpeech-Rooms. We provide audio generated by the current state-of-the-art (AViTAR) for reference on each example. We recommend wearing headphones for a better listening experience.
+
+\subsection{AVSpeech-Rooms}
+\label{sec:curation}
+Acoustic AVSpeech consists of audio clips from YouTube videos along with an RGB image frame selected randomly from the corresponding video clip. To create AVSpeech-Rooms, we design a set of criteria which we use to filter out samples in which the image contains uninformative, non-natural, or misleading acoustic information about the space. We focus on cases in which the room is not visible, a microphone is being used, or a virtual background/screen is present --- any of which will disturb the natural room acoustics for the speaker's voice. We query each sample with our criteria using a Visual Question Answering (VQA) model ~\cite{kim2021vilt}, which we found more reliable than manual annotations we originally obtained on MTurk.  \ref{tab:dataset} contains information about our criteria. 
+
+\begin{center}
+\begin{table}[h]
+\centering
+\caption{Filtering criteria and \% of Acoustic AVSpeech samples removed.}
+\begin{tabular}{m{9cm}m{1cm}m{1cm}} 
+    \hline
+    Question & Answer & dataset \% \\
+    \hline
+    \hline
+    Is a microphone or headset visible in the image? & yes & 7.2\\
+    Is there a whiteboard/blackboard in the background? & yes & 3.4\\
+
+    Is the entire background one solid color and material? & yes & 23.4\\
+
+    Is there a large projector screen covering most of the background? & yes & 2.2\\
+
+    Is part or all of the background virtual? & yes & 1.3\\
+
+    Are there multiple screens in the image? & yes & 3.5\\
+
+    Is the wider room clearly visible? & no & 3.0\\
+    \hline
+\end{tabular}
+\label{tab:dataset}
+\end{table}
+\end{center}
+
+% Figure environment removed
+
+\subsection{Ablations}
+\label{sec:ablations}
+
+Table~\ref{tab:ablation} displays our experiments with different self-supervised training objectives. We report performance on the LibriSpeech evaluation setting. The first three rows correspond to experiments in which we do not utilize the shorcut training strategy (referenced in Sec. 3 --- "Training" of main paper). Using SRMR alone (row 1) produces the largest (worst) RTE. Training with the acoustic residue metric instead (row 2) leads to a large improvement in RTE, providing empirical support for our metric as an effective training objective. Using our combined metric and the shortcut training strategy (both described in Sec. 3 --- "Training" of our main paper) further improves the performance by a small margin.
+
+\begin{table}[t]
+      \centering
+        \captionof{table}{Ablation study using different metric training objectives. AR denotes the proposed acoustic residue metric.
+        }\label{tab:ablation}
+        \begin{tabular}{cccccc}
+        \toprule
+        & \multicolumn{1}{c}{\textit{LibriSpeech}} \\
+        Metric & \multicolumn{1}{c}{RTE} \\
+        \midrule
+        SRMR~\cite{5547575}  & 0.2308\\
+        AR & 0.2156\\
+        AR (combined) & 0.2123\\
+        AR (combined) w/ shortcut & \textbf{0.2100}\\
+        \bottomrule
+        \end{tabular}
+\end{table}
+
+\subsection{Model/Training details}
+\label{sec:details}
+
+\paragraph{RT60 estimator}
+We adopt the RT60 estimator from \cite{chen2022visual}. The estimator takes a spectrogram as input, encodes it with a ResNet18 \cite{resnet18}, and outputs a scalar RT60 estimate. The model is trained on 2.56s clips of reverberant speech simulated on the SoundSpaces platform \cite{chen2020soundspaces} paired with the ground truth RT60 computed from the RIR used to generate the reverberant speech. The model trains using MSE loss between predicted and ground truth RT60 values. Ground truth RT60 is computed using the Schroeder method \cite{Schroeder}. 
+
+\paragraph{De-biaser architecture}
+The de-biaser $G$ takes a magnitude spectogram as input. This is passed to a bi-directional LSTM with input size 257 and two hidden layers each of size 200, which produces an output with the same temporal length as the input spectrogram. This is passed through a linear layer of size 300 and a leakyReLU activation, followed by another linear layer of size 257 and a Sigmoid activation. The final mask is multiplied with the input magnitude spectrogram to create the generated magnitude spectrogram. A resynthesis module computes phase information from the input audio waveform, combines this with the generated magnitude spectrogram, and performs an inverse STFT to produce the generated waveform. The discriminator $D$ consists of 4 2D Convolutional layers with kernel size (5,5) and 15 output channels, followed by a channel averaging operation and two linear layers of sizes 50 and 10. A LeakyReLU activation with negative slope $=$ 0.3 is used after each intermediate layer. The final layer outputs a scalar-valued metric score estimate.
+
+\paragraph{De-biaser training}
+In stage (1) (see Sec. 3 --- "Training" of our main paper), we train with batch size 32. During stage (3) fine-tuning, we use a batch size of 2. $G$ and $D$ are trained with learning rates of 2e-6 and 5e-4 respectively in both stages. In each epoch, We train on 10k samples randomly selected from the train set without replacement. The reverberator models $R_v$ and $R_b$ are updated with the target networks at a frequency of $E=8$ epochs. For all models, we clip each audio sample to 2.56s during training and evaluation.
+
+\paragraph{Reverberator training}
+We train the reverberators with batch size 4 and a learning rate of 1e-2 in stage (2). During stage (3) fine=tuning, we use batch size 2 and a learning rate of 1e-6. Both reverberator models and the ViGAS baseline are trained with MSE loss between the log magnitude spectrogram of predicted and ground truth audio. 
+
+\paragraph{Baseline training details} We use a learning rate of 1e-2 and a batch size of 4 to train ViGAS. We train AViTAR with batch size 4 --- all other hyperparameters are set as described in \cite{chen2022visual}.
+
+\paragraph{Compute}All models are trained on 8 NVIDIA Quadro RTX 6000 GPUs.
+
+\subsection{Augmentation strategy}
+\label{sec:augmentation}
+We follow a data augmentation strategy similar to that proposed in \cite{chen2022visual} for training the baseline models, which was shown to produce better generalization performance on the LibriSpeech setting than when trained without this augmentation strategy. In particular, to each batch of dereverberated audio we add colored noise, perform a polarity inversion on the waveform with $p=0.5$, and convolve the waveform with a randomly selected Room Impulse Response (RIR) from a different acoustic environment with $p=0.9$. At test time, we evaluate without these audio augmentations. This strategy is designed to mask over residual acoustic information in dereverberated audio during training. We do not use this augmentation strategy in our approach as our model directly learns to remove residual acoustic information, obviating the need for a heuristic strategy to mask it out.
+
+\subsection{Limitations}
+\label{sec:limitations}
+Our approach focuses on visual acoustic matching on mono-channel audio exclusively. However, binaural cues in audio play a fundamental role in our perception of reverberation and room acoustics \cite{devore_effects_2010}. We leave it to future work to extend our approach to binaural audio.
+
+\subsection{Broader impact}
+\label{sec:broader_impact}
+While training on in-the-wild web videos allows wider access to a diverse variety of speakers and environments, it also introduces uncontrolled biases, speaker privacy concerns, and potentially harmful content into the model. 
+
+\subsection{Data examples}
+Refer to video to view samples from both SoundSpaces-Speech and AVSpeech-Rooms.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
+
+\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}

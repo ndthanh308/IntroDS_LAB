@@ -1,0 +1,83 @@
+\section{Method}
+% Figure environment removed
+
+
+Our method, termed as \OURS{}, uses posed RGB images for indoor 3D object detection by extracting image features and projecting them into a 3D volume. We leverage NeRF to help infer scene geometry from 2D observations. To achieve this, we entangle the 3D object detection and NeRF with a \textit{shared} MLP, with which the multi-view constraint in NeRF can enhance the geometry estimation for the detection, as shown in Fig.~\ref{fig:framework}.
+
+
+\subsection{3D Detection Branch}
+\label{detection_branch}
+In the 3D detection branch, we input posed RGB frames to the 2D image backbone, denoting the images as $I_i \in \mathbf{R}^{H_i \times W_i \times 3}$ and the corresponding intrinsic matrix and extrinsic matrix as $K \in \mathbf{R}^{3 \times 3}$ and $R_i \in \mathbf{R}^{3 \times 4}$, where $i = 1, 2, 3, ..., T$ and $T$ is the total number of views. We follow \cite{rukhovich2022imvoxelnet}, which uses an FPN \cite{lin2017feature} to fuse multi-stage features and use high resolution features, denoted as $F_i \in \mathbf{R}^{C \times H/4 \times W/4}$, to generate a 3D feature volume.
+
+% \vspace{-0.25cm}
+% \paragraph{Generating 3D Feature Volume.} 
+We create the 3D feature volume by attaching 2D features from each image to their corresponding positions in 3D. We establish a 3D coordinate system, with the z-axis denoting height, and the x- and y-axis denoting two horizontal dimensions. Then, we build a 3D grid of with $N_x \times N_y \times N_z$ voxels. For each voxel center with coordinate $\mathbf{p} = (x, y, z)^T$, we project it to view-$i$ to obtain the 2D coordinates as
+% \begin{equation}
+%     \begin{pmatrix} u'_i \\ v'_i \\ d_i \end{pmatrix} = K' \times R_i \times \begin{pmatrix} x \\ y \\ z \\ 1 \end{pmatrix},
+% \end{equation}
+\begin{equation}
+\vspace{-0.1cm}
+    \begin{pmatrix} u'_i, v'_i, d_i \end{pmatrix}^T = K' \times R_i \times \begin{pmatrix} \mathbf{p}, 1 \end{pmatrix}^T,
+\end{equation}
+where $(u_i, v_i) = (u'_i/d_i, v'_i/d_i)$ is to the pixel coordinate of $\mathbf{p}$ in view-$i$. $K'$ is the scaled intrinsic matrix, considering the feature map downsampling. After building this correspondence, we assign 3D features as 
+\begin{eqnarray}
+    V_i(p) = \texttt{interpolate}((u_i, v_i), F_i),
+\end{eqnarray}
+where $\texttt{interpolate}()$ looks up the feature in $F_i$ at location $(u_i, v_i)$. Here we use nearest neighbor interpolation. For $\mathbf{p}$ that are projected outside the boundary of the image, or behind the image plane, we discard the feature and set $V_i(\mathbf{p}) = \mathbf{0}$. Intuitively, this is equivalent to shooting a ray from the origin of camera-$i$ through pixel $(u_i, v_i)$, and for all voxels that are on the ray, we scatter image features to the voxel in $V_i$. Next, we aggregate multi-view features by simply averaging all \textit{effective} features as done in ImVoxelNet \cite{rukhovich2022imvoxelnet}. Letting $M_p$ denote the number of effective 2D projections, we compute $V^{avg}(p) = \sum_{i=1}^{M_p} V_i(p)/M_p$.  
+
+However, volume features generated this way ``over populate'' projection rays without considering empty spaces and other geometric constraints. 
+% As shown in the detection branch of Fig.~\ref{fig:framework}, empty spaces in the volume are also filled with image features. 
+This makes the 3D representation ambiguous and causes detection errors. To mitigate this issue, we propose to incorporate a NeRF branch to improve learning geometry for the detection branch.
+
+% Figure environment removed
+
+
+\subsection{NeRF Branch}
+\label{sec:nerf_branch}
+
+\paragraph{Feature Sampling.} NeRF \cite{mildenhall2021nerf} is a neural rendering method for novel view synthesis. 
+However, previous NeRFs sample features from the 3D volume with high resolution, such as $128^3$ \cite{mildenhall2021nerf}. In 3D detection, we use a lower grid resolution of $40 \times 40 \times 16$, which suffers from the aliasing issue and results in degradation of geometry learning. To mitigate this, we draw inspiration from \cite{wang2021ibrnet,yu2020pixelnerf} and sample features from higher resolution 2D image feature maps, typically of size $160 \times 120$, as shown in Fig.~\ref{fig:feature_sampling}.
+Specifically, we first sample points along the ray originated from the camera, i.e., $\mathbf{r}(t) = \mathbf{o} + t \times \mathbf{d}$ where $\mathbf{o}$ is the ray origin and $\mathbf{d}$ is the view direction. For a coordinate $\mathbf{p}$ sampled on the ray and a viewing direction $\mathbf{d}$, we can compute the color $\mathbf{c}(\mathbf{p},\mathbf{d})$ and density $\sigma(\mathbf{p})$ as:
+\vspace{-0.3cm}
+\begin{align}
+\label{nerf_mlps}
+    \sigma(\mathbf{p}), \mathbf{\hat{h}}(\mathbf{p})&=\textit{G-MLP}(\Bar{V}(\mathbf{p}), \gamma(\mathbf{p})), \\
+    \mathbf{c}(\mathbf{p}, \mathbf{d})&=\textit{C-MLP}(\mathbf{\hat{h}}(\mathbf{p}), \mathbf{d}).
+    \vspace{-0.75cm}
+\end{align}
+% 
+$\Bar{V}(\mathbf{p})$ is ray features aggregated and \textit{augmented} from multi-view features, and $\gamma(\mathbf{p})$ is the position encoding same as \cite{mildenhall2021nerf} while $\mathbf{\hat{h}}$ is latent features. The first MLP is termed \textit{G-MLP} for estimating geometry and the second MLP is termed \textit{C-MLP} for estimating color. For activations, we follow \cite{mildenhall2021nerf} and use ReLU for the density $\sigma(\mathbf{p})$ and sigmoid for the color $c(\mathbf{p},\mathbf{d})$.
+
+
+\paragraph{Augmenting Features.}
+\vspace{-0.5cm}
+Although it is similar to \cite{wang2021ibrnet,yu2020pixelnerf} that use image features, it is still difficult to make \textit{G-MLP} estimate accurate geometry across different scenes by simply averaging features from multi-view features as detection branch does. Therefore, we propose to incorporate more priors to help optimize \textit{G-MLP}. Beyond averaging the projected features, we augment the sampled features with the variance from multiple views $V^{var}(p) = \sum_{i=1}^{M_p} (V_i(p) - V^{avg}(p))^2 / M_p$. The variance of the color features is able to roughly describe the occupancy of the 3D field, which has been widely used as cost volume in multi-view stereo depth estimation \cite{yang2020cost}. If the 3D location $\mathbf{p}$ is occupied, the variance of the observed features should be low under the assumption that the scene only contains Lambertian surfaces. On the other hand, if the location is in free space, different appearances would be observed from different views, and therefore the variance of color features would be high. Compared to naive average of features, variance provides a better prior for estimating scene geometry. 
+
+In addition to extracted deep features, which are trained to be invariant to subtle appearance changes, we also augment pixel RGB values into sampled features on the ray. This is inspired by IBRNet \cite{wang2021ibrnet} where they attach the pixel RGB to the input to the MLP for better appearance modeling. We compute the mean and variance for pixel RGB values in the same way as for deep features. 
+In all, the augmented feature $\Bar{V}$ is represented as a concatenation of $\{V^{avg}, V^{var}, RGB^{avg}, RGB^{var}\}$, as shown in Fig.~\ref{fig:feature_sampling}. The sampled augmented features are passed into NeRF MLPs (Eq. \ref{nerf_mlps}) to generate the density and color. We use volumetric rendering to produce the final pixel color and depth, 
+\vspace{-0.1cm}
+\begin{equation}
+\label{equ:nerf}
+    \mathbf{\hat{C}}(r) = \sum_{i=1}^{N_p} T_i\alpha_i \mathbf{c}_i, \\ D(r) = \sum_{i=1}^{N_p} T_i\alpha_i t_i,
+\end{equation}
+where $T_i=\exp{(-\sum_{j=1}^{i-1}\sigma_j\delta_t})$, $\alpha_i=1-\exp{(-\sigma_i\delta_t)}$, $t_i$ is the distance between sampled $i$th point between the camera, $\delta_t$ is the distance between sampled points of rays.
+% In this work, we only consider using uniform sampling along the ray.
+
+
+% \vspace{-0.35cm}
+
+
+% \vspace{-0.5cm}
+\subsection{Estimating Scene Geometry} We use an opacity field to model the scene geometry. The opacity field is a volumetric representation that reflects the probability of an object's presence in a particular area, i.e., if there is an object that cannot be seen through, the opacity field would be $1.0$ in that area. To generate the opacity field, we follow the same process of augmenting features in the detection branch as we do in the NeRF branch. 
+A key ingredient to the approach is sharing the G-MLP learned in the NeRF branch with the detection branch. This enables two important capabilities. Firstly, the shared G-MLP subtly connects the two branches, allowing gradients from the NeRF branch to back-propagate and benefit the detection branch during training. Secondly, during inference, we can directly input the augmented volume features of 3D detection into the shared G-MLP since both inputs from two branches are augmented features. The output of G-MLP is the density represented as $\sigma(\mathbf{p})=\text{G-MLP}(\Bar{V}(\mathbf{p}), \gamma(\mathbf{p}))$, where $\sigma(\mathbf{p}) \in [0, \infty]$. Note that $\mathbf{p}$ is the center position of each voxel in the volume of the detection branch.
+
+Next, we aim to transform the density field into the opacity field by $\alpha(\mathbf{p})=1-\exp{(-\sigma(\mathbf{p}) \times \delta t)}$. However, it is infeasible to calculate $\delta_t$ as we can not decide the ray direction and calculate the point distance within the undirected volume in the detection branch. Here we subtly take advantage of the uniform distribution of the voxels in the space. Thus, the $\delta_t$ in the volumetric rendering equation can be canceled out as it is a constant. So obtaining opacity can be reduced to $\alpha(\mathbf{p})=1-\exp{(-\sigma(\mathbf{p}))}$. After generating the opacity field, we multiply it with the feature grid $V^{avg}$ for 3d detection, denoted as $\alpha(\mathbf{p}) \times V^{avg}(\mathbf{p})$. 
+
+\subsection{3D Detection Head and Training Objectives}
+Our geometry-aware volumetric representation can fit to most detection heads. For fair comparison and the simplicity, we use the same indoor detection head as ImVoxelNet \cite{rukhovich2022imvoxelnet}, in which we select 27 location candidates for each objects and we use three convolution layers to predict the categories, the locations and the centerness. 
+
+We jointly train detection and NeRF branches end-to-end. No per-scene optimization for the NeRF branch is performed in test time. For the detection branch, we supervise training with ground truth 3D bounding boxes following ImVoxelNet \cite{rukhovich2022imvoxelnet}, which computes three losses: focal loss for classification $L_{cls}$, centerness loss $L_{cntr}$, and localization loss $L_{loc}$. For the NeRF branch, we use a photo-metric loss $L_c = ||\hat{C}(r) - \hat{C}_{gt}(r)||_2$. When depth ground truth is used, we can further supervise the expected depth of the scene geometry as $L_d = ||D(r) - D_{gt}(r)||$ where $D(r)$ is computed with Equ.~\ref{equ:nerf}. The final loss $L$ is given by
+\begin{equation}
+    L = L_{cls} + L_{cntr} + L_{loc} + L_c + L_d.
+\end{equation}
+Even though we \textit{optionally} use depth during training, it is not required in inference. Also our trained network is generalizable to new scenes which are never seen during \mbox{training}.

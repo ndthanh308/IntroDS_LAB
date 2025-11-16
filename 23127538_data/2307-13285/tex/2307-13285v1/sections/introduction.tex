@@ -1,0 +1,94 @@
+\section{Introduction \label{introduction}}
+Today's online services are made up of multiple microservices that communicate with each other using Remote Procedure Calls (RPCs), allowing access to functions and data as if they were local~\cite{alto,breakwater}.
+These services often have strict Service Level Objectives (SLOs) that require underlying data center systems to provide high throughput with \textit{microsecond-scale} tail latency~\cite{attackofus,dean13,breakwater,shinjuku,mcclure22}.
+This is because RPCs are getting smaller, and their runtime is generally an order of microseconds~\cite{shinjuku,alto,erpc}. 
+Unfortunately, RPC requests often experience excessive tail latency even if the request is the same~\cite{dean13,laedge}.
+One of the causes is unexpected variability in service times, which stems from various factors (e.g., load fluctuation, background tasks, interference among applications, and garbage collection~\cite{powerofd,dolly,rpcvalet,laedge}).
+
+Request cloning is a powerful technique to mask service-time variability.
+The traditional client-based cloning always sends redundant requests (typically 2~\cite{laedge,powerofd}) to multiple servers and only accepts the faster response.
+Owing to its simplicity and efficiency, the cloning technique has been employed in various domains~\cite{vulimiri13, dolly, xu14a,laedge,powerofd,redundancy}.
+One limitation is that it does not always result in improved performance.
+The latency is improved only within a sweet spot, and the system performance is rather degraded beyond a certain threshold load~\cite{laedge,vulimiri13}.
+This is not surprising because redundant requests add extra load to servers.
+Redundancy also doubles the packet processing overhead for clients, reducing the performance gain~\cite{vulimiri13}.
+
+A recent solution~\cite{laedge} addresses the limitation by using a centralized coordinator, which dynamically clones requests only if at least two servers are idle.
+Thanks to dynamic cloning, the performance is not degraded under high load.
+However, it is not enough to serve microsecond-scale workloads.
+This is because the coordinator incurs microseconds of additional latency overhead.
+It is also hard to scale out as throughput grows because of the limited capability of the coordinator CPU.
+Therefore, its target workload is millisecond-scale workloads with limited throughput. 
+In this context, we ask the following question: \textit{how can we perform dynamic request cloning quickly at scale for microsecond-scale RPCs?}
+
+As the answer to the question, we present \sys, a new request cloning system for microsecond-scale RPCs.
+To serve these workloads with high throughput and low tail latency at the cluster-level, cloning decisions should be made in a nanosecond-scale with scalability.
+However, achieving this in software is difficult because this is beyond the capability of modern CPUs even with advanced networking like RDMA.
+For this reason, \sys performs request cloning in hardware.
+Specifically, we dynamically clone requests and filter redundant slower responses in the Top-of-Rack (ToR) switch by leveraging the capability of programmable switch ASICs like Intel Tofino~\cite{tofinonodate}.
+The switch can process a few billion packets per second, and it takes only hundreds of nanoseconds to process a single packet.
+Therefore, with dynamic in-network request cloning, we can avoid latency overhead and a potential performance bottleneck, which are caused by the cloning coordinator.
+
+However, transforming the high-level idea into a working system is not straightforward because of various technical challenges as follows.
+First, we need to know server states (i.e., busy or idle) for cloning decisions.
+While the existing solution~\cite{laedge} can guarantee the idleness of servers by queueing requests in the coordinator, we cannot directly implement it in the programmable switch because of limited memory space.
+To address this, we make response packets piggyback the state of the server by lookup the vacancy of the request queue, and the switch stores the state in the switch memory.
+The switch replicates requests only if two candidate servers are idle.
+Unfortunately, the actual server state may be different due to the time gap.
+Therefore, we design a server-side mechanism that drops the cloned request if the actual state is busy.
+
+Second, we need to access the server state table twice to get the state of the candidate servers.
+However, this is not possible with the current programmable switch ASIC that makes packets go through processing stages sequentially.
+In particular, it requires two stages to access the state table twice, but the table is statically allocated in the first stage.
+To overcome this limitation, we put a shadow table in the second stage, a copy of the state table.
+Similarly, we cannot assign the destination IP to the cloned request at the time of cloning.
+To address this, we recirculate the cloned request by forwarding the clone to a port in loopback mode.
+
+Lastly, we need to block the slower response because it reduces the performance gain by causing unnecessary packet processing in the client.
+The challenge here is that memory footprint and hash collisions should be minimized.
+To address this, we make a filter table using the hash index, which can be reused by multiple requests.
+For the faster response of a request, the switch puts its request ID in the filter table as a fingerprint.
+In contrast, the switch drops the slower response of the request if the table slot contains the same request ID, since the switch knows that the faster response is already processed.
+To handle hash collisions, we use multiple filter tables with randomized table indices for requests.
+
+\iffalse
+\sys is incrementally deployable and supports multi-rack environments as well.
+This is because the switch data plane utilizes custom metadata and header fields only for cloning and redundancy filtering.
+The packet forwarding is still done by lookup the L3 forwarding table.
+Therefore, \sys can be deployed in either rack-scale computers~\cite{racksched,Legtchenko17} or cloud-scale data centers.
+\fi
+
+\sys is in line with emerging in-network computing solutions~\cite{netlr,racksched,jin18,yu20,harmonia}.
+We believe that a tier of coordinators like load balancers between clients and servers should be integrated into the network switch because we can eliminate performance overhead and save costs of hardware and software required to build and maintain coordinator nodes as well.
+In this context, \sys is a further advance to realize the vision of in-network computing, not just another case to show the benefit of in-network acceleration.
+To demonstrate this, we show that \sys can be integrated with RackSched~\cite{racksched}, a recent in-network request scheduler.
+
+We implement a prototype of \sys on an Intel Tofino switch.
+\sys consumes 4.77\% of the switch memory because we store small soft states in switch memory, which are generally server state information and request IDs in the filter table.
+To evaluate \sys, we build a testbed consisting of 8 commodity servers and a 6.5Tbps Intel Tofino programmable switch.
+We conduct a series of extensive experiments with a combination of synthetic\, Redis~\cite{redis} and Memcached~\cite{memcached} workloads.
+Our key findings include: 1) \sys can provide lower tail latency compared to the baseline, and has higher throughput than the client-based cloning and \sota~\cite{laedge}, the state-of-the-art coordinator-based cloning solution; 2) \sys can make synergy with RackSched~\cite{racksched} for various workload conditions; 3) \sys is robust to system conditions.
+
+In summary, this work makes the following contributions.
+\begin{itemize}[noitemsep]
+\item{
+We propose \sys, a request cloning system that provides dynamic, scalable, and fast request cloning and redundant response filtering to reduce the tail latency for modern microsecond-scale RPC workloads.
+\sys shows that programmable switches are a vantage point that can be used to accelerate applications with microsecond-scale latencies.
+}
+%\vspace{-5pt}
+\item{
+We address various technical challenges to design a custom switch data plane that clones requests, filters redundant responses, and tracks server states within the strict hardware constraints of switch ASICs.
+}
+%\vspace{-5pt}
+\item{
+We implement a \sys prototype with a commodity programmable switch and conduct a series of extensive testbed experiments to demonstrate the efficiency and robustness of \sys.
+}
+\end{itemize}
+
+
+The remainder of the paper is organized as follows.
+In Section~\ref{motivation}, we describe the motivation of this work.
+Section~\ref{design} provides the design of \sys.
+We present implementation and evaluation results in Section~\ref{implementation} and Section~\ref{evaluation}, respectively.
+We discuss related work in Section~\ref{relatedwork}.
+Lastly, we conclude our work in Section~\ref{conclusion}.

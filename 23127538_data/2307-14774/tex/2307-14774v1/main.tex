@@ -1,0 +1,553 @@
+\documentclass[runningheads]{comsis2}
+%% Necessary definitions for the running heads
+\def\journalissue{} % {Computer Science and Information Systems 00(0):0000--0000}
+\def\paperidnum{} % TODO {https://doi.org/}
+\setcounter{page}{1}
+
+%% Use this to show line numbers (and remove only in the final camera-ready version)
+\usepackage[pagewise]{lineno}
+%\linenumbers
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage{graphicx} % Required for inserting images
+\usepackage[dvipsnames]{xcolor}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{pdflscape}
+\usepackage{placeins} % \FloatBarrier
+
+\usepackage[algo2e,linesnumbered,commentsnumbered, lined, boxed,ruled,vlined]{algorithm2e}
+\def\HiLi{\leavevmode\rlap{\hbox to \hsize{\color{green!10}\leaders\hrule height .8\baselineskip depth .5ex\hfill}}}
+\def\HiLiScalar{\leavevmode\rlap{\hbox to \hsize{\color{blue!10}\leaders\hrule height .8\baselineskip depth .5ex\hfill}}}
+\def\HiLiAvx{\leavevmode\rlap{\hbox to \hsize{\color{red!10}\leaders\hrule height .8\baselineskip depth .5ex\hfill}}}
+\renewcommand{\algorithmcfname}{ALGORITHM}
+\SetAlFnt{\small}
+\SetAlCapFnt{\small}
+\SetAlCapNameFnt{\small}
+\SetAlCapHSkip{0pt}
+\SetKwProg{Fn}{function}{}{}
+\SetKwBlock{Begin}{ }{ }
+%\IncMargin{\parindent}
+
+\usepackage{pgfplots}
+\pgfplotsset{compat=newest}
+\usetikzlibrary{patterns}
+\usepackage{subcaption}% to enable subfigure
+\captionsetup{compatibility=false}
+\captionsetup{singlelinecheck=on}
+\definecolor{color_0}{rgb}{0.3, 0.3, 0.3}
+\definecolor{color_x}{rgb}{0.7, 0.75, 0.71}
+\definecolor{color_mkl}{rgb}{0.7, 0.75, 0.71}
+
+\definecolor{color_1}{rgb}{0.0, 0.3, 0.8}
+\definecolor{color_2}{rgb}{0.8, 0.0, 0.0}
+\definecolor{color_3}{rgb}{0.75, 0.0, 0.2}
+\definecolor{color_4}{rgb}{0.5, 0.0, 0.1}
+\definecolor{color_5}{rgb}{0.0, 0.34, 0.25}
+\definecolor{color_6}{rgb}{0.4, 0.7, 0.0}
+\definecolor{color_7}{rgb}{0.53, 0.47, 0.76}
+
+\usepackage{textcomp}
+
+
+\title{SPC5: an efficient SpMV framework vectorized using ARM SVE and x86 AVX-512}
+%% Use this if the title is too long for the running heads
+%% \titlerunning{Short Title of ComSIS Paper}
+\author{Evann Regnault\inst{1} \and B\'erenger Bramas\inst{2}}
+
+\institute{Strasbourg University\\
+  UFR de Mathématique et d’Informatique\\
+  7, rue René Descartes\\
+  67084 Strasbourg\\
+  France\\
+  \email{Evann.Regnault@etu.unistra.fr}
+  \and
+  Inria Nancy\\
+  CAMUS Team\\
+  615 Rue du Jardin-Botanique\\
+  54600 Villers-lès-Nancy\\
+  France\\
+  ICube laboratory\\
+  ICPS Team\\
+  300 bd Sébastien Brant\\
+  67412 Illkirch Cedex\\
+  France\\
+  \email{Berenger.Bramas@inria.fr}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\maketitle
+\begin{abstract}
+The sparse matrix/vector product (SpMV) is a fundamental operation in scientific computing. 
+Having access to an efficient SpMV implementation is therefore critical, if not mandatory, to solve challenging numerical problems.
+The ARM-based AFX64 CPU is a modern hardware component that equips one of the fastest supercomputers in the world. 
+This CPU supports the Scalable Vector Extension (SVE) vectorization technology, which has been less investigated than the classic x86 instruction set architectures.
+In this paper, we describe how we ported the SPC5 SpMV framework on AFX64 by converting AVX512 kernels to SVE.
+In addition, we present performance results by comparing our kernels against a standard CSR kernel for both Intel-AVX512 and Fujitsu-ARM-SVE architectures.
+\vspace{6pt}\textbf{Keywords:} SpMV, vectorization, AVX-512, SVE.
+\end{abstract}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+
+The sparse matrix/vector product (SpMV) is a fundamental operation in scientific computing. 
+It is the most important component of iterative linear solvers, which are widely used in finite element solvers. 
+This is why SpMV has been and remains studied and improved.
+
+Most of the studies work on the storage of sparse matrices, the implementation of SpMV kernels for novel hardware, or the combination of both.
+
+In a previous work \cite{10.7717/peerj-cs.151}, we proposed a new sparse matrix storage format and its corresponding SpMV kernel in a framework called SPC5. 
+The implementation was for x86 CPUs using the AVX512 instruction set architectures, and it was efficient for various types of data distribution.
+
+In the current work, we are interested in porting this implementation on ARM SVE \cite{10.1109/MM.2017.35,ARMSVE,ARMSVE2} architecture. 
+In other words, we aim at keeping the SPC5 storage format but create computational kernels that are efficient on ARM CPUs with SVE.
+
+AVX512 and SVE instruction set architectures are different in their philosophies and features.
+Consequently, as it is usually the case with vectorization, providing a new computational kernel is like solving a puzzle: we have the operation we want to perform on one side and the existing hardware instructions on the other side.
+
+The contribution of the paper is to depict a new SpMV kernel for ARM SVE, and to demonstrate its performance on several sparse matrices of different shapes.
+A secondary contribution is the description of our new AVX512 implementation, which is much simpler than the previous assembly implementation, while still delivering the same performance.
+
+This paper is organized as follows.
+In Section~\ref{sec:background}, we start by describing the vectorization principle, then the SpMV operation and the challenges of its efficient implementation, and finally provide the specificities of SPC5.
+Then, in Section~\ref{sec:spc5}, we present our SPC5 implementation with SVE.
+Finally, we study the performance of our implementation in Section~\ref{sec:study}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Background}
+\label{sec:background}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Vectorization}
+\label{sec:vec}
+
+Vectorization, also named SIMD for single instruction multiple data~\cite{flynn1966very}, is a key mechanism of modern processing units to increase the performance despite the clock frequency stagnation.
+As its name suggests, the idea consists in working on several elements stored in vectors instead of scalar distinct elements.
+As such, instead of performing operations on one element at a time, we perform the operations on vectors of elements using a vector instruction set architecture (ISA) that supports vector instructions.
+We provide a schematic view of the concept in Figure~\ref{fig:vecop}.
+
+% Figure environment removed
+
+Vectorization is straightforward when we aim to apply the same operation on all the elements of a vector.
+However, the principle is challenging when we have divergence, i.e., we do not apply the exact same operations on all the elements, or when we need to perform data layout transformations, i.e., the input/output data blocks from the main memory that are loaded from (stored to) vectors are not contiguous, or we need to shuffle the data inside the vectors.
+
+Moreover, not all instruction sets support the same operations, making each implementation specific to a given hardware.
+Consequently, what could be done with a single instruction in a given instruction set, might need several instructions in another.
+For example, non-contiguous stores (scatter), non-contiguous loads (gathers), or internal permutation/merging of vectors are not available in all existing instruction sets and not necessarily similar when they are supported.
+
+Many computational algorithms use conditional statements, therefore several solutions have been proposed to manage vector divergences.
+The first one is the single instruction multiple thread (SIMT) programming model, as used in CUDA and OpenCL.
+While the programmer expresses its parallel algorithm as if independent execution threads would be used, it is actually large vector units that will perform the execution, where each thread will be an element of the vector.
+The hardware takes care of the coherency during the execution.
+
+The second mechanism is the use of a vector of predicates, where each predicate tells if an operation should be applied on an element of the vector.
+When the elements of a vector should follow different execution paths (branches), all paths will be executed but predicate vectors will ensure to apply the correct operations.
+The ARM SVE technology uses this mechanism, and most instructions can be used with a predicate vector.
+Similar behavior can be obtained with classic x86 instruction sets using, for example, binary operations to merge several vectors obtained through different execution branches.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Related Work on Vectorized with SVE}
+
+Developing optimized kernels with SVE is a recent research topic \cite{8514923,8049003,aokioptimization,9513183,domke2021a64fx}.
+A previous study \cite{alappat2021ecm} has focused on the modelling and tuning of the A64FX CPU. 
+The authors implemented the SELL-C-$\sigma$ SpMV kernels and tuned it for this hardware. 
+This kernel was originally made for GPUs but works well on CPUs too. However, the format is very different from the CSR format and requires a costly conversion step, which we aim to avoid. 
+Additionally, the authors have performed important tuning for each matrix, by permuting the matrix or performing costly parameter optimization, where we want to provide a unique solution.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{SpMV}
+
+The SpMV operation has been widely studied. 
+This operation is memory bound in most cases with a low arithmetic intensity. 
+Consequently, a naive vectorization usually does not provide significant benefits if the arithmetic intensity remains unchanged. 
+This is why the storage of the sparse matrix is usually the central point of improvement.
+
+Each new ISA can potentially help to create new storage formats that take less memory and/or that can be vectorized more efficiently.
+
+For example, consider the more simple storage format called \emph{coordinates} (COO) or IJV, where each non-zero value (NNZ) is stored with a triple row index, column index and floating point value. 
+In this case, for each NNZ we need two integers and one floating point value.
+Not only this format is heavy but it is difficult to vectorized its corresponding SpMV kernel.
+
+Another well-known storage format is the \emph{compressed sparse row} (CSR), where the values of the same row are stored contiguously such that there is no need to store an individual row index per value. 
+With the CSR, each NNZ needs a single integer, which is the column index, decreasing the memory footprint up to 33\% compared to COO/IJV.
+
+Following this idea, plenty of storage formats have been proposed. 
+Many of them also tried to obtain a format that can be computed efficiently for a given architecture.
+
+Some of the first block-based formats are the block compressed sparse row storage (BCSR) \cite{bib:tspsparse} and its extensions to larger blocks of variable dimension \cite{vuduc2003automatic,im2004sparsity} or to unaligned block compressed sparse row (UBCSR) \cite{bib:dssparse}. 
+However, in these formats, the blocks have to be filled with zeros to be full.
+For these formats, the blocks were aligned (the upper-left corner of the blocks start at a position multiple of the block size).
+While the blocks are well suited for vectorization, the extra zeros can dramatically decrease the performance.
+
+More recent work has focused on GPUs and manycore architectures.
+Among them, the references are the ELLAPACK format \cite{liu2013efficient}, SELL-C-$\sigma$ \cite{kreutzer2014unified} defined as a variant of Sliced ELLPACK, and the CSR5 \cite{liu2015csr5} format that we used as reference in our previous study.
+
+The Cuthill-McKee method from \cite{cuthill1969reducing} is a well-known technique for improving the bandwidth of a matrix to have good properties for LU decomposition. 
+It does so by applying a breadth-first algorithm on a graph which represents the matrix structure. 
+While the aim of this algorithm is not to improve the SpMV performance, the generated matrices may have better data locality.
+
+Another method~\cite{bib:tspsparse} has been specifically designed to increase the number of contiguous values in rows and/or columns.
+This method works by creating a graph from a matrix, where each column (or row) is a vertex and all the vertices are connected with weighted edges.
+The weights represent the interest of putting two columns (or rows) contiguously.
+By solving the traveling salesman problem (TSP) to obtain a path that goes through all the nodes but only once and that minimizes the total weight of the path, we can find a permutation of the sparse matrix that should be better divided into blocks.
+This means that we should have fewer blocks and the blocks should contain more NNZ elements.
+
+Several updates to the method have been presented in~\cite{bib:dssparse,pichel2005performance,bramas2016optimization} using different formulas. While the current study does not focus on the permutation of matrices, it is worth noting that enhancing the matrix's shape, as in other approaches, would likely lead to improved kernel efficiency by reducing the number of blocks.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{SPC5}
+\label{sec:spc5}
+
+The SPC5 format consists in using a block scheme without adding additional zeros.
+SPC5 can be seen as an extension of the CSR format, but where the values of each row are split into blocks.
+Each block starts with a NNZ at column \emph{c} and includes the next NNZ values until column \emph{c+VEC\_SIZE-1} if they exist.
+Consequently, in the worst case a block contains a single value, and in the best case \emph{VEC\_SIZE} values.
+Then, for each block, we use a mask of bits to indicate which of the NNZ values in the block exist.
+As a result, in a poor configuration, SPC5 will have the same memory footprint as the CSR plus one bit mask per NNZ.
+On the other hand, in the other extreme scenario, SPC5 will save one integer for each value added to a block since we can retrieve the corresponding column index from $c$ and the position of the NNZ in the block.
+
+% Figure environment removed
+
+The SPC5 format has been extended so that a block is mapped to several rows.
+This is helpful if there are NNZ values closed (NNZ of consecutive rows that have closed column index) such that the values loaded from the vector \emph{x} can be used more than once and that the column index of the block is reused for more NNZ.
+
+In the rest of the document, we refer to $\beta$(r, VEC\_SIZE) when the blocks are over \emph{r} rows and of length \emph{VEC\_SIZE}.
+In the original study, we were also using blocks of $VEC\_SIZE/2$ but not in the current study.
+We give an example of CSR and SPC5 in Figure~\ref{fig:spc5}.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{SPC5 Implementation}
+
+We provide the SPC5 SpMV pseudocode in Algorithm~\ref{algo:spmvscalar}.
+
+First, we initialize an index to progress in the array of NNZ values, at line~\ref{alg1:idxVal}.
+Since we have no way to know where the values of a given block are located in the array, we have to increase the index with the number of values of each block that has been computed.
+This is visible at line~\ref{alg1:idxValinc} for the scalar version, line~\ref{alg1:idxValincavx} for AVX512, and line~\ref{alg1:idxValincsve} for SVE.
+
+At line~\ref{alg1:for_row}, we iterate over the rows with a step $r$. 
+For each row segment, we iterate over the blocks at line~\ref{alg1:for_block}. 
+For each block, we load its column index at line~\ref{alg1:store_idxCol}.
+
+Then, we process each row of the block.
+We start by getting the mask, at line~\ref{alg1:mask}, that tells us what are the NNZ that exist in the row of the block.
+A naive implementation consists in testing the existence of each possible value, at line~\ref{alg1:testmaskscalar}, and performing the computation if needed, at line~\ref{alg1:testopcalar}. 
+However, this loop over the NNZ can be done with a few instructions in AVX512, at line~\ref{alg1:avxop}. 
+In this case, we load a vector from $x$ that matches the column index, and expand the NNZ from the value array into a vector.
+
+The expand operation does not exist in SVE. 
+Consequently, the same behavior is obtained using different instructions. 
+First, we need a filter vector that contains $2^i$ at position $i$, see line~\ref{alg1:filter}.
+Then, we compute a binary \emph{and} operation between the filter vector and the mask, such that only the position for which a NNZ exist will not be zero.
+We do this operation at line~\ref{alg1:filterop} and get the active elements at line~\ref{alg1:active}.
+Second, instead of expanding the NNZ values, as with AVX512, we compact the values from $x$, at line~\ref{alg1:compact}.
+Doing so, we can simply load the right number of NNZ and leave them contiguous in the resulting vector, before performing the computation.
+A schematic view of the two approaches is provided in Figure~\ref{fig:expandorcompact}.
+
+% Figure environment removed
+
+Finally, we update $y$ at the end of the algorithm (at line~\ref{alg1:updatey}) for each of the rows that have been proceeded.
+
+\begin{algorithm2e}[h!]
+\SetAlgoLined
+\DontPrintSemicolon
+\KwIn{x : vector to multiply with the matrix.
+      mat : a matrix in the block format $\beta(r,c)$.
+      r, c : the size of the blocks.}
+\KwOut{y : the result of the product.}
+ \Fn{spmv(x, mat, r, c, y)}
+ {
+        \tcp{Index to access the array's values}
+        idxVal $\leftarrow$ 0\; \label{alg1:idxVal}
+        \HiLi filter $\leftarrow$ [1 $<<$ 0, ...., 1 $<<$ VS-1]\; \label{alg1:filter}
+        \For{idxRow $\leftarrow$ 0 \textbf{to} mat.numberOfRows-1 \textbf{inc by} $r$}{ \label{alg1:for_row}
+            \HiLiScalar sum[r] $\leftarrow$ init\_scalar\_array(r, 0)\;
+            \HiLi sum[r] $\leftarrow$ init\_simd\_array(r, 0)\;
+            \For{idxBlock $\leftarrow$ mat.block\_rowptr[idxRow/r] \textbf{to} mat.block\_rowptr[idxRow/r+1]-1}{ \label{alg1:for_block}
+                 idxCol $\leftarrow$ mat.block\_colidx[idxBlock]\; \label{alg1:store_idxCol}
+                \For{idxRowBlock $\leftarrow$ 0 \textbf{to} r}{
+                    valMask $\leftarrow$ mat.block\_masks[idxBlock $\times$ $r$ + idxRowBlock]\; \label{alg1:mask}
+                    \tcp{The next loop can be vectorized with vexpand}
+                    \HiLiScalar \For{k $\leftarrow$ 0 \textbf{to} $c$}{
+                    \HiLiScalar    \If{bit\_shift(1 , k) BIT\_AND valMask}{ \label{alg1:testmaskscalar}
+                    \HiLiScalar        sum[idxRowBlock] += x[idxCol+k] * mat.values[idxVal]\; \label{alg1:testopcalar}
+                    \HiLiScalar       idxVal += 1\; \label{alg1:idxValinc}
+                        }
+                    }
+                    \tcp{To replace the k-loop AVX512}
+                    \HiLiAvx sum[idxRowBlock] += simd\_load(x[idxCol]) * \label{alg1:avxop}
+                    \HiLiAvx       simd\_vexpand(mat.values[idxVal], valMask)\;
+                    \HiLiAvx idxVal += popcount(valMask)\; \label{alg1:idxValincavx}
+                    \tcp{To replace the k-loop SVE}
+                    \HiLi mask\_vec = svand(svdup(valMask), filter)\;\label{alg1:filterop}
+                    \HiLi active\_elts = svcmpne(mask\_vec, 0)\;\label{alg1:active}
+                    \HiLi increment = count(active\_elts)\;
+                    \HiLi xvals = svcompact(active\_elts, simd\_load(active\_elts, x[idxCol]))\;\label{alg1:compact}
+                    \HiLi block = simd\_load(svwhile(0, increment), mat.values[idxVal])\;
+                    \HiLi idxVal += increment\; \label{alg1:idxValincsve}
+                    \HiLi sum[idxRowBlock] += block * xvals\;
+                }
+                
+            }
+            \For{idxRowBlock $\leftarrow$ idxRow \textbf{to} r+idxRow}{\label{alg1:updatey}
+                \HiLiScalar y[idxRowBlock] += sum[r]\; 
+                \HiLi y[idxRowBlock] += simd\_hsum(sum[r])\;\label{alg1:hsum}
+            }
+        }
+ }
+ \caption{SpMV for a matrix \emph{mat} in format $\beta(r,c)$.
+          The lines in blue {\color{blue!90} \textbullet } are to compute in scalar and have to be replaced by the line in green {\color{green!90} \textbullet } to have the vectorized equivalent in SVE or in red {\color{red!90} \textbullet } with AVX.}
+ \label{algo:spmvscalar}
+\end{algorithm2e}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Optimizing the Loading of $x$}
+\label{sec:opt:x}
+
+In AVX512, the values from $x$ are loaded into a SIMD vector without pruning.
+This means that no matter how many NNZ are in the block or how many values we need from $x$, VEC\_SIZE values will be loaded from memory. 
+It is possible to prune/filter the values, but this will imply an extra cost (i.e., using a more expensive instruction like gather) and would certainly have no benefit as the AVX512 SIMD load instruction is translated into an efficient memory transaction.
+Consequently, in AVX512, the main optimization consists in loading the values from $x$ once for all the rows of a block, which allows accessing the memory once and using the resulting vector $r$ times.
+
+\FloatBarrier
+
+With SVE, it is different and we have mainly three alternatives:
+
+\begin{itemize}
+    \item Loading the values from $x$ without pruning, as with AVX512, and then compacting the obtained vector for each row of the block. We refer to this strategy as \emph{single $x$ load}.
+    \item Loading a different vector for each row of the block, as shown in Algorithm~\ref{algo:spmvscalar}. 
+    We refer to this strategy as \emph{partial $x$ load}.
+    \item Combining the predicates of several rows of the block by merging their predicates/masks to load all the values that are needed by the block, but not more.
+    In our study, we left this approach aside, as different tests we have conducted have shown poor performance.
+\end{itemize}
+
+The performance gains we can expect from the different strategies depend on the way the load is actually performed by the hardware.
+In fact, the main point is to know if the hardware can make faster memory transactions when some elements of the predicate vector used in the load are false.
+If the hardware actually loads VEC\_SIZE values from the memory but then only copies the ones that have their corresponding predicate value true to the SIMD vector, we should not expect any benefit.
+Moreover, ARM SVE can be seen as an interface, hence it can be implemented by the hardware differently such that the behavior can also change from one vendor to another.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Optimizing the Writing of the Result in $y$}
+\label{sec:opt:y}
+
+In the SIMD implementation, we have to perform the reduction (i.e., the horizontal sum) of $r$ vectors to add them to $y$ and store the result.
+
+A straightforward approach is to call a single reduction instruction per vector, as both AVX512 and SVE support such an operation.
+However, this means that we will perform $r$ individual summations between the reduced values and the values from $y$, and that we will also access the memory $r$ times (actually $2 \times r$, since we load values from $y$, perform the summation, and write back to $y$).
+
+To avoid this, we propose a possible optimization that consists in performing the reduction of all the vectors manually to obtain a single vector as output, and then performing a vectorial summation with $y$.
+
+With AVX512, this manual multi-reduction can be implemented by playing with AVX and SSE registers and using the horizontally add adjacent pairs instruction (\emph{hadd}).
+The operation is done without any loop.
+
+With SVE, we do this using odd/even interleave instructions (\emph{svuzp1} and \emph{svuzp2}). 
+In this case, we need a loop because the length of the vectors is unknown at compile time.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Performance Study}
+\label{sec:study}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%ù
+\subsection{Configuration}
+
+We assess our method on two configurations:
+\begin{itemize}
+    \item Fujitsu-SVE: it is an ARMv8.2 A64FX - Fujitsu with 48 cores at 1.8 GHz and 512-bit SVE~\cite{a64fxmanual}, i.e. a vector can contain 16 single precision floating-point values or 8 double precision floating-point values.
+    The node has 32 GB HBM2 memory arranged in four core memory groups (CMGs) with 12 cores and 8GB each, 64KB private L1 cache, and 8MB shared L2 cache per CMG.
+    We use the GNU compiler 10.3.0.
+
+    \item Intel-AVX512: it is a 2 $\times$ 18-core Cascade Lake Intel Xeon Gold 6240 at 2.6 GHz with AVX-512 (Advanced Vector 512-bit,  Foundation,  Conflict Detection, Byte and Word, Doubleword and Quadword Instructions, and Vector Length).
+    The main memory consists of 190 GB DRAM memory arranged in two NUMA nodes. 
+    Each CPU has 18 cores with 32KB private L1 cache, 1024KB private L2 cache, and 25MB shared L3 cache.
+    We use the GNU compiler 11.2.0 and the MKL 2022.0.2.
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%ù
+\subsection{Test Cases}
+
+We evaluated the performance of our proposed SPC5 SpMV kernels~\footnote{The code is available at \url{https://gitlab.inria.fr/bramas/spc5}} on a set of sparse matrices taken from the University of Florida sparse matrix collection (UF Collection) \cite{davis2011university}.
+It includes a dense matrix of dimension 2048.
+The results of the dense matrix are expected to provide an upper bound on the performance of the kernels, as all blocks will be full. 
+Of course, our kernels are not well-designed or optimized for a dense matrix-vector product.
+The properties of the matrices are given in Table~\ref{tab:matsetcomp}.
+
+We evaluated the performance of four kernels: $\beta$(1, VS), $\beta$(2, VS), $\beta$(4, VS), and $\beta$(8, VS), where VS is the vector size.
+We also provide the filling of the blocks when we format the matrices to the corresponding block sizes.
+The filling can be up to 80\% for \emph{nd6k} but as low as 1\% for \emph{wikipedia-20060925}. (It is obviously 100\% for the dense matrix.)
+
+We performed the computation in single precision (\emph{float/f32}) and double precision (\emph{double/f64}).
+
+The original AVX implementation was written in assembly language, while our current implementation is written in C++ with intrinsic functions.
+Consequently, the AVX and SVE kernels have very similar structures.
+
+\input{tabmatrices}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%ù
+\subsection{Results}
+
+The results are organized as follows.
+In the first part, we evaluate the difference of using the manual multi-reduction (described in Section~\ref{sec:opt:y}) vs. the native SIMD horizontal summation in Figures~\ref{res:perf:comp} (a) and~\ref{res:perf:comp} (b), for Fujitsu-SVE and Intel-AVX respectively.
+For Fujitsu-SVE, we also evaluate the use of full vector load of $x$ (described in Section~\ref{sec:opt:y}).
+Then, we provide the detailed results for all the matrices and the selected configuration in Figures~\ref{res:perf:full:sve} and~\ref{res:perf:full:avx}.
+Finally, we provide an overview of the parallel performance when the computation is naively divided among the threads in Figure~\ref{res:perf:par}.
+
+%%%%%%%%%%%%%%%%%%%%%%%
+
+
+% \label{res:plotsve}
+% \label{res:plotsve:f32}
+% \label{res:plotsve:f64}
+\input{figplotsve}
+% \label{res:perf:full:sve}
+\input{figressve}
+
+\paragraph{Comparisons of the Different Optimizations.}
+
+We provide the performance results of the different implementations in Table~\ref{res:perf:comp}.
+
+In Table~\ref{res:perf:comp} (a), we evaluate the use of manual multi-reduction and the single load of the $x$ vector for the Fujitsu-SVE architecture.
+There is no difference in most cases, and it is always meaningless for $\beta$(2,VS).
+The $\beta$(4,VS) and $\beta$(8,VS) kernels react differently with the optimizations and improve slightly.
+The small change in using the multi-reduction comes from the small difference in latencies between the two approaches.
+The \emph{reduce} instruction (\emph{addv}) has a latency of 12 cycles~\cite{a64fxmanual}.
+Our multi-reduction has a latency of around 96 cycles for two vectors (considering the following latencies \emph{uzp1} $6$, \emph{uzp2} $6$, \emph{whilelt} $4$ and full \emph{vadd} $22$), and it is almost the same cost for 4 or 8 vectors.
+Disabling the $x$ load optimization almost always degrades performance for the $\beta$(4,VS) kernel but seems to improve the performance for the $\beta$(8,VS).
+This is surprising, as we would expect that the larger the blocks would be, the more benefit we would have to load the vector from $x$ completely.
+From our understanding, the cost of a load depends on the location of the data it requests but not on the fact that the data it requests could be located in different cache lines.
+This explains why the optimization has a limited impact, as a partial load will move the data to the cache and speedup the next partial loads.
+Since the $\beta$(4,VS) is faster than $\beta$(8,VS), we consider the best configuration to be with both optimizations turned on.
+
+In Table~\ref{res:perf:comp} (b), we evaluate the use of manual multi-reduction on Intel-AVX512 architecture.
+The performance increases slightly with the use of manual multi-reduction in some cases.
+For instance, the best performance on average is obtained with $\beta$(4,VS) and for this configuration, using the manual multi-reduction has no impact (double) or increases the speedup by $0.1$ (float).
+The explanation is as follows: the \emph{reduce} intrinsic function (\emph{\_mm512\_reduce\_add\_ps}) is not actually a real hardware instruction, but a call to a function provided by the compiler~\cite{varela2022manycore}.
+Its implementation~\footnote{\href{https://github.com/gcc-mirror/gcc/blob/9d7e19255c06e05ad791e9bf5aefc4783a12c4f9/gcc/config/i386/avx512fintrin.h\#L15928}{https://github.com/gcc-mirror/gcc/blob/9d7e19255c06e05ad791e9bf5aefc4783a12c4f9}
+\href{https://github.com/gcc-mirror/gcc/blob/9d7e19255c06e05ad791e9bf5aefc4783a12c4f9/gcc/config/i386/avx512fintrin.h\#L15928}{/gcc/config/i386/avx512fintrin.h\#L15928}} is very similar to our manual multi-reduction, with the main difference being that we try to factorize the instructions to reduce several SIMD vectors at the same time. 
+This allows us to obtain a SIMD vector as output, which can then be used to update $y$ with vectorized instructions.
+In the end, the performance difference between the two approaches is limited. 
+However, for the rest of the study, we consider that the best Intel-AVX512 configuration is to use manual multi-reduction.
+
+
+
+\begin{landscape}
+\input{figcomparmavxtab}
+% \label{res:perf:comp:sve}
+% \label{res:perf:comp:sve:nofactonohsum}
+% \label{res:perf:comp:avx:nofactowithhsum}
+% \label{res:perf:comp:avx:factonohsum}
+% \label{res:perf:comp:sve:nofactowithhsum}
+%\input{figcomparm}
+%\label{res:perf:comp:avx:withhsum}
+%\label{res:perf:comp:avx:nohsum}
+%\label{res:perf:comp:avx}
+%\input{figcompavx}
+\end{landscape}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%
+\paragraph{Best Configuration Detailed Results.}
+
+We provide the complete results for Fujitsu-SVE in Figures~\ref{res:perf:full:sve} and~\ref{res:plotsve}. 
+The results for Intel-AVX are shown in Figures~\ref{res:perf:full:avx} and~\ref{res:plotavx}.
+
+In Figure~\ref{res:perf:full:sve}, we can see that the performance of the SPC5 kernels is clearly related to the block filling. 
+The performance model can be described as a constant cost per block that seems independent of the number of blocks or the number of NNZ. 
+This means that the performance can be easily predicted from the block filling.
+
+We also note that the performance increases as we increase the size of the blocks up to 4×VS, but then it decreases for $8 \times VS$. 
+This is more visible in Figure~\ref{res:perf:full:sve}, where $\beta$(8, VS) is the slowest SPC5 kernel in most cases.
+
+The behaviors in single and double precision are similar. 
+For some matrices, such as ns3Da, SPC5 is even slower than a simple CSR implementation. 
+This means that the overhead of using vectorial instructions outweighs the benefits of vectorization since the block filling is very low.
+
+The computation on the matrix TSOPF, which has a very high block filling, achieves performance almost equivalent to the dense matrix case. 
+Finally, we can see the average performance in Figure~\ref{res:perf:full:sve} (last bars). 
+While the speedup against CSR is significant, the raw performance is low compared to the peak performance of the machine.
+
+
+The results for Intel-AVX are slightly different. 
+In Figure~\ref{res:perf:full:avx}, we can see that while there is a correlation between the block filling and the performance, the relationship is less clear than for Fujitsu-SVE.
+
+We also note that the performance increases with the block size, such that the best performance is achieved with $\beta$(8, VS). 
+This is even more visible in Figure~\ref{res:perf:full:avx}.
+
+Contrary to Fujitsu-SVE, the performance obtained for TSOPF is not close to the dense matrix case. 
+This means that while the blocks are almost full, the fact that we have to jump over the vector $x$ has a negative impact on the performance.
+
+The performance of SPC5 on Intel-AVX is higher than those obtained with Fujitsu-SVE for almost all matrices. 
+Finally, SPC5 is faster than the Intel MKL CSR kernel for most matrices, but can be slower if there are less than two values per block.
+
+% \label{res:plotavx}
+% \label{res:plotavx:f32}
+% \label{res:plotavx:f64}
+\input{figplotavx}
+
+% \label{res:perf:full:avx}
+\input{figresavx}
+%%%%%%%%%%%%%%%%%%%%%%%
+\paragraph{Parallel Performance Overview.}
+
+In Figure~\ref{res:perf:par}, we provide the results for the parallel executions.
+For the Fujitsu-SVE hardware, Figure~\ref{res:perf:par:sve}, for some matrices the speedup is above 42 (the number of cores).
+This is possible because the matrices are split and allocated by the threads such that each thread has its data on the memory nodes that correspond to its CPU core.
+In addition, the split of the matrices and the use of all the cores can result in using the cache more efficiently.
+
+For the Intel-AVX512 hardware, Figure~\ref{res:perf:par:avx}, the executions on the dense matrix have poor performance for small blocks.
+This is clear that the $x$ vector will be fully loaded for each row, such that the cache performance is tied to the final execution performance.
+We can notice that the speedup around 15 is far from the number of CPU cores (36).
+The workload balance between the threads is similar to the Fujitsu-SVE configuration, therefore, we consider that the difference comes from the memory organization and use.
+
+% \label{res:perf:par:sve} 
+% \label{res:perf:par:avx}     
+% \label{res:perf:par}
+\input{figrespar}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusion}
+
+We have presented a new version of our SPC5 framework, which remains efficient on architectures with AVX512 and is now compatible with ARM architectures with SVE.
+The same sparse matrix format can be used to target both ISA, allowing for interoperability and the use of a single framework on x86 and ARM-based architectures.
+
+The SPC5's SpMV kernels are implemented differently, as they rely on an expand mechanism of the NNZ (AVX512) or a compaction of the $x$ vector (SVE).
+The performances we obtained are usually higher than a simple CSR kernel if there is more than a single NNZ per block.
+The $\beta$(1,$*$) format has a low conversion cost as it leaves the array of NNZ unchanged compared to CSR, which makes it easy to plug in existing CSR-based applications.
+
+In a future work, we would like to investigate if we could use a hybrid format, i.e., a format where we could have blocks of different sizes including blocks of scalar, to avoid using vectorial instructions when there is no benefit.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Acknowledgement}
+This work used the Isambard 2 UK National Tier-2 HPC Service~\footnote{\url{http://gw4.ac.uk/isambard/}} operated by GW4 and the UK Met Office, which is an EPSRC project (EP/T022078/1).
+We also used the PlaFRIM experimental testbed, supported by Inria, CNRS (LABRI and IMB), Universite de Bordeaux, Bordeaux INP and Conseil Regional d’Aquitaine~\footnote{\url{https://www.plafrim.fr}}. 
+In addition, this work used the Farm-SVE library~\cite{bramas:hal-02906179v1}.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Bibliography
+\bibliographystyle{splncs03}
+\bibliography{references}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% For the final version of the paper: %%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% Author information
+%\vspace{4ex}\noindent
+%\textbf{Author One} is\dots
+%
+%\bigskip\noindent
+%\textbf{Author Two} is\dots
+%
+%\bigskip\noindent
+%\textbf{Author Three} is\dots
+
+%% Reception and acceptance information
+%\bigskip
+%\paragraph{Received: Month DD, 20YY; Accepted: Month DD, 20YY.}
+
+\end{document}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

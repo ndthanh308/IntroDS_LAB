@@ -1,0 +1,246 @@
+\section{Motivation and Challenges}
+\label{sec:motivation}
+In this section, we motivate our attack which targets the write buffer in the MC to leak secret information. Also, we strengthen the point of using iGPU and write buffer compared to other possible shared resources.
+
+\subsection{Memory Controller's Write Buffer}
+Our attack exploits the write buffer in the MC. MC is shared between CPU cores and iGPU. There are many incentives for attackers to target MC resources. Buffers in the MC are shared between all CPU cores and iGPU in some heterogeneous SoCs. Consequently, they are not affected by existing cache-based defense approaches such as partitioning or randomization~\cite{pl_cache, scatter_cache}. Buffers within MC are usually smaller in size than caches, they do not have sophisticated replacement policies since they act as queues, and do not depend on address mapping and index hashing (e.g. across LLC slices in the case of Intel processors). As a result, overflowing or saturating these buffers is straightforward and depends on the frequency of memory requests. Furthermore, memory requests in buffers/queues within the MC are generally serviced using common scheduling policies. All these factors make targeting buffers in MC tempting for attackers to leak secret information.
+
+%Even though the size of buffers is usually smaller and their management policy is often simpler than caches, 
+There are multiple challenges that make targeting the MC's write buffer challenging for attackers. %At the level of memory controller, memory read and write requests don't necessarily indicate current execution status of program's execution. This is mainly due to caches and prefetching in case of reads and management polices of write buffers which serve writes depending on write buffer status or memory read requests.
+At the level of the MC, the write buffer status does not directly indicate the current execution status of the program. This is because entries in the write buffer could be due to an earlier execution state. Furthermore, the management policy of the write buffer plays a role in serving memory requests such as in the case of a full buffer or when there is standing read requests. Triggering write buffer related events such that secret information is leaked is dependent on write buffer size, its management policy, and the frequency of memory write requests as we will show later. Also, we will show that creating sufficient write requests to drain the write buffer in a secret-dependent way can not be easily achieved using memory traffic from a CPU core. This motivates our work in using iGPU memory traffic in modern heterogeneous systems.
+\begin{tcolorbox}[arc=5mm, outer arc=1mm, width=\linewidth,halign=flush center, left=1mm, right=1mm]
+\textit{
+Write buffer status affects memory read requests.
+}
+\end{tcolorbox}
+
+
+
+% % Figure environment removed
+
+
+\subsection{CPU-CPU vs. CPU-iGPU Slowdown}
+%\hoda{The title is misleading. It seems that we have slowdown on CPU vs. iGPU. We should think about some other titles to clarify it. Probably CPU-iGPU vs. CPU-CPU contention is better than slowdown.} \ghadeer{I'm not sure about calling it contention because latency overhead does not happen due to shared resource. CPU is using read buffer and iGPU is using write buffer, thus there is no shared resource. here may be okay because we have not confirmed the source of latency overhead till this part.}
+
+Our attack targets MC resources, and mainly the write buffer. To our knowledge, this is the first work to target the write buffer using iGPU memory write traffic. In this subsection, we motivate using iGPU memory traffic compared to CPU memory traffic. Later, we compare our attack and threat model with existing work that targeted MC resources, DRAM or LLC, and ring-interconnect.   
+
+\subsubsection{CPU-CPU Slowdown}
+To explore CPU-CPU possible slowdown at the MC level, we executed two processes (A) and (B) on different cores. Process(A) is iteratively reading from a buffer. We ensure each buffer access is a memory access by flushing the targeted cache line beforehand using {\fontfamily{pcr}\selectfont clflush} instruction. Process (B) on a different CPU core accesses another buffer. In process (B), we tried both memory reads and writes. For reads and writes, we access different cache lines. In the case of reads, we flush the buffer's cache line before accessing it. We measure the access time on process (A) using {\fontfamily{pcr}\selectfont rdtscp} instruction. 
+
+Figure~\ref{fig:slowdown_a} shows the slowdown observed by CPU process (A) due to memory accesses of CPU process (B) for different numbers of memory requests in the case of reads and writes. The latency values are normalized to the latency of memory accesses when there is no contention (baseline). Slowdown due to the CPU process's memory accesses is observable only at a large number of memory write requests. Memory reads are not causing a notable slowdown similar to the case observed with memory writes.
+
+
+
+
+\subsubsection{CPU-iGPU Slowdown}
+%In heterogeneous SoCs with integrated accelerators such as Intel integrated GPU, MC resources are shared between CPU cores and iGPU. 
+%In such systems, throughput-oriented GPUs with bandwidth-sensitive applications can create a high level of contention on the shared resources, observable in the latency-oriented CPU cores. In addition to a huge performance impact on CPU applications, we show that this slowdown leads to high-quality cross-component covert and side channel attacks.
+
+We investigated CPU process slowdown which can be caused by iGPU memory traffic. We executed two CPU processes: Process (A) and Process (B). Similar to the CPU-CPU slowdown experiment, process (A) is continuously doing memory read requests. To make sure all access are served from main memory, we used {\fontfamily{pcr}\selectfont clflush} instruction. CPU process's memory access latency is measured using {\fontfamily{pcr}\selectfont rdtscp} instruction. Process (B) is launching iGPU kernel and the possible slowdown is tested due to kernel memory requests from both reads and writes with a different number of memory requests. 
+
+The maximum size of the local work-group in iGPU kernel is 256 work-items (i.e. maximum local work-group size supported by OpenCL API), and the size of the global work-group is set according to the desired number of memory requests. For example, if the targeted number of memory requests is less than 256 requests, then size of global work-group is set to be the same as the number of memory requests, otherwise, the global work-group size is set to 256 work-items (the maximum size). As a result, the number of work-groups is one. This is done to avoid the overhead of synchronizing between different work-groups. Memory read and write requests are performed from/to different cache lines to avoid the effect of memory coalescing and guarantee the required number of memory requests for creating contention.
+
+As it can be noticed from Figure~\ref{fig:slowdown_b}, CPU process (A) slowdown is clearly observable in the case of iGPU kernel's memory write requests. It is barely notable in the case of the kernel's memory read requests. We elaborate on the reason behind such a slowdown through reverse-engineering in the next section. The slowdown caused by the iGPU kernel's memory writes is larger ($\times5$) than the slowdown caused by the CPU process's memory accesses. Also, such a slowdown is caused by using less number of memory write requests compared to the CPU process. This motivates the use of iGPU kernel memory traffic for leaking secret information rather than the CPU core's memory requests. 
+
+%We argue that it is possible to cause a larger slowdown using the CPU core's memory requests in case of CPU-CPU slowdown. This requires using multiple CPU cores, synchronizing between these cores to ensure that memory accesses are issued at a close time. Utilizing a lot of CPU cores to do the attack would make the attack notable and the probability of context switching with other standing CPU processes becomes higher.  Considering this, it is challenging for attackers to include multiple CPU cores in their attack.
+
+
+% Figure environment removed
+
+
+% Figure environment removed
+
+
+
+\begin{tcolorbox}[arc=5mm, outer arc=1mm, width=\linewidth,halign=flush center, left=1mm, right=1mm]
+%\vspace{-3.5mm}
+\textit{
+Latency of memory reads from a co-running CPU process during iGPU kernel writes is ($\times5$) larger than the latency during another CPU process writes ($\times0.5$).
+}
+\end{tcolorbox}
+
+\subsection{Comparison with Related Attacks}
+\begin{comment}
+\begin{table*}[h]
+    \centering
+    \begin{tabular}{||p{2.75cm}|p{2cm}|p{2.75cm}|p{2.75cm}|p{2.75cm}|p{2cm}||}
+    \hline
+     \multirow{2}{2.75cm}{}&\multirow{2}{2cm}{End-to-End Attack}&\multicolumn{3}{c|}{Attack Target}& \multirow{2}{2cm}{Attack Parties}\\ 
+    \cline{3-5}
+                            & & Memory Controller Resources  & DRAM Resources & LLC \& Ring Interconnect & \\
+         \hline
+        Y. Wang et al.~\cite{cornell_defense_hpca} & \xmark & No Reverse Engineering & No Reverse Engineering & No Reverse Engineering & CPU-CPU\\ 
+        \hline
+        DRAMA~\cite{drama_usenix}  & \cmark & \xmark & Bank Contention & \xmark & CPU-CPU \\ 
+        \hline
+        Leaky Buddies~\cite{leaky_buddies} & \cmark & \xmark & \xmark & \cmark & iGPU-CPU \\ 
+        \hline  
+        \cellcolor{red!30} Our Attack  & \cellcolor{red!30}\cmark & \cellcolor{red!30} Read and Write Buffers & \cellcolor{red!30}\xmark & \cellcolor{red!30}\xmark & \cellcolor{red!30} iGPU-CPU \\
+        \hline
+    \end{tabular}
+    \caption{Status of our attack compared to related attacks. \ghadeer{addressed}}
+    \label{tab:related_work}
+\end{table*}
+\end{comment}
+
+
+\begin{table*}[t]
+%\vspace{-2mm}
+    \centering
+    \begin{tabular}{||p{2.6cm}|p{2cm}|p{9cm}|p{2cm}||}
+    \hline
+     {}&\centering{End-to-End Attack}& \centering{Attack Target}& {Attack Parties}\\ 
+   
+         \hline
+        Y. Wang et al.~\cite{cornell_defense_hpca} & \centering\xmark & Memory Controller (No reverse engineering) & CPU-CPU\\ 
+         &  & *Main cause of contention/slow-down is not reverse engineered &  \\
+        \hline
+        DRAMA~\cite{drama_usenix} & \centering\cmark & DRAM (Bank Contention) & CPU-CPU \\ 
+        \hline
+        Leaky Buddies~\cite{leaky_buddies} & \centering\cmark & LLC \& Ring Interconnect & iGPU-CPU \\ 
+        \hline  
+        \cellcolor{red!30} Our Attack  & \centering\cellcolor{red!30}\cmark & \cellcolor{red!30} Memory Controller (Read and Write Buffers) & \cellcolor{red!30} iGPU-CPU \\
+        \hline
+    \end{tabular}
+    \caption{Status of our attack compared to related attacks. %\hoda{I think this version looks better, but feel free to edit it if you want to emphasize on anything.}
+    }
+    \label{tab:related_work}
+\end{table*}
+
+%TODO:add a table to summerize related work status
+We further motivate our proposed attack by comparing it to existing attacks that target MC resources and/or integrated accelerators in heterogeneous SoCs.
+Our attack is the first to characterize the slowdown (through reverse engineering) and develop end-to-end covert attacks on MC resources  mainly the write buffer.
+
+Wang et al.~\cite{cornell_defense_hpca} proposed a defense approach targeting timing attacks on the MC. To motivate their protection scheme, they briefly discussed the possibility of a covert and a side channel attack without characterizing and confirming the source of contention. For the side channel attack, they targeted RSA decryption algorithm and caused a cache miss when the modulo operation is executed. The modulo is executed when the bit in the private key is one '1'. They showed that the execution time of the attacker increases when the number of bit one in the private key increases. They also showed the possibility of a covert channel attack. In this attack, to send bit one, the adversary issues memory requests, while nothing is issued when sending bit zero.
+
+Some other works studied covert and side channels on the other resources in the memory subsystem rather than the MC. Pessl et al. proposed DRAMA~\cite{drama_usenix}, covert and side channel attacks by utilizing DRAM bank contention. Their attack requires attack parties to agree on set of a rank, a channel, a bank group, and a bank to leak secret information. Our attack does not require this. Dutta et al. ~\cite{leaky_buddies} developed covert channels across CPU and iGPU in Intel-based SoCs, but targeted LLC and ring interconnect which are shared between iGPU and CPU cores. Their attack requires finding precise eviction and polluting sets on LLC to ensure a successful attack.
+
+Table~\ref{tab:related_work} compares our proposed attack against existing attacks that target MC and DRAM resources and/or developed in CPU-iGPU SoCs.
+
+
+
+
+
+
+
+
+%Applications running on accelerators such as GPUs are bandwidth sensitive. For this reason, memory controller and main memory are organized to support bandwidth needs of GPU applications such as partitioned memory\hoda{do you mean dedicated memory?}. This is unlike CPU applications which are latency sensitive \cite{Aamodt2018, cornell_defense_hpca, mem_sys_book}.
+
+
+\begin{comment}
+Prior work ~\cite{cornell_defense_hpca} proposed memory timing channels in a multi-core CPU. They show a simple attack on the shared memory to propose a defense mechanism against this potential timing attack, without identifying the cause of contention in the memory subsystem and characterizing the contention on specific shared resources within the memory controller or DRAM banks. There are no details of attack development (e.g. memory access pattern, number of memory requests from each side) in ~\cite{cornell_defense_hpca}. Several works also proposed defense mechanisms against attacks targeting contention on memory controllers without consideration of memory traffic from integrated accelerators such as iGPUs ~\cite{cornell_defense_hpca, utah_defense_hasp, princeton_defense_hpca, mit_defense_asplos, utah_defense_micro}.\newline
+%\hoda{These are not only in multi-core CPUs. We should revise the text or cite only cpu-based ones.}
+\end{comment}
+
+\begin{comment}
+\noindent \textbf{CPU-CPU Contention:} To investigate this, we launched two processes (A and B), running on two different CPU cores. Process A is iteratively accessing a buffer of size 1MB at a stride of eight cache lines.  We selected the stride of eight cache lines to avoid cache prefetching. These accesses are memory reads, so we flush the buffer using {\fontfamily{pcr}\selectfont clflush} instruction before accessing it, to ensure that it is not served by LLC or private caches. Process B on a different CPU core accesses a buffer of size 32MB at the stride of four cache lines to avoid the effect of cache line prefetching. %\hoda{why stride of 32 lines here?} 
+In process B, we tried both memory reads and writes. For reads, we flush the buffer before accessing it. We measure the access time on process A using {\fontfamily{pcr}\selectfont rdtscp} instruction.  %\hoda{is the instruction name correct?} instruction. 
+
+% Figure environment removed
+
+
+
+%\hoda{You iteratively access the buffer on the spy side, so is the plot showing the average latency of each address over iterations?} \ghadeer{yes that's right, if i say iteration, i mean average spy buffer latency. each iteration a single spy buffer is accessed and average latency is reported.}
+
+Figure \ref{fig:cpu_cpu_attack} shows the contention level observed by process A due to memory accesses of process B for both memory reads and writes. The latency values are normalized to the latency of memory access when there is no contention. Each point in the plot shows the average latency of the buffer access in each iteration.  It can be noticed that the latency difference between contention and lack of contention cases is barely observable. We have also explored using larger buffer sizes and more memory requests from process B, however, we have not observed a reasonable latency difference to be able to build a reliable covert channel attack in any of those cases. Figure~\ref{fig:cpu_attack_per_buffer_size} shows the contention level observed in process A by accessing different sizes of buffer in process B (both reads and writes).
+
+%Spy has a buffer of 1MB with stride of eight. Trojan buffer is being accessed at stride of four.
+
+
+
+% Figure environment removed
+
+%\hoda{add a figure to show the buffer size of CPU trojan and contention level} 
+
+%Figure~\ref{fig:cpu_attack_per_buffer_size} shows the contention level generated by different buffer sizes on the process B.
+
+% % Figure environment removed
+
+%Considering the execution behavior of CPU applications which are latency sensitive, bandwidth-sensitive GPU applications, and the shared memory controller, it is possible that GPU applications are affecting the performance of CPU applications based on memory traffic.
+
+%\ghadeer{add read and write data}
+%\hoda{Based on our discussion, We were supposed to start with trojan read, so we should show read from GPU or at least both read and write. Also we should start with CPU-CPU ... to motivate the work }
+\end{comment}
+
+\begin{comment}
+    
+
+\noindent \textbf{CPU-GPU contention:}
+To investigate the contention level that is generated by iGPU, we launched two processes A and B. Process A is running on the CPU, while process B launches a GPU kernel to execute on the integrated GPU. CPU process is iteratively accessing a buffer of size 1MB at a stride of eight cache lines like the CPU-CPU contention experiment, all accesses are memory reads and are flushed from the caches before accessing the buffer. 
+
+Process B launches a GPU kernel with a buffer of size 64MB. The kernel is launched with one work-group of 256 threads. This means that only one sub-slice of iGPU is used to perform memory accesses. The buffer is accessed at a stride of eight cache lines by 256 threads in parallel. To avoid memory coalescing on the iGPU, memory access must be done to different cache lines \cite{gen9, gen11}. %The number of buffer accesses determines the level of contention. 
+
+We investigate both memory reads and writes from the GPU. Figure \ref{fig:attack_motivation} shows CPU's memory read latency for each access when process B is executing on the integrated GPU. Launching the GPU kernel has some overhead, as a result, CPU and GPU processes do not overlap for the whole time of the experiment. As is shown in Figure \ref{fig:attack_motivation}, during the GPU kernel execution, a high level of contention is observed in the CPU process, when the GPU writes into the memory. CPU's read latency is increased by 3.5-4 times the read latency without iGPU memory writes. However, for GPU read accesses, the contention level is not notable. 
+
+In the GPU kernel, there is no access to {\fontfamily{pcr}\selectfont clflush} instruction to evict the data from the caches. Moreover, GPU's internal L3 cache is non-inclusive~\cite{leaky_buddies} (note that L1 and L2 private caches on iGPU are only for the graphics stack and not used in the computational stack), so even if we launch many short kernels (one for each iteration) and we flush the LLC (on the CPU) before launching GPU kernels, the data may remain in GPU's L3 cache. As a result, for memory reads of the same buffer iteratively, most accesses are served by GPU's internal caches or LLC and do not reach the memory to be observed on the CPU side. However, for memory writes, even if the data is already in the private caches, it needs to update the memory and the memory request traffic eventually reaches the memory controller and memory banks.
+
+%\hoda{You do not flush from the cpu side of trojan for read or writes, is that right?}
+%\ghadeer{generally, I do not need to flush for writes. but for reads, if it is multi-kernel, i flush before each kernel launch. while it is a single kernel, I flush before the single kernel launch, I can not use clflush because trojan buffer will be mainly accessed at iGPU side.}
+
+% Figure environment removed
+
+
+   % \ghadeer{This is just for single spy buffer, while the previous one is average data per spy buffer. iteration index indicate how many times spy buffer was accessed}
+
+Motivated by this observation on Intel processors with integrated graphics, we investigate the possibility of high-quality covert channels to leak information across the processors by exploiting memory requests from the iGPU and considering the parallelism offered by iGPU architecture. 
+
+
+%Compared to CPU-CPU covert channel, exploiting iGPU to do a covert channel attack will lead to a faster attack considering the parallelism offered by iGPU architecture. Also, as we illustrated in \ref{fig:attack_motivation}, the performance degradation due to iGPU kernel execution is large. This makes the contention notable and should reduce the error rate assuming synchronization. Using the same trojan parameters used in figure \ref{fig:attack_motivation}, we investigated the contention level using a trojan running mainly on the CPU, and not launching any iGPU kernel.
+
+
+%Because kernel memory accesses are mainly writes, it is not required to flush this buffer. For this experiment, kernel buffer is accessed at stride of eight cache lines. To avoid memory coalescing, memory writes must be done to different memory cache lines \cite{gen9, gen11}. Number of buffer accesses determines the level of contention. Figure \ref{fig:attack_motivation} shows process(A) memory read latency when process(B) kernel is executing on the integrated GPU.
+
+%TODO: show the role of number of memory accesses on the level of contention. this will give an idea about the role of memory writes.
+
+%Performance degradation of process(A) due to kernel running on the iGPU and is clearly notable. Process(A) read latency is increased by 3.5-4 times the read latency without iGPU memory writes. Motivated by this phenomenon on Intel processors with integrated graphics, we investigate the possibility for trojan to launch a kernel and leak information to other processes via memory contention and by exploiting performance effect of iGPU kernel on CPU processes. `
+
+
+
+%Although we show contention based on specific buffer parameters such as size and access stride, we note that the contention level caused by kernel memory writes is determined by factors such buffer size, number of memory requests and global work group size. we elaborate about such factors in Section \label{attack_details}.
+
+
+
+
+
+% % Figure environment removed
+
+
+
+%Figure \ref{fig:cpu_attack_1} shows the contention level observed by a CPU spy process due to memory accesses of the trojan running only on the CPU for both memory reads and writes. It can be noticed latency difference between contention and lack of contention case is barely observable. We have also explored using larger buffer size at the trojan side. The contention level is not as high as the contention caused by integrated GPU, even though the buffer size is larger.
+
+
+
+
+
+
+%\begin{comment}
+
+To achieve a covert channel attack by exploiting the contention on the shared memory controller between CPU cores and iGPU, we need to address multiple primary challenges, including:
+
+\begin{itemize}
+
+
+\item In Intel-based systems, CPU cores and iGPU share resources such as LLC caches and ring interconnect. It is possible for such resources to cause contention considering the large memory traffic of iGPU. %This can possibly affect the level of contention which can be generated due to the memory controller. 
+    Since our work targets the shared memory controller as the contention source, it is necessary to determine the contribution of other shared resources in the contention level as well. \newline %compared to the contention caused by the memory controller.
+
+
+    \item Although we can use {\fontfamily{pcr}\selectfont clflush} instruction on the CPU side to flush the accessed data from the inclusive cache hierarchy of CPU cores, on the iGPU side, there is no support of {\fontfamily{pcr}\selectfont clflush} or similar instructions. Therefore, frequent memory accesses to the same buffer on the GPU side are mostly served by GPU's internal caches or LLC, reducing the contention on resources such as memory controller and DRAM. Considering this scenario, we need to ensure that all iGPU's accesses to the buffer are memory accesses or generate memory requests to the memory controller.\newline
+    
+    %Using {\fontfamily{pcr}\selectfont \_clflush} instruction is not needed in our attack for the GPU side. Considering this, and because we are using one kernel launch to leak secret information, consecutive accesses to the kernel buffer, will result on high cache hit rate reducing the contention on resources such as memory controller and DRAM. Considering this scenario, we need to make sure that all trojan accesses to kernel buffer are memory accesses. We explore using trojan memory writes to cause such contention.
+    
+   
+   %  \hoda{I remove this from here, very unclear and hard to follow at this point. We should talk about it in read vs. write sections.} \item Memory writes are not on the critical path of program execution as memory reads. Generally, memory writes do not necessarily indicate the execution behavior of targeted applications when viewed from memory controller perspective. This is mainly due to write-back policy and limited time measurement of write memory requests till caches \cite{add cite about write back}. This is unlike memory reads because programs are aware of both start and end time of serving memory read request. As a result, exploiting memory writes with relation to program execution behavior is challenging. It is necessary to be aware of when and how memory requests can cause contention with consideration to parallelism offered by iGPU.
+    
+    %\hoda{Memory read vs. write is not introduced yet, this is not clear!}
+    
+    
+    %\hoda{Launching a single kernel vs multiple kernel is not explained yet. The need for clflush is not clear.}
+\item  CPU cores and iGPU use different clock rates. This frequency disparity introduces a challenge to synchronization when the spy process on the CPU and trojan kernel on GPU are communicating through the covert channel.
+
+\end{itemize} 
+    
+
+
+In the next sections, we describe our approaches to overcome these challenges and some other issues in developing the covert channel.
+\end{comment}
+

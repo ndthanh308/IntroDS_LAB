@@ -1,0 +1,88 @@
+\section{Challenges with prototyping \name} \label{sec:implementation}
+
+Additional considerations arise when employing the ideas from Sec.~\ref{sec:design} while prototyping \name using off-the-shelf components. First, we need to acquire low-noise phase measurements. In Sec.~\ref{im:clock}, selecting the right clock is imperative to ensure a low phase noise. Second, due to hardware imperfections, we find that the expected PDoA measurements (Eq.~\ref{eq:pdoa}) do not match the real-world measurements. To account for the offsets, we devise a calibration scheme and re-consider the formulation of the expected PDoA measurements in Sec.~\ref{im:calib}. Finally, we explore the effects of multipath reflection on the TDoA measurements in Sec.~\ref{im:mp}.
+
+\subsection{Acquiring accurate time and phase} \label{im:clock}
+
+Before prototyping \name, we conducted extensive simulations to investigate the minimum phase and time acquisition accuracy needed to achieve few-centimeter positioning accuracy, assuming 6 antennas were equally spaced in a 1-meter region. In a $3 \times 3$ environment, we implemented the algorithm presented in Sec.~\ref{sec:des-opt} at varying phase and time acquisition noise levels. 
+Our simulation results are presented in Fig.~\ref{fig:error_param_study}(a), where the horizontal axis represents the standard deviation of the phase error, and the vertical axis represents the 50 percentile of the localization error. Each line shows the standard deviation of the time error.
+
+From this simulation, we make two key observations. First, we see that time errors between 3--250 ps provide similar localization accuracy, and these lines are grouped in the plot. However, exceeding $300$ ps in time error significantly increases localization error, as TDoA fails to segregate ambiguity made by PDoA. Second, these simulations clarify that few-cm level accurate localization requires high phase accuracy. Specifically, the red vertical line marks a threshold of $5^\circ$ of standard deviation in phase measurement needed to achieve few-cm accurate locations. 
+
+The synchronization clock is the main factor affecting this phase noise in our system. The phase of the UWB signal is measured by first down-converting the received signal with the carrier signal. It is measured relative to this carrier signal by the baseband processing unit~\cite{decawave-pdoa-kit}. And when we consider measuring the PDoA, we look at the difference in the phase of any two receivers. In this situation, if both receivers share the same carrier clock, then the PDoA they measure will be induced purely from the relative distance traveled by the signals to each receiver (see Eq.~\ref{eq:pdoa}). A simple way to achieve this is to connect the two receive antennas to the same UWB module~\cite{cao2021itracku}. However, we observed the overhead of extracting the complete CIR when implementing these systems is large ($\sim 1.2$ ms), precluding low-latency localization. Specifically, we have the API overhead to measure the data and the data extraction overhead over USB, requiring 599 $\mu$s and 612 $\mu$s, respectively. 
+
+Alternatively, we prototype our system using independent UWB modules~\cite{evb1000} for each receiver, eliminating the need to export CIR measurements. This reduces the data acquisition latency by $\sim 4 \times$ to $\sim 340~\mu$s. However, we cannot synchronize the carrier clocks on these independent modules, but instead, synchronize a lower $38.4$ MHz clock leading to phase measurement errors. Via measurements with different clocks, we find that the phase noise in this input clock can largely influence the noise in the PDoA measurements. Specifically, from the oscillator's data sheet~\cite{crystek}, we can obtain the phase noise of the oscillator, $N_\phi (f_{\rm offset})$ where $f_{\rm offset}$ is the frequency offset from the center frequency of the oscillator.
+Using the $N_\phi (f_{\rm offset})$, the standard deviation of clock jitter, $\sigma_{\rm jitter}$, can be expressed as follows.
+\begin{align}
+    \sigma_{\rm jitter} =  \frac{\sqrt{2}}{2 \pi f_{\rm osc}} \sqrt{\Delta f N_\phi (f_{\rm offset})}
+\end{align}
+where, $\Delta f$ is the bandwidth of the measurement and $f_{\rm osc}$ is the oscillator frequency. We measure the standard deviation of the phase error ($\sigma_\phi$) and time stamping error ($\sigma_t$) as:
+\begin{align*}
+    \sigma_{\phi} = \frac{c}{\lambda} \frac{f_{\rm osc}}{2 \pi f_s} \sigma_{\rm jitter}\ ; \quad \sigma_{t} = \frac{f_{\rm osc}}{f_{t}} \sigma_{\rm jitter}
+\end{align*}
+where, $f_s$ is the sampling frequency, $f_{\rm t}$ is the frequency of the clock used for to measure time-of-arrival and $c$ is the speed of light. We can choose an appropriate clock to meet our phase and time measurement thresholds by modeling this noise behavior. Many off-the-shelf~\cite{crystek, astxr} clocks satisfy these requirements at reasonable price points and employ \cite{crystek} in prototyping \name.
+For example, according to the datasheets provided by Crystek \cite{crystek} and Abracon \cite{astxr}, their respective phase noise values at 100 kHz offset are $-160$ dBc/Hz and $-150$ dBc/Hz, while their respective phase noise values at 100 Hz offset are $-115$ dBc/Hz and $-109$ dBc/Hz.
+
+
+% Figure environment removed
+
+\subsection{Combating hardware biases}\label{im:calib}
+
+In Eq.~\ref{eq:pdoa}, we provided an expression for the expected PDoA measurement if we know the underlying tag and receiver locations. In reality, however, we see a large deviation when we compare the expected PDoA measurements with true PDoA measurements. To verify this, we perform an experiment varying the distance of a tag from \name's localization module. In Fig.~\ref{fig:error_param_study}(b), the green`RAW' measurements are shifted from black ground truth `GND' measurements. Visually, we observe three deviations --- a constant additive bias ($\alpha$) which contributes to a downward shift, a multiplicative bias ($\beta$) w.r.t. distance affecting the slope of the line, and an exponential bias ($\gamma$) w.r.t. distance affecting the curvature (non-visualized in the figure). We assume these biases result from the ADC saturation when the distances are too close and propose a 3-point calibration to compute these hardware-specific calibrations below. Subsequently, we modify our \textit{expected} PDoA measurements from Eq.~\ref{eq:pdoa} as 
+\begin{align*}
+    \hat{\phi}_{i,j} = \mod\bigg( & \left\{\frac{2\pi d_i}{\lambda} - \alpha_i - \beta_i d_i^{\gamma_i}\right\} -  \\
+                                    & \left\{\frac{2\pi d_j}{\lambda} - \alpha_j - \beta_j d_j^{\gamma_j}\right\}, 2\pi\bigg)
+\end{align*}
+where, $\alpha_i$, $\beta_i$, $\gamma_i$ are the calibration parameters and $d_i = |\vec{p} - \vec{x_i}|$ is the distance between the tag and UWB receiver. 
+We replace Eq.~\ref{eq:pdoa} with this updated expected PDoA equation for the particle filter described in Sec.~\ref{sec:des-opt}. 
+
+To estimate these calibration parameters, we perform a three-point calibration. First, we model the phase ($\tilde{\Phi}$) measured at each UWB module according to these biases as
+\begin{align*}
+\tilde{\Phi}_i = \Phi_{i} + \alpha_i + \beta_i (d_i)^{\gamma_i}, \quad i \in [1, N],
+\end{align*}
+where $\tilde \Phi$ is the calibrated phase. Next, we measure the received phase ($\Phi$) at each UWB receiver for three \textit{known} locations within our space. Finally, we use regression to find the expected calibration parameters, which minimize the deviation between the measured and expected phases according to the above equation. 
+
+\subsection{Handling multipath reflections} \label{im:mp}
+
+However, in common indoor settings, reflections of the RF signal can potentially lead to ambiguities in TDoA measurement~\cite{scheuing2006disambiguation}. Despite our best efforts to acquire bias-corrected PDoA measurements, the presence of multipath can prevent us from ruling out ambiguous location predictions. However, UWB signals sample at the rate of $1$ GHz, implying a time resolution of $1$ ns. This fine-time resolution implies we are only corrupted by reflected paths whose additional travel distance is within $30$ cm. In indoor environments, finding such close-by reflected paths is unlikely, and we find that our direct path and reflected signals are separable in the time domain. With this in mind, we measure the time of arrival and phase of the signals at the hardware reported first peak index, FPI~\cite{dw_fpi}, at the 6 UWB receivers in \name's localization module.   
+
+% Figure environment removed
+
+
+\section{Enabling multi-tag operation} 
+\label{sec:des-mac}
+
+Through the ideas presented in Sec.~\ref{sec:design} and ~\ref{sec:implementation}, \name fulfills the first two requirements for a localization system to be compatible with XR applications --- ease of deployment (\textbf{R1}) and accuracy (\textbf{R2}). However, when we extend the current system to localize multiple tags in an environment, packet collisions amongst various tags can detrimentally affect our localization rates, resulting in a packet drop of $25\%$. Alternative to allowing tags to transmit arbitrarily, we can schedule individual tags at specific time intervals and leverage time-division multiple access (TDMA) to prevent collisions. 
+
+We seek to enable a total localization rate of $1000$ Hz at \name's receiver means localizing a $1000$ tags at a rate of $1$ Hz or $10$ tags at $100$ Hz.
+Specifically, we explore leveraging low-power wireless technologies~\cite{sanchez2016state,gupta2016ble} as a side channel for MAC protocol operation. 
+A MAC controller needs to perform three tasks --- onboarding new tags, providing time synchronization, and applying corrections to tags that deviate from their time slots. Existing systems~\cite{tiemann2019atlas, macoir2018mac, bauwens2021uwb} leverage UWB signals for providing this MAC control. However, we observe when a large number of tags need to be onboarded or corrections to the tag's time slots need to be made, frequent collisions between UWB beacons for localization and UWB transmission for MAC control can exacerbate the problem we seek to solve. Alternatively, we propose using an additional side-channel leveraging low-power wireless technologies~\cite{sanchez2016state,gupta2016ble} to simplify the MAC control and allow for independent tag management and localization functions.
+UWB is known to have high power consumption (e.g., about 416 mW for DW1000) during reception due to its use of wide bandwidth and despreading processing \cite{biri2020socitrack}.
+From the viewpoint of low power reception, using LoRa (e.g., about 20 mW for SX1280) or BLE (e.g., about 16 mW for nRF52832) for the side channel is practical.
+We employ LoRa as a side channel to furnish reliable and low-power MAC control for multiple tags.
+LoRa and UWB are at $~900$ MHz and $~3.5$ GHz, allowing them to co-exist with minimal interference. We also note that alternative side channels like BLE be employed; however, we choose to implement this prototype with LoRa given its simplicity. 
+
+The MAC protocol consists of two components --- a LoRa MAC controller (gateway), which is deployed along with the localization module we have built so far, and a LoRa Receiver (LoRa RX) connected to the UWB tag. The gateway performs the three core functions of the MAC protocol. 
+
+\noindent \textbf{Discovery and Onboarding:} New tags introduced to a system transmit beacon packets to announce their presence. Subsequently, the gateway invites these new tags to join the network by assigning a specific transmit time slot to transmit the UWB localization packets. The number and duration of a transmit slot are determined by the maximum number of tags and their localization rate. Currently, we support $1000$ slot with a $1$ ms slot width. Fig.~\ref{fig:implementation}(c) illustrates a block diagram of operation. 
+
+\noindent \textbf{Global Time sync:} Each tag must have a consistent notion of time slots, which requires a global time synchronization within the accuracy of at least half the slot width. Previous works~\cite{ramirez2019longshot} have showcased $\mu$s accuracy in synchronization clocks, and we leverage these works to provide time synchronization. Specifically, the gateway transmits time-sync packets every $100$ s, the time it takes for the $5$ ppm clocks to drift by $500$ $\mu$s, half the slot width for each tag. The LoRa RX receives these sync packets and corrects for its clock drift. 
+
+\noindent \textbf{Correcting erroneous tags:} Finally, as a precautionary measure, we develop a correction mechanism to re-slot colliding tags. There may be a time-sync failure at tags, resulting in transmission at an incorrect time slot, leading to consistent collisions among groups of tags. By tracking the tags which suffer consistent collisions, the gateway broadcasts a correction packet over LoRa to re-slot the erroneous tag.   
+
+\section{Implementation}
+
+We have seen \name consists of three core components --- the localization module, the LoRa MAC handler, and the UWB+LoRa tag. This section will take a closer look at prototyping these components. 
+
+\noindent \textbf{Localization Module:} \name's primary contribution is a single-vantage point localization module using off-the-shelf components with a size of $1$ m. This small size allows the localization module to be deployed within common electronics like TV's our soundbars.  
+Fig.\ref{fig:implementation} shows the implemented prototype.
+The prototype is built with $6$ UWB receivers EVB1000~\cite{evb1000}, with table~\ref{fig:implementation}(e) detailing the configuration parameters. We synchronize the UWB modules to a common clock (OCXO~\cite{crystek}) via a clock distributor module~\cite{lmk-clock} as shown by the `blue' path in Fig/~\ref{fig:implementation}(a).  
+Additional to the clock modification discussed in Sec.~\ref{im:clock}, we expose the EVB1000's `SYNC' pin to reset the time on the UWB modules to reduce bias in TDoA measurements. This sync is handled by an Arduino Due and is indicated in the `red' path, with additional details provided in \cite{tdoa_an}. 
+When each EVB1000 receives a single ``blink'' signal for localization from the UWB Tag, the receiver reports the first-peak-index (FPI) of the direct path in the channel impulse response's peak, the signal phase at this point, time of arrival (RXTIME), and a carrier phase correction (RCPHASE) via the data path (shown in black).
+
+\noindent \textbf{LoRa MAC gateway:} The LoRa gateway is the central controller to initialize, discover, and onboard all the tags in the environment. It is prototyped with a LoRa SX1272~\cite{sx1272mb2das} transmitter. This handler maintains the MAC state machine and performs all the functions described in Sec.~\ref{sec:des-mac}.  
+
+\noindent \textbf{Tags:} We prototype the tag (shown in Fig.~\ref{fig:implementation}(d)) using the EVB1000~\cite{evb1000} and program it with the parameters in Table~\ref{fig:implementation}(e). 
+The tag transmits `blink' packets at $60$ Hz, with each transmitted frame having 14 bytes of payload, including packet number and MAC address, to facilitate and test the MAC protocol. Operating in parallel, we have the LoRa SX1272 receiving time-sync packets from the Gateway module maintaining the UWB transmit slots and providing medium access control. An interrupt pin is raised by LoRa RX (shown in blue in Fig.~\ref{fig:implementation}(d)) to initiate a UWB `blink' transmission at the accurate time slot.    
+
+

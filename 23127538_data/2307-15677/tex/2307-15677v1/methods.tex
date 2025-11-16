@@ -1,0 +1,280 @@
+\section{Methods}
+\label{sec:methods}
+
+Figure~\ref{fig:overall_system_diagram} shows a high level view of our adversarial training method. We summarize the main parts leaving details for later sections:
+
+\begin{enumerate}
+    \item \textbf{Inputs}:  
+    \begin{itemize}
+        \item \textit{Raw features dataset (Section~\ref{subsubsec-input-data})}: We assume we have a tabular dataset with $N$ rows as input. For each row, the vector of raw feature values to be perturbed is $x \in \mathcal{X}$ and the classification target values is $y\in \mathcal{Y}$.
+        %, with $\mathcal{X}$ and $\mathcal{Y}$ the respective spaces. 
+        The union of all rows composing the dataset is denoted by matrices $X \in \mathcal{X}^N$ and $Y \in \mathcal{Y}^N$. 
+
+        \item \textit{Features plan (Section~\ref{subsubsec-input-data})}: We assume the set of raw features is enriched via a transformation $f: \mathcal{X}^N \to \mathcal{X}'$ of the input rows $X$ to produce a new vector of features $x' = f(X)$ for each row. The matrix of new feature values for all rows is denoted by $X'$. 
+        A row-by-row mapping operation is a special case where, instead, $x\to x' = f(x): \mathcal{X} \to \mathcal{X}'$. 
+        Feature engineering is important 
+        %for model training 
+        in tabular data domains
+        %to be able to train high performance ML models. 
+        and it often involves non-bijective mappings from the raw dataset, which forces us to adapt the adversarial training loop. Aggregations that group several instances, such as time window aggregations grouped by an entity (e.g., user), which we denote as profiles, and feature extraction from text fields, are common examples.
+    \end{itemize}
+    \item \textbf{Apply feature engineering:} The first step is then to enrich the original raw features dataset by applying the features plan.
+    \item \textbf{Train Profile Features Estimator} (Section~\ref{subsubsec:perturbed-features-update-methods}): 
+    %This is an example of a non-bijective mapping from groups of raw events to the new space of features (i.e., $\mathcal{X}^N \to \mathcal{X}'$). 
+    Profile feature re-computations can be expensive inside the adversarial training loop. For a faster adversarial training we train auxiliary models to estimate changes in profiles under adversarial attacks, using only the unperturbed event.
+    %, i.e., approximating it with a row-by-row mapping. 
+    \item \textbf{Train Initial Classifier (to be made robust):} Before adversarial training, we train a model on the unperturbed dataset. 
+    \item \textbf{Adversarial Training Loop} (Section~\ref{subsec:adversarial-training}):  This consists of several rounds of i) searching for attacks on a portion of the training set instances and ii) updating the model by including those perturbed instances in the training. The main goal is to obtain a robust model that, after a number of rounds, performs better than the initial model trained without attacks, when both are subject to the same attack search strategy. Our steps of adversarial training are as follows: 
+    \begin{enumerate}
+        \item \textit{Sample Instances:} We focus on a binary classification use-case where only the positive instances are sampled to be attacked. The goal is to lead the model into wrongly classifying positives as negatives.
+        \item \textit{Attack Search} (Section~\ref{subsec:adversarial-perturbations}): Next we search for the best attack for each of the selected instances. Our attacks are targeted at reducing the positive class score by perturbing a set of raw fields. Then the perturbations are propagated to the engineered features. In particular, the perturbations of the profile features are applied using the pre-trained \textit{Profile Features Estimator}. 
+        \item \textit{Update Classifier:} The attacked dataset is then used to tune the model by performing several gradient steps (we use a gradient boosted decision trees algorithm).
+        \item \textit{Attack Validation Set 
+ and Evaluate Model:} Finally, the validation set is attacked and a target performance is evaluated on it to verify if the model performance stabilized or if adversarial training continues.
+    \end{enumerate}
+\end{enumerate}
+In the next sections we provide further details of the method.
+
+\subsection{Input Data Transformations}
+\label{subsubsec-input-data}
+
+%We start by describing the raw input data.
+%We provide examples for the use case of credit card fraud detection, though our setup applies more generally.
+We assume the input data contains numerical features, text fields and categorical features.
+%We assume the input data contains numerical features (e.g., transaction amount, geolocation coordinates or timestamp), text fields (e.g., addresses, phone numbers) and categorical features (e.g., country codes, entity identifiers, labels of particular classification systems or ranges of a numerical feature).
+% \begin{itemize}
+%     \item \textit{Numerical features:} In credit card fraud detection this can be, for example:  transaction amount, geolocation coordinates, physical dimensions of items being purchased or a timestamp. 
+%     %In another example of an industrial application where a classifier is used to detect cracks in a material~\cite{Wang_2022}, this could be features describing an image of the material or readings of a sensor (e.g., temperature or humidity). 
+%     \item \textit{Text field features:} These are often useful for feature extraction. Examples are addresses, phone numbers or text descriptions.
+%     \item \textit{Categorical features:} These are numbers, text, or they may be extracted from other features (e.g., text fields or numerical fields). Some examples are country codes, entity identifiers, labels of particular classification systems or ranges of a numerical features.
+% \end{itemize}
+Complex entities may be present combining various features. For example, a card entity combines a categorical feature to identify the credit card network with a card number and expiry date. 
+So, an attack where a card is switched likely changes many attributes at once. 
+%The same may hold for other composite entities describing a merchant or someone's account. 
+Next we describe transformations to produce features in $\mathcal{X}'$.
+
+\subsubsection{Row-wise map operations:} 
+%These are functions that take one or more raw features of a single row and output a new feature. 
+Simple examples in transaction fraud detection are: i) compute a ratio between two features, ii) extract a country category from a phone number, iii) extract geolocation from a zip code, etc...
+
+\subsubsection{Aggregations of groups of rows:}
+These features encode more complex information.
+%and are often implemented by non-bijective mappings. 
+Examples are temporal or spatial windowed aggregations that group together instances within a time frame or in a given spatial region 
+%In our empirical study we compute profile features, which consist of aggregations over a rolling time window for a given group-by entity value. 
+(a count of transactions by a card in the last 24 hours is such a profile feature aggregation). In this example, perturbing the timestamp of the targeted row could potentially influence which rows are used in the aggregation, 
+%Thus, in this type of aggregation perturbing the raw features of a row,  
+%These make adversarial training non-trivial since perturbing the raw features of a row may change which other rows fall into the group, 
+%may imply a re-computation of the group before aggregation, 
+thus making adversarial training non-trivial. On the other hand, if perturbations are applied on the co-domain $\mathcal{X'}$ directly, i.e., on the engineered features, we can obtain values that do not correspond to any configuration of perturbed rows in the domain $\mathcal{X}^N$. Or, even if they do, finding the exact domain values might be very complex, involving finding the exact grouping configuration originating the perturbed feature value.
+More specifically, consider the example of the count of transactions by a card in the last 24 hours. If the count is perturbed directly, e.g., from 5 to 12, we have to find how to adjust the timestamps of several other rows so that they fall into the last 24 hours to increase the count (with the complex side effect of perturbing several other groups containing the adjusted rows). This example shows that devising an efficient way to propagate perturbations from $\mathcal{X}$ to $\mathcal{X}'$ is key for adversarial training (later discussed in Section~\ref{subsubsec:perturbed-features-update-methods}).
+
+\subsubsection{Higher order transformations:}
+Finally, it is common to apply secondary transformations to the generated features. This is useful to provide direct signals to the model.
+%thus reducing the burden on the model to learn such signals in its training. 
+For example, after computing a profile feature for the average and standard deviation of the amount spent by a card in the last week, compute a z-score for the amount of the current transaction to signal how much of an outlier the observed amount is. 
+%Another simpler example would be a ratio to compare two features.
+
+%Some further specific examples of some of these fields that are relevant for the credit card fraud detection use case are network related features (which fall into the categorical or text fields) such as IP address, network type, device type or  browser type. In many applications, other complex entities also arise that may combine various field types. For example, a card entity may combine a categorical feature to identify the credit card network, the card number and expiry date. So, for example, an attack where the card is switched will likely change many (if not all) of the attributes of this entity. The same may hold for other composite entities like merchant or account, depending on the application. 
+%In an example of crack identification in a building, such a complex entity could be the building component (with properties such as component type or material).
+
+\subsection{Adversarial Perturbations}
+\label{subsec:adversarial-perturbations}
+We discuss how to define adversarial perturbations on $\mathcal{X}$, propagate them to $\mathcal{X}'$, measure their magnitude and search for them.
+
+\subsubsection{Types of perturbations}
+\begin{itemize}
+    \item \textit{Categorical perturbations:} Categorical features are perturbed by replacing the category value by an existing value.
+    \item \textit{Text perturbations:} The string in a text feature can be changed in part (e.g., replacing, removing or adding characters) or fully. If used as a categorical it amounts to replacing the category value. If used for feature extraction then derived features can be affected.
+    \item \textit{Numerical perturbations:} These can be defined by a shift, scaling or any other numerical mapping. 
+    \item \textit{Grouped perturbations:} In some cases groups of features may be perturbed together in a correlated way, either categorical, text or numerical groups or mixtures of any of them. For example, a perturbation of a latitude coordinate may imply a perturbation of the longitude within the constraint of not falling into the ocean.
+\end{itemize}
+
+\subsubsection{Perturbation Propagation Methods}
+\label{subsubsec:perturbed-features-update-methods}
+
+In this section, we start by discussing how perturbations propagate from $\mathcal{X}$ to $\mathcal{X}'$, in the credit card fraud detection use case, to present our perturbations pipeline. Then we discuss practical methods to update such derived features either exactly or approximately.
+
+\subsubsection*{Examples of effects of perturbations on engineered features}
+In credit card fraud detection common attacks by fraudsters are as follows:
+\begin{itemize}
+    \item \textit{Amount perturbations} -  
+    A fraudster can alter the numerical amount of a transaction, thereby affecting profile features.
+    %
+    \item \textit{Temporal perturbations} - This impacts profile features. Shifting the timestamp of an instance alters which instances are in the time window, thereby affecting the aggregation outcome.
+    %
+    \item \textit{Card resets or switches} - 
+    In fraud detection
+    %This perturbation type involves replacing an entity (which may comprise categorical and numerical features) with a new one or some of its attributes. In fraud detection 
+    this corresponds to a fraudster switching a card that was identified as stolen. The engineered features involving the card identifier as a grouping criterion are reset to a base value (e.g., the count of transactions of the card in a time window goes back to 1). If all the card's features are changed (e.g., the card issuing network also changes) we call it a card switch.
+    %
+    \item \textit{Geolocation perturbations} - This is an example of a group of numerical features (latitude and longitude) that are typically perturbed simultaneously. In some scenarios, fraudsters could spoof their IP, which is used to identify their location. 
+    %In that case, when an IP changes, both coordinates change. 
+    %Engineered features may contain for example distances between the geolocation in one transaction and a previous one, or between a home address geolocation and the card (or transaction) geolocation.
+\end{itemize}
+In our method we apply such perturbations to a transaction in 4 steps: i) change categorical and numerical features directly (either individually or in groups) in an exact manner, ii) shift timestamp and update the corresponding profiles, iii) change the amount and update profiles 
+%(assuming fraudsters can change amounts arbitrarily) 
+and iv) reset profiles by changing the values of grouping entities (e.g., card). A representation of this pipeline applied to a perturbed (victim) instance is displayed in Figure~\ref{fig:pipeline}.
+% Figure environment removed
+
+\subsubsection*{Exact updates}
+We now provide examples of exact updates of the engineered features in $\mathcal{X}'$ following the pipeline of Figure~\ref{fig:pipeline}:
+\begin{itemize}
+    \item \textit{Categorical features updates:} 
+    To perturb such a feature one simply changes its value (e.g., switch the card issuer from Visa to Mastercard).
+    When perturbing categorical features, it is important to note that they are frequently interdependent
+    %in ways that are limited by the domain. 
+    For instance, the distribution of Card Verification Value (CVV) flags may differ across various card issuers. Therefore, some categorical feature groups have to be perturbed together. Thus, for a card switch, we replace the values of its features by those of another card, selected randomly with uniform probability (i.e., reproducing the original dataset's distribution).
+    %, and replace the features in the original transaction accordingly. 
+    Similar arguments hold for network features. After categorical features are perturbed, other dependent features may also be updated either exactly or approximately (see other examples provided in this and the next section).
+    \item \textit{Latitude and Longitude:}
+    Values are selected for both coordinates simultaneously using a uniform distribution from regions with sufficient density in the original dataset.
+    \item \textit{Aggregation function value updates}: Even if a group of instances used in an aggregation does not change (e.g., as a result of a timestamp perturbation), other perturbed features may change the output of the aggregation. For sum profiles and other associative operations this can be updated exactly by computing differences. For example, if the sum amount in the last hour for a victim card is 1200 when the amount for the current transaction is 100, the new sum amount will be 1150 when the transaction amount is perturbed to 50.  
+    \item \textit{Higher order transformation updates:} Other secondary feature updates are, in many cases, straightforward, since most consist of ratios between profiles or derived features via functions of a single row. 
+    %After perturbing profiles and mapped features, the old values of profile ratios (or other secondary mapped features using such profiles) are no longer correct and can, in many such examples, be adjusted exactly.
+\end{itemize}
+
+\subsubsection*{Approximate updates}
+
+We now discuss methods to approximate temporal aggregations (i.e., profiles):
+%As already discussed, these aggregations are typically heavier to compute so, in the adversarial training loop, we use the following approaches:
+
+\begin{itemize}
+    \item \textit{Data-driven}: For time windows with a large number of instances in each group (high volume profiles), we estimate perturbations of a single instance using a look-up table that stores the mean profile value over time for each profile. The assumption is that 
+    %shifting just one instance in time does not affect much the aggregation value at any one point in time, so 
+    the main source of change is not due to the instance shifting in time but, instead, is due to the group of instances changing.  An example of a high volume profile is  the number of transactions for a given merchant (e.g., an electronics retail website) in the last month.
+    %So, e.g., if we want to estimate what is the total amount sent to a specific entity that groups a large volume of transactions in a specific timestamp, we need only to perform a look-up operation of a transaction that occurred around that time. 
+    %To avoid expensive look-up operations over millions of records to find a previous transaction near the timestamp after the perturbation, 
+    For these profiles we compute a histogram of values by binning over time (e.g., calculate the mean for each profile using bins of one hour - see diagram in Figure~\ref{fig:dd-diagram}). 
+    %
+    % Figure environment removed
+    %
+    Then, for the perturbed value of a profile feature, we use the mean value found in the look-up table for this feature at the new temporal bin (due to the time shift). 
+    This approach assumes that within the time-frame of 1 bin, the profile value does not change significantly around the mean when a single event is inserted or removed. 
+    \item \textit{Model-based}: For profiles with a small number of instances in each group (low volume) we estimate their changes over time by fitting a multi-output regression model. To train each model, we build a dataset containing instances perturbed several times, corresponding to profile changes for various perturbation time intervals (positive or negative delays). The features of one perturbed example, for the regression task, consist of the  raw and engineered features before the perturbation (including profiles) and the amount of delay that was injected in the timestamp. The regression targets are the resulting profile values computed exactly. We consider delays between one minute and one week for consistency with the typical time windows used for profiling. We choose to draw delays $\delta t$ from a logarithmic (scale invariant) distribution with constant probability for $\log |\delta t|$, and with equal probability for either sign.
+
+\end{itemize}  
+
+\subsection{Perturbation Norms}
+\label{sub:pert_norm}
+To be able to quantify the magnitude of a perturbation, we define a norm on $\mathcal{X}$, which is specifically tailored to the use case we want to investigate. In credit card fraud detection, fraudsters are only able to manipulate the raw features directly so a norm on this space reflects the real costs driving the fraudster's decisions when attacking the model. Furthermore, a norm on the raw features is more practical, since it can be computed before the (often complex) updates of the engineered features. 
+%We denote this norm by \textit{fraudster cost} norm. 
+It is defined by assigning a custom set of costs for each attacked feature
+%, related to how expensive it is for the fraudster to apply a given perturbation, 
+and then summing them.  To gain insights on the relative importance of each type of perturbation, we interviewed domain experts whose knowledge helped defining the following parametrization of perturbations:
+%
+% % Figure environment removed
+%
+\begin{itemize}
+\label{list:vectors}
+    \item \textit{Amount perturbations cost}: We allow to vary between 2\% to five times larger than the original value through a scaling factor. We use a custom cost function of the scaling factor $s$ that grows as:
+    \begin{equation}
+        \sim c_{\textrm{amount}} \begin{cases}
+        \log(s) &, s > 1 \\
+        \log(1/s) &, s \leq 1
+        \end{cases}
+    \end{equation}
+    where $c_{\textrm{amount}}$ is a constant. Note that, from a fraudster's perspective, both reducing or increasing the amount incurs a penalty related to trial and error (increasing the risk of blocking several cards while trying). Increasing the amount offsets some of the penalty with extra profits from using a larger amount. In contrast, reducing the amount always reduces the profit a fraudster can extract from a stolen card, which is why a rapidly growing penalty is used when $s$ decreases.
+    %This parametrization has the advantage of allowing us to adjust derived features, such as original currency amount, without having to deal with \enquote{exchange rates}.
+    %
+    \item \textit{Temporal perturbations} - We allow time shifts $|\delta t|$ (in milliseconds) smaller than 1 week with a cost $\sim c_{\mathrm{temporal}} \log(|\delta t| + 1)$.
+    %
+    \item \textit{Card resets and switches} - It is frequent for a fraudster to have access to various stolen cards (e.g., stolen online banking details that allow them to generate virtual cards). We consider two types of perturbations: i) card resets, which consist of preserving card features (e.g., name, issuing network, etc...) while only changing the card id, ii) card switches, which consist of using a completely new card with all features changed (assumed to cost more).
+    %
+    \item \textit{Geolocation and Network perturbations} - Fraudsters can easily manipulate these (e.g., changing IP through a Virtual Private Network). Thus, we assign small constant costs to each of these.
+    %
+\end{itemize}
+A summary of the costs used in the experiments is provided in Table~\ref{tab:costs}.
+\begin{table*}
+\centering
+\begin{tabular}{|r|c|c|c|c|c|c|}
+\hline
+\textbf{Perturbation} & Network & Geolocation & Temporal & Amount & Card reset & Card switch (=Card Reset + Additional Cost)    \\ \hline \hline
+\textbf{Cost}         & 3       & 4           & 18 ($\max$)       & 26 ($\max$)     & 33         & 49 (= 33 + 16) \\ \hline
+\end{tabular}
+\caption{Cost of each perturbation used in the experiments.}
+\label{tab:costs}
+\end{table*}
+We normalize the values so that the norm ranges from 0 to 100 (when all maximal perturbations are applied). 
+%We consider that reducing the original amount to 1\% of its original value is as \enquote{expensive} for the fraudster as it is to get a new card, since both of these operations represent a major change in how a fraudster must actually commit fraud. These represent the largest two perturbations, and the other ones are adjusted according to the qualitative information collected by domain experts on the relative difficulty of each perturbation.
+It is important to note that the choice of norm is use-case specific. The values we choose for the experiments, though well motivated, are illustrative.
+
+\subsection{Perturbation Search Strategies}
+\label{subsec:perturbation-search-strategies}
+We now describe methods to generate attacks on $\mathcal{X}$. The goal is to generate attacks with the highest possible success rate under the lowest possible search budget.  The main attack generation strategies in the literature are: \textit{black box}, \textit{white box} and \textit{white box proxies}, respectively corresponding to attacks with access to: i) the system decision, ii) the full model, iii) to a model that imitates the true model. Another intermediate possibility, which we explore, is to attack a black box model in a partial observability setting, i.e., with full access to the model outputs (e.g., model scores and not only the final decision). 
+
+\subsubsection*{Random Search}
+This is a black box approach that serves as a baseline for the other search methods.
+For each sample to be perturbed, many random perturbations are generated independently by sampling a Bernoulli variable for each feature, to decide if the feature is perturbed.  The Bernoulli trial probability is kept low so that it is not very likely to perturb an instance using all raw perturbations, which may skew the distribution of norms to large values. For each perturbed feature, a new value is generated from a feature specific distribution (as discussed in Sect.~\ref{subsubsec:perturbed-features-update-methods}).
+%
+A similar strategy is used for every independently perturbed feature, whereas for features groups (e.g., card features) a single Bernoulli trial is used to perturb the group.
+%
+% We include the pseudo-code for the random search in the algorithm box~\ref{algo:rsearch}.
+% %
+% \begin{algorithm}
+% \caption{Random search pseudocode}
+% \begin{algorithmic}
+% \State $\tilde{x} \gets x$ \Comment{Initialize adversarial sample to be the same as victim}
+% \For{$d \: : \: directions$}
+% \State $u \gets rand()$
+% \If{$u < p_{d}$} \Comment{$p_d$ being the probability of perturbing direction $d$}
+%     \State $\delta \gets \mathrm{sample}(\Delta_d)$ \Comment{Sample a perturbation according to direction $d$}
+%     \State $\tilde{x} \gets \mathrm{apply}(\delta, \tilde{x})$ \Comment{Update adversarial attack with the perturbation we just sampled}
+% \EndIf
+% \EndFor
+% \end{algorithmic}
+% \label{algo:rsearch}
+% \end{algorithm}
+% %
+
+To evaluate an adversarial strategy, such as random search, we can consider its success rate in addition to the size of the perturbations it generates. The success rate is computed as:
+\begin{equation}
+    \text{Sucess Rate} = \frac{\# \; \text{successful attacks}}{\# \; \text{generated attacks}}\; .
+    \label{eq:sr}
+\end{equation}
+%
+For random search, an adversarial attack is successful if any of the generated attacks on an instance switches the model decision. 
+%For example, in binary classification, a transaction that was formerly labelled as positive, is now labelled as negative.
+
+\subsubsection*{Stochastic Coordinate Descent}
+Given the high prevalence of discrete variables in the search space for the use case at hand, we employ standard algorithms from the discrete optimization literature, namely Stochastic Coordinate Descent (SCD)~\cite{scd}. SCD is initialized with a clean input instance followed by several iterations sweeping over various features. A sweep consists of repeatedly picking a different random feature to attack until all features have been selected. For each selected feature we explore its values, and update the perturbation value if it is better than the last perturbation (e.g., in fraud detection if it results in a lower model score, corresponding to a lower fraud risk). In this method convergence occurs whenever a full sweep of all features yields no improvements. In particular, whenever a feature is selected, a grid of possible values to explore is generated within the norm constraint on the perturbation. For categorical features all values are explored whereas for numerical features a discrete grid of values is generated. 
+
+Variations of this method can be formulated depending on the criterion used to select the best perturbation from the grid, 
+%(i.e., the criterion that defines the best perturbation), 
+namely:
+\begin{itemize}
+    \item \textit{Greedy approach}: When the goal is to trick the model into classifying positives as negatives, we accept perturbations yielding a smaller model score.
+    %from the generated grid for a direction.  This is expected to converge fast, while being prone to get stuck in local minima.
+
+    \item \textit{Cost-efficient approach}:
+    In each attempt to perturb a feature, we select the perturbation with the best norm change to score change ratio. Thus, this approach tries to avoid getting stuck in local minima by optimizing for cost-efficiency. 
+    %It is expected to yield higher success rates at the expense of more iterations and a longer time to converge.
+\end{itemize}
+
+\subsubsection*{Greedy Search}
+Another approach, which tries to circumvent the local minima problem, consists of generating and exploring a grid for every feature on each iteration and pick the best feature to perturb.
+%taking the SCD greedy strategy one step further: on each iteration, a grid is generated for all directions \textit{individually}. We then explore every direction simultaneously and pick the best one. 
+%This may circumvent the local minima problem, allowing to be greedy more safely. 
+The success rate of this method 
+%of such method 
+is expected to be higher at the expense of more model score evaluations and, thus, slower convergence.
+
+\subsection{Adversarial Training}
+\label{subsec:adversarial-training}
+In this section we describe specific choices of our implementation of adversarial training described at the beginning of Section~\ref{sec:methods}.
+
+We begin by generating attacks against a baseline model. These attacks take a percentage of the positives in the training set and all positives in the validation set. The attack strategy has its own set of parameters. The norm constraint is the most important one, as it determines the maximum cost of the attack and significantly affects the attack's success rate.
+
+After replacing the generated samples in the training and validation sets we update the model by running several iterations of gradient boosting with early stopping.
+%if the validation set target metric stops improving.
+
+Finally, to validate the updated model we generate new attacks on the validation set and compute three metrics. We evaluate the model's performance against a dataset without any adversarial attacks with the \textit{Clean pAUC at a 1\% FPR}, i.e., the area under the ROC curve up to $1\%$ False Positive Rate\footnote{In fraud detection, the operating region is usually at a low FPR to keep the number of alerts under control.}. 
+%(in our case, 1\%) 
+%using exclusively non-adversarial data, we evaluate .
+This gives us an unbiased estimate of its performance 
+%how well we expect our model to perform 
+on clean test set. 
+Similarly, we compute the \textit{Adversarial pAUC at 1\% FPR} 
+%to measure the performance of our model in an adversarial setting, i.e., calculated 
+on the attacked version of the validation set, which can only be as high as the clean pAUC, since the attack strategy never generates perturbations that are easier to classify. Lastly, we also assess the attack's \textit{Success Rate}.
+

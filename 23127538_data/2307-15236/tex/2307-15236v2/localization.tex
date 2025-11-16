@@ -1,0 +1,86 @@
+\label{sec:localization}
+
+Localization is the process by which the robot determines where it is with respect to a global frame of reference.
+As opposed to state estimation, this typically occurs at a reduced rate and provides corrections to odometric drift.
+A localization system attempts to match its sensor data to a known model of the environment or build the model simultaneously, e.g., Simultaneous Localization and Mapping (SLAM).
+Commonly, localization is preformed using 2D laser scanners, 3D lidars, or cameras - though techniques exist using more exotic and/or mixtures of sensors.
+Localization's output is a pose and confidence relative to a world model.
+This pose solves the REP 105 portion of the \textit{tf} transformation tree from {\tt map} to {\tt odom}.
+
+In ROS~2, the standard localization and SLAM implementations continue to be 2D laser scanner techniques due to their robustness in dynamic and changing environments over long durations.
+While strides have been made in visual techniques, the field is still rapidly evolving and even relatively mature methods like ORB-SLAM3 are insufficiently robust for large classes of practical robotics tasks \cite{vslam}.
+They are generally sufficient for a number of small-scale or short-duration applications, but official ROS~2 support requires further substantive improvements. 
+
+\subsection{Localization}
+\label{sec:secloc}
+\label{sec:amcl}
+
+\textbf{AMCL} One popular approach for solving the localization problem is through the use of particle filters \cite{particle_filter}, which enable robust state estimation in dynamic environments and in the presence of noisy sensor data. Particle filters represent non-Gaussian statistical distributions using a discrete set of hypotheses (particles). In the case of mobile robot localization, the distribution represents the probable pose of the robot. 
+
+If an initial pose is not set, a particle filter may initialize the particle cloud by uniformly distributing it throughout the space.
+Otherwise, the particles are distributed around the provided start pose of the robot.
+At each update step, the particles are projected using a kinematic model of the robot with noise perturbations.
+The particles are then weighted based on the likelihood of their sensor observations at that pose.
+The filter may then resample the particles, that is, generate a new particle distribution by selecting particles from the existing distribution.
+
+The \textit{amcl} (Adaptive Monte Carlo Localization) package contains a pure and fully-parameterized implementation of the grid particle filter localizer, Fig. \ref{fig:amcl} \cite{prob_rob}.
+The package exposes numerous parameters for controlling the full behavior of the filter: minimum and maximum particle counts, resampling periods, statistical weights, motion model noises, and more.
+State projection is handled via a motion model that supports differential drive or holonomic bases with configurable characteristics.
+Particle weight assignment is performed by taking the current laser scan of the environment in the sensor frame, transforming it based on the pose of each particle, and then attempting to match the scan to a rastered map of the environment.
+Particles that have better matches with the map will therefore have higher weights, and will be more likely to be selected in the next resampling step.
+
+Like the odometry model, the laser model is highly configurable.
+Two main models are supported: the \textit{beam model} performs ray tracing from each particle to generate a model laser beam, and then compares the ideal beam with the sensed laser measurements \cite{beammodel}.
+The beam model models four sources of error due to physical phenomenon with the laser scanner and environment: sensor measurement noise, changes in the environment, failures to measure, and random noise.  
+The \textit{likelihood field model} diffuses the map via a Gaussian distribution into a lookup grid such that each cell represents the range from that cell to the nearest occupied cell in the original map \cite{lhfieldmodel}.
+Each laser scan point is then projected onto the lookup grid, and the score for the scan is proportional to the sum of the values of the cells into which the projected points fall.
+This models sensor noise using the Gaussian distribution, but also explicitly models errors from sensor failures and random measurements in the same way as the beam model. 
+This can be more optimal computationally as well as resolve lack of smoothness concerns with the beam model due to many small, dispersed occupancy grid entries in complex settings.
+The performance characteristics of the \textit{amcl} package is well researched and can achieve localization accuracies of 5 cm or better in many practical environments \cite{amcl_acc}.
+
+% Figure environment removed
+
+\textbf{GPS Localization} Localizing a robot using GPS sensors is a popular approach for outdoor robot platforms. While subject to drift in some environments, GPS data provides a globally unambiguous positional reference and reduces the need for techniques that rely on expensive sensors. The key to integrating GPS data in a robot's state estimate is the computation of the transform between the robot's world frame (e.g., the {\tt map} frame as specified in REP-105) and the GPS frame, most commonly the WGS-84 geodetic datum \cite{wgs84}.
+
+Generating this transform requires knowledge of the robot's pose in a world frame, the robot's latitude and longitude as provided from a GPS sensor, and the robot's heading in an earth-referenced frame, as might be obtained via an IMU with a magnetometer.
+
+The \textit{robot\_localization} package described in Section \ref{sec:rl} provides the NavSat Transform Node, whose purpose is to calculate this transformation. It does this by converting the GPS position and earth-referenced heading into a position in the Universal Transverse Mercator (UTM) coordinate frame \cite{utm}. From there, the transform to the robot's world frame is trivial. The output of NavSat Transform Node is a pose that can be fused into the robot's state estimate or directly used for localization with respect to the robot's world frame.
+The accuracy of GPS localization is limited by the environment, quality of the GPS receiver, and whether RTK (Real-time kinematic) GPS corrections are available in the area.
+When RTK is available, accuracies can reach 2 cm or better \cite{rtk}.
+
+\subsection{Mapping}
+
+Mapping solves the fundamental problem of how a robot understands its environment.
+It uses sensor data and potentially robot state estimates to generate a globally accurate model of the world.
+This world representation is used for many tasks, including global planning and localization, when not using GPS or other global positioning systems.
+Succinctly, mapping is the process of learning a world's contents from sensor data.
+For mapping techniques in ROS~2, the map is represented as an occupancy grid, or a grid map of cells representing the probability of occupancy.
+They also perform mapping and localization simultaneously, e.g. SLAM. 
+
+\textbf{Cartographer} provides real-time simultaneous localization and mapping in both 2D and 3D for multiple platforms and sensor configurations using pose-graph optimization \cite{cartographer}.
+Laser scans are added into submaps over short periods of time to create locally accurate maps with current measurements.
+Scan matching is performed on these local submaps and the scan is inserted into the submap at its best estimated pose.
+When a submap is completed, it takes part in a loop closure process which compares submaps and local scans to refine the global occupancy grid model.
+
+While Cartographer is a good option for some users, it is worth noting that out-of-the-box results with Cartographer are typically poor.
+It is possible to achieve 3-5 cm accuracy using Cartographer, but requires extensive professional tuning using hardware platforms with high-quality odometry.
+Further, the original author's organization has halted development and support.
+ROS~2 support is managed by a community effort but has not received significant attention due to the complexity of the codebase.
+Thus, it is difficult to recommend the use of Cartographer. 
+
+% Figure environment removed
+
+% SLAM TOOLBOX
+\textbf{SLAM Toolbox} is a set of tools and capabilities for 2D SLAM built upon the OpenKarto SLAM library \cite{slam}.
+SLAM Toolbox is also a pose-graph optimization method.
+It matches incoming sensor readings with a recent rolling buffer of scans to provide a corrected pose.
+This uses a correlation grid constructed from the buffer of local measurements to match the incoming scan at a coarse half-resolution, followed up by full resolution for fine tuning the results.
+
+The incoming scan with the initially corrected pose is then evaluated for loop closure.
+Candidate scans are found which are near the incoming measurement but not connected locally in the graph.
+The candidates are matched against the scan at a coarse resolution.
+If the match is strong enough, a full resolution match is performed on the fine correlation grid.
+If again the match is sufficiently strong, a constraint is added; then the pose-graph optimization process is performed. 
+
+Changes were made to the OpenKarto library to increase speed of scan matching using multi-threading and replace the Sparse Bundle Adjustment with Google Ceres to provide more flexible optimization settings. It can reliably map spaces greater than 100,000 sq ft in real-time (fig. \ref{fig:slam}), enables serialization of maps for continued mapping, allows for manual manipulation of the pose-graph, and comes with several operating modes. 
+

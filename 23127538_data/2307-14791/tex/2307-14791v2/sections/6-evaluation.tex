@@ -1,0 +1,220 @@
+\section{Evaluation}
+\label{section:evaluation}
+
+In this section, we evaluate \maestro and the three different types of parallel implementations it can generate: (1) \emph{shared-nothing}, (2) \emph{lock-based}, and (3) parallel solutions using \emph{hardware transactional memory}~\cite{larus2007transactional} via the Intel's Restricted Transactional Memory interface~\cite{rtm}.
+We aim to answer four questions:
+(i) how long does it take \maestro to parallelize NFs?
+(ii) how well does the performance of these parallel implementations scale with the number of cores?
+(iii) what are the impacts on performance of the various parallelization strategies that \maestro can use?
+and (iv) how do \maestro's automatic parallel implementations fare against highly-optimized manually parallelized versions?
+
+%-------------------------------------------------------------------------------
+\subsection{Target NFs and Microbenchmarks}
+\label{subsection:microbenchmarks}
+%-------------------------------------------------------------------------------
+
+To evaluate \maestro we analyzed 8 NFs---a simple forwarder (NOP), a policer, a bridge, a firewall (FW), a port scan detector (PSD), a NAT, a load-balancer (LB), and a connection limiter (CL). These are open-source NFs, most are non-trivial in complexity, and all have been used by a body of previous work~\cite{zaostrovnykh2019verifying,bolt,pix}\protect\footnote{As mentioned in \cref{section:limitations}, the requirement that NFs be amenable to ESE can prevent \maestro from analyzing many existing codebases.}.
+In this section, we present a brief description of each, and show how \maestro parallelizes them\protect\footnote{Every automatically generated parallel solution can be found on~\cite{maestro-repo}.}.
+For each NF, we measured how much time \maestro took to generate a parallel implementation (shared-nothing when possible, lock-based otherwise), summarizing the results in \cref{fig:microbenchmarks}.
+
+% Figure environment removed
+
+%-------------------------------------------------------------------------------
+\subsubsection{NOP}
+%-------------------------------------------------------------------------------
+This is a simple forwarding no-operation NF, \ie a stateless NF that simply forwards all packets that arrive from one interface to the other.
+\maestro finds that this NF has no state, and provides no constraints between packets arriving at the same core.
+RSS is thus configured with all available packets fields and a random key on both ports.
+
+%-------------------------------------------------------------------------------
+\subsubsection{Policer}
+%-------------------------------------------------------------------------------
+This NF aims to limit each user's download rate, identifying users by their IPv4 address.
+When \maestro analyzes this NF, it finds that state is indexed by the destination IP address, implying that packets with the same destination address must be sent to the same core.
+Because this constraint uses the destination IP address, the chosen RSS packet field options must contain this field.
+Although DPDK allows RSS packet field options containing only IP addresses, our NICs do not support this option.
+\maestro thus chooses a packet field option that includes IP addresses and TCP/UDP ports.
+This increases the complexity of the constraints on the key, increasing the generation time in \cref{fig:microbenchmarks}.
+
+%-------------------------------------------------------------------------------
+\subsubsection{Bridge}
+%-------------------------------------------------------------------------------
+A bridge associates MAC addresses with interfaces, and redirects packets accordingly.
+In a typical MAC learning bridge, the association between source MAC addresses and input interface is learned dynamically.
+When analyzing this NF, \maestro detects that state is indexed by a MAC address, which is a field not supported by RSS on our NIC.
+As such, \maestro warns the user that it cannot generate a shared-nothing implementation, opting for read/write locks instead.
+
+By modifying the NF to disable dynamic MAC learning, leaving only statically configured MAC-Port bindings, the NF becomes more amenable to parallelization (as all state is read-only), albeit with reduced functionality.
+This further illustrates the ability of \maestro to inform developers and help guide the development process by pointing out relevant trade-offs between functionality and performance.
+With this in mind, we created two versions of this NF: the standard bridge with dynamic MAC learning (DBridge) and a static one with fixed bindings (SBridge).
+When analyzing SBridge, \maestro encounters only read-only data structures, requiring no specific constraints on the RSS configuration.
+As with NOP, \maestro generates a random RSS key and uses all the available packet fields on all ports.
+
+%-------------------------------------------------------------------------------
+\subsubsection{FW}
+\label{subsubsection:microbenchmarks:fw}
+%-------------------------------------------------------------------------------
+This is the same firewall we have been using as a running example throughout the paper (\cref{subsection:par_firewall}). It indexes state with typical flow information on the LAN (source and destination addresses and ports), and symmetrically on the WAN. \maestro generates a shared-nothing implementation that shards state by the flow information, sending WAN packets corresponding to symmetric LAN sessions to the same core as these (as shown in \cref{fig:fw-pipeline}).
+
+%-------------------------------------------------------------------------------
+\subsubsection{PSD}
+%-------------------------------------------------------------------------------
+A Port Scan Detector (PSD) counts how many distinct destination TCP/UDP ports each host (source IP) has touched within a given time frame.
+Above a threshold, connections to new ports are blocked, preventing port scans.
+\maestro analyzes the PSD and finds that it uses only the source IP to access one map, but also the source IP and destination port to access another. As such, the constraints for accessing the first map subsume those of the second (\ref{cf:subsumption}) and \maestro finds an RSS key that shards based only on source IPs.
+
+% Figure environment removed
+
+%-------------------------------------------------------------------------------
+\subsubsection{NAT}
+%-------------------------------------------------------------------------------
+A NAT translates addresses between a LAN and a WAN, allowing multiple clients in the LAN to share a single public IP in the WAN~\cite{rfc3022}.
+It keeps track of flows initiated in the LAN, but to aid with translation it associates a unique external port with each flow.
+Reply packets from the WAN are checked to see if their address and port match those on record before subsequently translating the destination address and port to match those of the client.
+
+\maestro notices that the NAT associates flows with external ports using a map, fitting case \ref{cf:incompatible} in \cref{subsection:sharding}. However, it also finds an additional constraint fitting case \ref{cf:interchangeable}: packets from the WAN are only translated if they target the hosts that started the session in the first place. This constraint allows for sharding based on the external server's IP address and port.
+
+Much like its sequential implementation, the parallelized NAT enforces unique ports inside each core. It does not, however, enforce this uniqueness \emph{across} cores, a feature that does not break semantic equivalence. Whereas on the sequential implementation the allocated ports were used to distinguish between sessions, now the sharding solution allows for packets sent to different cores (hence pertaining to different external servers) to have the same allocated ports.
+
+%-------------------------------------------------------------------------------
+\subsubsection{CL}
+%-------------------------------------------------------------------------------
+A Connection Limiter (CL) aims to limit how many connections any single client (source IP) can make to any single server (destination IP) over a wider time frame (\eg several days).
+Given the longer time frames involved, this NF uses a memory-efficient count-min sketch~\cite{count-min-sketch} to estimate the connection count from each client to each server.
+For new connections, the source and destination IPs are used to index the sketch, indexing a configurable number of entries based on different hashes (5 by default in our case).
+If all entries surpass the connection limit, the packet is dropped, preventing the new connection.
+Otherwise, each entry is incremented.
+
+As with the PSD, \maestro finds two different access patterns: the 5-tuple indexes a connection tracking map, while the source and destination IPs index the sketch. Again, the latter constraint subsumes the former and \maestro shards based on source and destination IPs.
+
+%-------------------------------------------------------------------------------
+\subsubsection{LB}
+%-------------------------------------------------------------------------------
+LB is a Maglev-like load balancer~\cite{eisenbud2016maglev}. Its main goal is to distribute traffic coming from the WAN to a series of identical servers on the LAN. LB registers new servers when it receives their packets coming from the LAN, and matches packets coming from the WAN with previously registered servers, keeping track of flows to ensure the same server handles packets from the same flow.
+
+In order to maintain semantic equivalency between a shared-nothing parallel implementation and a sequential implementation, packets that find an available server in the sequential implementation must also find it available in the other.
+This ultimately means that all cores would need to have all backends registered in their local state.
+That said, packets coming in from the LAN in such a parallel implementation would only be able to be registered in a single core, preventing packets that arrive at other cores from seeing it.
+With this limitation in mind, it becomes impossible for multiple cores to hold an identical set of backend servers without coordination, thus preventing the use of a shared-nothing model.
+The \maestro analysis detects this issue when analyzing the LB SR.
+Lacking a better alternative, \maestro issues a warning and opts for a read/write lock based approach.
+
+%-------------------------------------------------------------------------------
+\subsection{Performance Benchmarking Methodology}
+%-------------------------------------------------------------------------------
+
+To benchmark the NFs, we use a standard testbed topology~\cite{rfc2544}, connecting a traffic generator (TG) and a device under test (DUT), as shown in \cref{fig:testbed}. Both devices connect through a top-of-rack (TOR) switch from which we collect packet counters at the end of each experiment.
+Both TG and DUT are equipped with dual socket Intel Xeon Gold 6226R @ 2.90GHz, 96~GB of DRAM, and Intel E810 100~Gbps NICs.
+Turbo Boost, Hyper-Threading, and power saving features were disabled, as recommended by DPDK.
+
+To measure throughput, the TG replays a given traffic sample (a PCAP file) in a loop at a given rate via the outbound cable for 10s per experiment.
+The DUT receives this traffic, processes it, and sends it back via the return cable, allowing the TG to measure latency. We further use the TOR to infer loss at the DUT, and---through comparison with the TG report---to also detect when packets were lost within the TG as well.
+We use DPDK-Pktgen~\cite{Pktgen} on the TG to find the maximum rate with less than $0.1\%$ loss.
+We exclude and repeat sporadic experiment runs where loss within the TG---as opposed to the DUT---limited the results.
+When studying scalability, we repeatedly reevaluate the NF, while varying the number of cores it may use.
+We perform 10 measurements per experiment for statistical relevance and show error bars with min/max values. 
+Our experiments properly handle NUMA considerations and indirection table rebalancing (\cref{section:implementation}).
+
+%-------------------------------------------------------------------------------
+\subsection{Picking the Workload}
+\label{subsection:workload}
+%-------------------------------------------------------------------------------
+
+In this section we analyze how different workloads impact performance, and ultimately establish the right workload configuration to evaluate all \maestro's parallelization solutions.
+
+% Figure environment removed
+
+\textbf{Packet size.} To measure the impact of packet size on the performance of NFs, we ran the NOP on all cores and generated traffic with fixed-sized packets (40k uniformly distributed flows), varying the size on each iteration. 
+The results (\cref{fig:pkt_sz}) show that typical Internet traffic~\cite{benson2010network} and large packets easily achieve line-rate (100G), but that smaller packets struggle to keep up, reaching only \textasciitilde{}45Gbps with 64B packets---even with such a trivial NF.
+Prior work~\cite{neugebauer2018understanding,agarwal2022understanding,enso} has pointed out that this bottleneck comes from PCIe 3.0 x16 and cannot be overcome without improved hardware.
+Unless stated otherwise, further experiments in this paper use 64B packets.
+As we measure more complex NFs that limit throughput below the 90Mpps shown in~\cref{fig:pkt_sz}, the bottleneck shifts from PCIe to the CPU, illustrating the NF's intrinsic performance.
+
+\textbf{Churn.} The performance of parallel NFs can vary significantly for read or write workloads.
+In networking terms, this typically relates to \emph{churn}, or the rate at which new flows are added and expired.
+This is particularly important for lock and TM based implementations, where creating new flows can lead to costly aborted transactions or exclusive write locks.
+
+We start by studying these churn effects on performance by focusing on the read/write lock-based parallel firewall, and comparing it to its shared-nothing counterpart.
+To conduct churn experiments, ideally one would generate traffic live that changes flows periodically in an online manner.
+We found it challenging to generate such traffic programmatically at line-rate so we followed an alternative solution: generating PCAPs with different levels of \emph{relative churn}---measured in $\text{flows} / \text{Gbit}$.
+As Pktgen varies the replay rate of the PCAP to probe the NF, the resulting \emph{absolute churn}---measured in $\text{flows} / \text{minute}$ or fpm---changes in tandem.
+This guarantees that our experiments converge to an equilibrium where the highest rate is found for the given churn.
+Once we find this rate, we can multiply the PCAP's relative churn with the experimental rate to compute the absolute churn.
+
+With this in mind, we built PCAPs which
+(i) were small enough to fit in memory;
+(ii) changed enough flows to produce the desired relative churn;
+(iii) evenly spread these changes throughout the traffic;
+and (iv) were cyclic (\ie the flows that expire at the start of the PCAP are created at the end).
+We then replay these files in a loop for 10s as in all other experiments.
+
+% Figure environment removed
+
+% Figure environment removed
+
+\cref{fig:churn} shows how the FW---parallelized with different approaches---scales under varying amounts of churn.
+As absolute churn is computed based on the achieved rate, note that it too has error bars.
+Under low or no churn, the lock-based FW scales well until bottlenecked by PCIe.
+At a churn of \textasciitilde{}100k fpm we start observing the collapse of performance as the use of more cores just wastes more cycles busy-waiting under exclusive write locks.
+Under heavy churn, performance is abysmal as all cores end up contending for write locks.
+Note that the churn limit of an NF depends on the size of packets---\cref{fig:churn} uses 64B packets but for Internet traffic~\cite{benson2010network} the lock-based FW handles churn up to 400k fpm.
+
+The results also show just how badly the FW parallelized with transactional memory handles churn. Although a useful tool in other domains, it proves ineffective when dealing with networked applications under churn.
+
+The shared-nothing approach, unlike the lock-based one, suffers almost no performance variation with churn up to at least \textasciitilde{}100M fpm, a great advantage over the lock-based implementation.
+Benson \etal~\cite{benson2010network} tell us to expect up to 6M fpm in typical data-center traffic---within the ability of our shared-nothing FW, but not the lock-based one.
+University networks---typically with less than 15k fpm---could easily be handled even by our lock-based FW.
+
+We focus the rest of this evaluation on studies without churn, giving the lock and TM based approaches the benefit of the doubt and illustrating their \emph{best-case} performance.
+
+%-------------------------------------------------------------------------------
+\subsection{Performance benchmarks}
+\label{subsection:benchmarks}
+%-------------------------------------------------------------------------------
+
+With parallel versions of each of the above 8 NFs generated, we now evaluate their performance and scalability.
+By default, \maestro generates a shared-nothing implementation when possible, falling back to read/write locks otherwise.
+This choice can, however, be overriden, and \maestro can specifically generate parallel implementations using read/write locks and TM for any of the NFs, upon request.
+
+\textbf{Parallelization technologies.} We now study the performance and scalability of each NF while being parallelized for each of the three approaches.
+As per~\cref{subsection:workload}, the workload used is composed of uniformly-distributed, read-heavy, small packets\footnote{Experimental results using Zipfian traffic are shown in~\cref{appendix:zipf}}.
+\cref{fig:technologies} shows throughput as a function of the number of cores.
+Our raw performance is comparable to measurements from other recent works~\cite{farshin2021packetmill}, but we focus our attention on \emph{scalability}.
+Though most NFs top out their performance before using all 16 cores due to bottlenecks in the PCIe bus or the memory controller, the takeaway here is the relative performance of the different approaches.
+
+For all NFs where a shared-nothing approach was feasible, this option scales linearly until bottlenecked by the PCIe bus and then plateaus---an ideal outcome.
+The lock-based implementations---though slower than their shared-nothing counterparts when available---still scale fairly well but do not always reach the PCIe bottleneck with 16 cores\protect\footnote{Eventually, all lock-based NFs except for the Policer and CL can reach the PCIe bottleneck using extra cores from the remote NUMA node.}.
+The Policer shows what happens to these locks when writes are inevitable: as every packet must update the token bucket state, every packet requires an exclusive write lock, and performance suffers catastrophically.
+Fortunately, this NF can be sharded by IP address, so is amenable to the shared-nothing approach.
+
+The benefits of state sharding (\cref{subsec:sharding}) become clear when we compare the shared-nothing approaches with the lock-based ones for the more state intensive NFs, \ie the FW, NAT, CL, and PSD. When each core holds less state due to sharding, more of it fits in the core-local L1+L2 cache. In a shared-nothing approach where cores work independently on different working-sets this leads to an added performance improvement due to better caching, in addition to the benefits of parallelization. As a result, performance for few ($<4$) cores can be worse than linear scalability would predict and using many cores can have an added boost in comparison. Running these experiments with a workload of only 256 flows---which fits entirely in L1 cache---nullifies this effect.
+
+A surprising takeaway is that TM  does not work well with the kinds of workloads found in more complex NFs, even in the absence of churn.
+For simpler NFs it performs quite well, scaling linearly with the number of cores, though still operating more slowly than both shared-nothing and lock-based alternatives.
+In these cases TM eventually catches up with the other approaches, albeit needing more cores to do so.
+However, for more complex NFs TM performs abysmally, as the likelihood of a transaction aborting increases.
+
+Ultimately, the clear winner is the shared-nothing approach, with the best backup option consistently being our read/write locks.
+The PSD---our most CPU intensive NF which stands to gain the most from parallelization---performs $19\times$ better with 16 cores than a single-core version, due to the \emph{compound effects} of parallelization and improved cache efficiency.
+
+\maestro does not deeply affect latency. We subjected all NFs to a 1Gbps uniform background traffic of 64B packets and collected 1000 latency probes within 10 seconds.
+We detected no noticeable differences on the average and tail latency values between the sequential NFs and their respective parallel implementations, regardless of the adopted parallelization strategy.
+Pktgen measured an average of $12 \pm 2 \mu s$ for CL and $11 \pm 1 \mu s$ for the remaining NFs.
+
+\textbf{VPP comparison.} Finally, we compare \maestro with the Vector Packet Processing framework (VPP)~\cite{barach2018high,fdio-vpp}, which extends the concept of batch processing to the entire packet processing pipeline with the purpose of increasing performance by minimizing instruction cache misses.
+VPP follows a converse approach to \maestro: packets are processed in batches in a shared-memory parallel environment where packets can end-up on any core without regard to flows or locality.
+Developers must then adapt the way they implement the NF to those assumptions.
+This approach can require more expertise and development effort, but once NFs are built in this way the framework handles many of the low-level details.
+
+To compare the performance of a \maestro parallelized NF with an expertly developed one for VPP, we pitch our NAT against the VPP \texttt{nat44-ei} with the DPDK plugin.
+These two NFs are the most similar we found between the VPP distribution and our corpus. We further removed a number of features from the VPP NAT to bring their implementations even closer together\protect\footnote{We removed statistical counters, disabled IPv4 checksum checking, completely removed the IPv4 reassembly feature, and finally replaced the IPv4 lookup with static forwarding.}.
+
+\cref{fig:vpp-64b} shows the performance comparison between the parallel \maestro NAT (shared-nothing and lock-based) and \texttt{nat44-ei}, all under uniformly distributed 64B packets.
+Though all approaches scale well, \maestro's shared-nothing decisively outperforms VPP, reaching the PCIe bottleneck with 10 cores.
+This is due to the shared-memory design that VPP follows.
+A fairer comparison would be between VPP and the lock-based \maestro NAT, as both use shared-memory.
+Here both scale more slowly, never fully reaching the PCIe bottleneck up to 16 cores.
+\maestro slightly outperforms VPP. Further investigation with the \texttt{perf}~\cite{perf} tool showed us that although the \maestro lock-based NAT and the VPP one perform very similar numbers of memory reads and writes per packet, the \maestro NAT more frequently finds the data on L1 cache (\maestro's $55\%$ vs.\ VPP's $46\%$) and has to access RAM less frequently (\maestro's $3\%$ vs.\ VPP's $4\%$).
+The key takeaway though, is that \maestro's \emph{automatically} parallelized NFs perform competitively with expertly developed, manually parallelized NFs, without as much of a hassle.
+
+% Figure environment removed

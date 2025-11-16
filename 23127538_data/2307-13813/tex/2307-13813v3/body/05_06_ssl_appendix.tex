@@ -1,0 +1,239 @@
+\FloatBarrier
+
+\section{Additional details and results for self-supervised image representation learning}
+\label{app:ssl}
+
+\paragraph{Organization} 
+This appendix is structured into three sections.
+We first give an overview of our chosen 
+\gls{ssl} method \gls{byol} (\Cref{app:sec-components-ssl}),
+our recipe for training \gls{byol} using ResNet 18s (\Cref{subsec:byol-r18}), 
+our recipe for training \gls{byol} using \glspl{vit} (\Cref{app:byol-vit}), 
+ablations of normalization approaches that lead to the development of this recipe (\Cref{app:byol-vit-ln-vs-bn}), 
+and additional results corresponding to longer training duration (\Cref{app:byol-waterfall}) and further understanding the impact of Progressive Scaling (\Cref{app:byol-progressive-scaling-regimes}).
+
+Second, we demonstrate that the \gls{ema} Scaling Rule combined with Progressive Scaling can scale a ResNet-50 BYOL model trained with LARS to batch size 32,768 without performance drop, demonstrating the empirical utility of the tools we provide outside of their theoretical validity (\Cref{subsec:byol-additional}).
+
+Finally, we show that it is possible to systematically scale DINO \citep{DBLP:journals/corr/abs-2104-14294} using a combination of Progressive Scaling and the \gls{ema} Scaling Rule,
+providing a solution for researchers and practitioners wanting to train DINO at scale.
+
+\subsection{Components of self-supervised learning}
+\label{app:sec-components-ssl}
+
+First, a key component of many \gls{ssl} methods is the \emph{stop-gradient} 
+or $\text{StopGrad}$ (\Cref{def:stop-grad}).
+\begin{definition}[Stop Gradient/$\text{StopGrad}(\,\cdot\,)$] 
+     The \emph{stop-gradient} operator $\text{StopGrad}(\,\cdot\,)$ prevents the flow of gradient information
+    \begin{equation}
+    \frac{df(\text{StopGrad}(h(x ; \rvomega)); \rvtheta)}{d\rvomega}\equiv 0
+    \end{equation}
+    \label{def:stop-grad}
+    for all parametric functions $h$ and $f$ and for all parameters $\rvtheta$ and $\rvomega$.
+\end{definition}
+Applying a \emph{stop-gradient} is sometimes called \emph{detaching} in the literature. 
+Now, we 
+introduce the update rule of our representative \gls{ssl} method \gls{byol} in \Cref{def:byol}.
+\begin{definition}[BYOL Update] 
+     \gls{byol} learns unsupervised features by minimizing the cosine distance between the predictions of a student backbone
+     $f(\,\cdot\,;\rvtheta)$ (typically a ResNet or Vision Transformer),
+     projected through 
+     $h(\,\cdot\,;\rvomega$) (typically a \gls{mlp}), and the predictions of an \gls{ema} teacher $f(\,\cdot\,;\rvzeta)$ \citep{DBLP:conf/nips/GrillSATRBDPGAP20}. 
+     The update for the parameters of \gls{byol} is then
+    \begin{align}
+    (\rvtheta_{t+1},\rvomega_{t+1})
+    &=
+    (\rvtheta_t,\rvomega_t) - \eta \times \frac1B
+    \sum_{x\in\sB} \nabla_{(\rvtheta,\rvomega)} \Ls(x;\rvtheta_{t},\rvomega_{t},\rvzeta_{t})\\
+    \rvzeta_{t+1}
+    &=
+    \rho \,\rvzeta_t + (1-\rho)\,\rvtheta_{t+1} \label{eq:byol-ema-update}\\
+    \text{with} \;\; 
+    \Ls(x;\rvtheta_{t},\rvomega_{t},\rvzeta_{t})
+    &=
+    \frac12
+    \cos \big[ h( f(x_1;\rvtheta_t);\rvomega_t), \text{StopGrad}(f(x_2;\rvzeta_t))  \big]  + (x_1\leftrightarrow x_2),
+    \end{align}
+    where $\cos (\va,\vb)\equiv 1-\va\cdot \vb/(||\va||\,||\vb||)$ is the cosine distance, 
+    and
+    $x_1$ and $x_2$ are two views of a single variate $x$, often produced by augmentations,
+    and
+    $x_1\leftrightarrow x_2$ denotes symmetrization over $x_1$ and $x_2$.
+    \label{def:byol}
+\end{definition}
+As noted in \Cref{subsec:self-supervised},the  \gls{byol} \gls{ema} update (\Cref{eq:byol-ema-update}) uses $\rvtheta_{t+1}$ instead of our analyzed $\rvtheta_{t}$ (\Cref{eq:scalingRuleSummaryEquation}).
+The effect upon the overall \gls{ema} update is $\mathcal{O}(\eta\times\beta_\rho)$ and so is captured by the \gls{ema} Scaling Rule (\Cref{def:ema-sr}).
+
+One more piece of technology typically employed in \gls{ssl} is a \emph{tracking probe} (\Cref{def:linear-probe}) which we will use to evaluate the performance of \gls{byol} on downstream tasks of interest, for example, image classification.
+\begin{definition}[Tracking Probe/Linear Probe] 
+    When optimizing model parameters $\rvomega_t$ of an \gls{ssl} method, 
+    simultaneously optimize the parameters $\rvxi$ of a probe model $r(\,\cdot\,;\rvxi)$
+    under a downstream objective $\Ls^{(d)}$.
+    For example, in classification, with data $x$ and samples $y$
+    \begin{align}
+    \Ls^{(d)}(x,y,\rvtheta_{t},\rvxi_t)&= - \log P(y|r(\text{StopGrad}(h(x;\rvomega_t));\rvxi))\\
+    \Ls^{(\text{total})}(x,y;\rvtheta_{t},\rvomega_{t},\rvzeta_{t},\rvxi_t) & = \Ls(x;\rvtheta_{t},\rvomega_{t},\rvzeta_{t})+\Ls^{(d)}(x,y,\rvomega_{t},\rvxi_t),
+    \end{align}
+    The is a probe for the teacher, which is typically the better choice due to Polyak-Ruppert averaging effects (see \Cref{subsec:supervised-polyakking}).
+    \label{def:linear-probe}
+    When the $r$ is a linear model, the tracking probe is called a linear probe.
+\end{definition}
+It is also typical to use a Batch Normalization layer \emph{without} trainable affine terms before this linear layer as in \citet{DBLP:conf/cvpr/HeCXLDG22} to stabilize probe training.
+In this case, the running statistics can be absorbed into a definition of the linear layer weights and biases, and so this is still a \emph{linear probe}, although we will call this a \emph{pre-bn linear probe} to remove ambiguity.
+
+\subsection{A ResNet-18 recipe for BYOL}
+\label{subsec:byol-r18}
+
+\paragraph{Hyperparameters} We present the base hyperparameters for training \gls{byol} with a ResNet-18 backbone using \gls{sgd} in \Cref{tab:byol-r18-recipe}.
+This recipe was developed by starting from a well-known BYOL ResNet-50 recipe \citep{DBLP:conf/nips/GrillSATRBDPGAP20}, adapting the input augmentations for CIFAR10, and performing a search over learning rate choices for an SGD optimizer.
+
+
+\begin{table}[t]
+  \caption{BYOL ResNet-18 hyperparameters for CIFAR10}
+  \label{tab:byol-r18-recipe}
+  \centering
+  \small
+  \begin{tabular}{lc}
+    \toprule
+    & ResNet-18 \\
+    \midrule
+    Weight initialization & \texttt{kaiming\_uniform} \citep{DBLP:conf/iccv/HeZRS15} \\
+    Backbone normalization    & BatchNorm  \\
+    Head normalization    & BatchNorm  \\
+    Synchronized BatchNorm over replicas & Yes \\     
+    Learning rate schedule & Single Cycle Cosine \\    
+    Learning rate warmup (epochs) & 20 \\    
+    Learning rate minimum value & $0$  \\    
+    Training duration (epochs) & 100 \\
+    Optimizer & SGD \\    
+    Optimizer scaling rule & SGD \\
+    Optimizer momentum & $0.9$ \\
+    Gradient clipping & $0.1$ \\
+    Base learning rate & $0.02$  \\
+    Base batch size & $1024$  \\
+    Base teacher momentum & $0.992$ \\    
+    Weight decay & $1\times 10^{-6}$ \\
+    Weight decay scaling rule & None \\
+    Weight decay skip bias & Yes \\
+    Numerical precision & \texttt{tf32} \\
+    Augmentation stack & \texttt{BYOL CIFAR10} \\   
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\FloatBarrier
+
+\subsection{A Vision Transformer recipe for BYOL}
+\label{app:byol-vit}
+
+\paragraph{Hyperparameters} We present the base hyperparameters for training \gls{byol} with a ViT-B/16 backbone in \Cref{tab:byol-recipe}.
+This recipe was developed by starting from a well-known supervised ViT-B/16 recipe \citep{DBLP:conf/cvpr/HeCXLDG22} and performing a search over weight decay and learning rate hyperparameter choices. 
+We find that \gls{byol} performs well with heavy weight decay ($\lambda=0.3$)
+and a low learning rate
+($\eta=10^{-3}$)
+at a base batch size $B=4096$.
+The AdamW optimizer
+is used, and so for scaling to other batch sizes $\hat B=\kappa B$ we use the Adam Scaling Rule (\Cref{def:adam-sr})\footnote{We note that Adam \citep{DBLP:journals/corr/KingmaB14} and AdamW  \citep{DBLP:conf/iclr/LoshchilovH19} are equivalent in the limit of zero weight decay, and that
+the Adam Scaling Rule (\Cref{def:adam-sr}) was derived with zero weight decay \citep{DBLP:conf/nips/MalladiLPA22}.
+}
+We use a pre-bn linear probe as discussed in \Cref{app:sec-components-ssl}.
+Finally, the performance of \gls{byol} can be further improved by employing multicrop \citep{DBLP:conf/nips/CaronMMGBJ20} by $\approx$ +2\% in absolute test top-1 performance on ImageNet1k compared to without multicrop, however, as this is not our focus, we omit this from the presented recipe.
+
+
+\begin{table}[t]
+  \caption{BYOL ViT-B/16 hyperparameters.}
+  \label{tab:byol-recipe}
+  \centering
+  \small
+  \begin{tabular}{lc}
+    \toprule
+    & BYOL ViT-B/16 \\
+    \midrule
+    ImageNet1k Linear Probe Test Top-1 & 74.47\% (\Cref{fig:vitb-byol-ln-vs-bn}) \\
+    \midrule
+    Weight initialization & \texttt{trunc\_normal(.02)}  \\
+    Backbone normalization    & LayerNorm  \\
+    Head normalization    & BatchNorm  \\
+    Synchronized BatchNorm over replicas & No \\     
+    Learning rate schedule & Single Cycle Cosine \\    
+    Learning rate warmup (epochs) & 40 \\    
+    Learning rate minimum value & $1\times 10^{-6}$  \\    
+    Training duration (epochs) & 480 \\
+    Optimizer & AdamW \\    
+    Optimizer scaling rule & Adam \\
+    Base ($\beta_1, \beta_2$) & (0.9, 0.95) \\
+    Base learning rate & $1\times 10^{-3}$  \\
+    Base batch size & 4096  \\
+    Base teacher momentum & 0.99 \\    
+    Weight decay & 0.3 \\
+    Weight decay scaling rule & None \\
+    Weight decay skip bias & Yes \\
+    Numerical precision & \texttt{bf16} \\
+    Augmentation stack & 
+    \texttt{BYOL} \citep{DBLP:conf/nips/GrillSATRBDPGAP20} \\   
+    Stochastic depth & 0.1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Additional background} 
+Achieving large scale \gls{ssl} training with \glspl{vit} to large scale \gls{ssl} training has been a long standing goal in the community. 
+MoCo-v3 \citep{DBLP:conf/iccv/ChenXH21} enables the use of \gls{vit}s with contrastive learning, but achieves this through modifications of the \gls{vit} training procedures, including gradient freezing on the image patching layer, and re-introducing Batch Normalization to post-attention MLP layers.
+Despite these modifications, MoCo-v3 was only trained up to a batch size of 6144, where model performance begins to suffer \citep{DBLP:conf/iccv/ChenXH21}. 
+In \Cref{fig:vitb-byol} we demonstrate that combining dynamic batch scaling (\Cref{subsec:dynamic-batch-scaling}) with the \gls{ema} Scaling Rule (\Cref{def:ema-sr}) enables \gls{byol} to be trained using \glspl{vit} to batch sizes of 24,576 without any drop in performance compared to the reference batch size of 4096. 
+We emphasize that the piecewise transitions in the schedules are important for preserving training dynamics.
+
+\subsection{The role of Batch Normalization and Layer Normalization in BYOL with ViTs}
+\label{app:byol-vit-ln-vs-bn}
+% Figure environment removed
+
+Here we compare the roles of Batch Normalization (BatchNorm, \cite{DBLP:conf/icml/IoffeS15}) and  Layer Normalization (LayerNorm, \cite{DBLP:journals/corr/BaKH16})
+in the projection and prediction heads of \gls{byol} \citep{DBLP:conf/nips/GrillSATRBDPGAP20} using \glspl{vit}.
+
+It has been observed that BatchNorm 
+plays a critical role in \gls{byol} predictor and projector dynamics \citep{Fetterman_Albrecht_2020}, 
+and using either LayerNorm or \emph{no normalization} significantly decreases model performance.
+Subsequently, it was demonstrated \citep{DBLP:journals/corr/abs-2010-10241} that competitive \gls{byol} performance could be achieved through a combination of Group Normalization (GroupNorm, \cite{DBLP:conf/eccv/WuH18}) and Weight Standardization \citep{DBLP:journals/corr/abs-1903-10520}.
+Additionally, \citet{DBLP:journals/corr/abs-2010-10241} showed that if BatchNorm is used in the backbone, one can use LayerNorm or \emph{no normalization} in the predictor and projector without any performance drop.
+
+In this work, we we show it is possible to train \gls{byol} \gls{vit} using \emph{only LayerNorm} across the backbone, projector and predictor (see \Cref{fig:vitb-byol-ln-vs-bn}),
+decoupling \gls{byol}'s reliance on batch statistics, a desirable trait for a representation learning algorithm \citep{DBLP:conf/icml/BrockDSS21}. 
+At batch size 3072, using LayerNorm in the predictor and projector achieves competitive performance (74.10\%), performing slightly worse than using BatchNorm (74.47\%). 
+At the larger batch size of 24,576, runs perform significantly worse as the \gls{ema} Scaling Rule was not applied.
+
+\subsection{Longer training duration with incremental Progressive Scaling}
+\label{app:byol-waterfall}
+% Figure environment removed
+
+Here we use the same base hyperparameters as \Cref{tab:byol-recipe}, except that we train for 480 instead of 300 epochs.
+To mitigate the student impulse phenomena discussed in \Cref{subsec:self-supervised}, in \Cref{fig:vitb-byol-waterfall} we investigate increasing the batch size every 60 epochs using Progressive Scaling  (\Cref{def:progressive-scaling}).
+We observe that this more gradual procedure enables closer tracking of the baseline train loss trajectory.
+Additionally, this procedure results in a scaled linear probe performance that outperforms the baseline (75.64\% compared to the baseline performance of 74.47\%).
+The same procedure can be applied to the LayerNorm variant discussed in \Cref{app:byol-vit-ln-vs-bn}, which produces a similar result (75.09\% compared to the baseline performance of 74.10\%).
+
+\subsection{Building intuition around Progressive Scaling and momentum sensitivity}
+\label{app:byol-progressive-scaling-regimes}
+% Figure environment removed
+Our final \gls{byol} \gls{vit} results are to help build intuition around Progressive Scaling (\Cref{def:progressive-scaling}),
+as well as when the \gls{ema} Scaling Rule is most important.
+In \Cref{fig:vitb-byol-rho-ablations} we explore transitioning from the baseline batch size 4096 model to batch size 24,576 in a \emph{single transition} after 60 epochs.
+After this transition, we continue training for 240 epochs for a range of momenta: $\rho \in \{0.8, 0.9, 0.95, 0.97, 0.9867, 0.994, 0.999\}$ \emph{without} the EMA Scaling Rule. 
+
+We observe that after the transition, any $0.9\leq \rho\leq0.994$ produces a linear probe performance that matches or outperforms the baseline at the end of training. 
+This indicates that after the initial training period, BYOL becomes less sensitive to the choice of teacher momentum. 
+Note that without the initial 60 epochs of training with batch size 4096, \emph{all models}, including those employing the \gls{ema} Scaling Rule diverge (see $B=24,576$ in \Cref{fig:vitb-byol}).
+
+We present an illustration for why this might happen in \Cref{fig:robustness-cartoon}.
+First, we see that using the \gls{ema} Scaling Rule \emph{always} keeps the model within the acceptable momentum region.
+We also wee that \emph{not} using the \gls{ema} Scaling Rule can keep the model  within the acceptable momentum region for a range of batch sizes, depending on how large wide in momenta the acceptable region is at the base batch size.
+Finally, we see that the momentum value matters much more at low values of momenta (the acceptable momentum region shrinks), whereas at large momenta, this region of acceptability widens.
+
+% Figure environment removed
+
+\ifthenelse{\equal{\anonymous}{0}}{
+\input{body/05_06_ssl_vit_compute}
+}{\compute}
+
+\input{body/05_06_ssl_byol_additional}
+
+
+\input{body/05_06_ssl_dino}

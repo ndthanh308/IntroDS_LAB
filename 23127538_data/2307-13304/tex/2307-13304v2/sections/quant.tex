@@ -1,0 +1,457 @@
+This section introduces quantization with incoherence processing (QuIP), a new method consisting of:
+(1)~an adaptive rounding step;
+(2)~efficient pre- and post-processing that ensures weight and Hessian incoherence. We define and analyze step (1) in this section; the next section focuses on step (2).
+
+Following existing state-of-the-art post-training quantization methods, we round weights per-layer by minimizing the ``adaptive rounding'' proxy objective, as in \citet{nagel2020up},
+\begin{equation}
+    \label{eqnAdaptiveEll}
+    \textstyle
+    \ell(\hat W)
+    =
+    \mathbf{E}_x\left[ \norm{ (\hat W - W) x }^2 \right]
+    =
+    \trace{ (\hat W - W) H (\hat W - W)^T }.
+\end{equation}
+Here, $W \in \mathbb{R}^{m \times n}$ is the original weight matrix for a given linear layer, $\hat W \in \mathbb{R}^{m \times n}$ are the quantized weights, $x \in \mathbb{R}^n$ is an input vector drawn uniformly at random from a calibration set, and $H$ is the second moment matrix of these vectors, interpreted as a proxy Hessian. Crucially, this formulation lets the quantization be run in parallel across neurons, which 
+is tractable for
+large language models~\citep{frantar2023gptq}. 
+For simplicity, we will focus in this section on rounding to the integers; subsequent sections will extend the analysis to finite grids.
+
+
+\subsection{LDLQ: An Optimal Adaptive Rounding Method}
+Our strategy is to define a family of adaptive rounding methods for optimizing objective (\ref{eqnAdaptiveEll}) and then define LDLQ, the optimal method within that class. Our defined methods iteratively perform the following update for $k=1,2,...,n$:
+\[
+    \hat W_k = \round( W_k + (W_{1:(k-1)} - \hat W_{1:(k-1)}) a_k),
+\]
+where $W_k$ denotes the $k$-th column, $W_{1:(k-1)}$ denotes the first $k-1$ columns, the subroutine $\mathcal{Q}$ denotes either nearest rounding or standard unbiased rounding to the integers (which rounds up or down such that $\Exv{\mathcal{Q}(z)} = z$), and $a_k \in \R^{k - 1}$ is some sequence of vectors. 
+This scheme rounds columns one at a time; at each step, it adds a ``correction'' term that is a linear function of the residual from the rounding we have done so far. The final $\hat W$ satisfies the following matrix equation:
+\begin{equation}
+  \label{eqnVectorQuant}
+  \hat W = \round( W + (W - \hat W) U),  
+\end{equation} 
+where $U$ is a strictly upper-triangular matrix whose columns are the vectors $a_k$ and $\mathcal{Q}$ acts elementwise. 
+Because $U$ is upper-triangular, $\hat W_k$ only depends on $\hat W_{1:(k-1)}$.
+
+If we let $\eta = \mathcal{Q}( W + (W - \hat W) U) - ( W + (W - \hat W) U)$ denote the quantization error of $\mathcal{Q}$, we find that $\hat W - W = \eta (U + I)^{-1}$ and we can rewrite objective (\ref{eqnAdaptiveEll}) as
+\begin{equation}
+    \label{eqnProxyEq}
+    \operatorname{tr}((\hat W - W) H (\hat W - W)^T)
+    =
+    \operatorname{tr}(\eta (U + I)^{-1} H (U + I)^{-T}  \eta^T ).
+\end{equation}
+
+\paragraph{The LDLQ Method}
+How should we specify $U$, the linear feedback from the quantization error of preceding columns in \eqref{eqnVectorQuant}?
+Equation~\ref{eqnProxyEq} provides an answer.
+If we choose $U \gets \grave U$ such that the LDL decomposition of $H$ is 
+\begin{equation}
+    \label{eqnH=LDL}
+    H = (\grave U + I) D (\grave U + I)^T,
+\end{equation}
+where $D$ is a (non-negative) diagonal matrix and $\grave U$ is upper unit triangular, then the terms $(U + I)$ in Eq.~\eqref{eqnProxyEq} cancel.
+We denote as LDLQ the rounding procedure in Eq.~\eqref{eqnVectorQuant} with $U \gets \grave U$ as the LDL assignment from Eq.~\eqref{eqnH=LDL}. 
+We will now see that the LDL assignment of $U$ is in fact optimal. 
+
+
+\newcommand{\titleLDLQopt}{Deriving the Optimality of the LDLQ Adaptive Rounding Procedure} % for apxproof subsection titles
+\subsection{\titleLDLQopt}\label{secLDLopt}
+\begin{toappendix}
+\subsection*{Subsection~\ref{secLDLopt} (\titleLDLQopt)} % for aprxproof subsection titles
+\end{toappendix}
+
+In order to reason about optimality, 
+we consider weights which are worst and average-case for the proxy loss.
+Let $\alglin$ denote a rounding method,
+and let $\alglin(W,H)$ be the resulting quantized weights.
+Define the \emph{worst-case} ($\Lworst$) and \emph{average} ($\Lavg$) proxy losses with respect to the input weights as
+\begin{align}
+    \Lworst(\alglin, H) &= \sup_{W \in \R^{m \times n}} \Exv{ \trace{ ( \alglin(W, H) - W) H (\alglin(W, H) - W)^T } } 
+    \label{eqnLworst}\\
+    \Lavg(\alglin, H)  &= \Exv[{W \sim \operatorname{Unif}[0,1]^{m \times n}}]{ \trace{ ( \alglin(W, H) - W) H (\alglin(W, H) - W)^T } }.
+    \label{eqnLavg}
+\end{align}
+
+\begin{theoremrep}\label{thmLDLopt}
+$\ldl$ is worst and average-case optimal amongst rounding methods which specify the linear feedback $U$ as a function of $H$ (not of $W$), and when rounding to the integers.
+That is, for all rounding methods $\alglin$ in the class described by Eq.~\eqref{eqnVectorQuant}, for all positive semi-definite $H$, and for $\round$ as either nearest or stochastic rounding,
+\[
+    \textstyle
+    \frac{m}{4} \operatorname{tr}(D) = \Lworst(\ldl, H) \leq \Lworst(\alglin, H)
+    \;\;\text{and}\;\;
+    \frac{m}{c} \operatorname{tr}(D) = \Lavg(\ldl, H) \leq \Lavg(\alglin, H),
+\]
+where $D$ is the matrix from the LDL decomposition of $H$, and $c=12$ for nearest, $c=6$ for stochastic.
+\end{theoremrep}
+\begin{proof}
+Let $X$ be the strictly upper triangular matrix associated with the rounding procedure $\alglin$ such that $U \gets X$ in Eq.~\eqref{eqnVectorQuant}.
+Let $B \equiv (X + I)^{-1} (\grave U + I)$ where $\grave U$ is from the LDL decomposition of $H$ in Eq.~\eqref{eqnH=LDL}.
+The proxy loss is then, 
+\begin{align}
+    \trace{ (\alglin(W, H) - W) H (\alglin(W, H))^T }
+    &\stackrel{\eqref{eqnProxyEq},\eqref{eqnH=LDL}}{=}
+    \trace{ \eta (X + I)^{-1} (\grave U + I) D (\grave U + I)^T (X + I)^{-T} \eta^T }\nonumber\\
+    &= 
+    \trace{ \eta B D B^T \eta^T }.
+    \label{eqnThm1proofa} 
+\end{align}
+With the LDL assignment of $U$, we further have that,
+\begin{equation}
+    \label{eqnThm1proofb} 
+    \trace{ \eta B D B^T \eta^T }
+    =
+    \trace{ \eta D \eta^T }.
+\end{equation}
+
+First, consider the worst-case loss, $\Lworst$.
+The goal is to construct a particularly bad case where the entries of $\tilde W$ are $1/2 \pm \epsilon$, and thus when rounding to the integers we will always have error 1/2.
+Construct a weight matrix $\tilde W \in \R^{m \times n}$ such that each entry satisfies,
+\[
+    \tilde W_{ij} 
+    = 
+    \begin{cases} 
+        0.5 - \epsilon &w.p. \; 1/2 \\ 
+        0.5 + \epsilon &w.p. \; 1/2 
+    \end{cases}
+    \;\;\Rightarrow\;\;
+    \eta_{ij}
+    =
+    \begin{cases} 
+        +0.5  &w.p. \; 1/2 \\ 
+        -0.5 &w.p. \; 1/2 
+    \end{cases},
+\]
+and the quantization errors $\eta \in \R^{m \times n}$ are for each entry $\{+1/2, -1/2\}$ with equal probability.
+For this particular $\tilde W$, $\alglin$ achieves proxy loss $\Lworst(\alglin, H) \stackrel{\eqref{eqnThm1proofa}}{=} \Exv{ \trace{ \eta B D B^T \eta^T } } = \frac m4 \trace{ B D B^T }$, with $\round$ as either nearest or stochastic rounding.
+It follows from the supremum in the definition of $\Lworst$ in Eq.~\eqref{eqnLworst} that,
+$
+    \Lworst(\alglin, H) 
+    \geq
+    \frac m4 \trace{ B D B^T }
+$.
+For the LDL assignment of $U$, the worst case expected quantization error rounding to the integers is $1/2$.
+Therefore,
+$
+    \Lworst(\ldl, H)
+    \stackrel{\eqref{eqnThm1proofb}}{=}
+    \frac m4 \trace{ D }
+$, again for $\round$ as either nearest or stochastic rounding.
+$B$ must be a unit triangular matrix since it is the product of unit triangular matrices.
+Therefore $\trace{ B D B^T }$ is minimized when $B = I$, and 
+\[
+    \Lworst(\ldl, H)
+    \leq
+    \Lworst(\alglin, H).
+\]
+
+Next, consider the average loss, $\Lavg$, where $W \sim Unif[0,1]^{m \times n}$.
+For $\round$ as nearest rounding, the entries of the quantization error $\eta$ are $Unif[-\frac 12, \frac 12]$, because each entry is independent and uniformly distributed.
+It follows that for any entry of $\eta$, $\Exv{ \eta_{ij}^2 } = \int_{-1/2}^{1/2} x^2 dx = \frac{1}{12}$.
+Therefore,
+$
+    \Lavg(\alglin, H)
+    \stackrel{\eqref{eqnThm1proofa}}{=}
+    \Exv[{W \sim Unif[0,1]^{m \times n}}]{\trace{ \eta B D B^T \eta^T } }
+    =
+    \frac{m}{12} \trace{ B D B^T }
+$.
+For $\round$ as stochastic rounding, the entries of the quantization error $\eta$ are $Unif[-1,1]$.
+It follows that for any entry of $\eta$, $\Exv{ \eta_{ij}^2 } = \int_0^1 x (1-x) dx = \frac16$.
+Note that for stochastic rounding, the quantization error will be $x$ with probability $(1-|x|)$.
+Therefore,
+$
+    \Lavg(\alglin, H)
+    = 
+    \frac m6 \trace{ B D B^T }
+$. 
+Based on these same calculations of $\Exv{ \eta_{ij}^2 }$, we have that $\Lavg(LDL, H) \stackrel{\eqref{eqnThm1proofa}}{=} \frac{m}{12} \trace{ D }$ with $\round$ as nearest , and $= \frac m6 \trace { D }$ with $\round$ as stochastic rounding.
+By the same reasoning on the minimization of $\trace{ B D B^T }$,
+\[
+    \Lavg(\ldl, H)
+    \leq
+    \Lavg(\alglin, H).
+\]
+
+\end{proof}
+
+\textbf{Remarks.}
+The number of rows being quantized is $m$, and each quantization method operates across the $n$ entries of each row.
+For all rounding methods described by Eq.~\eqref{eqnVectorQuant}, and for all positive semi-definite $H$, $\round$ as nearest rounding achieves the same worst-case proxy loss as stochastic rounding, but achieves better average proxy loss.
+
+
+Moving beyond a generic algorithm $\alglin$ within our framework, we consider the common baselines of nearest and stochastic rounding.
+These methods are represented within our framework by choosing the appropriate $\round$ subroutine, and setting all entries of the linear feedback to zero.
+
+For these baseline methods, their optimality gap to LDLQ is governed by $\trace{D}$ vs. $\trace{H}$.
+For any non-diagonal $\tilde H \succeq 0$, LDLQ achieves strictly lower worst and average-case proxy loss because $\trace{D} < \operatorname{tr}(\tilde {H})$.
+Let $\mathcal{B} = \{\near, \stoch\}$. Then,
+$\Lworst(\ldl, \tilde H) < \Lworst(\stoch, \tilde H)$
+and
+$\Lavg(\ldl, \tilde H) < \Lavg(\mathcal{B}, \tilde H)$.
+Across OPT models 125m to 2.7b,
+$\trace{D}/\trace{H} \leq 0.65$---empirically verifying that the gap is not insignificant.
+See Supplement~\ref{suppAddResults} for full details.
+
+
+\newcommand{\titleIncoherOpt}{Incoherence: Optimality with a Spectral Bound}
+\subsection{\titleIncoherOpt}\label{secIncoherOpt}
+\begin{toappendix}
+\subsection*{Subsection~\ref{secIncoherOpt} (\titleIncoherOpt)}
+\end{toappendix}
+
+
+% Figure environment removed
+
+Theorem~\ref{thmLDLopt} gives exact expressions for the proxy loss, albeit with $\trace{D}$, which can be difficult to reason about.
+In Figure~\ref{figEigH}, we
+empirically observe that $H$ is approximately low-rank: we visualize the spectrum of several randomly chosen $H$ from OPT-2.7b, and observe that the spectrum decays rapidly.
+In fact, across all layers of OPT-125m to 2.7b models, a vast majority of $H$ matrices have fewer than a quarter of eigenvalues $>1\%$ of the max eigenvalue; see Supplement~\ref{suppAddResults} for full details.
+Given this observation about the low rank of $H$, can we bound the behavior of LDLQ, and thus $\trace{D}$, using the spectrum of $H$?
+
+We do this building on a variant of the incoherence assumption that is specialized to our case~\cite{desa2015matrix, jain2013complete}.
+\begin{definitionrep}
+We say a symmetric Hessian matrix $H \in \R^{n \times n}$ is $\mu$-incoherent if it has an eigendecomposition $H = Q \Lambda Q^T$ such that for all $i$ and $j$,
+$\Abs{ Q_{ij} } = \Abs{ e_i^T Q e_j } \le \mu / \sqrt{n}$. By extension, we say a weight matrix $W \in \mathbb{R}^{m \times n}$ is $\mu$-incoherent if all $i$ and $j$,
+$\Abs{ W_{ij} } = \Abs{ e_i^T W e_j } \le \mu \norm{W}_F / \sqrt{mn}$.
+\end{definitionrep}%
+Note that ``most'' $n \times n$ matrices are incoherent with $\mu = \mathcal{O}(\sqrt{\log n}) = \tilde{\mathcal{O}}(1)$ because a random orthogonal matrix has entries with squared-magnitudes that concentrate around their mean of $1/n$.
+Incoherence in $W$ can be viewed as a form of outlier reduction: a small bound on the magnitude of its entries means that we do not need to scale it as much to make it fit in the finite range of representable low-precision numbers.
+Figures~\ref{figbeforeafterW} and~\ref{figbeforeafterH} plot the max absolute weight and hessian eigenvector entries before and after our incoherence processing, on all layers in OPT-2.7b.
+A line with slope=1 is drawn for reference.
+We see that $W$ and $H$ are more incoherrent after our incoherence processing is applied.
+Making $H$ incoherent is less intuitive, but its utility is motivated by the following lemma.
+
+\begin{toappendix}    
+\begin{lemma}
+\label{lemmaSigmaRecurrence}
+Let $H \in \R^{n \times n}$ be a positive semi-definite symmetric matrix, and let $a_1,\ldots,a_n$ be a sequence of vectors in $\R^n$. Consider the recurrence given by $\Sigma_0 = 0 \in \R^{n \times n}$ and from $k=0$ to $n-1$
+\[
+    \Sigma_{k+1} = (I - e_k a_k^T) \Sigma_k (I - a_k e_k^T) + e_k e_k^T.
+\]
+Let $\ell(a_1,\ldots,a_n) = \trace{H \Sigma_n}$.
+Then if $H = L D L^T$ is the LDL decomposition of $H$, a global minimum of $\ell$ occurs when $a_k$ is the $k$th column of $L$, and at this minimum, $\ell = \trace{D}$.
+\end{lemma}
+\begin{proof}
+First observe that at step $k$, $\Sigma_k$ will be $0$ in all entries $(\Sigma_k)_{ij}$ if $\min(i,j) \ge k$. This means that changing the last $n-k$ entries of $a_k$ does not change $\Sigma$ (or $\ell$) at all. Without loss of generality, set those entries of $a_k$ to $0$. If $A$ is the matrix whose $k$th row is $a_k$, this is equivalent to saying that $A$ is strictly lower triangular.
+
+Next, let $\eta$ be a random Gaussian sampled from $\mathcal{N}(0, I)$, and consider the recurrence given by $x_0 = 0 \in \R^n$ and
+\[
+    x_{k+1} = x_k - e_k a_k^T x_k + e_k e_k^T \eta.
+\]
+It's straightforward to see that $\Sigma_k = \Exv{ x_k x_k^T }$. But it's also easy to see that the step-$k$ update only modifies/assigns the $k$th entry of $x$, and does so based only on earlier entries of $x$. Since $e_k^T x_k = 0$, and no later step assigns the $k$-or-lower entries of $x$,
+\[
+    e_k^T x_n = e_k^T x_{k+1} = 0 - a_k^T x_k + e_k^T \eta = - a_k^T x_n + e_k^T \eta,
+\]
+which in vector form yields
+\[
+    (I + A) x_n = \eta.
+\]
+In particular, this immediately implies that
+\[
+    \Sigma_n = (I + A)^{-1} (I + A)^{-T}
+\]
+and
+\[
+    \ell = \trace{H \Sigma_n} = \trace{ (I + A)^{-T} H (I + A)^{-1} } = \trace{ B^{-T} H B^{-1} }.
+\]
+where $B = I+A$.
+Differentiating with respect to $B$ in strictly lower triangular direction $\Delta$ (the only direction in which we have degress of freedom, since the diagonal of $B$ must be unit) yields %\todo{JC: check derivative}
+\[
+   -2 \trace{ B^{-T} H B^{-1} \Delta B^{-1} }.
+\]
+It's not hard to see that if $H = L D L^T$ is the LDL decomposition of $H$, and $B^T = L$, that the gradient is
+\[
+   -2 \trace{ D \Delta B^{-1} }
+   =
+   -2 \trace{ \Delta B^{-1} D }
+   =
+   -2 \langle \Delta^T, B^{-1} D \rangle.
+\]
+Since $\Delta^T$ is strictly upper triangular, but $B^{-1} D$ must be lower triangular, this is $0$ so we have a minimum. The uniqueness of this minimum (up to assignments of the lower-triangular elements of $A$ or $B$, which have no effect on $\ell$) also immediately follows from the recurrence relation. This implies the minimum is global. This is what we wanted to show.
+\end{proof}
+\end{toappendix}
+
+
+\begin{lemmarep}\label{lemDincoherentBd}
+Let $H \in \R^{n \times n}$ be a $\mu$-incoherent positive semi-definite symmetric matrix
+and let $H = (\grave U + I) D (\grave U + I)^T$ be its LDL Cholesky decomposition, where $\grave U$ is a strictly upper triangular matrix and $D$ is a (non-negative) diagonal matrix. Then,
+\[
+    \trace{D} \le \frac{\mu^2}{n} \trace{ H^{1/2} }^2.
+\]
+\end{lemmarep}
+\begin{proof}
+By continuity of $\trace{D}$ and $\trace{H^{1/2}}$, it suffices to prove the lemma for positive definite $H$.
+First, the closure of positive definite symmetric matrices is the set of positive semi-definite symmetric matrices.
+Second, consider the set of $H$ that are positive definite and satisfy $\frac{\mu^2}{n} \trace{H^{1/2}}^2 - \trace{D} \geq 0$, i.e. are non-negative.
+The closure of this set (i.e. $H \succeq 0$) must also satisfy that the inequality is non-negative.
+
+Let $H = Q \Lambda Q^T$ be the eigendecomposition of $H$.
+First, observe that by incoherence,
+\[
+    e_k^T H^{1/2} e_k
+    =
+    \sum_{i=1}^n \lambda_i^{1/2} (e_i^T Q e_k)^2
+    \le
+    \frac{\mu^2}{n} \sum_{i=1}^n \lambda_i^{1/2}
+    =
+    \frac{\mu^2}{n} \trace{H^{1/2}}.
+\]
+
+Set
+\[
+    \alpha = \frac{\mu^2}{n} \trace{H^{1/2}},
+\]
+and consider the recurrence from Lemma~\ref{lemmaSigmaRecurrence} with
+\[
+    a_k = \frac{H^{1/2} e_k}{\alpha}
+\]
+Then
+\[
+    \Sigma_{k+1} = \left(I - \alpha^{-1} e_k e_k^T H^{1/2} \right) \Sigma_k \left(I - \alpha^{-1}H^{1/2} e_k e_k^T \right) + e_k e_k^T.
+\]
+Suppose by way of induction that for some scalar the covariance $\Sigma_k \preceq \alpha H^{-1/2}$. For the base case, this obviously holds since $\Sigma_0 = 0$. At step $k$,
+\begin{align*}
+    \Sigma_{k+1} 
+    &\preceq
+     \left(I - \alpha^{-1} e_k e_k^T H^{1/2} \right) \alpha H^{-1/2} \left(I - \alpha^{-1}H^{1/2} e_k e_k^T \right) + e_k e_k^T
+    \\&=
+    \alpha H^{-1/2} - 
+    2 e_k e_k^T
+    +
+    \alpha^{-1} e_k e_k^T H^{1/2} e_k e_k^T
+    +
+    e_k e_k^T
+    \\&\preceq
+    \alpha H^{-1/2}.
+\end{align*}
+Note that with this assignment,
+\[
+    a_k^T \Sigma_k a_k
+    \le
+    (\alpha^{-1} e_k^T H^{1/2}) (\alpha H^{-1/2}) (\alpha^{-1} H^{1/2} e_k)
+    =
+    \alpha^{-1} e_k^T H^{1/2} e_k
+    \le
+    1.
+\]
+
+
+So, by induction it follows that
+\[
+    \Sigma_n \preceq \frac{\mu^2}{n} \trace{H^{1/2}} \cdot H^{-1/2},
+\]
+and so
+\[
+    \trace{H \Sigma_n} \le \frac{\mu^2}{n} \trace{H^{1/2}} \trace{H \cdot H^{-1/2}}
+    = \frac{\mu^2}{n} \trace{H^{1/2}}^2.
+\]
+But from Lemma~\ref{lemmaSigmaRecurrence}, we know that $\trace{D}$ is the global minimum of $\trace{H \Sigma_n}$ for any assignment of $a_k$. This immediately gives us the desired result.
+\end{proof}
+To the best of our knowledge, this is a novel result  using incoherence to obtain a bound on $\trace{D}$ that depends only on the spectrum of $H$.
+To help interpret this result, we derive explicit proxy losses for plain nearest and stochastic rounding, which we will then compare to what LDLQ gets via Lemma~\ref{lemDincoherentBd}.
+
+
+\begin{lemmarep}\label{lemNearStochProxyH}
+Let $H$ be symmetric positive definite.
+In the worst case stochastic rounding achieves $\Lworst(\stoch, H) = (m/4) \trace{H}$.
+In the average case nearest and stochastic rounding achieve $\Lavg(\{\near, \stoch\}, H) = (m/c) \trace{H}$, where $c=12$ for nearest, and $c=6$ for stochastic.
+\end{lemmarep}
+\begin{proof}
+For nearest and stochastic rounding, set the linear feedback $U$ in Eq.~\eqref{eqnVectorQuant} to be zero.
+Stochastic rounding achieves worst-case loss,
+\begin{align}
+    \Lworst(\stoch, H)
+    &\stackrel{\eqref{eqnProxyEq}}{=}
+    \sup_{W \in \R^{m \times n}} \Exv{ \trace{ \eta H \eta^T } }
+    = \frac m4 \trace{ H }.
+    \label{eqnThm3proofb}
+\end{align}
+For the average-case proxy loss, recall the computations of $\Exv{ \eta_{ij}^2 }$ from the proof of Theorem~\ref{thmLDLopt}.
+\begin{align}
+    \Lavg(\near, H)
+    &\stackrel{\eqref{eqnProxyEq}}{=}
+    \Exv[{W \sim Unif[0,1]^{m \times n}}]{ \trace{ \eta H \eta^T } }
+    = \frac{m}{12} \trace{ H } 
+    \label{eqnThm3proofc}\\
+    \Lavg(\stoch, H)
+    &\stackrel{\eqref{eqnProxyEq}}{=}
+    \Exv[{W \sim Unif[0,1]^{m \times n}}]{ \trace{ \eta H \eta^T } }
+    = \frac m6 \trace{ H }.
+    \label{eqnThm3proofd}
+\end{align}
+\end{proof}
+
+
+To interpret this result, consider $H$ rank-$k$ with $\mu^2 k < n$.
+By Cauchy-Schwarz, $\operatorname{tr}( H^{1/2} )^2 \leq k \trace{ H }$. Combining Lemma~\ref{lemDincoherentBd} with the LDLQ proxy losses of Theorem~\ref{thmLDLopt} and comparing with Lemma~\ref{lemNearStochProxyH},
+{\small\begin{align*}
+   \Lworst(\ldl, H) 
+   &\leq 
+   \frac{m \mu^2}{4n} \trace{ H^{1/2} }^2 
+   \le
+   \frac{m \mu^2 k}{4n} \trace{H}
+   \leq
+   \frac{m}{4} \trace{H}
+   =
+   \Lworst(\stoch, H) \\
+   \Lavg(\ldl, H) 
+   &\leq 
+   \frac{m \mu^2}{cn} \trace{ H^{1/2} }^2 
+   \le
+   \frac{m \mu^2 k}{cn} \trace{ H } 
+   \leq 
+   \frac{m}{c} \trace{H}
+   =
+   \Lavg(\mathcal{B}, H),
+\end{align*}}%
+where $\mathcal{B} \in \{\near, \stoch\}$, and $c$ is as given in Theorem~\ref{thmLDLopt}.
+This shows that for sufficiently low-rank $H$, LDLQ is asymptotically better than plain nearest and stochastic rounding by a factor of $\mu^2 k / n$.
+
+
+\newcommand{\titleNoIncohSpectral}{Without incoherence: no improvement with a spectral bound}
+\paragraph{\titleNoIncohSpectral.}
+By assuming incoherence, we were able to show LDLQ gets an asymptotically better bound in terms of just the spectrum of $H$. We might ask: \emph{was the incoherence assumption necessary to get this result?} The following theorem answers this question in the affirmative by showing that without incoherence, the best spectral bound for LDLQ cannot differentiate it from the nearest and stochastic rounding baselines.
+\begin{toappendix}
+\subsection*{\titleNoIncohSpectral}
+\end{toappendix}
+
+
+
+\begin{theoremrep}\label{thmOPTQequivNearStoch}
+Consider all $\tilde H$ with the same spectrum as $H$.
+For any positive semi-definite $H$, the following holds.
+On the worst-case loss $\ldl$ achieves the same error as stochastic rounding,
+\[
+    \sup_{\tilde H s.t. \eig{\tilde H} = \eig{H}} \Lworst(\ldl, \tilde H)
+    =
+    %\Lworst(\near, H) = \Lworst(\stoch, H) 
+    \Lworst(\stoch, H) 
+    = 
+    \frac m4 \trace{ H }.
+\]
+On the average-case loss $\ldl$ achieves the same error as the corresponding rounding routine. Let $\mathcal{B} = \{\near, \stoch\}$ and $c=12$ for nearest, $c=6$ for stochastic.
+\[
+    \sup_{\tilde H s.t. \eig{\tilde H} = \eig{H}} \Lavg(\ldl^\ast, \tilde H)
+    =
+    \Lavg(\mathcal{B}, H) 
+    = 
+    \frac{m}{c} \trace { H }.
+\]
+\end{theoremrep}
+\begin{proof}
+See Lemma~\ref{lemNearStochProxyH} for calculations on the proxy loss for nearest and stochastic rounding.
+
+For LDLQ, we will derive lower and upper bounds on $\sup_{\tilde H s.t. \eig{\tilde H} = \eig{H}} \Lworst(\ldl, \tilde H)$ and $\sup_{\tilde H s.t. \eig{\tilde H} = \eig{H}} \Lavg(\ldl, \tilde H)$, and show they are equal.
+To construct a lower bound, consider $\tilde H = I \Lambda I$ where $\Lambda$ are the eigenvalues of $H$.
+This decomposition is also the LDL decomposition of $\tilde H$, rewritten as $\tilde H=(U + I) D (U + I)^{-1}$.
+It follows that $\trace{ D } = \trace{ \tilde H }$ for this $\tilde H$.
+Combine this result with the worst and average-case losses calculated in the proof of Theorem~\ref{thmLDLopt}.
+For the worst-case loss from the proof of Theorem~\ref{thmLDLopt}, $\geq \frac m4 \trace{H}$.
+The lower bound for the average-case loss is $\geq \frac{m}{12} \trace{H}$ for $\round$ as nearest, and $\geq \frac m6 \trace{H}$ for $\round$ as stochastic.
+Now upper bounds are derived using the preceding calculations in Eq.~\eqref{eqnThm3proofb}-\eqref{eqnThm3proofd}, and using the worst and average-case optimality of LDLQ proven in Theorem~\ref{thmLDLopt}.
+The lower and upper bounds are tight, proving our result.
+\end{proof}
+
+Note that the worst case for comparing LDLQ against these baselines occurs when $H$ is diagonal, see Theorem~\ref{thmLDLopt} and Lemma~\ref{lemNearStochProxyH}.
+Assuming incoherence as we do is a natural way to exclude such cases.
+
+

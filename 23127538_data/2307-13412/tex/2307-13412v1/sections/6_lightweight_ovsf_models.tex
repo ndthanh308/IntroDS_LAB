@@ -1,0 +1,251 @@
+
+\section{Deriving Lightweight OVSF Models}
+\label{sec:light_ovsf_models}
+
+Having presented \tool's hardware architecture, its strategy for mapping OVSF models on the accelerator and its design space exploration process, we now describe important challenges for constructing efficient OVSF models. The main challenges comprise: \textit{i)}~extracting correctly-sized filters from OVSF codes, \textit{ii)}~selecting a subset of OVSF vectors to meet a given OVSF ratio for each layer, and \textit{iii)}~setting the per-layer OVSF ratios themselves. Section~\ref{sec:OVSF_issues} discusses our approach to \textit{i)} and \textit{ii)}, while Section~\ref{sec:hw_aware_ratios} introduces our novel hardware-aware scheme for tuning OVSF ratios.
+
+\subsection{Practical Considerations to Train OVSF Models}
+\label{sec:OVSF_issues}
+Unlike standard CNNs, architectures using OVSF codes do not learn convolutional ﬁlters directly. Instead, they learn weighting coeﬃcients for each OVSF code representing a filter. However, despite their simplicity as a straight drop and replacement option for standard convolutional layers, the nature of OVSF codes and the filter generation process, present two fundamental challenges: \textit{1)}~OVSF codes are of power-of-two length: This constrains the generation of filters with all $N_{\text{out}}$, $N_{\text{in}}$, and $K$ being power-of-two integers. While this might be reasonable for the input and output channel dimensions, it prevents the construction of $3$$\times$$3$ filters, which are ubiquitous in modern CNN architectures; and \textit{2)}~choosing a subset of basis: Model compression is only achieved when OVSF ratio $\rho<$ $1$, which raises the question of \textit{which bases to choose} from the total $L$ available for OVSF codes of length $L$. Intuitively, their should be an optimal subset of basis for a given $\rho<$ $1$ that allows the learning of more expressive filters.
+
+For \textit{1)}, we consider between \textit{i)}~utilising the first $\lfloor \rho \cdot K^2\rceil$ codes and \textit{ii)}~iteratively discarding OVSF codes based on their associated scalar $\alpha$ until the target compression ratio $\rho$ is reached. Compared to \textit{ii)}, with \textit{i)} we have a simpler optimization objective at the expense of potentially limiting the expressivity of OVSF filters. For \textit{2)}, we consider \textit{i)}~extracting a $3$$\times$$3$ crop from a $4$$\times$$4$ filter and \textit{ii)}~learning a mapping to a $3$$\times$$3$ filter by means of an average pooling layer. Similarly to the first pair of solutions, \textit{i)} represents a simpler training stage at the expense of a reduced effective field over the OVSF basis when constructing $3$$\times$$3$ filter. In Sec.~\ref{sec:basis_selection_and_3x3_extraction}, we compare both pairs of approaches for the above challenges.
+
+%Training OVSF-base models require the explicit generation of OVSF filters in a layer as part of the inference stage. This can slow down training, especially in very large models.
+In certain scenarios, a pre-trained model with standard convolutions might be available or can be trained very cheaply. In such cases, the formulation in Eq.~(\ref{eq:vector_eq}) could be reinterpreted as a minimisation problem and regress the set of $\pmb{\alpha}^*_i$ that minimise the difference w.r.t the standard filter $\hat{f}_{i}$ as \mbox{{\footnotesize$\pmb{\alpha}^{*}$$=$$\argmin_{\alpha}\left\|f - \hat{f} \right \|_2^2$}}, which can be implemented as a 2-layer MLP regression stage. We leverage this strategy when training OVSF models on ImageNet. More details are provided in Section \ref{sec:training_scheme}. %The \textit{Converter}, as in Fig.~\ref{fig:design_flow} transforms a CNN with normal convolutions into its OVSF counterpart following the same regression procedure.
+
+
+% Figure environment removed
+
+\subsection{Hardware-Aware Tuning of OVSF Ratios}
+\label{sec:hw_aware_ratios}
+
+A critical component of \tool is the \textit{OVSF Ratios Selection} module of the \textit{OVSF Model Converter} (Fig.~\ref{fig:design_flow}).
+In the original work~\cite{unzipfpga2021fccm}, the OVSF ratios (\textit{i.e.}~$\rho$ for each layer) were manually selected in a coarse, per-block manner, with the objective to reach a given compression ratio while minimising accuracy degradation. For example, as detailed in Section~\ref{sec:training_scheme}, to achieve a compression of 50\% in model size, denoted by OVSF50, the hand-tuned ratios were set by the tuple $[1.0, 0.5, 0.5, 0.5]$, indicating the OVSF ratio for each of the four blocks comprising a ResNet. Lower ratios were assigned to deeper layers as these contain a larger portion of the model parameters and are known to be more resilient to compression. The first CONV layer in the network remains untouched (\textit{i.e.}~not OVSF) as it has been shown to be less resilient to approximations including quantisation~\cite{alizadeh2018a}. To reach higher compression ratios with minimal accuracy drop, more involved tuning is required. This can be observed through the OVSF25 variant which achieves 75\% compression with diverse ratios of $[1.0, 0.4, 0.25, 0.125]$. Nonetheless, this process neither takes into account the impact of ratio values on hardware performance nor is automated, requiring elaborate tuning.
+
+To alleviate this, we introduce a hardware-aware autotuning scheme for selecting the OVSF ratios of a given model on a target device. 
+The key insight behind our method is that, for layers that are either compute- or memory-bound, we can allow the weights generation stage to consume more cycles by using more OVSF vectors (\textit{i.e.}~using a higher OVSF ratio) \textit{without} affecting the processing speed. As such, \texttt{CNN-WGen} will output a better approximation of the layer's weights, increasing the model's expressivity and potentially improving accuracy. With reference to our performance model (Section~\ref{sec:perf_model}), this case occurs for layer $i$ when either the processing engine's runtime ($t^i_{\text{eng}*}$) or the off-chip memory transfers ($t^i_{\text{mem in}}$ or $t^i_{\text{mem out}}$)  dominate the initiation interval in Eq.~(\ref{eq:initiation_interval}). This allows us to allocate more cycles for $t^i_{\texttt{CNN-WGen}}$ by using a higher OVSF ratio and obtaining a better approximation of the weights.
+
+With this insight, Fig.~\ref{fig:hw_aware_tune_flow} presents our hardware-aware autotuning scheme is as follows. As a first step, we run \tool's design flow (Fig.~\ref{fig:design_flow}) using the OVSF25 ratios (\textit{e.g.}~$[1.0, 0.4, 0.25, 0.125]$ for ResNet) and derive the corresponding accelerator configuration $\bigl(\circled{1}\bigr)$. Next, we perform a bottleneck analysis of each layer's mapping on the accelerator that indicates which stage dominates the initiation interval $\bigl(\circled{2}\bigr)$, \textit{i.e.}~whether it is memory-bound (either input or output activation transfer), compute-bound or weights-generation-bound. For the layers where \texttt{CNN-WGen} is \textit{not} the bounding factor, we iteratively \stelios{Typically, we converged at 5 to 6 iterations in the examined models. We can report how much extra time that is, i.e. the tuning/search overhead - given the journal's theme, this might be expected. Else, we can leave it for the revised version after the reviews.} increase the OVSF ratios up to the point where the bottleneck does not shift to the weights generation stage $\bigl(\circled{3}\bigr)$. 
+This leads to a more balanced pipelining of each layer, hence increasing accuracy by better utilising the instantiated accelerator. At the end of this process, the converged set of OVSF ratios are passed as the output of the \textit{OVSF Ratios Selection} module (Fig.~\ref{fig:design_flow}) and the rest of \tool's flow is run $\bigl(\circled{4}\bigr)$. As such, the model is retrained and the design space exploration is rerun with the new OVSF ratios $\bigl(\circled{5}\bigr)$, and the final model-accelerator pair are deployed on the target FPGA. Despite the additional retraining step, we note that the training protocol, \textit{i.e.}~all hyperparameters, remains the same throughout, without the need for further tuning.
+
+\stelios{This paragraph is new.}
+In step $\circled{3}$, the candidate values of ratio $\rho^l$ for the $l$-th layer lie in $\left\{ L^l/n ~|~ \forall \, n \in [1,L^l] \right\}$, where $L^l=N^l_{\text{in}}K^lK^l$ is the layer's code length (Sec.~\ref{sec:background_cnn_ovsf}). As such, there are $|L^l|$ candidate OVSF ratio values per OVSF layer. Overall, for a CNN with $N_L$ OVSF layers, there is a total of $\prod_{l=1}^{N_L} |L^l|$ possible OVSF ratio combinations. With an increase in either the model's depth or an OVSF layer's width, an enumerative exhaustive search quickly becomes computationally intractable. To alleviate this, we perform a parallel search for all OVSF layers, starting from the OVSF25 configuration.
+At the first iteration, we first calculate the \textit{throughput ratio} between the weights-generation stage and the bottleneck stage of each layer and set the respective OVSF ratio to the closest feasible value. Then, we search the neighbouring candidate ratios until we find the maximum value that does not turn the weights-generation stage into the bottleneck. Throughout our experiments, this process lead to an average of 5 iterations to converge to the final hardware-aware set of ratios across the examined models.
+
+Table~\ref{tab:hw_aware_tune_example} illustrates the impact of our scheme, denoted by \texttt{hw-aware-autotuning}, using ResNet18 on Z7045 for varying bandwidth availability. In the most bandwidth-constrained case (1.1~GB/s), OVSF25 is memory-bound, with all layers being limited by the transfer of the input feature maps. Our method exploits severe memory-boundedness and selectively increases the OVSF ratios, leading to an accuracy improvement of 1.2pp over OVSF25 with no sacrifice of the processing speed. For medium bandwidth levels (2.2~GB/s), a number of OVSF25 layers become compute-bound. If we naively set all OVSF ratios to 1.0 (shown as \texttt{uniform-1.0}), several layers become bound by the weights generation stage. Instead, with our bottleneck-guided method, the weights are more accurately generated while no change occurs to the boundedness of each layer. This results in achieving the same throughput as OVSF25, but with a 1.1pp increase in accuracy. Finally, in the high-bandwidth case (4.4~GB/s), our method introduces a 0.3pp accuracy gain, without affecting the hardware performance.
+\stelios{Can comment more on the selection of ratios. Specifically, point out that our method picks the exact OVSF ratio values depending on the margin of each layer from changing bounding factor, e.g. there is room for higher ratios for some middle layers (0.333 in 4.4 GB/s) and less room in latter layers (0.25 ratios).}
+
+Overall, our OVSF ratio selection method incorporates three features: \textit{1)}~it is fine-grained by allowing for different per-layer OVSF ratios within each block. As such, we obtain finer-grained control over the accuracy-compression trade-off; \textit{2)}~it bounds the accuracy drop from below by means of an informed initialisation of the ratio values. By starting from the OVSF25 ratios (\textit{i.e.} our most lightweight setting), we guarantee the accuracy's lowest bound and, by allowing only increases in OVSF ratios, we ensure that these would only potentially contribute accuracy gains; and \textit{3)}~it is hardware-aware as it is guided by the bottleneck analysis of each layer's processing.
+
+
+
+
+
+\begin{table}[t]
+    \normalsize
+    % \tablefontsize
+    \centering
+    \captionsetup{font=small,labelfont=bf}
+    \captionof{table}{\footnotesize Different OVSF ratio selection methods with respect to accuracy and bottleneck stage for ResNet18.}
+    \vspace{-0.1cm}
+    \resizebox{1.0\linewidth}{!}{
+    \begin{tabular}{c|c|c|l|cccccccccccccccccccc}
+   
+        \toprule
+         Memory & OVSF Ratio & Accuracy & & \multicolumn{20}{c}{Layer ID} \\
+         Bandwidth & Selection Method & (\%) & & L0 & L1 & L2 & L3 & L4 & L5 & L6 & L7 & L8 & L9 & L10 & L11 & L12 & L13 & L14 & L15 & L16 & L17 & L18 & L19 \\ 
+        \midrule
+
+        % 1.1 GB/s
+        % \multirow{6}{*}{\parbox{1.9cm}{\centering ResNet18}} 
+        \multirow{6}{*}{1.1 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+        \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{68.5} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.25 \\
+        \cline{2-24}
+
+        % 2.2 GB/s
+         \multirow{6}{*}{2.2 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & W & IFM & W & W \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+        \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{68.4} & Bound & 
+        IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.25 \\
+        \cline{2-24}
+
+        % 4.4 GB/s
+        % \multirow{6}{*}{\parbox{1.9cm}{\centering ResNet18}} 
+        \multirow{6}{*}{4.4 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+        IFM & C & C & C & C & C & C & OFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+        % \cline{5-24} 
+         & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+        IFM & C & C & C & C & C & C & OFM & C & C & W & W & IFM & W & W & W & W & IFM & W & W \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+        \\
+        
+        \cline{3-24} & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{67.6} & Bound & 
+        IFM & C & C & C & C & C & C & OFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+        % \cline{5-24} 
+        & & & OVSF Ratio & 
+        1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.333 & 0.333 & 0.5 & 0.333 & 0.333 & 0.333 & 0.25 & 0.25 & 0.25 & 0.25 & 0.25 \\
+        
+        % \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+        % & \multirow{2}{*}{Iterative} & Crop &  & 94.1 & & 93.6 & & \textbf{93.6} \\
+        % & & Adaptive &  & 94.0 & & 93.8 & & 92.3 \\ 
+        % \midrule \midrule
+                                   
+        % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet18$^\dagger$ 91.3\% 0.27M}} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{0.48} & 90.8 & \multirow{4}{*}{0.25} & 90.8 & \multirow{4}{*}{0.15} & 88.3 \\
+        %                           & & Adaptive &  & 91.1 & & 91.2 & & 88.5\\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+        %                           & \multirow{2}{*}{Iterative} & Crop &  & 91.1 & & 91.3 & & \textbf{91.4}\\
+        %                           & & Adaptive &  & 91.2 & & 91.4 & & 91.0\\ \midrule \midrule
+                                   
+        % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet34 93.9\% 21.3M }} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{37.7} & 94.1 &  \multirow{4}{*}{17.6} & 93.9 & \multirow{4}{*}{7.2} & 93.4  \\
+        %                           & & Adaptive &  & 94.3& & 94.0 & & 93.4 \\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+        %                           & \multirow{2}{*}{Iterative} & Crop &  & 94.1& & 93.8 & & \textbf{94.3}\\
+        %                           & & Adaptive &  & 93.8 & & 93.7 & & 93.2\\ \midrule \midrule
+
+        % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet34$^\dagger$ 92.1\% 0.46M}} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{0.82} & 92.3 & \multirow{4}{*}{0.43} & 91.4 & \multirow{4}{*}{0.26} & 89.3 \\
+        %                           & & Adaptive &  & 92.2 & & 91.5 & & 89.2\\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+        %                           & \multirow{2}{*}{Iterative} & Crop &  & 92.3& & 91.8 & & \textbf{92.2}\\
+        %                           & & Adaptive &  & 92.4 & & 91.7 & & 91.7\\
+
+    \bottomrule
+    \multicolumn{20}{l}{* IFM: Memory-bound w.r.t. input feature maps | OFM: Memory-bound w.r.t. output feature maps | C: Compute-bound | W: Weights Generation-bound.} \\
+    \end{tabular}
+    }
+    
+    \label{tab:hw_aware_tune_example}
+\end{table}
+
+% \begin{table}[t]
+%     \normalsize
+%     % \tablefontsize
+%     \centering
+%     \captionsetup{font=small,labelfont=bf}
+%     \captionof{table}{\footnotesize Comparison of different OVSF ratio selection methods with respect to accuracy and bottleneck stage.}
+%     \vspace{-0.1cm}
+%     \resizebox{1.0\linewidth}{!}{
+%     \begin{tabular}{c|c|c|c|l|cccccccccccccccccccc}
+   
+%         \toprule
+%         Model & Bandwidth & OVSF Ratio & Accuracy & & \multicolumn{20}{c}{Layer ID} \\
+%         Arch. &  & Selection Method & (\%) & & L0 & L1 & L2 & L3 & L4 & L5 & L6 & L7 & L8 & L9 & L10 & L11 & L12 & L13 & L14 & L15 & L16 & L17 & L18 & L19 \\ 
+%         \midrule
+
+%         % 1.1 GB/s
+%         % \multirow{6}{*}{\parbox{1.9cm}{\centering ResNet18}} 
+%         & \multirow{6}{*}{1.1 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+%         \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{68.5} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM & IFM \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.25 \\
+%         \cline{2-25}
+
+%         % 2.2 GB/s
+%         \multirow{6}{*}{\parbox{1.9cm}{\centering ResNet18}} & \multirow{6}{*}{2.2 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & W & IFM & W & W \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+%         \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{68.4} & Bound & 
+%         IFM & IFM & IFM & IFM & IFM & C & C & IFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.5 & 0.25 \\
+%         \cline{2-25}
+
+%         % 4.4 GB/s
+%         % \multirow{6}{*}{\parbox{1.9cm}{\centering ResNet18}} 
+%         & \multirow{6}{*}{4.4 GB/s} & \multirow{2}{*}{OVSF25} & \multirow{2}{*}{67.3} & Bound & 
+%         IFM & C & C & C & C & C & C & OFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.4 & 0.4 & 1.0 & 0.4 & 0.4 & 0.25 & 0.25 & 1.0 & 0.25 & 0.25 & 0.125 & 0.125 & 1.0 & 0.125 & 0.125 \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{uniform-1.0}} & \multirow{2}{*}{N/A} & Bound & 
+%         IFM & C & C & C & C & C & C & OFM & C & C & W & W & IFM & W & W & W & W & IFM & W & W \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0
+%         \\
+        
+%         \cline{3-25} & & \multirow{2}{*}{\texttt{hw-aware-autotuning}} & \multirow{2}{*}{67.6} & Bound & 
+%         IFM & C & C & C & C & C & C & OFM & C & C & C & C & IFM & C & C & C & C & IFM & C & C \\
+%         % \cline{5-24} 
+%         & & & & OVSF Ratio & 
+%         1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 1.0 & 0.333 & 0.333 & 0.5 & 0.333 & 0.333 & 0.333 & 0.25 & 0.25 & 0.25 & 0.25 & 0.25 \\
+        
+%         % \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+%         % & \multirow{2}{*}{Iterative} & Crop &  & 94.1 & & 93.6 & & \textbf{93.6} \\
+%         % & & Adaptive &  & 94.0 & & 93.8 & & 92.3 \\ 
+%         % \midrule \midrule
+                                   
+%         % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet18$^\dagger$ 91.3\% 0.27M}} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{0.48} & 90.8 & \multirow{4}{*}{0.25} & 90.8 & \multirow{4}{*}{0.15} & 88.3 \\
+%         %                           & & Adaptive &  & 91.1 & & 91.2 & & 88.5\\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+%         %                           & \multirow{2}{*}{Iterative} & Crop &  & 91.1 & & 91.3 & & \textbf{91.4}\\
+%         %                           & & Adaptive &  & 91.2 & & 91.4 & & 91.0\\ \midrule \midrule
+                                   
+%         % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet34 93.9\% 21.3M }} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{37.7} & 94.1 &  \multirow{4}{*}{17.6} & 93.9 & \multirow{4}{*}{7.2} & 93.4  \\
+%         %                           & & Adaptive &  & 94.3& & 94.0 & & 93.4 \\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+%         %                           & \multirow{2}{*}{Iterative} & Crop &  & 94.1& & 93.8 & & \textbf{94.3}\\
+%         %                           & & Adaptive &  & 93.8 & & 93.7 & & 93.2\\ \midrule \midrule
+
+%         % \multirow{4}{*}{\parbox{1.9cm}{\centering ResNet34$^\dagger$ 92.1\% 0.46M}} & \multirow{2}{*}{Sequential} & Crop & \multirow{4}{*}{0.82} & 92.3 & \multirow{4}{*}{0.43} & 91.4 & \multirow{4}{*}{0.26} & 89.3 \\
+%         %                           & & Adaptive &  & 92.2 & & 91.5 & & 89.2\\ \cline{2-3} \cline{5-5} \cline{7-7} \cline{9-9}
+%         %                           & \multirow{2}{*}{Iterative} & Crop &  & 92.3& & 91.8 & & \textbf{92.2}\\
+%         %                           & & Adaptive &  & 92.4 & & 91.7 & & 91.7\\
+
+%     \bottomrule
+%     \multicolumn{16}{l}{* IFM: Memory-bound w.r.t. input feature maps | OFM: Memory-bound w.r.t. output feature maps | C: Compute-bound | W: Weights Generation-bound.} \\
+%     \end{tabular}
+%     }
+    
+%     \label{tab:hw_aware_tune_example}
+% \end{table}
+

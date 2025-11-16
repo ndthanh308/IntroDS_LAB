@@ -1,0 +1,294 @@
+
+\section{Methodology}
+\label{sec:methodology}
+
+This section provides a detailed explanation of the MASE framework. Firstly, we present the specifications for the proposed MASE IR. Then, we demonstrate how software transformations can be performed on the MASE IR using MASE passes. Next, we elaborate on the process of hardware optimization and generation within the MASE IR. Finally, we describe the implementation of the testing framework, which enables co-simulations between the software model and the hardware design.
+
+\subsection{Unified IR for Software and Hardware}
+\label{sec:methodology:mase_ir}
+
+We seek an efficient IR that provides a high-level description of ML models and can be transformed back into the PyTorch model. Designing an \emphbold{efficient} and \emphbold{trainable} IR for hardware accelerator design is crucial for effectively exploring both software and hardware aspects. By using the term ``trainable'', we mean that the IR can be converted back into a trainable module within a high-level framework like PyTorch, enabling the re-training of a modified IR.
+
+In this work, we introduce a novel software and hardware co-design IR at the module level, called MASE IR. A MASE IR is a directed graph representation of \change{an ML model and its accelerator architecture}, consisting of multiple vertices connected by edges. Each vertex is referred to as a `MASE node'. \change{A MASE node represents the computation of an operation at the module level for software (an event) and a custom computation kernel for hardware (an instance). Each edge between two MASE nodes represents data dependence for software and data interface in wires for hardware.} MASE IR preserves the original PyTorch model within the IR by associating it with the nodes and edges, enabling analysis, transformation, training, and execution of the model.
+
+Figure~\ref{fig:example_ir} provides several examples of MASE IR. The leftmost part of the figure shows the initial representation of an input model. The IR consists of six nodes, where the orange nodes represent nodes that do not alter the tensor values, and the blue nodes compute tensors and generate new values. The colours of the nodes serve as annotations, and all the nodes are treated the same by the tool. The node types in MASE IR are a superset of the types supported by PyTorch built-in modules and functions, enabling a direct translation between MASE and PyTorch. A list of the supported node types can be found in the top left of Table~\ref{tab:mase_ir_attr}.
+
+Each instance of a node in MASE IR is associated with a set of attributes that model both software and hardware behaviour. In the figure, we show the key attributes for the sake of simplicity. Attributes denoted by black text in the figure are general and applicable to every node, such as input and output types. Certain attributes are specific to individual node types, highlighted in blue text in the figure. These node-specific attributes correspond to parameters specific to different types of nodes, such as convolutional layers and linear layers as depicted in the figure. The information regarding edges in the IR is captured by the attributes of the preceding and succeeding nodes. A list of key attributes used in this work can be found in the bottom left of Table~\ref{tab:mase_ir_attr}.
+
+MASE interacts with MASE IR through two forms: actions and passes. An action, also referred to as a pass manager, carries out coarse-grained transformations of MASE IR. It consists of a sequence of passes and can be directly utilised by general users, as depicted in Figure~\ref{fig:overview}. A pass performs analysis or transformation at a finer grain and is employed during development. A comprehensive list of actions and passes is provided in Table~\ref{tab:mase_ir_attr}. In the following sections, we will delve into the process of transforming MASE IR in both software and hardware through a series of MASE passes.
+
+\subsection{Software \& Hardware Transformation}
+\label{sec:methodology:modify_sw}
+
+The software transformation passes can be classified into two categories: architecture-level and node-level. In Figure~\ref{fig:example_ir}, a pipeline of transformations is demonstrated using a sequence of three MASE passes. The first pass (fusion pass) conducts software transformation on the model architecture, while the second pass (quantization pass) performs software transformation on the model parameters.
+
+Firstly, the fusion pass merges a {\tt BatchNorm} layer following a {\tt Conv2d} layer into the {\tt Conv2d} layer by updating the weights within the {\tt Conv2d} layer. A key benefit of such a transformation is that it reduces the hardware area due to the removal of a {\tt BatchNorm} kernel, at the cost of preprocessing the weights. The fusion pass is an architecture-level transformation that modifies the model architecture.
+
+Secondly, the quantization pass replaces the {\tt Conv2d} and {\tt Linear} nodes in floating-points with the quantized ones in integer types. \change{The forward and backward passes of each node are updated so the node is still trainable.} A key benefit of such a transformation is that it reduces the area occupied by each hardware kernel by utilising efficient arithmetic for hardware computation, at the cost of potential accuracy loss. The quantization pass operates at the node level, as it solely modifies the node locally. As depicted in the second rightmost IR in Figure~\ref{fig:example_ir}, the values are quantized from float32 to small integers. Our quantization pass has the capability to conduct a mixed-precision search for each parameter in the model, which allows for fine-grained optimization of parameters and maximizes the benefits of quantization at scale. A detailed case study on mixed-precision quantization is presented in Section~\ref{sec:experiments:search}.
+
+The hardware transformation can also be conducted at both levels. In Figure~\ref{fig:example_ir}, we show an example of a design space exploration (DSE) pass. This pass explores the hardware design metrics using the provided specifications, such as available hardware resources, and establishes efficient constraints for hardware mapping. There are various design constraints to be explored for each node. For simplicity, we will only highlight the key hardware attributes of a linear layer:
+
+\begin{itemize}
+\item The {\tt toolchain} attribute specifies the hardware synthesis approach used, which currently employs pre-defined hardware components provided by MASE.
+\item MASE offers a range of IP cores, and the {\tt IP core} attribute indicates the specific component to be utilised if a pre-defined hardware component is used.
+\item Tensors computed by this linear layer are large. To maintain high throughput, matrices are partitioned into tiles and processed in a pipelined manner. The {\tt size} and {\tt depth} attributes specify the tile size and the number of partitions for each parameter, input, and output.
+\item The {\tt order} attribute defines the order of tiles fed into the hardware kernel across multiple dimensions.
+\item The {\tt interface} attribute determines the hardware interface for each data port, with the current configuration mapping inputs and outputs to handshake interfaces.
+\item The internal parameters can be stored in BRAM or DRAM, depending on the use cases. The {\tt map} attribute specifies how weights are stored for the linear layer.
+\end{itemize}
+A detailed explanation of the DSE approach on how to determine these attributes is explained in Section~\ref{sec:methodology:dse}.
+
+As a software and hardware co-design tool, MASE facilitates the interleaving of software and hardware co-optimization by utilizing the same MASE IR for both abstractions. The passes shown in Figure~\ref{fig:example_ir} can be executed in any order, allowing for efficient transformation and creating opportunities for synergistic effects between different passes.
+
+\subsection{System Synthesis}
+\label{sec:methodology:modify_hw}
+
+% % Figure environment removed
+
+In order to synthesize an efficient accelerator system, MASE explores the hardware parameters within the MASE IR and optimizes the hardware design using several optimization passes. Firstly, we demonstrate three possible approaches for synthesizing ML accelerators in MASE: utilizing \change{pre-defined parameterized blocks available in MASE (in either RTL or HLS code), incorporating user-defined blocks, or directly utilizing HLS-generated blocks through MLIR and Vivado HLS~\cite{vivado_hls}}. Secondly, we explain how MASE explores the hardware architecture using these blocks. Lastly, we illustrate how the exploration engine in MASE determines the optimized accelerator design.
+
+\subsubsection{Hardware Back End}
+
+The hardware backend of MASE takes a model in MASE IR and translates it into a hardware system. In the MASE IR, each MASE node can be mapped into hardware using one of three approaches. First, MASE contains a set of predefined parameterized blocks in its internal hardware library. Each block has a set of inputs and a set of outputs with handshake interfaces. These blocks are parameterized and manually implemented as templates in RTL or HLS code. If an operation has been defined in the internal hardware library, it could be directly synthesized into one of the pre-defined components with custom parameters. An advantage of such a component is that these components have been optimized for high performance and area efficiency. However, the internal hardware library requires manpower to develop and takes a long time to support new operations in state-of-the-art ML models.
+
+% Figure~\ref{fig:linear_example} illustrates an internal hardware component that computes the linear layer, which contains a handshake data input and a handshake data output, as shown in lines 3 and 4. The width parameters specify the precision of input, output, weights, and bias. The other parameters do not affect the correctness of the hardware but the throughput. For instance, the input data to this linear component could be tiled in two dimensions. {\tt row} and {\tt col} mean the size of a single tile, and {\tt row\_depth} and  {\tt col\_depth} mean the iteration counts. Additionally, the weights could be tiled as well. The row size of the weight tile affects the parallelism of multiplication. Given the size of the input, the throughput of the hardware could be explored by varying these parameters.
+
+% Figure environment removed
+
+\noindent
+\jcp{1) Enabling reusability by supporting external block}
+
+A second approach is to import user-defined hardware components. There have been a variety of ML accelerator designs that show high performance and energy efficiency for a particular ML model. These accelerators often contain reusable hardware blocks. To use these blocks, MASE enables the integration of external hardware blocks if each data port is implemented using a handshake interface. A user-defined hardware block is treated as a black box. With the parameters of the custom blocks provided, the parallelism of these blocks can be explored with other blocks in the DSE pass.
+
+\noindent
+\jcp{2) Enabling synthesizability by supporting MLIR-HLS end}
+
+However, new models often contain new or custom ops. Manual hardware development is slow and cannot catch up with the software model evolution. The absence of a single operation can fail the hardware synthesis of the entire model. To overcome this challenge, MASE supports the hardware synthesis of \textbf{\textit{arbitrary}} ML models by mapping new operations into hardware using the MLIR-HLS flow. Figure~\ref{fig:mase_hls} illustrates the HLS flow from MASE IR to hardware. \change{In MASE, each MASE node can be transformed by the Torch-MLIR front end~\cite{torch_mlir} into MLIR, specifically the {\tt linalg} abstraction at the tensor level. It can then be successively transformed into the {\tt affine} abstraction \change{using open-sourced MLIR passes} and then translated into HLS code using MASE emit-c pass. These HLS blocks are modularised and connected to other hardware blocks using the handshake interface.}
+
+Here we use AMD Xilinx Vivado HLS~\cite{vivado_hls} as MASE HLS back end. Vivado HLS generates 
+hardware with a block interface by default, also called latency-sensitive design. Directives of 
+synthesising a handshake interface for the input and output require human efforts. MASE currently has 
+two passes on the MLIR end: 1) automatically inserting such directives using static analysis; 
+2) HLS code and wrapper generation from MLIR. 
+
+Here, we use AMD Xilinx Vivado HLS~\cite{vivado_hls} as our HLS backend. By default, Vivado HLS generates hardware with a block interface, which is referred to as a latency-sensitive design. However, directives for synthesising a handshake interface for the input and output necessitate manual intervention. In MASE, we currently have two passes on the MLIR end for enabling hardware generation: 1) the automatic insertion of these handshake directives, and 2) the generation of HLS code and wrappers from MLIR.
+
+\begin{table}[]
+    \centering
+    \caption{Hardware block types in this work.}
+    \label{tab:summary}
+    \begin{tabular}{lr}
+    \toprule
+Hardware Module Class & \multicolumn{1}{l}{Percentage} \\
+\midrule
+Pre-defined & 75.5\% \\
+\change{Directly through MLIR-HLS} & 10.8\% \\
+User-defined & 13.7\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% \algdef{SE}[DOWHILE]{Do}{doWhile}{\algorithmicdo}[1]{\algorithmicwhile\ #1}%
+% \begin{algorithm}[ht]
+% \caption{ MASE Hardware Design-Space Exploration.}\label{alg:dse}
+% \label{fig:alg}
+% \begin{algorithmic}[1]
+% \footnotesize 
+% \change{
+% \Require $M$ \Comment{Input MASE IR}
+% \Require $B$ \Comment{Maximum Corss-device bandwidth}
+% \Require $P$ \Comment{Pre-defined hardware blocks}
+% \Require $R$ \Comment{Area budget per device}
+% \Require $N$ \Comment{Number of available devices} \\
+% 
+% \Procedure{get\_A\_and\_T}{$n$} \Comment{Evaluate area and throughput} \\
+% \Comment{$A$ means area and $T$ means throughput}
+% \If{$n \in P$}
+% \State \Return from\_regression\_model($n$)
+% \Else
+% \State \Return from\_synthesis\_report($n$)
+% \EndIf
+% \EndProcedure \\
+% 
+% \Procedure{balance\_T}{$n$} \Comment{Throughput balancing}
+    % \For{each MASE node $n$ in $M \cap P$}
+        % \State $\theta \gets$ get\_actual\_T($M$, $n$) \Comment{Adapt from \cite{venieris2016fccm}}
+        % \State $S \gets$ get\_node\_search\_space($n$) 
+        % \State $n \gets$ $\min_{\theta'}$ \{$n \in S$ | (a, $\theta'$) $\gets$ get\_A\_and\_T($M$, $n$) $\wedge \theta' \geq \theta$\}
+    % \EndFor
+    % \State \Return $M$
+% \EndProcedure \\
+% 
+% \\\Comment{Starting with the fully parallelised design}
+% \State $M \gets$ max\_parallelism\_param($M$)
+% \State $M \gets$ BALANCE\_T($M$)
+% \While{$(\forall n \in M \ldotp$ get\_resource($n$) $> R)$ \\
+% ~~~~~~~$\vee (\sum_n$ get\_resource($n$) $> N \cdot R)$ \\
+% ~~~~~~~$\vee (\forall n \in M \ldotp$ eval\_throughput($n$) $> B)$} \Comment{Search}
+% \State $M \gets$ decrement\_parallelism($M$) 
+% \State $M \gets$ BALANCE\_T($M$)
+% \EndWhile \\
+% 
+% %\State $\theta$ = $max_n$(EVAL\_THROUGHPUT(n)), $n \in M$ \Comment{Balancing rates}
+% %\For{each MASE node $n$ in $M$}
+% %    \While{EVAL\_THROUGHPUT(n) > $\theta$}
+% %        \State decrement\_parallelism($n$)
+% %    \EndWhile
+% %\EndFor \\
+% 
+% \State rsc = 0; i = 0  \Comment{Device-level partitioning}
+% \For{each MASE node $n$ in $M$} 
+    % \State $n$.device\_id = i
+    % \If{rsc+GET\_RESOURCE($n$) > R}
+        % \State rsc = 0; i++
+        % \State rsc += GET\_RESOURCE($n$)
+    % \EndIf
+% \EndFor
+% }
+% \\
+% \State \Return $M$
+% \end{algorithmic}
+% \end{algorithm}
+
+\change{The MLIR-HLS stage is considered as an exit point in the MASE flow, as it generates HLS code to enable the hardware synthesis capability of MASE.} Ongoing research efforts on HLS optimization in MLIR~\cite{zhao2022fpl, xu2022iccad} can be applied in MASE for further improving the design quality of the HLS hardware. \change{However, these optimizations are beyond the scope of this paper, as our focus is primarily on software and hardware optimization in the MASE IR.} The hardware generated by vanilla MLIR-HLS still exhibits a significant performance gap compared to manually optimized RTL or HLS hardware. Nonetheless, during our experiments, we observed that the proportion of such hardware is minimal, as most operations are directly supported by MASE, as indicated in Table~\ref{tab:summary}. The performance overhead is limited and is expected to be further reduced with dedicated engineering efforts.
+
+% Figure environment removed
+
+
+%\begin{table*}
+%\caption{A list of throughput formulas for rate balancing during design-space explortion. Throughput means }
+%\label{tab:dse}
+%\centering
+%\change{
+%\begin{tabular}{lllll}
+%\toprule
+%Ops & Inputs & Parameters & Throughput modelling \\
+%\midrule
+%Linear & $P_{input}$ & $P_{weight}$, $P_{bias}$ & $\theta_{output} = \theta_{input}$  \\
+%ReLU & $P_{input}$ &  & $P_{output}$ & $\theta_{output} = \theta_{input}$ \\
+%View & $P_{input}$ &  & $P_{output}$ &  \\
+%Size & $P_{input}$ &  & $P_{output}$ &  \\
+%Flatten & $P_{input}$ &  & $P_{output}$ &  \\
+%Add/Sub/Mul & \multicolumn{2}{l}{$P_{input0}$, $P_{input1}$} & $P_{output}$ &   \\
+%Conv2d & $P_{input}$ & $P_{weight}$ & $P_{output}$ &   \\
+%\bottomrule
+%\end{tabular}}
+%\end{table*}
+
+
+% \jc{This text meant to refer to table~\ref{tab:dse}}
+% \change{
+% Let $x$ be a data interface for a single node.
+% Say $x$ has $n$ dimensions, and let $P_{x} = (d_1, ..., d_n, D_1, ..., D_n, \theta)$ be the parallelism constraints. $D_k$ is the size of its dimension $k$, where $k \leq n$. In most time, $x$ is large and cannot be directly mapped on to hardware. Each dimension $k$ is then tiled with a unit size $d_k$, and $x$ is streamed between nodes. $\theta$ denotes the clock cycle-wise throughput of elements, which means the number of elements processed in each clock cycle. The overall throughput of $x$ then can be defined by $\theta/\prod{D}$.
+% 
+% }
+
+\subsubsection{Design Space Exploration}
+\label{sec:methodology:dse}
+
+Here we introduce the DSE engine in MASE. The DSE problem can be formalised using the following terms:
+\begin{itemize}
+    \item $M = \{n_0, n_1, n_2...\}$ denotes the set of all the nodes;
+    \item $S : n \rightarrow \{s_0, s_1...\}$ denotes the search space of node $n$;
+    \item $O \subseteq M \times S$ denotes a single design point of $M$;
+\end{itemize}
+MASE takes a model and explores all the search space $S$ for each MASE node. Given a budget for hardware resources and cross-device memory bandwidth, the optimiser searches for an efficient $O$ to maximise the system throughput \change{in a greedy form}.
+
+\change{As mentioned, MASE contains a set of pre-defined components. The throughput and area of nodes that use these components can be directly obtained using the internal regression model in MASE. The user-defined and HLS-generated components need to be analyzed from synthesis reports. The synthesis time overhead is relatively small because there were a small number of user-defined and HLS-generated components, as shown in Table~\ref{tab:summary}.}
+
+\noindent
+\jcp{1) Maximise throughput}
+
+The DSE process can be divided into five steps. It starts with the fully parallelized design and aims to efficiently reduce the area to a size that can fit onto the given devices. Let $\theta(n, s)$ represent the maximum achievable throughput of a node instance $(n, s)$. Then the fully parallelized design $O$ satisfies the following conditions:
+\begin{align}
+\theta_n = \max_{s \in S(n)} \theta(n, s) \\
+\forall n \in M \Rightarrow \theta(n, s) = \theta_n \wedge (n, s) \in O
+\end{align}
+These conditions ensure that all nodes are paired with the configuration that provides maximum throughput.
+
+\noindent
+\jcp{2) \change{Rate balancing}}
+
+The nodes are fully parallelized, but some of them may underperform, meaning that the actual throughput at runtime is significantly lower than the target throughput. To address this, we can reduce the parallelism of these nodes without affecting the overall throughput. This approach is known as rate balancing. We adopt the analysis provided by Venieris and Bouganis~\cite{venieris2016fccm} for estimating the actual throughput in dataflow hardware. Let $\theta_r(n, s)$ represent the actual throughput of a node instance $(n, s)$. After rate balancing, each node in the balanced design $O'$ is configured with a parallelism level close to its actual throughput.
+\change{
+\begin{align}
+ \theta_n' = \min \{\theta(n, s') | \theta(n, s') \geq \theta_r(n, s)\} \\
+ \forall n \in M \wedge (n, s) \in O \Rightarrow \theta(n, s') = \theta_n' \wedge (n, s') \in O' \label{eqn:balance}
+\end{align}}
+\change{Constraint~\ref{eqn:balance} ensures that all nodes in the design are computing efficiently in a pipeline. We define such design points as Pareto-front hardware designs.}
+
+\begin{table}[]
+\centering
+\caption{\change{Area estimation error for internal hardware blocks.}}
+\label{tab:dse_err}
+\change{
+\resizebox{0.3\textwidth}{!}{
+\begin{tabular}{p{4cm} p{5cm}}
+\toprule
+Node Types & \multicolumn{1}{r}{Errors} \\
+\midrule
+{\tt Linear} &  \multicolumn{1}{r}{8.1\%  }\\
+{\tt Conv2d} &  \multicolumn{1}{r}{11.3\% }\\
+{\tt ReLU} &    \multicolumn{1}{r}{2.7\%  }\\
+{\tt Softmax} & \multicolumn{1}{r}{4.1\%  }\\
+{\tt Layernorm} & \multicolumn{1}{r}{ 3.7\%} \\
+\bottomrule
+\end{tabular}}
+}
+\end{table}
+
+\noindent
+\jcp{3) \change{Partitioning and bandwidth check}}
+
+However, these design points are target-independent. MASE searches among these points and identifies an efficient design that can be implemented on the target hardware system, taking into account two constraints: resource and bandwidth. Here are the definitions of the terms used:
+\begin{itemize}
+\item $B$ denotes the maximum cross-device bandwidth.
+\item $R$ denotes the area budget per device.
+\item $N$ denotes the number of devices.
+\end{itemize}
+
+Firstly, MASE attempts to map a balanced design point onto the system by partitioning the MASE IR, represented as a graph, into $N$ subgraphs. Our pass traverses from the input nodes towards the output nodes and constructs a set of subgraphs $D$ from $M$, where $|D| = N$ and $\forall d \in D \ldotp d \subseteq O'$. Let $A(n, s)$ denote the area of a node instance $(n, s)$. The resource constraint, where each subgraph must fit onto a single device, is expressed as follows:
+\begin{align}
+\forall d \in D \ldotp (n, s) \in d \Rightarrow \sum_{n \in d} A(n, s) + \delta \leq R
+\end{align}
+Here, $\delta$ represents the area of the cross-device interconnect components, which can be obtained from the regression model in MASE, along with other predefined components.
+
+Secondly, MASE also verifies whether the cross-device communication bandwidth can accommodate the data throughput between subgraphs. Let $I(d) \subseteq d$ and $I'(d) \subseteq d$ represent the sets of input and output nodes of a subgraph $d$. The bandwidth constraint can be expressed as follows:
+\begin{align}
+\forall d \in D \ldotp (n, s) \in I(d) \Rightarrow \sum_{n \in I(d)} \theta_r(n, s) \leq B \\
+\forall d \in D \ldotp (n, s) \in I'(d) \Rightarrow \sum_{n \in I'(d)} \theta_r(n, s) \leq B
+\end{align}
+If both the resource and bandwidth constraints are satisfied, then the design point $O'$ is considered efficient.
+
+% Figure environment removed
+
+\input{imgs/model_specs}
+
+\noindent
+\jcp{5) Decrement parameters}
+
+If either of the constraints fails to be satisfied, MASE employs a strategy to gradually decrease the parallelism of the design. This process involves reducing the parallelism of an input node $n$ in $M$ by a small step. MASE then iterates through the re-balancing process described in step 2) until a valid design point is achieved. This iterative approach allows MASE to find a design that fulfills the resource and bandwidth requirements.
+
+% \begin{align}
+    % \theta''_n = \max_{s'} \{\theta(n, s') | \theta(n, s) > \theta(n, s')\} \\
+    % \theta(n, s') = \theta''_n \label{eqn:new_s}
+% \end{align}
+
+Our DSE approach allows us to thoroughly examine the entire design space across all numbers of devices and efficiently maps the model onto any number of devices for acceleration. We utilise QSFP28 as the interface for communication between FPGA devices, ensuring that the communication throughput and latency between every device are consistent and predictable. Figure~\ref{fig:dse_results} depicts the design spaces for three ML models. The blue points indicate the Pareto front design points defined by Constraint~\ref{eqn:balance}. The figure demonstrates that MASE can map these models onto hundreds of FPGAs for high-performance computing and onto a small number of FPGAs for area-efficient computing. The throughput of the model increases exponentially with the total area. However, a saturation point exists for the throughput when the area reaches a certain size, suggesting that the hardware system is memory-bound.
+
+The accuracy of our regression model is high. Table~\ref{tab:dse_err} shows the errors in the estimated area of the key components used for our experiments. This enables the design to be efficiently mapped onto each device based on the given resource budget. The throughput model is cycle accurate as there is no input-dependent control flow in the hardware, and all the hardware behaviour is predictable. Figure~\ref{fig:partition} shows an example of {\tt bert-base-uncased} being mapped onto two U250 FPGA devices. The small blue blocks represent the QSFP28 component for data transmission. The point-to-point cross-device link between two devices has a maximum bandwidth of 100 Gbps. The area of the first device is efficiently utilised, and the second device only uses 32\% because all the kernels have been mapped.
+
+\subsection{Testing Framework}
+\label{sec:methodology:test_hw}
+
+% Figure environment removed
+
+
+Most HLS tools do not need a hardware testing framework if the tool is correctly
+implemented and the software model has been verified. However, MASE needs a
+testing framework because the correctness of the user-defined hardware block
+might cause errors. In order to test and verify the correctness of the generated
+hardware system, MASE runs software and hardware co-simulation to check the
+equivalence of software and hardware implementation.
+
+Figure~\ref{fig:cosim} illustrates the co-simulation flow in MASE. The left side of the figure shows the software testing flow, and the right side of the figure shows the hardware testing flow. For the software testing flow, the model in MASE IR takes a set of data from the validation dataset and runs inference on GPUs. For the hardware testing flow, the model in MASE IR is translated into a hardware system. The hardware testbench is also generated, taking the same test data as the software flow for hardware simulation. MASE calls an external hardware simulator~(AMD Xilinx Vivado XSIM simulator~\cite{vivado}). Both the software model and the corresponding hardware system should return the same results or results with small discrepancies.\footnote{Small discrepancies between the software and hardware results might happen when the model contains floating-point operations.} MASE compares the results for correctness check. \change{The hardware testbench tests the whole system, including {\bf \em cross-device components}. MASE also provides a user option to simulate without these components for a fast behaviour simulation.}

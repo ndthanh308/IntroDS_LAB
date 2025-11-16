@@ -1,0 +1,153 @@
+\section{Methods}
+\label{sec:method}
+
+CTVIS builds upon Mask2Former \cite{mask2former}, which is an effective image instance segmentation model (briefly reviewed in Section~\ref{sec:mask2former})\footnote{
+%We would like to
+Note that CTVIS can be easily combined with other query-based instance segmentation models \cite{idol, detr, deformabledetr} with minor modifications.}. Our CTVIS is motivated by the inference of typical online VIS methods introduced in Section~\ref{sec:inference}. 
+Then we detail our consistent training method in Section~\ref{sec:ct}. Finally, Section~\ref{sec:pseudo} presents our goal-oriented pseudo-video generation technique for training VIS models with sparse image-level annotations.
+
+% We closely follow the Notations in MinVIS
+\subsection{Brief Overview of Mask2Former} 
+\label{sec:mask2former}
+Mask2Former \cite{mask2former} composed of three main components: an \emph{image encoder} $\mathcal{E}$ (consist of a backbone and a pixel decoder), a \emph{transformer decoder} $\mathcal{T}$ and a \emph{prediction head} $\mathcal{P}$. Given an input image $I\in \mathbb{R}^{H \times W \times 3}$, $\mathcal{E}$ extracts a set of feature maps $\bm{F}=\mathcal{E}(I)$, where $\bm{F} = \{ F_0 \cdots F_{-1}\}$ is a sequence of multi-scale feature maps, and $F_{-1}$ is the final output of the $\mathcal{E}$ with $1/4$ resolution of $I$. The $N$ raw query embeddings $\hat{Q} \in \mathbb{R}^{N \times C}$ are learnable parameters, where $N$ is a large enough number of outputs and $C$ is the number of channels. Then, $\mathcal{T}$ takes both $\bm{F}$ and $\hat{Q}$ to iteratively refine query embeddings, and consequently outputs $Q \in \mathbb{R}^{N \times C}$. Finally, the prediction head outputs the segmentation masks $M$ and the classification scores $O$. For classification, $O=\mathcal{C}(Q) \in \mathbb{R}^{N \times K}$, where $K$ is the number of object categories. For  segmentation, the masks $M \in \mathbb{R}^{N \times H/4 \times W/4}$ are generated with $M = \sigma(Q \ast F_{-1})$, where $\ast$ denotes the convolution operation and $\sigma(\cdot)$ is the sigmoid function.
+
+\noindent\textbf{Our Modification.} Because CTVIS employs instance embeddings to associate instances during inference, we add a  head (a few MLP layers) to compute the instance embeddings $E \in \mathbb{R}^{N \times C}$ based $Q$. 
+% The entire process can be summarized as
+% \begin{equation}
+% \label{eq:mask2former}
+%     O, M, E = Mask2Former(I).
+% \end{equation}
+
+\subsection{Inference of CTVIS}
+\label{sec:inference}
+CTVIS leverages Mask2Former\cite{mask2former} to process each frame 
+%(\ie Equation~\eqref{eq:mask2former}) 
+and introduces an external memory bank\cite{idol, masktrackrcnn} to store the states of previously detected instances, including classification scores, segmentation masks and instance embeddings. 
+% gets the corresponding classification scores, segmentation masks and instance embeddings for each frame. 
+% Specially, CTVIS makes instance association frame by frame and introduces an external memory bank to store the states of previously detected instances, including classification scores, segmentation masks and instance embeddings. 
+To ease presentation, we assume that CTVIS has already processed $T$ frames out of an input video of $L$ frames, and there are $N$ predicted instances with $N$ instance embeddings $\bold{d}_i \in \mathbb{R}^C$ in the current frame. The memory bank stores for the previous $T$ frames $M$ detected instances, each of which has multiple temporal instance embeddings $\{ \bold{e}^t_j \in \mathbb{R}^C  \}^T_{t=1}$ and a momentum-averaged instance embedding $\hat{\bold{e}}_j^T$, which is computed according to the similarity-guided fusion \cite{sgf}: 
+\begin{gather}
+    \label{eq:sgf}
+    \hat{\bold{e}}^T_j=(1-\beta^T) \hat{\bold{e}}^{T-1}_j+\beta^T \bold{e}^T_j \text {, } \\
+    \beta^T=\max \left\{0, \frac{1}{T-1} \sum_{k=1}^{T-1} \Psi_d\left(e^T_j, e^{T-k}_j\right)\right\} , 
+\end{gather}
+
+% Figure environment removed 
+
+\noindent where $\Psi_d$ denotes the cosine similarity. % This momentum type brings more flexblity for instance embedding fusion. 
+We refer the reader to \cite{sgf} for more details. Next, for each instance $i$ detected in the current frame, we compute its bi-softmax similarity \cite{qdtrack} with respect to the previously detected instance $j$ using
+
+
+\begin{equation}
+\label{equ:bio_softmax}
+    f_{i,j}=
+    0.5 \cdot \left[\frac{\exp \left(\hat{\mathbf{e}}_j^T \cdot \mathbf{d}_i\right)}{\sum_k \exp \left(\hat{\mathbf{e}}_k^T \cdot \mathbf{d}_i\right)}+\frac{\exp \left(\hat{\mathbf{e}}_j^T \cdot \mathbf{d}_i\right)}{\sum_{l} \exp \left(\hat{\mathbf{e}}_j^T \cdot \mathbf{d}_l\right)}\right] %\cdot 
+ %   / 2. 
+\end{equation}
+
+Finally, we find the ``best''  
+instance ID for $i$ with
+\begin{equation}
+\hat{j}=\arg \max f_{i,j}, \forall j \in\{1,2, \ldots, M\}.
+\end{equation}
+If $f_{i,\hat{j}} > 0.5$, we believe that newly detected instance $i$ and instance $\hat{j}$ in the memory bank correspond to the identical target. Otherwise, we initiate a new instance ID in the memory bank. When all frames are processed, the memory bank contains a certain number of instances, each of which takes a classification score list $\{c_i^t\}_{t=1}^{L}$ and a mask list $\{m_i^t\}_{t=1}^{L}$ (recall that $L$ denotes the number of frames). For each instance $i$, we calculate its video-level classification score by averaging the frame-level scores of the object. 
+% $\boldsymbol{c_i}$ as follows: $\boldsymbol{c_i} = \Sigma_{t=1}^L c_i^t$. We get the $\{(\boldsymbol{c_i}, \{m_i^t\}_{t=1}^{L})\}_{i=1}^S$ as final outputs. 
+
+% \subsection{Constructing CIs via Consistent Training}
+\subsection{Consistent Learning}
+\label{sec:ct}
+
+A reliable matching of instances (\ie using Equation~\eqref{equ:bio_softmax}) across time is required to track instances successfully. Hence the extraction of highly discriminative embeddings of objects is of great importance. 
+We argue that the discrimination of instance embeddings extracted with recent models \cite{idol, stc} is still inadequate, especially for videos involving object-occlusion, shape-transformation and fast-motion. One main reason is that mainstream contrastive learning methods build CIs (\ie $\{\mathbf{v},\mathbf{k}^+,\mathbf{k}^-\}$) from the reference frame only, which results in the comparison of the anchor embedding against instantaneous instance embeddings in $\mathbf{k}^+$ and $\mathbf{k}^-$. Such embeddings are typically less discriminative and contain noise, which prevents training from learning robust representations. To address this, our CTVIS leverages a memory bank to store MA embeddings, thus supporting contrastive learning from more stable representations. Here our insight is to align the embedding comparison of training with that of inference (such that the two comparisons are consistent). Figure~\ref{fig:main} sketches our CTVIS, which processes the training video frame-by-frame. For an arbitrary frame $t$, CTVIS involves three steps: a) it first takes the Mask2Former and Hungarian matching to compute the instance embeddings, and to match them with GT (highlighted by red, green and purple); b) Then, it builds CIs using MA embeddings within the memory bank, and performs contrastive learning with CIs; and c) It updates the memory bank with noise (\eg the embedding of the \emph{cat} is deliberately added to the memory of the \emph{dog}), which serves the learning from the next frame.
+
+\noindent\textbf{Forward passing and GT assignment.} As shown in Figure~\ref{fig:main}~(a), we first feed the current frame $t$ into Mask2Former to compute the embeddings for queries. Then we employ Hungarian matching to find an optimal match between the decoded instances and the ground truth (GT), such that each GT instance is assigned one instance embedding. Note that Hungarian matching relies on the costs calculated for all (\emph{Decoded-Instance}, \emph{GT-Instance}) pairs. Essentially, each cost measures the similarity between a pair of instances based on their labels and masks.
+
+\noindent\textbf{Construct CIs.} 
+After GT assignment, we build the contrastive items for each GT instance using a memory bank. The memory bank stores all detected instances of previous $t-1$ frames, each associated with 1) a series of instance embeddings extracted at different times, and 2) its MA embedding computed by Equation~\eqref{eq:sgf}. 
+% To clarify, we only  show the contrastive item of the person in Figure~\ref{fig:main}(b), we select the instance embeddings of the person at current frames as query embedding $v$. For the positive embedding, we select the momentum-averaged embedding of person from the memroy bank
+In order to prepare the CIs $\{\mathbf{v}, \mathbf{k}^+, \mathbf{k}^-\}$ for instance $i$ (termed as the \emph{anchor}, \eg the person in Figure~\ref{fig:main}~(a)) at the $t$-th frame, the instance embedding extracted from this frame is used as the anchor embedding $v$.
+%
+For the positive embedding, we pick from the memory bank the MA embedding of instance $i$.
+%
+The negative embeddings $\mathbf{k}^-$ include the major negative embeddings and the supplementary negative embeddings. We use the MA embeddings of other instances in the memory bank as the major negative embeddings. We also sample the background query embeddings of previous $t - 1$ frames to form the supplement negative embeddings. Taking as inputs the created CIs, we compute the contrastive loss with
+\begin{equation}
+\label{eq:loss_embed}
+\begin{aligned}
+    \mathcal{L}_{\text {emb}} & =-\log \frac{\exp \left(\mathbf{v} \cdot \mathbf{k}^{+}\right)}{\exp \left(\mathbf{v} \cdot \mathbf{k}^{+}\right)+\sum\nolimits_{\mathbf{k}^{-}} \exp \left(\mathbf{v} \cdot \mathbf{k}^{-}\right)} \\
+    & =\log \left[1+\sum\nolimits_{\mathbf{k}^{-}} \exp \left(\mathbf{v} \cdot \mathbf{k}^{-}-\mathbf{v} \cdot \mathbf{k}^{+}\right)\right].
+\end{aligned}
+\end{equation}
+As shown in Figure~\ref{fig:main} (c), training with $\mathcal{L}_{\text {emb}}$ pulls the embeddings of positive instances close to the anchor embedding, while pushing the negative embeddings away from it.
+
+\noindent\textbf{Update memory bank.} After computing the $\mathcal{L}_{\text{emb}}$ for each instance in frame $t$, we need to update the memory bank, such that the updated version can be taken to build CIs for frame $t+1$.
+%
+Unlike the inference stage, for training we can get the ground truth ID of each instance so as to update the memory bank with their embeddings extracted from frame $t$.
+%
+In comparison, inference can fail to track instances across time (\ie the ID switch issue), especially for complicated scenarios. To alleviate this, we introduce noise to the update of the memory bank, which compels the contrastive learning to tackle the switch of instance IDs.
+%
+Specifically, each disappeared instance (\eg the dog) in frame $t$ will have a little chance to receive an embedding of other instances (\eg the cat, which is randomly picked from all available instances) in the same frame, which is called the \emph{noise}. 
+%
+% As illustrated in Figure~\ref{fig:main}~(c), the dog disappeared in frame $t$, and a new instance of cat presents.
+%
+If the generated random value exceeds a threshold (\eg 0.05), as illustrated in Figure~\ref{fig:main}~(c), we use the noise as the embedding of the disappeared instance at frame $t$. Finally, the MA embeddings are updated for all instances using Equation~\eqref{eq:sgf}. Due to the low similarity between the disappeared instance and the noise, such an update has quite a limited impact on the MA embedding of the instance, which is reidentified later. Indeed, training with noise is able to reduce the chance of ID switch, as demonstrated by the fish example in Figure~\ref{fig:video}. 
+
+\noindent\textbf{Loss.} After processing all frames, The $\mathcal{L}_{\text {emb}}$ values of all CIs are averaged to obtain $L_{\text {emb}}$.
+The total training loss is
+\begin{equation}
+L_{\text{total}} = \lambda_{\text{emb}}L_{\text{emb}} + \lambda_{\text{cls}} L_{\text{cls}} + \lambda_{\text{ce}} L_{\text {ce}} + \lambda_{\text{dice}} L_{\text{dice}},
+\end{equation}
+where $\lambda$ denotes loss weight. $L_{\text {cls}}$, $L_{\text {ce}}$ and $L_{\text {dice}}$ supervise the per-frame segmentation as suggested in \cite{mask2former}.
+
+% when the ID of an instance changes to another instance in a complicated scene, most current methods always accumulate errors; to ease this issue, we introduce noise training, which directly simulates this situation during the construction of CI. As illustrated in Figure~\ref{fig:main}, the dog disappeared in the third frame, but a new instance of the cat appeared, and we added the cat's embedding to the external memory bank of the dog. Due to the low similarity between the instance embeddings of cats and dogs, it will have little impact on the MA embedding of further dogs that appear in the following frames. As shown in the video scene on the right of Figure~\ref{fig:video}, the wrong instances are corrected to original trajectories through noise training. 
+
+% Here we describe how to build CIs via consistent training. Following the inference pipeline, we build the CIs frame by frame with updating the memory bank. For each frame (expect the first frame),  we will build CIs for each instances. 
+
+% The consistent training aims at constructing CIs frame by frame following the inference stage introduced in Section~\ref{sec:inference}. As shown in Figure~\ref{fig:main}, we sample $T$ temporally adjcent frames as train video $\{ I_t\}_{t=1}^T$. 
+% The first step is feeding each frame into a weight-shared Mask2Former and then matching the output with the corresponding ground truth via Hungarian matching. The output of each input frame $I_t$ comprises classification scores, segmentation masks and instance embeddings, formulated as $\{ O_t, M_t, E_t\}$. Then we calculate the pair-wise matching cost, considering both class prediction and the similarity of predicted and the ground truth masks. Next, we use Hungarian matching to assign one predicted instance to each ground truth instance. Specially, for each ground truth instance $j$ at frame $I_t$, we have a matched predicted instance embedding $\mathbf{e}^t_j$. 
+
+% Then we construct contrastive items, each of which consists of anchor/positive/negative embeddings, for each ground truth instances at each frames. 
+% % Contrastive items are composed of three parts: anchor embedding, positive embedding and negative embedding. Assume we contruct the contrastive item for the instance $i$ at the $I_t$, we build 
+% Here we detail the construction of the CI of the GT instance $i$ at the frame $I_t$ (e.g. the dog at the $I_5$ shown in Figure~\ref{fig:main}). As shown in Figure~\ref{fig:main} (b), the memory bank stores the status of instances of previous frames. For each instance ID in the memory bank, we can get corresponding momentum-averaged embedding from the instance embeddings via Equation~\ref{eq:sgf}. We sample the instance embedding $e^t_j$ at the current frame as the anchor embedding $v$. For the positive embedding, we choose the momentum-averaged embedding of the same instance ID from the memory bank. The negative embeddings $k^-$ of contrastive item compose of two parts: major negative embeddings and supplement negative embeddings. And we select the momentum-averaged embeddings of other instance IDs as major negative embeddings. Furthermore, we sample the background embedding of previous $t - 1$ frames as supplement negative embeddings. Finally, we compute the contrastive loss upon each contrastive item as follows:
+% \begin{equation}
+% \label{eq:loss_embed}
+% \begin{aligned}
+%     \mathcal{L}_{\text {embed}} & =-\log \frac{\exp \left(\mathbf{v} \cdot \mathbf{k}^{+}\right)}{\exp \left(\mathbf{v} \cdot \mathbf{k}^{+}\right)+\sum_{\mathbf{k}^{-}} \exp \left(\mathbf{v} \cdot \mathbf{k}^{-}\right)} \\
+%     & =\log \left[1+\sum_{\mathbf{k}^{-}} \exp \left(\mathbf{v} \cdot \mathbf{k}^{-}-\mathbf{v} \cdot \mathbf{k}^{+}\right)\right].
+% \end{aligned}
+% \end{equation}
+% As shown in Figure~\ref{fig:main} (c), the $\mathcal{L}_{\text {embed}}$ enforces the embeddings of same instances while draws embeddings of different embeddings far away. 
+
+% In addition, when the ID of an instance changes to another instance in a complicated scene, most current methods always accumulate errors; to ease this issue, we introduce noise training, which directly simulates this situation during the construction of CI. As illustrated in Figure~\ref{fig:main}, the dog disappeared in the third frame, but a new instance of the cat appeared, and we added the cat's embedding to the external memory bank of the dog. Due to the low similarity between the instance embeddings of cats and dogs, it will have little impact on the MA embedding of further dogs that appear in the following frames. As shown in the video scene on the right of Figure~\ref{fig:video}, the wrong instances are corrected to original trajectories through noise training. 
+
+% Finally, we get the final contrastive loss by average on all contrastive items. Besides, we get the loss final loss as follows: $$
+
+% For instance, a contrastive item is generated for contrastive learning that matches the ground truth (GT) on each frame. This contrastive item is mainly composed of three parts:
+% \begin{itemize}
+% \item The anchor, which is the instance embedding of the current frame
+% \item The positive and negative samples, which are the instances matched with GT by calculating the momentum-averaged instance  embedding of the current frame through the similarity-guided fusion mentioned in Section~\ref{sec:inference}
+% \item Other embeddings that do not match GT, which are directly treated as negative samples
+% \end{itemize}
+
+% When the ID of an instance changes to another instance in a complicated scene, most current methods will always be wrong; thus, we directly simulate this situation in the training phase. As illustrated in Figure~\ref{fig:main}, the dog disappeared in the third frame, but a new instance of the cat appeared, and we added the cat's embedding to the external memory bank $B_{dog}$ of the dog. Due to the low similarity between the instance embeddings of cats and dogs, it will have little impact on the MA embedding of further dogs that appear in the following frames. As shown in the video scene on the right of Figure~\ref{fig:video}, the wrong instances are corrected to original trajectories through noise training.
+
+\vspace{-3mm}
+\subsection{Learning from Sparse Annotation}
+\label{sec:pseudo}
+
+% Figure environment removed 
+
+We now elaborate on our pseudo-video and mask generation technique, which enables the training of VIS models when only sparse annotations (\eg image data) are available. We take a few widely applied image-augmentation methods, including \emph{random rotation}, \emph{random crop} and \emph{copy\&paste} on source image to create pseudo-videos and the associated instance masks. Note that the pseudo-videos are created by no means to approximate real ones. Instead, they are taken to mimic the movement of targets in reality. 
+
+\noindent\textbf{Rotation.} 
+As shown in the first row of Figure~\ref{fig:augs}, the rotation augmentation rotates the source images with several random angles (e.g., $ [-15, 15]$ ) to introduce subtle changes between frames of the pseudo-videos. 
+
+\noindent\textbf{Crop.} 
+The rotation augmentation cannot alter the shapes and magnitudes of instances. However, instances deform or/and enter/exit the visible field due to the movement introduced either by the target or the camera. To address this, we apply random crop augmentation to the image, which allows the generated videos to mimic the zooming in/out effect of the camera lens and the shifting of targets. The second and the third rows of Figure~\ref{fig:augs} present two examples of \emph{crop-zoom} and \emph{crop-shift}, respectively. The pseudo-videos generated by such augmentations cover a large proportion of targets' movements.
+
+\noindent\textbf{Copy and Paste.} 
+As mentioned earlier, the trajectories of instances in pseudo-videos created by the augmentations share the identical motion direction. To incorporate the relative motion between instances, we also employ the \emph{copy\&paste} augmentation\cite{copypaste}, which copies the instances from another image in the dataset and pastes them into  random locations within the source image. Note that the pasting positions of an instance are typically different across time, which brings the relative motion between different instances (as shown in the fourth row of Figure~\ref{fig:augs}).
+% As shown in Figure~\ref{fig:augs}, this operation brings relative between several instances.
+
+% \noindent\textbf{Merge All.} Suppose we want to generate a pseudo-video of T frames. Given an input image $I_{des}$, we randomly select another image from datasets as $I_{src}$. Then we parallelly make the copy\&paste $T$ times each of which copy\&pastes the instances of $I_{src}$ into the $I_{des}$. We get the output as N
+
+% which selects two images, ${img_k}$ and ${img_r}$, from the dataset by random, and applies the aforementioned augmentations to them simultaneously. Subsequently, a subset of the pixel values of the instance from ${img_r}$, exceeding a certain threshold, is selected and pasted onto ${img_k}$. Finally, the necessary modifications to the ground-truth annotation are made, the fully occluded object is removed, and the mask of the partially occluded mask and bounding box is updated. As shown in the fourth row of Figure~\ref{fig:augs}, the copy\&paste augmentation\cite{copypaste}

@@ -1,0 +1,37 @@
+\section{Introduction}
+
+With the transition of Network Functions (or NFs) from custom, fixed-function devices to software running on commodity hardware came a well known performance challenge. As line-rates kept increasing, the networking community kept proposing new tools, techniques, and architectural enhancements to overcome individual bottlenecks.
+User-mode frameworks, like DPDK~\cite{Intel2010}, bypass the kernel, avoiding costly context switches; DDIO~\cite{DDIO} places incoming packets directly in the CPU cache as they arrive; and NICs implement Receive Side Scaling (RSS)~\cite{rss} to consistently distribute traffic across multiple CPU cores using a configurable hash-function. Despite this wealth of tools, the challenge of developing performant software at these time scales is considerable, typically requiring parallelization~\cite{farshin2021packetmill} and, with it, a deep knowledge of low-level architectural details such as cache-friendly allocation, cache-coherence-aware coordination, and a deep understanding of the RSS hashing mechanism.
+
+Although parallelization is paramount to achieving high performance, ensuring equivalence between parallel and sequential implementations is hard~\cite{khalid2016paving,opennf,split-merge,ftmb,de2014beyond}. Thus, we argue that \emph{developers need not shoulder the burden of fine-grained parallelization themselves}. Much like how developers typically do not write entire code-bases in assembly language, allowing a compiler to analyze their code, extract its functionality, and build an assembly implementation that is equivalent in semantics, we argue that the fine-scaled parallelization of NFs should follow a similar approach. Developers should implement sequential versions of their NFs, benefiting from the inherent simplicity of testing, debugging, and updating such systems, and when deploying to production they can “compile” the NF to obtain its parallelized version.
+
+There are two key insights supporting the solution for this challenge. Due to the increasingly pervasive use of NF frameworks amenable to symbolic execution~\cite{ebpf,katran,xdp,cilium,crab,hxdp,xdp-netdev,hda,zaostrovnykh2019verifying,bolt}, the first key insight is that this technique can be used to not only analyze the NF and infer how it maintains state, but also automatically generate modified versions of it. The second key insight is that by knowing how the NF maintains its state, we can configure the RSS mechanism to send packets accessing the same state to the same core, aiming to minimize inter-core coordination in a parallel implementation, thus maximizing performance.
+
+With these key insights in mind, we propose \textbf{\maestro}, a tool that automatically analyzes a software NF and generates a new implementation that distributes the workload across multiple cores while preserving the semantics of the sequential implementation.
+This analysis builds a comprehensive symbolic model of how the NF stores and accesses state, and how that state is structured around flows. Flows (also called \emph{flowspace}~\cite{khalid2016paving} and \emph{scope}~\cite{de2014beyond} by prior work) describe related packets---identified through packet header fields---that the NF logically tracks as an isolated unit.
+A firewall, for example, often tracks TCP/UDP flows, identified by the packet 5-tuple (source and destination IPs and ports and the IP protocol number), whereas a traffic monitor may identify flows by destination IP alone.
+As NFs typically store state on a per-flow basis \cite{khalid2016paving,mp5}, \maestro learns how flows are defined in the NF by extracting the constraints that define how packets access state.
+We then use a solver to find an RSS configuration that distributes traffic across multiple CPU cores, in such a way as to minimize costly inter-core coordination.
+Our tool then automatically generates a new implementation of the NF that parallelizes its operation accordingly.
+
+When possible, \maestro generates an implementation based on a \emph{shared-nothing architecture}, wherein RSS is configured to forward packets of the same flow to the same CPU core, completely eliminating any inter-core coordination.
+When the NF is not compatible with such a model, \maestro can still generate a parallel implementation where cores share state but accesses to that state are coordinated by a read-write locking mechanism that, while not as performant as a shared-nothing architecture, can still perform well under typical (Zipfian) Internet traffic.
+
+\maestro draws inspiration from prior work in NF analysis~\cite{khalid2016paving} and verification~\cite{Zaostrovnykh2017,zaostrovnykh2019verifying}, as well as the wisdom of a wide body of research on NF performance~\cite{dobrescu2012toward,pedrosa2018automated,bolt,farshin2021packetmill}.
+We also use the lessons learned by many before us that address the challenges of \emph{manually} parallelizing NFs, including NUMA considerations~\cite{Emmerich2018}, configuring RSS for symmetric flow handling~\cite{Woo2012}, and rebalancing load with skew~\cite{barbette2019rss++}.
+
+\maestro handles DPDK NFs which store state using the Vigor API~\cite{zaostrovnykh2019verifying}. For these NFs to be amenable to ESE, they are implemented under some constraints, which we describe in~\cref{section:limitations}. These limitations, however, pertain only to NFs given as input to \maestro, and not to the generated parallel solutions.
+
+We evaluate the performance of \maestro by parallelizing 8 DPDK NFs.
+Our experimental evaluation shows that NFs that can be parallelized using the shared-nothing architecture scale linearly with the number of cores used until bottlenecked by PCIe when using small packets or by 100~Gbps line-rate with typical Internet traffic~\cite{benson2010network}.
+The remaining NFs that require read-write locks to maintain their semantics vary their performance with the workload.
+High-churn traffic--where most packets establish a new flow--requires more writing to shared state, degrading performance.
+Fortunately, the majority of packets in typical Internet traffic belong to a minority of flows~\cite{benson2010network}, requiring less state writing and allowing more concurrency.
+Under this read-heavy traffic, \maestro's lock-based parallel NFs perform comparably to a shared-nothing model.
+Notably, when Maestro had to resort to locking, equivalent versions of the NFs that use hardware transactional memory~\cite{larus2007transactional} (TM) to preserve semantics (via the Restricted Transactional Memory interface~\cite{rtm}) were unable to outperform our optimized locks, as we show in \cref{subsection:benchmarks}. We also show that NFs automatically parallelized by \maestro rival in performance with ones manually parallelized using VPP~\cite{barach2018high}.
+
+In \cref{section:motivation}, we describe the inherent challenge of parallelizing NFs, to better motivate our work.
+We subsequently present the main contributions of our work, describing the \maestro architecture in \cref{section:architecture} and several key optimizations in \cref{section:implementation}.
+In \cref{section:limitations} we discuss \maestro's inherent limitations.
+In \cref{section:evaluation}, we evaluate \maestro and the performance of the parallel NFs it generates.
+Finally, we describe related work in \cref{section:rw} and conclude with final thoughts in \cref{section:conclusions}.

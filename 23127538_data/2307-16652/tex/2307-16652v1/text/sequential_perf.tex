@@ -1,0 +1,94 @@
+\section{Sequential Performance Optimization.}\label{sec:seqexp}
+We study the performance improvements achieved by each optimization, the tuning parameters introduced, and performance tradeoffs between the pairwise and triplet variants.
+All algorithms were written in C and compiled with the Intel C compiler (\verb|icc|) release 2021.06.
+The code was compiled with the following compiler flags: \verb|-Ofast -mavx512 -opt-zmm-usage=high|.
+Experiments are performed on a single-node, dual-socket platform with two Intel Xeon Gold 6226R CPUs (16 cores per socket).
+We run 5 trials for each experiment and use the mean to compute speedups.
+We observe low runtime variance across trials, so we omit error bars for simplicity.
+We perform experiments on randomly generated distance matrices for powers of two $n \in \{128, \ldots,4096\}$.
+Our code can handle arbitrary square matrix sizes, but we limit performance evaluation to powers of two.
+% Figure environment removed
+We begin performance tuning by applying one level of blocking to \cref{alg:pairwise} (naive pairwise) and \cref{alg:triplet} (naive triplet).
+We show speedups relative to the previous optimization tried in \cref{fig:seqopt} with a fixed $n = 2048$ matrix.
+Overall speedup over naive pairwise (resp. naive triplet) may be obtained by multiplying speedups across all optimizations.
+Naive triplet resulted in a speedup of $1.11\times$ over naive pairwise due to less computation.
+Introducing one level of blocking to naive pairwise led to a speedup of $1.07\times$.
+Applying blocking to the triplet variant led to speedups of $1.20\times$ over naive triplet ($1.33\times$ over naive pairwise).
+\Cref{alg:pairwise,alg:triplet} require branches to correctly update $U$ and $C$ based on distance comparisons.
+Distance comparisons can be vectorized, but updates to $U$ and $C$ cannot due to branching.
+We avoid branches in both algorithms by computing auxiliary mask variables and performing FMAs with these explicit masks.
+For \cref{alg:pairwise}, we compute the masks: $r = d_{xz} < d_{xy}~\Or d_{yz} < d_{xy}$ and $s = d_{xz} < d_{yz}$. %, where $\Or$represents the boolean or operator.
+The variable $r$ indicates that $z$ is in the $(x,y)$ local focus and $s$ determines the entry of $C$ to update.
+$C$ can be updated via two FMAs: $c_{xz} = c_{xz} + r \cdot s \cdot (1/u_{xy})$ and $c_{yz} = c_{yz} + (r)(1 - s)(1/u_{xy})$.
+Branch avoidance introduces a performance tradeoff by increasing computation (e.g. performing FMAs with explicit zeros) but eliminates branch misprediction overhead.
+For \cref{alg:pairwise}, branch avoidance enables a fixed stride length for updates of $C$ and facilitates other compiler optimizations (e.g. auto-vectorization and loop unrolling).
+Branch avoidance alone yielded a speedup of $1.7\times$ over naive pairwise.
+While branch avoidance allows for vectorization, updates to $c_{xz}$ and $c_{yz}$ require a stride length of $n$.
+After blocking, we reduce the stride length to $1$ by updating columns of $C$ instead (see \cref{fig:pairwise_dependency}).
+The combination achieved speedups of $20.2\times$ over naive pairwise.
+
+\Cref{alg:triplet} must determine the closest pair of points from a triplet $(x,y,z)$.
+We avoid branches in \cref{alg:triplet} by computing three masks from three floating point comparisons: $r = d_{xy} < d_{xz}~\tAnd d_{xy} < d_{yz}$, $s = (1 - r)(d_{xz} < d_{yz})$, and $t = (1 - r)(1 - s)$. %, where $\tAnd$represents the boolean and operator.
+$C$ can then be updated using six FMAs:
+\begin{align*}
+    c_{xy} = c_{xy} + r\left(1/u_{xz}\right), \quad &
+    c_{yx} = c_{yx} + r\left(1/u_{yz}\right),\\
+    c_{xz} = c_{xz} + s\left(1/u_{xy}\right), \quad &
+    c_{zx} = c_{zx} + s\left(1/u_{yz}\right),\\
+    c_{yz} = c_{yz} + t\left(1/u_{xy}\right), \quad &
+    c_{zy} = c_{zy} + t\left(1/u_{xz}\right).
+\end{align*}
+Applying branch avoidance to the triplet algorithm yields a speedup of $0.98\times$ due to the stride-$n$ updates to $C$.
+When combined with blocking, however, we attain speedups of $20\times$ over naive triplet.
+Triplet with branch avoidance and blocking yields a speedup of $1.1\times$ over pairwise with the same optimizations. % branch avoidance and blocking.
+We were able to extract additional speedup by replacing floating point operations with integer operations during local focus updates, and ignoring equality in pairwise/triplet distance comparisons.
+Each entry of $U$ counts the number of points in the local focus based on distance comparisons, with results stored in a mask register.
+If $U$ is stored as a floating point array, then each increment to update $U$ requires an expensive integer mask to 32-bit floating point cast operation.
+We avoid this by storing $U$ as an integer array during the local focus computation.
+This allowed us to combine casting with computing reciprocals prior to cohesion updates.
+
+The theoretical formulation of PaLD \cite{pald_pnas22} allows for ties in pairwise distances (e.g., $d_{xz} == d_{yz}$).
+When ties occur, support is split between cohesion entries $c_{xz}$ and $c_{yz}$ (i.e. $c_{xz} = c_{xz} + r\cdot s \cdot \left(0.5/u_{xy}\right)$).
+In finite arithmetic, floating point equality is unlikely due to round-off and truncation.
+Avoiding ties is critical for \cref{alg:triplet} which contains more distance tie permutations than pairwise.
+Introducing these additional optimizations yields self-relative speedups (over naive) of $25.5\times$ and $26.2\times$ for pairwise and triplet, respectively.
+Overall, optimized triplet achieves a speedup of $1.14\times$ over optimized pairwise for $n = 2048$.
+% Figure environment removed
+We also perform block size tuning for each algorithm.
+We experiment with (powers of two) block sizes in the range $[2^5, 2^{10}]$. Optimized pairwise attains a maximum speedup of $25.5\times$ for $n = 2048$ after tuning.
+
+For optimized triplet, updates to $U$ require storing $3$ distinct blocks of $D$ and $3$ distinct blocks of $U$ in cache.
+Updates to $C$ require $3$ distinct blocks of $D$, $3$ distinct blocks of $U$, and $6$ distinct blocks of $C$ in cache.
+This suggests that different block sizes may be better than a fixed block size.
+\Cref{fig:triplet_heatmap} (bottom) illustrates the speedups observed (over \cref{alg:triplet}) for various block size combinations for the optimized triplet algorithm.
+We observe a maximum speedup of $26.2\times$ over naive triplet with $\hat{b} = 256$ and $\tilde{b} = 128$.
+\begin{table}[t]
+\footnotesize
+    \centering
+    \begin{tabular}{c|c|c}
+        $n$ & Pairwise Optimized & Triplet Optimized\\ \hline\hline
+        128 & {\bf 0.00117 (1.58$\times$)} & {0.00185} \\ \hline
+        256  & {\bf 0.00497 (1.34$\times$)} & {0.00665} \\ \hline
+        512  & {\bf 0.0188 (1.18$\times$)} & {0.0221} \\ \hline
+        1024 & 0.1274 & {\bf 0.1208 (1.05$\times$)} \\ \hline
+        2048 & 0.9942 & {\bf 0.8734  (1.14$\times$)} \\ \hline
+        4096 & 8.3623 & {\bf 6.6111  (1.26$\times$)} \\% \hline
+    \end{tabular}
+    \caption{Running time in seconds (and speedup) comparison of  pairwise and triplet algorithms.}
+    \label{tab:seqtimes}
+\end{table}
+In \cref{tab:seqtimes} we compare running times (and speedups) of optimized pairwise and optimized triplet over a range of input matrix sizes.
+For small matrix sizes, where $D,U$ and $C$ all fit in cache, optimized pairwise is fastest (e.g. speedup of $1.58\times$ over triplet at $n = 128$).
+This is because $n/b$ is a small integer where lower order terms dominate (see \cref{thm:triplet}).
+For larger matrices, optimized triplet performs better (speedup of $1.26\times$ over pairwise at $n = 4096$) due to lower computation cost.
+In practice, we expect triplet to be the better sequential variant for most applications of PaLD.
+If distances ties must be handled correctly, then pairwise is the better variant due to fewer branches.
+
+Finally, we note that optimized pairwise attains $27.7\%$ of hardware peak at $n = 2048$ and optimized triplet attains $28\%$ at $n = 8192$.
+Our Intel CPU has a single-core, single precision peak of $249.6$ Gflops/sec.
+Single precision comparisons on our CPU have a cycles-per-instruction (CPI) of $1$ while all other single precision ops have a CPI of $0.5$.
+Thus, floating point comparisons are twice as expensive.
+See \Cref{sec:pct-peak} for details on percentage of peak calculations for each algorithm.
+
+The combination of all optimizations achieves speedups of $25.5\times$ and $29\times$ for pairwise and triplet, respectively, over naive pairwise (for $n = 2048$).
+We observe speedups of $23\times$ and $26.2\times$ over naive triplet.

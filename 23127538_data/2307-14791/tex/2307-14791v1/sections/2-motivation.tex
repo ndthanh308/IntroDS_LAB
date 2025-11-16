@@ -1,0 +1,39 @@
+%-------------------------------------------------------------------------------
+\section{Why Parallelization is Hard}
+\label{section:motivation}
+%-------------------------------------------------------------------------------
+
+% Figure environment removed
+
+Ideally, one would parallelize an NF by spinning up individual instances per core, each running independently, and using the NIC to evenly distributing traffic among them. NFs, however, typically store state that persists across packets. Sharing this state among cores requires coordinating access to it, but minimizing this coordination is crucial to achieving high performance. Parallel implementations that require no state sharing among their instances (and therefore no synchronization) are called \emph{shared-nothing}. Implementing a shared-nothing implementation of a stateful NF requires carefully configuring the NIC to distribute traffic to each core in a way that aligns with how state is structured in the NF. With such a mechanism, state is \textit{sharded} across cores and packets accessing the same state always find themselves on the same core.
+
+The NIC can perform this traffic distribution in hardware using the Receive-Side Scaling (RSS) mechanism~\cite{rss}.
+This mechanism hashes packet headers using a user-defined set of fields and a hash key.
+The computed hash is subsequently used to direct traffic to different queues which can deliver the packets to different cores.
+To send, for example, packets of the same TCP flow to the same core, one would configure RSS to hash the source and destination IP addresses, and TCP/UDP ports, and the IP protocol number (\textit{i.e.} the 5-tuple), ensuring that any two packets with the same 5-tuple will have the same hash and will end up on the same core.
+
+This leads us to the traditional method for building parallel shared-nothing NFs: first, developers shard state in the NF, building a full understanding of how state is accessed under all circumstances.
+They then use this sharding solution to construct an RSS configuration that distributes traffic accordingly.
+This approach, however, poses three big challenges:
+
+\textbf{1. Finding the right sharding solutions is hard.}
+Though some NFs simply shard on the 5-tuple, many others require a more careful approach.
+One common use case involves symmetrical access to state based on the 5-tuple so that incoming traffic---that has the source and destination swapped---access the same state as outgoing traffic~\cite{Woo2012}.
+Other NFs require a more coarse-grained partitioning: some policers and traffic monitors only use the destination addresses to index state, connection limiters may only use source addresses, and network address translators (NATs) will typically shard on the WAN's server address and port (as all the other addresses and ports are translated). Simply sharding on the 5-tuple here would require expensive coordination (\textit{e.g.} locks), as cores are unable to act independently.
+
+Arriving at sharding solutions is harder than generically using locks each time state is accessed.
+The developer needs intricate knowledge of the NF's semantics and internals, particularly around how state is kept and manipulated.
+This thought process must not only take place upon initial implementation, but also as the NF code evolves over time. Augmenting a firewall with a connection limiter feature renders the previously configured 5-tuple sharding obsolete, requiring a complete rethink of how it should be sharded.
+
+\textbf{2. Finding the right RSS configuration is hard.} Even if we take the sharding solution for granted, configuring RSS accordingly is difficult.
+For trivial cases, this is just a matter of selecting the right fields to hash but more complex scenarios can require carefully crafting the RSS key.
+Such an approach was used in \cite{Woo2012} to handle symmetrical TCP/UDP flows, but manually tracking the sharding constraints and finding internal symmetries in the hash key that pair with those constraints quickly becomes unmanageable.
+For NFs with other sharding requirements, the problem becomes even harder. Not all sets of fields are supported by NICs~\cite{x710,e810}, requiring a specific RSS key that cancels out some bits to circumvents this limitation.
+One might even require symmetry between different interfaces (when incoming and outgoing traffic use different NICs), which requires a separate but interrelated configuration and key for each NIC. More complex NFs can shard state in ways that do not neatly fit into any common case, requiring a custom formulation which, as before, may need to be completely rethought from scratch should the NF change over time.
+Some cases are outright infeasible, due to inherent NIC limitations, at which point a well-placed warning could help guide developers towards better solutions.
+
+\textbf{3. Writing performant parallel code is hard.} Even if a developer correctly shards the NF and properly configures RSS to achieve a valid shared-nothing solution, they can still be leaving performance on the table. Though shared-nothing goes a long way towards ensuring good performance, many more minute details play a further role in parallel code.
+Packet buffers and state must now be cache-aligned to avoid false cache-line sharing. Memory allocation must be NUMA-aware to avoid slower remote accesses across the QPI bus. Even exogenous factors like traffic skew must now be considered~\cite{barbette2019rss++} to fully realize the potential of a parallel implementation.
+
+Getting any of these issues wrong can stand in the way of performance, correctness, or both, but are ultimately amenable to automation. Our tool---\maestro---tackles the first challenge by analyzing how the NF keeps its state and finding the constraints that packets that need to be sent to the same core must satisfy. It further tackles the second challenge by formulating an SMT problem and using a solver to find the right RSS keys that satisfy the sharding requirements. Finally, \maestro addresses the third challenge by automatically generating a parallel implementation that is semantically equivalent to its sequential counterpart. The generated code fully handles NIC initialization and RSS configuration, cache-alignment, load-balancing, and NUMA considerations.
+Even when a shared-nothing approach is not possible, \maestro can still help by generating an optimized lock-based parallel implementation that uses carefully crafted read-write locks to minimize inter-core coordination with typical Internet power-law traffic.

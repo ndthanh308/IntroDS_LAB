@@ -1,0 +1,76 @@
+%% If your work has an appendix, this is the place to put it.
+\appendix
+%
+
+\section{More about Multicast Table Registration} \label{apx:regis}
+The in-fabric logic of \sys is based on the switches' multicast forwarding table. \sys follows the table information to copy packets and forward them to specific output ports. Although existing multicast solutions commonly adopt the table-based approach, \eg, IP multicast~\cite{crowcroft1988multicast}, the multicast table registration in \sys has some primary differences from them.
+
+The first difference is that the table registration of \sys is centralized, while the traditional works~\cite{fenner1997internet,crowcroft1988multicast, estrin1998protocol} perform a distributed registration algorithm\cite{rfc3376}. The critical insight pushing registration from distributed to centralized is that the datacenter is highly autonomous, and the multicast membership is highly controlled. This centralized approach is widely used in various datacenter frameworks~\cite{shahbaz2019elmo, diab2022orca}. Secondly, previous works only register layer-3 states to switch. \sys, on the other hand, registers both layer-3 states and layer-4 states to switches for the connectivity and reliability supports, as introduced in $\S$\ref{design}.
+
+\sys's registration protocol is centralized and relied on an application-assigned master node. Before communication starts, the master node in the multicast group collects the connection states (including the layer-3 IP and layer-4 IB information) of all other members through an out-of-band protocol (\eg, TCP). Then, the master node fits these states into the self-developed \envelope protocol's packet layout, which is illustrated in Fig.~\ref{fig:envelope-packet}. The \envelope packet is identified by the destination IP (\ie, GroupIP) and a specific UDP port number. The payload contains metadata and detailed connection states of each node, including the node's IP and QPN. The metadata comprises group statistics, where $seq$ and $total$ indicate the sequence and the total number of \envelope packets. Limited by the MTU (typically 1500Bytes), one \envelope packet can contain at most 183 nodes; thus, the connection states of a multicast group with more than 183 members must span multiple \envelope packets.
+
+% Figure environment removed
+
+% Figure environment removed
+
+Upon receiving the \envelope packet, the switch builds its local multicast forwarding table and sends one or more new \envelope packets to downstream devices. Algorithm~\ref{alg:three} illustrates the behavior of \sys switches. An \envelope packet ($p$) carries a GroupIP and an array of multicast member connection states ($p.array$). The switch first generates an empty table indexed by $p.groupIP$. Then the switch iterates over $p.array$ to append items to the created table. For every node in the array, the switch finds this node's routing information through the normal unicast routing table. If this node is directly connected (\eg, connected to $port_i$), then the switch creates a table item with $port$ as $i$, marks this item's type to $connected$, and fills this node's connection states into this item. Otherwise, if this node isn't directly connected, the switch finds the set of possible output ports ($set_p$) for this node. If one port in $set_p$ has been marked as $forwarded$, the switch selects this port again to distribute data optimally and save bandwidth. If all ports in $set_p$ are new, the switch selects the least utilized port among $set_p$ to perform a group-level load balancing. 
+
+After processing \envelope packet and filling the multicast forwarding table, the switch generates one or more new \envelope packets to ports included in the table. The new \envelope packet that through each port only contains connection states of nodes that select this port. We show the actions that taken by $S_1$ in Fig.~\ref{fig:envelope-transmission}, and the whole topology is shown in Fig.~\ref{fig:overview}. The \envelope packet received by $S_1$ contains $R_1$, $R_2$, and $R_3$. As instructed by Algorithm~\ref{alg:three}, $S_1$ should forward a data copy to $port_{L2}$ (eventually reaching $R_1$), and a copy to $port_{C2}$ (eventually reaching $R_2$ and $R_3$). Thus the \envelope packets forwarded to $port_{L2}$ and $port_{C2}$ contains information of $\{R_1\}$ and $\{R_2, R_3\}$, respectively, used in downstream devices to build their local forwarding table.
+   
+Finally, if a node receives an \envelope packet, and its IP address is included in the packet, this node will answer an ACK back to the master node to confirm its participation. After the master node collects all nodes' confirmation ACKs, the control-plane table registration is finished, and the multicast transmission can start. 
+
+\begin{algorithm}[t]
+\caption{Multicast Forwarding Table Registration}\label{alg:three}
+\begin{algorithmic}[1]
+%\Function{Receive}{$p$}\Comment{$p$: \envelope packet}
+\State $p\gets $ received \envelope packet
+%\State $T\gets $ multicast forwarding table
+\State $n\gets$ the number of switch ports
+%\State $key\gets p.groupIP$
+\State create multicast forwarding table $T[p.groupIP]$
+\State $R[n]\gets \{ 0 \}$ \Comment{\textcolor{gray}{for creating new \envelope packets}}
+\For{$node$ in $p$}\Comment{\textcolor{gray}{loop over nodes in $p$ and build $T$}}
+	\If{$node$ is directly connected to port $i$}
+		\State $out \gets i$ \Comment{\textcolor{gray}{create new entry}}
+		\State $Entry \gets $ a new entry
+		\State $Entry.port \gets out$
+		\State $Entry.type \gets connected$
+		\State $Entry.vaue \gets $ node's connection states
+		\State $T[p.groupIP].append(Entry)$
+	\Else
+		\State $S\gets $ the set of accessible ports
+		\If{port $j\in S$ has been marked as $forwarded$}
+			\State $out \gets j$ \Comment{\textcolor{gray}{reuse exiting entry}}
+		\Else \Comment{\textcolor{gray}{create new entry}}
+			\State $out \gets $ the least utilized port in $S$
+			\State $Entry \gets $ a new entry
+			\State $Entry.port \gets out$
+			\State $Entry.type \gets forwarded$
+			\State $T[p.groupIP].append(Entry)$
+		\EndIf
+	\EndIf
+	\State update port utilization
+	\State $R[out].append(node)$
+\EndFor
+\State \textcolor{gray}{// create new \envelope packets and send out}
+\For{$Entry \in T[p.groupIP]$}
+\State create \envelope packet $\overline{p}$ that contains nodes in $R[Entry.port]$
+	\State send $\overline{p}$ through $Entry.port$
+\EndFor
+%\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+% Figure environment removed
+
+\section{Multicast Source Switching} \label{apx:source-switch}
+\sys supports the source switching inside a multicast group. When the source of a multicast group changes, the switches can detect this by recognizing the change of the incoming port of multicast data packets. The new incoming port is recorded for later ACK forwarding. There are no other modifications to \sys's in-fabric logic. 
+
+For the end-host, the old and new source nodes need to run a PSN synchronization procedure. Note that each QP maintains two PSN records. The \textit{Send Queue PSN} (sqPSN) is used to record the output packets, and the \textit{Receive Queue PSN} (rqPSN) is used to verify the input packets. The senders' sqPSN should equal the receiver's rqPSN at the beginning of the transmission. A PSN synchronization is needed to maintain this PSN consistency when the multicast source changes. For example, as shown in Fig.~\ref{fig:source-change}, node \textit{A} has multicasted 100 packets to nodes \textit{B}, \textit{C}, and \textit{D}. Assume that all nodes' sqPSN and rqPSN start from 0, the sqPSN of \textit{A} and rqPSNs of \textit{B}, \textit{C}, \textit{D} become 100 when the transmission ends. When the multicast source switches to \textit{B}, if \textit{B} starts transmission immediately, the PSN of sent packets would be \textit{B}'s current sqPSN, \ie, 0. These packets would be dropped by \textit{C} and \textit{D} as their rqPSNs are already 100. Therefore, the old and new multicast source nodes need to synchronize their PSNs. In particular, the old source node assigns its rqPSN as its sqPSN, and the new source node assigns its sqPSN as its rqPSN. This problem can also be avoided by using Dynamic Connected Transport (DCT)\cite{dct}, which synchronizes the PSN of the sender and the receiver with the DC Connect packet.
+
+\section{Optimization for one-to-many \rdwrite} \label{apx:opwrite}
+As mentioned in $\S$\ref{connection-handle}, to support one-to-many \rdwrite, we need an additional message to carry the MR info of different receivers for each \rdwrite request. This incurs extra bandwidth overhead, especially when the number of receivers is large. A straight idea to eliminate this overhead is to enable the possibility to write all receivers with the same MR info. We claim this idea is logically reasonable and easy to implement with few modifications to the RNICs. Note that the VA in MR is \textit{virtual} and is translated to the physical memory address by the RNIC. Therefore, it is reasonable to use an identical virtual address for all nodes, which can be translated to different physical addresses at different nodes. On the other hand, the \rkey is mainly used as an index for the RNIC to look up the Memory Translation Table (MTT). All receivers in a multicast group can share the same \rkey for the corresponding MR if some indexes are reserved for this purpose.
+
+Currently, the VA is assigned by the OS kernel, and the \rkey is obtained from the RNIC. If the RNIC is modified so that the application can assign the VA and \rkey for an MR at the QP establishment phase, we can enable all receivers to use the same VA and \rkey. Consequently, the switch no longer needs to modify the MR info for different receivers, and the overhead for MR info update is avoided.
+
+%\section{Calculation of maximum group support} \label{apx:cal}

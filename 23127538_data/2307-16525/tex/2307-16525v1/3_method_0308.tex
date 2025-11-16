@@ -1,0 +1,108 @@
+\section{Empirical Observations}
+\label{sec:sec3}
+
+% Figure environment removed
+
+This section demonstrates the existence of modality bias and object hallucination when adapting VLMs and LLMs for image-to-text generation. It serves as a starting point for the proposed ViECap, which can address such limitations. 
+
+\paragraph{Modality Bias.} 
+%
+A good captioning model should strike a balance between visual guidance and language contexts. To evaluate the influence of visual guidance, we design a two-stage decoding strategy: first, we use the captioning model (\eg, MAGIC~\cite{MAGIC}, CapDec~\cite{CapDec}) to generate the first $m$ words of the caption, then we feed these prefix words into a pre-trained language model to obtain the subsequent words based on pure language contexts. The accuracy of generated captions, measured by CIDEr~\cite{CIDEr}, is denoted as CIDEr($m$). We define the importance of visual guidance $G_{\rm vis}(m)$ as: 
+\begin{equation}
+    G_{\rm vis}(m) = 1 - G_{\rm lang}(m) = 1 - \frac{{\rm CIDEr}(m)}{\rm CIDEr_{model}}
+\end{equation}
+where $\rm CIDEr_{model}$ is the accuracy of captions generated without a pure language model (\ie, $m$ equals sentence length). $G_{\rm lang}(m)$ is the importance of language contexts. 
+
+If a captioning model is dominated by language priors, $G_{\rm vis}(m)$ will be small as a pure language model can accurately predict captions. As Fig.~\ref{fig:prelim} (left) shows, the late-guidance method MAGIC gains much lower $G_{\rm vis}(m)$ compared to early-guidance methods CapDec and our ViECap, especially when $m$ is small. This observation confirms modality bias towards language in late-guidance methods. 
+
+\paragraph{Object Hallucination.}
+%
+While early-guidance decoding alleviates the problem of modality bias effectively, previous models still show limited generalizability towards OOD images containing novel concepts. To illustrate the degradation of transferability in current methods, we calculate the cosine similarity using CLIP between the image and the corresponding generated caption. Fig.~\ref{fig:prelim} (middle) shows that CapDec experiences a gradual performance drop when transferring from ID to OOD settings, while our ViECap exhibits a more robust capability in describing images with different domains.
+
+Object hallucination leads to incorrect entities in the generated caption. We further analyze the precision of entities detected by different methods in Fig.~\ref{fig:prelim} (right). While the CLIP embedding shows remarkable transferability, it is degraded in the caption generation process of CapDec. The accuracy of CapDec drops significantly (60.2 $\rightarrow$ 43.6) when transferring from ID to OOD images.
+%
+By explicitly introducing visual entities, ViECap demonstrates the capability to describe both seen and unseen entities in images. Specifically, the accuracy of correctly detecting entities decreases slightly by 4.3 compared to the accuracy predicted by CLIP, which is a reduction of 3.
+
+\section{ViECap}
+
+The proposed ViECap is a transferable captioning framework based on CLIP and trained on a text-only corpus. Specifically, We train a language decoder to decode the CLIP text embedding of sentences and incorporate entity-aware prompts to enable transferable captioning. For zero-shot inference, we directly feed the CLIP image embedding of a given image into the trained decoder to generate captions. Fig.~\ref{fig:overview} illustrates the overall framework of ViECap.
+
+\subsection{Entity-aware Transferable Decoding}
+%
+Given the text-only data, our goal is to train an entity-aware language decoder with promising transferability. To this end, we extract two types of visual-aware guidance from the ground-truth caption: 1) nouns in the caption, which serve as anchors for grounding entities in the image. These nouns (\ie, discrete category names) are capable of capturing salient and static visual cues, such as humans, animals, and objects.
+%
+2) CLIP text embedding of the caption, which is implicitly aligned with the image embedding, provides the overall contexts across all images, such as scenes and interactions between objects.
+%
+We transform entities and the text embedding into prompt tokens to guide the language model (\ie, GPT-2) in predicting captions. During training, we freeze the parameters of the CLIP text encoder to maximize its transferability. We train the projector from scratch and fine-tune the language model using an auto-regressive loss (details can be found in the Appendix).
+
+\input{tables/cross_domain_cap_nocaps}
+\input{tables/cross_domain_cap_flickr}
+
+\paragraph{Hard Prompt.} 
+%
+We first construct a vocabulary of entities, denoted as $\mathcal{V}$. Nouns in the caption, regarded as visual entities, are recognized by the NLTK grammar parser and filtered by this vocabulary. The extracted entities are then inserted into a prompt template ``There are {$e_1$}, ..., {$e_N$} in the image.'', where $e_n$ refers to the $nth$ entity. The entity-aware hard prompt is constructed by a training-agnostic module, enabling strong robustness to the domain shift from ID to OOD images.
+
+\paragraph{Soft Prompt.} 
+%
+We first inject Gaussian noise into the CLIP text embedding to alleviate the modality gap as indicated in CapDec~\cite{CapDec}. A trainable projector then transforms the CLIP text embedding to generate the soft prompt. The projector is implemented as a lightweight transformer with $L$ learnable queries as in ClipCap~\cite{ClipCap}. The output features of $L$ query tokens are considered as the soft prompt.
+% by taking $F_{T}'$ as input during the training phase. During inference, the adapter encodes $F_{I}$ to generate soft prompts, which can more effectively focus on modeling attributes and relationships as the hard prompts provide explicit visual entities. By doing so, object hallucinations can be reduced significantly in the unseen scene.
+
+\paragraph{Entity masking.} 
+%
+We observe that naively integrating nouns to construct hard prompts tends to learn a copy-then-paste shortcut during training, where all nouns are input together to generate a caption, \ie, the model simply pastes the input nouns without making any modification. Consequently, the captioning prediction task becomes trivial, and the model's generalizability is severely impaired, particularly when confronting incorrect entities during inference.
+%
+To address this issue, we propose a simple yet effective entity masking strategy that randomly drops a certain proportion of nouns with the masking ratio $r_{mask}$ during training. This strategy significantly alleviates the learning collapse and boosts captioning performance in both ID and OOD settings. The effectiveness of the masking strategy is verified in Tab.~\ref{tab:masking}.
+
+\subsection{Zero-shot Inference}
+
+Once the decoder is trained, we can leverage it for zero-shot captioning inference. Given a test image, we first extract its visual embedding using the CLIP image encoder. We then employ the trained projector to convert the visual embedding into the soft prompt.
+%
+For the hard prompt, we again use visual embedding for entity classification. Specifically, we use the manual template ``A photo of \{entity\}" as the entity description for each category in $\mathcal{V}$. Then we rank and select the top $M$ entities with the highest similarity scores between different entity descriptions and the visual embedding to construct the entity-aware hard prompt. Finally, the soft prompt and hard prompt are concatenated together in sequential order and input into the language model to predict the caption auto-regressively.
+
+It should be noted that there exists a training-inference gap in the model structure. Two strategies during training are adopted to address this gap and improve the model performance. Firstly, we use noisy text embedding to bridge the gap between visual and text embedding. Secondly, we propose a non-trivial entity masking mechanism to avoid the copy-then-paste shortcut, meanwhile pushing the model to recover the missing entities from soft prompts.
+
+\paragraph{Transferability on OOD images.}
+%
+Trained on limited ID data, the projector may overfit to the ID dataset, leading to a significant performance degradation of the soft prompt for OOD inputs. In contrast, the entity-aware hard prompt, predicted by the frozen CLIP, inherits the powerful transferability from CLIP embeddings. The GPT could flexibly combine the soft and entity-aware hard prompts for a better trade-off between ID and OOD performance.
+
+
+% Given an OOD image with novel concepts, the soft prompt trained on text corpus may be excessively adapted into an IID domain, 
+
+% To decode the image information into accurate captions, we leverage two complementary prompts as the guidance for language model. First, entity-aware prompts captures the main visual entities by a non-learnable module, enabling strong robustness to the domain shift from IID to OOD images. Second, the soft prompts focus on modeling global contexts of the image meanwhile reorganizing entities into a complete sentence. 
+
+
+% visual contexts that 
+
+% noun entities in the sentence by grammar parser. Then, soft prompts encodes the overall contexts of the sentence by CLIP text encoder followed by a learnable projector. Two types of prompts are concatencated together as the input of language model for predicting captions. During inference, given a test image, we input the CLIP image embeddings into the projector to obtain soft prompts, and introduce a CLIP-based entity classifier for entity-aware prompts.   The overview of the proposed method is shown in Fig.~\ref{fig:overview}.
+
+% and that are extracted by a grammar parser
+
+
+% During training, ViECap leverages CLIP to encode captions into textual embeddings, which are then used as input to an adapter to generate soft prompts. The \emph{nltk} toolkit is used to extract nouns in texts, and we deem these nouns as visual entities, which are randomly masked to construct hard prompts, to address the challenge of describing novel entities.  During inference, the adapter uses visual features encoded by the image encoder of CLIP to generate soft prompts. An open vocabulary is used to retrieve visual entities in images for hard prompts. GPT-2 takes the concatenation of soft and hard prompts to generate descriptions.
+% }
+
+% \subsection{Training and Inference}
+% The paper proposes a method that leverages both the text and image encoders of CLIP$_{\rm base}$ as the backbone. During training, the text encoder $E_{T}$ encodes the input text $T$ into textual embeddings $F_{T}$. The image encoder $E_{I}$ generates visual features $F_{I}$ from the input image during inference. These embeddings are then fed into the decoder to generate captions. However, the modality gap between $F_{T}$ and $F_{I}$ poses a challenge for captioning task, which is addressed by adding noise to $F_{T}$ to bridge this gap. The resulting noisy textual embeddings $F_{T}'$ are then used as the input of the decoder during training. 
+
+
+
+
+% \paragraph{Text-only Training.} The paper proposes a method that leverages both the text and image encoders of CLIP$_{\rm base}$ as the backbone. During training, the text encoder $E_{T}$ encodes the input text $T$ into textual embeddings $F_{T}$. The image encoder $E_{I}$ generates visual features $F_{I}$ from the input image during inference. These embeddings are then fed into the decoder to generate captions. However, the modality gap between $F_{T}$ and $F_{I}$ poses a challenge for captioning task, which is addressed by adding noise to $F_{T}$ to bridge this gap. The resulting noisy textual embeddings $F_{T}'$ are then used as the input of the decoder during training. 
+
+% \paragraph{}
+% We leverage two complementary prompts as the guidance for the language model (\ie, GPT-2$_{\rm base}$~\cite{GPT2}). First, entity-aware hard prompts captures the salient visual entities by a non-learnable parser, enabling strong robustness to the domain shift from IID to OOD images. Moreover, the soft prompts focus on modeling global scene and visual contexts, meanwhile closely collaborating with hard prompts to convert entities into a complete sentence. 
+
+% % The decoder consists of an adapter and a pretrained GPT-2$_{\rm base}$, the decoder takes hard prompts as extra input to force GPT-2 to attend novel entities in images while generating captions.
+
+% \paragraph{Hard Prompts.} We explicitly construct hard prompts through CLIP-based retrieval. Benefiting from CLIP's strong zero-shot transfer classification capability, constructed hard prompts can often contain accurate visual entities regardless of whether seen or unseen, enabling GPT-2 to generate descriptions of novel entities.
+
+% {\color{red}
+% \paragraph{Entity Masking.} 
+% In order to extract visual entities from texts during training, nouns in the text input $T$ are accounted as entities, which are then masked randomly to prevent the model from learning a copy-then-paste shortcut. These extracted entities are used to construct hard prompts with prompt templates. The extent to which constructed hard prompts can generalize to novel entities positively correlates with the size of an open vocabulary used for retrieving visual entities. 
+% While Visual Genome (VG) has rich and diverse annotations, the annotations are noisy and even wrong sometimes. Therefore, we use the vocabulary proposed in VinVL \cite{VinVL}, which cleans VG classes combined with the other three object detection classes to form a vocabulary containing 1848 classes (i.e., VGOI). 
+% We conduct CLIP-based zero-shot entity retrieval to detect either seen or unseen entities.
+% }
+
+% \paragraph{Soft Prompts.} We leverage soft prompts to model attributes and relationships in the images. To this end, a trainable adapter generates soft prompts by taking $F_{T}'$ as input during the training phase. During inference, the adapter encodes $F_{I}$ to generate soft prompts, which can more effectively focus on modeling attributes and relationships as the hard prompts provide explicit visual entities. By doing so, object hallucinations can be reduced significantly in the unseen scene.
+
+

@@ -1,0 +1,231 @@
+\section{Video Recovery}
+\label{sec:recovery}
+
+In this section, we present a deep neural network-based video recovery model for the client to recover the video whenever video frames get lost. This significantly enhances the resilience of video streaming under diverse network conditions. Note that there has been considerable work on video prediction, which predicts the next video frame based on the previous frames and can be applied to recover lost videos in our context. However, predicting solely based on the previous information has limited accuracy whenever the video frame has new content, which is common in reality. Our main idea is to send some hint about the next video frame along with the encoded video to facilitate video recovery. We design a light-weight mechanism to extract a compact hint for recovering the next video frame and show it can significantly enhance the quality of the recovered videos. Below we describe (i) how to extract a compact binary code at the video server and (ii) how to leverage the code for video reconstruction at the client. 
+
+% Video recovery as well as video frame prediction are very open problems that can be generated well with enough scale model and data, but for client devices with limited computing power, it is difficult to generate predictions of sufficient quality by relying on the model itself.
+
+% We expect to be able to transmit some hint information to reduce the search space for small model in client devices and thus enhance the quality of video recovery. At the same time, the computing power of server side is relatively powerful, and some precomputation on server side can effectively reduce the pressure on the client side.
+
+% to allow reducing the dependence on network bandwidth, transmitting compressed video and then restoring the video through a video recovery model. 
+% Depending on the network environment, we use different video resolutions. We downsampled the frames at different ratios to provide the client different transmission bit rates to choose from. For extreme cases where even downsampled video frames are difficult to be subjected to, we encoded the video frames onto a binary point code of no more than 1KB and then chose a stable TCP network for transmission.
+
+\para{Extracting binary point code: }%  In this architecture, the key issue is whether the client can receive the computation result from the encoder stably. Therefore, we use two design points: (i) the encoder will have a very high compression ratio, for example, compressing 1080p video frames into $64\times128$ binary bits. (ii) the transmission process will use a stable network path such as TCP.
+In order to extract meaningful information from a video frame to help the video recovery, our encoder borrows the concept of edge detection to preserve the contours of objects. We adopt PidiNET~\cite{pidinet} trained on BSDS500~\cite{BSDS500} as an edge encoder due to its stable performance and small inference overhead. The result of edge detection is usually a value between 0 and 1, so we binarize it here to form a binary point code.
+The resolution of this binary point code can be very low. We find that even a $64\times128$ code (only 1 KB) can significantly improve the quality of the video recovery. We use TCP to reliably transmit it at a low cost (within one RTT). % Therefore, we choose to transmit it with a more stable network to ensure a stable video even in extreme network conditions streaming quality under extreme network conditions.
+
+We train the encoder end-to-end with the decoder for better reconstruction. We use a binarization layer in Movement Pruning~\cite{sanh2020movement}. To ensure the encoder-decoder structure is differentiable, we skip the gradient from binarization, which directly pass the gradient before the quantization layer to the upper layer. % so that this encoder-decoder structure is differentiable. % \yifan{made some change, pass the gradient seems the same meaning with skip? }
+
+Figure~\ref{fig:vis_recovery} illustrates the learned binary point code. It captures the motion and contour information of the current video frame. Despite its small size, it significantly improves the prediction accuracy. 
+
+% efficiently encodes a wealth of information that enables the client to recover video frames, and it can produce predictions very close to the ground truth.
+
+% make the quantization process derivable. We have  \lili{XXX: this part is not clear. why skip gradient can help training e2e? Check with Yifan.}
+
+% so this binary point code finds a more suitable pattern according to the downstream decoder's needs. \lili{XXX:not clear about Movement Pruning and how to use it here. Please elaborate.} \yifan{Referring to Movement Pruning~\cite{sanh2020movement}, we have used a jump gradient method to make the quantization process derivable. We have directly passed the gradient after the quantization layer back to the upper layer so that this encoder-decoder structure can be trained end to end.}
+
+\para{Leveraging binary point code:} The client recovers the current frame based on the current binary point code, previous video frames, and optionally a portion of the current frame that is received correctly. 
+
+% Figure environment removed
+
+% \section{down sample ratios} Referring to Table X, we chose 240p, 360p, 480p, 720p, which correspond to bit rates of xx,xx,xx,xx,. \yifan{Zhaoyuan can move abr statement for this part in here}
+
+% \section{binary point code within 1KB}
+% \label{sec:video_recovery}
+
+% We design an encoder-decoder structure, where the encoder is computed at the server side to compress the video frames with high ratio. The decoder computes at the client side and tries to recover the current frame by using the compression result from server side and the historical frames as the context. 
+
+
+% \subsection{video recovery model}
+% Video recovery requires a combination of historical frames information and corrupted current frame to infer the original frame. 
+
+Its video recovery consists of the following steps: % (i) extracting a compact binary point code as described above, 
+(i) estimating the optical flow between two consecutive binary point codes, (ii) upsampling the optical flow to the resolution of the video frame and warping the previous video frame to the current frame using the optical flow, (iii) further enhancing the content that is warped from the previous frame, and also using inpainting to generate new content that does not appear in the previous frames.
+
+For (i), we use SpyNet~\cite{ranjan2017optical}, an efficient optical flow network, to derive the delta between the two binary codes. Different from SpyNet, we fine-tune the optical flow network end-to-end in order to warp the previous frame to match the current frame. % Meanwhile, we maintain an RNN-like hidden layer to memorize some useful historical features. 
+
+For (ii), we find that warping on iPhone is very slow. We improve its speed by changing the wrapping resolution to 270p, which reduces the warping time to within 5 ms. 
+
+For (iii), we improve the content in the warped regions based on the difference to the ground truth. Meanwhile, we observe that warp-based video frame prediction predicts the movement of the content that already exists in the previous video frames. We further use the binary point code from the current video frame to generate new content by upsampling it to the video frame size and using an inpainting module to generate the content in the region that is left empty after warping. It then concatenates the two prediction results to produce the final video frame. We use the Charbonnier loss~\cite{chan2021basicvsr}, a widely used loss function for generation tasks, as the optimization metric during training. 
+
+To support partial error concealment, we introduce  $I_{part}$ as an additional input. $I_{part}$ is a partially decoded video frame due to packet loss, and the part they receive is a valuable input for recovering the missing part. We feed it to the recovery model to utilize this partial information, and partial content is also used to override the predicted $\widehat{I}_{pred}$ in thecorresponding region. Refer to  Figure~\ref{fig:vis_conceal} for $I_{part}$ and the recovery results for the missing region.
+
+% to support error concealment caused by partial decoding failures due to packet loss.
+
+% We try to warp the previous frame using the optical flow to reconstruct the current frame. However, their image resolutions can be quite different. 
+% Our corrupted current frame may be different low-resolution images or binary point codes. 
+% To support images with different resolutions, we design super-resolution modules with different upsampling rates to provide high-resolution prediction end-to-end. They share an optical flow network mentioned before to save memory. The optical flow network calculates the optical flow based on the low-resolution image to provide the alignment of historical information to the current frame. \lili{XXX: what is the difference between optical flow and binary point code? how to use both? Need to consolidate this and next paragraphs.}
+
+% Since our binary point code has much lower resolution than the original video frame, we design a video frame prediction module to incorporate the low-resolution code. We compute the optical flow through the optical flow network on two binary point codes and use it to align the information from the historical frames to the current frame to produce a rough prediction. This step is similar to the motion vector in codec, and then we design modules to enhance this rough prediction by adding more details and inpainting in the blanks where the alignment fails. % \lili{XXX: do we use optical flow or motion vector?}  \yifan{we use optical flow as alignment information but this align-and-wrapping step is quite similar with motion vector in codec}
+
+\para{Recovery model implementation details:} Figure~\ref{fig:arch}(a) shows the overall framework of our video recovery. The server transmits the binary point code to help video prediction at the client.  To improve computational efficiency, all inputs to the optical flow network are downsampled to $64\times128$. Outside the optical flow network, we resize the output to $270\times480$ and feed it to subsequent convolution layers. We use PixelShuffle~\cite{shi2016real} to upsample by 4x to produce 1080p output. Because wrapping operation on a mobile device is too costly, we resize the 1080p $I^{t-1}$ frame to 270p resolution and then perform wrapping to generate $\widehat{I}_{wrap}^t$. But it is hard to avoid the information loss due to downsample, so this degradation needs to be compensated by the enhancement module. So we additionally feed the 270p $I^{t-1}$ into the enhance convolution layers to compensate for the loss. \yifan{$H_e$ and $H$ are two hidden layer states maintained at the server and client, respectively, following a structure similar to RNNs. $H_e$ is responsible for capturing the temporal information during the server-side encoding of the binary point code, while $H$ records the temporal information associated with the video recovery process based on the binary point code. During the training phase, at each time step, both $H_e$ and $H$ selectively propagate the most valuable features to the subsequent time step. We have selected a set of feature maps from the output of the optical flow network and applied two groups of convolution layers with non-shared parameters. This results in two intermediate predictions, $\widehat{I}_{inpaint}$ and $\widehat{I}_{enhance}$. The former focuses on filling the gaps in $\widehat{I}_{wrap}$ created by the wrapping process (where the newly emerged content cannot be matched by the optical flow), while the latter concentrates on further adjusting $\widehat{I}_{wrap}$ (as wrap is only based on moving pixels from historical content, $\widehat{I}_{enhance}$ provides more subtle change predictions).}
+
+\para{Joint FEC and video recovery:} So far, we are focused on designing a video recovery model. In practice, one can use both FEC and video recovery to cope with network losses and excessive delay. As shown in Figure~\ref{fig:qoe_redundant}, the best QoE performance is achieved when we add an appropriate amount of FEC. To determine the right amount of FEC to add under our video recovery, we take the video training traces (described in Section~\ref{ssec:eval-method}) and play it under different network loss rates, where a loss means the packet is either lost or not received in time. For each network loss rate, we apply different levels of FEC and perform video decoding and recovery as described above. We derive the resulting QoE and select the FEC that yields the highest QoE. In this way, we offline build a lookup table that specifies the best FEC level for each loss rate. During online running, we predict the loss rate for the next video chuck and index to the table using the predicted loss rate to determine the appropriate FEC redundancy to use. A similar approach can be applied to support other recovery methods. 
+
+% We further adaptively Our recovery model can still get benefits under lossy networks because we can recover the lost frames without retransmission to avoid much rebuffering overhead. Figure~\ref{fig:qoe_redundant} indicates that there is always a peek where we can get the best QoE with the combination of FEC and our recovery model. To this end, we build a lookup table to get the best FEC redundant ratio under different packet loss rates and different network traces. Figure~\ref{fig:rc_lossy_qoe} shows the QoE performance across different network traces. 
+
+
+
+% inpainting and enhancement to 1008p outputs.
+
+% encodes video frame $\mathbf{I}^t$ at time $t$, taking into account the previous image and the encoded hidden layer maintained by the encoder to try to incorporate more information. This information will generate more efficient intermediate information $\mathbf{C}^t$ as a binary point code to help the video prediction on the client side. For the yellow $\textbf{Client}$ section on the right side of the figure, 
+
+ % For a historical status \textbf{H} and corrupted frame \textbf{I_c}, We need a 
+
+\section{Super-Resolution Videos}
+\label{sec:video_sr}
+
+We develop a DNN for super-resolution videos in real-time. As shown in Section~\ref{sec:motivation}, existing super-resolution videos are either too slow or not accurate. Our super-resolution can achieve good accuracy on mobile devices (\eg, iPhone 12) at 30ms per frame. 
+
+% \yifan{may be we lack numbers now for accurate now. Our method compares +0.6db PSNR with bilinear interpolation upsampling (smaller than the dataset we are using now, we have about 1-2db improvement on our current dataset, it is not clear why the improvement is not much in REDS for now), and -2db or so with other SOTA methods. Our advantage seems to be just over 10x faster than them, and we are the only method that can run in real time on the iphone because of doing a lot of lossy efficiency optimization. }
+
+
+% Our SR model is based on our recovery model but differs in the following ways: XXX. 
+Figure~\ref{fig:arch}(b) shows our Super-Resolution process. The network structure of our SR model and Recovery model are similar. Both are based on an optical flow network to align features, and then use upsampling modules to generate higher-resolution frames. To support streaming at different bit rates, the server will resize the video into different resolutions and transmit the resolution requested by the client as the $\mathbf{I}^{t}_{LR}$. On the client side, the optical flow network computes the pixel shift between $\mathbf{I}^{t}_{LR}$ and $\mathbf{I}^{t-1}_{LR}$. To save memory, SR models with different up-scaling will share the same optical flow network. To support super-resolution prediction at different resolutions, we use independent convolution layers to learn different degradation patterns. The learning target of SR network is the gap between the bilinear upsampled $\mathbf{I}^{t}_{LR}$ and the ground truth $\mathbf{I}^{t}$. As with the recovery model, we use Charbonnier loss to optimize above target and all scales task are trained simultaneously.
+
+Our SR model stands out due to its unique properties, such as real-time execution on mobile devices and support for multiple input resolutions. This is achieved through an efficient design that incorporates a shared optical flow network for different up-scaling factors and independent convolution layers tailored to specific degradation patterns. Furthermore, our model provides up-sampling for different resolutions without incurring additional computational costs by resizing the feature maps to predict degradation at various resolutions. This innovative approach allows our model to effectively accommodate devices with diverse computational capabilities, ensuring an optimized video streaming experience across a wide range of devices under various network conditions.
+
+% \lili{On the client side, the optical flow network calculates the pixel shift between $\mathbf{C}_{t}$ and $\mathbf{C}_{t-1}$ as the same with recovery model. Unlike Recovery, super-resolution modules for upsampling to different scales are outside the optical flow network. They share the same optical flow network to save memory but use independent parameters to adapt to different upsampling scale's degradation. To save computation time, we resize all inputs to 64*128 resolution when inputting to the optical flow network, so in effect we have the same inputs for different downsampling scales. They differ in the final target because they output $\mathbf{\widehat{I}}^{t}_{SR}$ plus the resized $\mathbf{C}_{t}$ from different initial resolutions.}
+
+\section{Enhancement Aware ABR}
+
+We develop an enhancement aware ABR algorithm. It is built on the ABR in Pensieve~\cite{mao2017neural}, but advances Pensieve in two respects: (i) it is enhancement aware ABR, which considers the impact of video recovery and super-resolution, and (ii) it incorporates the latest Reinforcement Learning (RL) algorithm -- Proximal Policy
+Optimization (PPO)~\cite{PPO}. Below we focus on how to model the impact of video recovery and super-resolution on video QoE, and refer the readers to ~\cite{PPO} for detailed description about PPO.
+
+% Figure environment removed
+
+\para{Quality of Experience (QoE):} The widely used video Quality of Experience (QoE) is a function of bitrate utility, rebuffering time, and smoothness of selected bitrates, which is defined as follow:
+\[\frac{\sum_{n=1}^{N} R_{n} - \mu \sum_{n=1}^{N} T_{n} - \sum_{n=1}^{N-1} |R_{n+1} - R_{n}|}{N} \]
+where $N$ is the number of video chunks, $R_{n}$ and $T_{n}$ represent the video chunk n’s bitrate and the
+rebuffering time resulting from its download, respectively, and $\mu$ is the
+rebuffering penalty. Video recovery and super-resolution impact the QoE in two ways: (1) they improve the video quality and its corresponding bitrate and (2) their running time also affects the rebuffering time. Below we compute (i) how video recovery affects the video quality, (ii) how SR affects the video quality, (iii) how video recovery affects rebuffering time, and (iv) how SR affects rebuffering time. 
+
+\para{Impact of video recovery on video quality:} Let us first consider how video recovery affects the video quality. The impact can be quantified based on how many video frames go through video recovery and how much video quality change after recovery. First, we estimate the number of video frames in the current video chuck that need recovery. We observe that recovery takes place when either (i) a video frame is lost (\eg, due to network congestion, low SNR, mobility) or (ii) a video frame arrives too late (\ie, the frame has not arrived by the time the video frame is scheduled to play). We can predict the loss rate (\eg, using Exponential Weighted Moving window Average (EWMA) or Holt Winters (HW)), and use the predicted loss rate to estimate (i). To estimate (ii), we compute the expected play time for the $i$-th video frame as $T_{play} = T_{prev} + i \Delta$, where $T_{prev}$ is the end time of the previous video chuck, $i$ is the video frame index, and $\Delta$ is the inter-frame time. We compute the expected arrival time for the $i$-th frame as $T_{arr}=T_{prev} + \sum_i S_i/tput_{curr}$, where $S_i$ is the total size of data for the $i$-th frame and $tput_{curr}$ is the predicted throughput for the current video chuck, which can be derived using EWMA or HW. Then for every video frame $i$ in the current chuck, we count the number of frames whose $T_{play}^i < T_{arr}^i$. 
+
+Next we need to compute the video quality for the recovered frame. This depends on the selected video bit rate. For simplicity, we take videos from the top ten popular categories~\cite{medium-report} on YouTube as our training data; for each bit rate, we compute the average PSNR of these video frames after applying video recovery. We use this value as the estimate for the video quality. For the remaining videos that do not need recovery, we can estimate the video quality based on the selected bit rate (\eg, computing the average PSNR of our training video frames at that rate). 
+
+\para{Impact of SR on video quality:} The impact of SR can also be quantified based on (i) the number of video frames that go through SR and (ii) the enhanced video quality after applying SR. (ii) can be estimated by computing PSNR of the frames in our training videos after applying SR at each bit rate. 
+
+Below we compute (i). Since rebuffering time is more annoying than degraded video quality, we skip SR if SR can cause rebuffering. Therefore video frames can be grouped into the following three scenarios: 1) those that are not received in time for playout and require recovery, 2) those that are received in time and can be applied SR before the playout time, and 3) those that are received in time but cannot finish SR before the playout time. To derive 2), for every video frame $i$ in the current chuck, we count the number of frames whose $T_{play}^i > T_{arr}^i + T_{SR}$, where $T_{SR}$ is the processing time of SR.
+% which is 24 ms.  
+
+% Note that video frames are either directly received and go through SR for further enhancement or go through video recovery, where the video recovery also brings the video frame to the highest resolution. Therefore, (i) is essentially the frames that are received and do not need video recovery. (ii) can be estimated by computing PSNR of the frames after applying SR at each bit rate. 
+
+\para{Impact of video recovery on rebuffering time:} To quantify the video recovery on the rebuffering time, we observe that only the frames that go through recovery has rebuffering time. \zhaoyuan{These frames can be recovered either when they are received successfully but late or corrupted due to network losses.} Therefore, their rebuffering time can be estimated as $min(\sum_i S_i/tput_{curr}-T_{play}^i, T_{RC})$, where $T_{RC}$ is the recovery time.
+% which is 24 ms in our implementation. 
+
+\para{Impact of SR on rebuffering time:} As mentioned earlier, to minimize rebuffering time, only the frames that can finish SR before their playout time will go through SR. Therefore, SR does not affect rebuffering time. 
+
+\para{Enhancement-aware ABR:} Our final ABR algorithm computes the QoE of the current video chuck for each video bit rate and selects the rate that leads to the highest QoE. 
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% end of file %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+% Since rebuffering time is more annoying than degraded video quality, we skip SR if SR can cause rebuffering. Therefore, SR does not affect rebuffering time. 
+
+% Only the video frames that are successfully received before their playout time go through SR, we simply compare if SR can finish before their scheduled playout time. 
+
+% As we know the processing time of SR, upon the successful packet arrival, we 
+
+% To quantify the impact of SR on the rebuffering time, we observe that the frame 
+
+% only the frames that go through recovery has rebuffering time. These frames can be recovered either when they are received successfully or recovered successfully. Therefore, their rebuffering time can be estimated as $min(\sum_i S_i/tput_{curr}, RT)$, where $RT$ is the recovery time, which is 25 ms in our implementation. 
+
+% video quality and rebuffering time after applying video recovery and super-resolution.
+
+% The selected bitrate is improved by video super-resolution and video recovery, so we need to update $R_{n}$ to indicate the benefit of video enhancement. 
+% For (i), we observe that after applying video recovery and super-resolution, the video quality improves. NAS defines an effective bitrate $R_{effective}$ as the bitrate that corresponds to the improved video quality (\eg, SSIM or PSNR). The mapping is a piece-wise linear interpolation from video quality to video bitrate. We follow the same idea but use a polynomial mapping function because it fits our data better. 
+
+% mapped bitrate from its enhanced video quality, e.g. SSIM or PSNR.  \lili{XXX: map from rate to quality, instead of the other way around, right? If so, pls fix it}
+
+\comment{
+\subsection{Recovery Aware ABR}
+
+% Next we derive the rebuffering time affected by video recovery.
+% 1) check only handle (ii) 
+% 2) how to predict which frame has rebuffering; how to estimate tx
+% 3) how to estimate the recovery benefit for a given frame
+\para{Video quality:} Let us first consider how video recovery affects the video quality. Our video recovery takes place when either (i) a video frame is lost (\eg, due to network congestion, low SNR, mobility) or (ii) a video frame arrives too late. 
+
+While our video recovery handles both types of losses, our recovery-aware ABR algorithm only considers (ii) because the losses in (i) are typically low and it is challenging to predict exactly which video frame will be lost and need to go through video recovery. 
+
+For the next video chuck, our goal is to estimate (1) how many video frames in the next video chuck needs recovery and (2) what is the video quality after recovery. For (1), we focus on (ii) and observe the $i$-th video frame in the chuck has an expected playout time $T_{playout}$, which can be calculated as $T_{playout} = T_{prev} + i \times \Delta$, where $T_{prev}$ is the end time of the previous video chuck, $i$ is the video frame index, and $\Delta$ is the inter-frame time. For each video frame $i$, we compute the buffer occupancy as $B_{curr}^i = max(0,B_{prev} - \sum_{k=1..i-1} D_i/ \Delta + i)$, where $B_{prev}$ is the buffer
+
+\zhaoyuan{Zhaoyuan: We can consider the buffer occupancy as a buffer time to avoid the integer rounding problem, then the recovery-aware buffer time would be as follows.
+\[B_{curr}^i = max(0, B_{prev} - \sum_{k=1}^{i} D_k + i\times \Delta)\]
+$D_k$ would be determined by the transmission delay of the kth frame. The SR-aware buffer time would be as follows.
+\[B_{curr}^i = max(0, B_{prev} - \sum_{k=1}^{i} D_k + i\times \Delta)\]
+\[D_k = T_k + T_{sr}\]
+Here $D_k$ would be the sum of the transmission delay and the SR inference time of the kth frame.
+}
+
+(i-1) + (i-1)\times \Delta + \sum_k tx_{k}$. For any video frames whose $B_{curr}^i$
+goes below 0, they need video recovery.
+
+For (2) 
+need to compute the buffer occupancy at 
+% The goal of our recovery-aware ABR is to maximize QoE using recovered frames to avoid the rebuffering penalty when the video chunk transmission cannot finish before the buffer time.
+
+NAS defines an effective bitrate $R_{effective}$ as the bitrate that corresponds to the improved video quality (\eg, SSIM or PSNR). The mapping from video quality to video bitrate is a piece-wise linear interpolation. We follow the same idea but use a polynomial mapping function because it fits our data better. Our recovery can also provide a good effective bitrate $R_{effective}$, leading to a stable and high QoE. 
+
+$R_{effective}$ depends on the recovered video quality, which degrades with an increasing number of recovered frames because we always use a predicted frame to further predict the next frame. In this case, the prediction error is accumulated, which degrades the recovery quality. To estimate the degradation, we first do DNN inference for our recovery model with different consecutive recovered frames and get the average PSNR among all the videos. Then we use interpolation to map the number of recovered frames to the average PSNR among these frames. The average PSNR can be further mapped to $R_{effective}$.
+
+\para{Rebuffering time:} Next we examine how video recovery affects the rebuffering time. In on-demand video streaming, a video is divided into multiple video chucks, each lasting a few seconds. A video chuck can be played once it is successfully decoded. Rebuffering happens when we need to play out video but the video buffer is empty. In order to compute the rebuffering time, we need to first determine the expected playout time for each video frame and then check if the buffer is empty at the playout time. 
+
+compute the rebuffering time after applying the video recovery. In general video streaming systems, as a client receives a video frame, the frame will be stored in a video buffer to be played later. The total delay of a video chunk is determined by the video transmission time. After the video chunk is fully received, we calculate the rebuffering time $T_{rebuf}$ and the buffer time $T_{buf}$ as follows. 
+\[T_{rebuf} = max(delay - T_{buf}, 0)\]
+\[T_{buf} = max(T_{buf} - delay, 0)\]
+
+In our recovery-aware ABR, it is essential to find a recovery frame index and the corresponding total delay such that the QoE can be optimized. Our approach is described as follows. 
+
+If we find the total transmission delay of the current video chunk larger than the current buffer time, then we perform Algorithm ~\ref{alg:get_recovery_delay} to get a recovery frame index and the corresponding delay to avoid the rebuffering penalty. We first acquire a list of transmission delays $Dl$ for all received video frames. Then, we iterate over all frames backward to find a video frame whose delay $T$ is less than or equal to the buffer time. $T$ is calculated based on the sum of the transmission delay until the frame is received and the recovery inference time of all remaining frames in the video chunk. Then, the recovery index $n$ and the corresponding delay $T$ would be returned. 
+
+\begin{algorithm}[h!]
+	\caption{Get recovery frame index of each video chunk}
+	\label{alg:get_recovery_delay}
+	\begin{algorithmic}[1]
+    \State $N:$ The number of frames in the current video chunk
+    \State $T_{buf}:$ The buffer time of the current video chunk
+    \State $Dl:$ The list of transmission delays until each received frame
+    \For{$frame\ f_{n},\ n = N,N-1\ldots,1$}
+        \State Get the transmission delay $Dl[n]$ until frame $n$ is received; Get the recovery inference time $RC_{f_{n-1}}$
+        \State $T$ = $Dl[n]$ + $RC_{f_{n-1}} \times (N - n)$
+        \If{$T$ <= $T_{buf}$}
+            \State \textbf{Return} $n$, $T$
+        \EndIf
+    \EndFor
+	\end{algorithmic}
+% \vspace{-5pt}
+\end{algorithm}
+
+
+\subsection{SR Aware ABR}
+
+The goal of our SR-aware ABR is to maximize QoE by improving the effective bitrate $R_{effective}$ with our video super-resolution model while keeping the SR inference time low. After a client receives a video frame, the video super-resolution is performed. In the meantime, the client can receive the next video frame to be stored in the video buffer. In this case, a pipeline is formed such that the total delay of a video chunk is determined by the video transmission time and super-resolution delay together. The total delay is calculated by Algorithm~\ref{alg:get_sr_delay} and $D_{SR}$ would be the returned value.  
+
+\begin{algorithm}
+	\caption{Get delay of each video chunk}
+	\label{alg:get_sr_delay}
+	\begin{algorithmic}[1]
+    \State $N:$ The number of frames in the current video chunk
+    \State $D_{T}:$ Transmission delay of the current video chunk
+    \State $D_{SR}:$ SR delay of the current video chunk
+    \State Get the transmission time $T_{f1}$ of $frame\ 1$ from throughput and frame size
+    \State $D_{T} = T_{f1}$
+    \State $D_{SR} = T_{f1}$
+    \For{$frame\ f_{n},\ n = 2,3,\ldots,N$}
+        \State Get the transmission time $T_{f_{n}}$ from throughput and frame size; Get the SR inference time $SR_{f_{n-1}}$
+        \State $D_{T}$ += $T_{f_{n}};\ D_{SR}$ += $SR_{f_{n-1}}$
+        \If{$D_{T}$ > $D_{SR}$}
+            \State $D_{SR}$ = $D_{T}$
+        \EndIf
+    \EndFor
+    \State $D_{SR}$ += $SR_{f_{N}}$
+	\end{algorithmic}
+% \vspace{-5pt}
+\end{algorithm}
+
+For each frame of the current video chunk, we perform video super-resolution after the frame is received. At the same time, the next frame is being received. Following this pipeline, we receive the first frame before performing video super-resolution. Then, we get the transmission time of the current frame and the SR inference time of the last frame. If the accumulated transmission delay $D_{T}$ is greater than the accumulated SR delay $D_{SR}$, that means the low throughput takes up most of the overhead, thereby delaying the time of performing SR inference. If $D_{T}$ is less than $D_{SR}$, the transmission delay can be accumulated ahead of the SR delay. After all of the video frames are received, the total delay would be the maximal accumulated delay through the pipeline, namely, $D_{SR}$. 
+}

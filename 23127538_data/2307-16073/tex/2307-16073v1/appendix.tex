@@ -1,0 +1,732 @@
+\appendix
+% \printglossary
+
+\section{Use cases}
+
+We will present some use cases of name-based CPS transformation and LDK in this section, to illustrate the simplicity of our approach, in comparison to previous solutions.
+
+\subsection{Resolve the \lstinline{printf} problem, trivially}\label{resolve-printf-problem}
+
+The type-safe \lstinline{printf} problem \cite{danvy1998functional} is often used to demonstrate the ability of modifying the answer type of a typed delimited continuation. The problem can be also resolved by \textit{Dsl.scala}'s CPS-transformation plug-ins as shown in \cref{printf}.
+
+\begin{lstlisting}[caption={A solution of the type-safe \lstinline{printf} problem in \textit{Dsl.scala}},label={printf}]
+object IntPlaceholder {
+  @shift def unary_! : String = ???
+  def cpsApply[Domain](f: String => Domain): Int => Domain = { i: Int =>
+    f(i.toString)
+  }
+}
+
+object StringPlaceholder {
+  @shift def unary_! : String = ???
+  def cpsApply[Domain](f: String => Domain): String => Domain = f
+}
+
+def f1 = "Hello World!"
+def f2 = "Hello " + !StringPlaceholder + "!"
+def f3 = "The value of " + !StringPlaceholder + " is " + !IntPlaceholder + "."
+
+println(f1) // Output: Hello World!
+println(f2("World")) // Output: Hello World!
+println(f3("x")(3)) // Output: The value of x is 3.
+\end{lstlisting}
+
+This solution works because our plug-ins performs CPS-transformation for \lstinline{f1}, \lstinline{f2} and \lstinline{f3}, as shown in \cref{transformed-printf}.
+
+\begin{lstlisting}[caption={The translated source code of \lstinline{Dsl.scala}-base solution of \lstinline{printf} problem},label={transformed-printf}]
+// The type of f1 is inferred as `String`
+def f1 = "Hello World!"
+
+// The type of f2 is inferred as `String => String`
+def f2 = StringPlaceholder.cpsApply { tmp =>
+  "Hello " + tmp + "!"
+}
+
+// The type of f3 is inferred as `String => Int => String`
+def f3 = StringPlaceholder.cpsApply { tmp0 =>
+  IntPlaceholder.cpsApply { tmp1 =>
+    "The value of " + tmp0 + " is " + tmp1 + "."
+  }
+}
+\end{lstlisting}
+
+Our solution is more concise than the solution with Scala Continuations \cite{rompf2009implementing}, because:
+\begin{enumerate*}
+  \item No explicit \lstinline{reset} is required, as \lstinline{reset} is automatically added by the \lstinline{ResetEverywhere} plug-in.
+  \item No explicit \lstinline{@cps} type annotation is required, since the \lstinline{BangNotation} plug-in is name-based. The type of \lstinline{f1}, \lstinline{f2} and \lstinline{f3} can be inferred automatically, according to Scala's type inference algorithm for closures.
+\end{enumerate*}
+
+\subsection{The prefix problem}\label{The prefix problem}
+
+The \lstinline{prefix} problem introduced in \cite{asai2007polymorphic} is a problem that requires polymorphic delimited continuations, which is a CPS function whose answer type can be modified, i.e. \lstinline{(A => B) => C} where \lstinline{B} and \lstinline{C} differ. We provide a \lstinline{PolymorphicShift} LDK to perform \lstinline{shift} control operator for polymorphic delimited continuations, as defined in \cref{PolymorphicShift}. Note that \lstinline{PolymorphicShift} is not interpreted by \lstinline{Dsl}, hence it is not ad-hoc polymorphic.
+
+\begin{lstlisting}[caption={The definition of PolymorphicShift},label={PolymorphicShift}]
+final case class PolymorphicShift[A, B, C](cpsApply: (A => B) => C) {
+  @shift def unary_! : A = ???
+}
+
+implicit def implicitPolymorphicShift[A, B, C](cpsApply: (A => B) => C) = PolymorphicShift(cpsApply)  
+\end{lstlisting}
+
+The solution to \lstinline{prefix} problem uses ``underscore trick'' along with \lstinline{PolymorphicShift}, as shown in \cref{prefix}.
+
+\begin{lstlisting}[caption={The solution to \lstinline{prefix} problem by the ``underscore trick''},label={prefix}]
+def visit[A](lst: List[A]): (List[A] => List[A] @reset) => List[List[A]] = _ {
+  lst match {
+    case Nil =>
+      !{ (h: List[A] => List[A]) =>
+        Nil
+      }
+    case a :: rest =>
+      a :: !{ (k: List[A] => List[A] @reset) =>
+        k(Nil) :: k(!visit(rest))
+      }
+  }
+}
+
+def prefix[A](lst: List[A]) = !visit(lst)
+
+// Output: List(List(1), List(1, 2), List(1, 2, 3))
+println(prefix(List(1, 2, 3)))
+\end{lstlisting}
+
+Traditional polymorphic delimited continuations performs CPS transformation across functions. In contrast, with the help of the ``underscore trick'', we achieve the same ability of answer type modification as polymorphic delimited continuations, by performing function-local CPS-translation.
+
+\subsection{Mutable states}
+
+Purely functional programming languages usually do not support first-class mutable variables. In those languages, mutable states can be implemented in state monads. In this section, we will present an alternative approach based on LDK to simulate mutable variable in a pure language \footnote{Scala is an impure language, but we don't use Scala's native \lstinline{var} or other impure features when simulating mutable states, therefore, our approach can be ported to Haskell or other pure languages as described in \cref{Haskell implementation}.}. Unlike state monads, our LDK-based approach is more straightforward, and supports multiple mutable states without manually lifting.
+
+\subsubsection{Single mutable state}\label{Single mutable state}
+
+We use unary function as the domain of mutable state. The parameter of the unary function can be read from \lstinline{Get} LDK, and changed by \lstinline{Put} LDK, which are defined in \cref{Get,Put}, respectively.
+
+\begin{lstlisting}[caption={The definition of \lstinline{Get} LDK},label={Get}]
+case class Get[S]() extends Keyword[Get[S], S]
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The definition of \lstinline{Put} LDK},label={Put}]
+case class Put[S](value: S) extends Keyword[Put[S], Unit]
+\end{lstlisting}
+
+\Cref{upperCasedLastCharacter} is an example of a unary function that accepts a string parameter and returns the upper-cased last character of the parameter. The initial value is read from \lstinline{Get} LDK, then it is changed to upper-case by \lstinline{Put} LDK. At last, another \lstinline{Get} LDK is performed to read the changed value, whose last character is then returned.
+
+\begin{lstlisting}[caption={Using \lstinline{Get} and \lstinline{Put} in a unary function},label={upperCasedLastCharacter}]
+def upperCasedLastCharacter: String => Char = {
+  val initialValue = !Get[String]()
+  !Put(initialValue.toUpperCase)
+
+  val upperCased = !Get[String]()
+  Function.const(upperCased.last)
+}
+
+// Output: O
+println(upperCasedLastCharacter("foo"))
+\end{lstlisting}
+
+The \lstinline{Dsl} instances for \lstinline{Get} and \lstinline{Put} used in \lstinline{upperCasedLastCharacter} are shown in \cref{getDsl,putDsl}. The \lstinline{Dsl} instance for \lstinline{Get} LDK passes the \lstinline{currentValue} to the \lstinline{handler} of current LDK, and then continues the enclosing unary function; the \lstinline{Dsl} instance for \lstinline{Put} LDK ignores \lstinline{previousValue} and continues the enclosing unary function with the new \lstinline{value} in \lstinline{Put}.
+
+\begin{lstlisting}[caption={The \lstinline{Dsl} instance for \lstinline{Get} LDK},label={getDsl}]
+
+implicit def getDsl[S0, S <: S0, A] =
+  new Dsl[Get[S0], S => A, S0] {
+    def cpsApply(keyword: Get[S0], handler: S0 => S => A): S => A = { currentValue =>
+      handler(currentValue)(currentValue)
+    }
+  }
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The \lstinline{Dsl} instance for \lstinline{Put} LDK},label={putDsl}]
+implicit def putDsl[S0, S >: S0, A] =
+  new Dsl[Put[S0], S => A, Unit] {
+    def cpsApply(keyword: Put[S0], handler: Unit => S => A): S => A = { previousValue =>
+      handler(())(keyword.value)
+    }
+  }
+\end{lstlisting}
+
+Traditionally, the data type of state monad is an opaque type alias of \lstinline{S => (S, A)}, which is more complicated than our domain type \lstinline{S => A}, indicating state monads are potentially less efficient than LDK-based implementation. We will discuss the reason why monad-based DSL are more complicated and less efficient than LDK-based DSL in \cref{Monads}.
+
+\subsubsection{Multiple mutable states}\label{Multiple mutable states}
+
+\lstinline{Get} and \lstinline{Put} LDKs can be performed on multiple mutable states as well. The domain types are curried functions in those use cases.
+
+In \cref{formatter}, we present an example to create a \lstinline{formatter} that performs \lstinline{Put} on a \lstinline{Vector[Any]} to store parts of the string content. At last, a \lstinline{Return} LDK is performed at last to concatenate those parts. The \lstinline{formatter} internally performs \lstinline{Get} LDKs of different types to retrieve different parameters.
+
+\begin{lstlisting}[caption={Using \lstinline{Get} and \lstinline{Put} in a curried function},label={formatter}]
+def formatter: Double => Int => Vector[Any] => String = {
+  !Put(!Get[Vector[Any]] :+ "x=")
+  !Put(!Get[Vector[Any]] :+ !Get[Double])
+  !Put(!Get[Vector[Any]] :+ ",y=")
+  !Put(!Get[Vector[Any]] :+ !Get[Int])
+
+  !Return((!Get[Vector[Any]]).mkString)
+}
+
+// Output: x=0.5,y=42
+println(formatter(0.5)(42)(Vector.empty))
+\end{lstlisting}
+
+Since we had introduced \lstinline{Dsl} instance for \lstinline{Get} and \lstinline{Put} LDKs in unary functions, now we only need a derived \lstinline{Dsl} instance to port these LDKs in curried functions, which is defined in \cref{derivedFunction1Dsl}.
+
+By combining \lstinline{getDsl} and \lstinline{derivedFunction1Dsl} together, the Scala compiler automatically searches matched type in the curried function when resolving the implicit \lstinline{Dsl} instance for a \lstinline{Get} LDK. For example, \lstinline{!Get[Vector[Any]]()} reads the third parameter of the \lstinline{formatter}. It will be translated to \lstinline[mathescape=true]|Get[Vector[Any]]().cpsApply { _ => $\hdots$ }|, where the \lstinline{cpsApply} call requires an instance of type \lstinline{Dsl[Get[Vector[Any]], Double => Int => Vector[Any] => String, Vector[Any]]}, which will be resolved as \lstinline{derivedFunction1Dsl(derivedFunction1Dsl(getDsl))}. Similarly, the \lstinline{Dsl} instance for reading the first parameter and the second parameter can be resolved as \lstinline{getDsl} and \lstinline{derivedFunction1Dsl(getDsl)}, respectively.
+
+Derived \lstinline{Dsl} instance for \lstinline{Put} and \lstinline{Return} can be resolved similarly. Since all the \lstinline{!Put} LDK in \lstinline{formatter} write the third parameter, their \lstinline{Dsl} instances are \lstinline{derivedFunction1Dsl(derivedFunction1Dsl(putDsl))}; the \lstinline{Dsl} instance for \lstinline{!Return} are \lstinline{derivedFunction1Dsl(derivedFunction1Dsl(derivedFunction1Dsl(returnDsl)))}.
+
+Now we had demonstrated a simple and straightforward solution for the feature of multiple mutable states, with the help of nested \lstinline{Dsl} derivation.
+
+\subsection{Asynchronous programming}\label{Asynchronous programming}
+
+With the help of \lstinline{Dsl} derivation, a complex DSL can be composed of simple features. In this section we will present a sophisticated implementation of asynchronous task, which is composed of three independent features:
+\begin{enumerate*}
+  \item asynchronous result handling
+  \item exception handling
+  \item stack safety
+\end{enumerate*}, as defined in \cref{Task}. A new infix type alias \lstinline{!!} is used instead of \lstinline{Continuation}, as a shorter notation for nested \lstinline{Continuation} types.
+
+\begin{lstlisting}[caption={The definition of asynchronous \lstinline{Task}},label={Task}]
+type !![Domain, Value] = Continuation[Domain, Value]
+type Task[A] = TailRec[Unit] !! Throwable !! A
+\end{lstlisting}
+
+\lstinline{Task} supports the features of tail call optimization and exception handling. Each feature corresponds to a part the type signature. \lstinline{scala.util.control.TailCalls.TailRec} is used for tail call optimization, and \lstinline{scala.Throwable} is used to represent the internal exceptional state.
+
+We create some derived \lstinline{Dsl}s to handle exceptions, which support domains whose types match the pattern of \lstinline[mathescape=true]{($L_i$ !! $\hdots$ !! $L_0$ !! Throwable !! $R_0$ !! $\hdots$ !! $R_i$)}, and some derived \lstinline{Dsl}s to optimize tail calls as trampolines, which support domains whose types match the pattern of \lstinline[mathescape=true]{(TailRec[$\hdots$] !! $R_0$ !! $\hdots$ !! $R_i$)}, where $L_0 \hdots L_i$ and $R_0 \hdots R_i$ are arbitrary number of types \footnote{Those \lstinline{Dsl}s are implemented in the \lstinline{Dsl} derivation technique described in \cref{Dsl derivation}. Check the artifact for the complete implementation}. Therefore, \lstinline{Dsl} instances for \lstinline{Task} are composed from these orthogonal features.
+
+In \cref{An asynchronous HTTP client}, we will present how to create an asynchronous HTTP client from \lstinline{Task}; in \cref{Parallel execution}, we will introduce the usage of \lstinline{Task[Seq[A]]}, which collects the results of multiple tasks into a \lstinline{Seq}, either executed in parallel or sequentially.
+
+\subsubsection{An asynchronous HTTP client}\label{An asynchronous HTTP client}
+
+\Cref{httpClient} is an example of an HTTP client built from low-level Java NIO.2 asynchronous IO operations. Note that the ``underscore trick'' is used to allow \lstinline{Task} to be executed across functions.
+
+\begin{lstlisting}[caption={An asynchronous HTTP client},label={httpClient}]
+def readAll(channel: AsynchronousByteChannel, destination: ByteBuffer): Task[Unit] = _ {
+  if (destination.remaining > 0) {
+    val numberOfBytesRead: Int = !Read(channel, destination)
+    numberOfBytesRead match {
+      case -1 =>
+      case _  => !readAll(channel, destination)
+    }
+  } else {
+    throw new IOException("The response is too big to read.")
+  }
+}
+
+def writeAll[Domain](channel: AsynchronousByteChannel, destination: ByteBuffer): Task[Unit] = _ {
+  while (destination.remaining > 0) {
+    !Write(channel, destination)
+  }
+}
+
+def asynchronousHttpClient(url: URL): Task[String] = _ {
+  val socket = AsynchronousSocketChannel.open()
+  try {
+    val port = if (url.getPort == -1) 80 else url.getPort
+    val address = new InetSocketAddress(url.getHost, port)
+    !Connect(socket, address)
+    val request = ByteBuffer.wrap(s"GET ${url.getPath} HTTP/1.1\r\nHost:${url.getHost}\r\nConnection:Close\r\n\r\n".getBytes)
+    !writeAll(socket, request)
+    val MaxBufferSize = 100000
+    val response = ByteBuffer.allocate(MaxBufferSize)
+    !readAll(socket, response)
+    response.flip()
+    io.Codec.UTF8.decoder.decode(response).toString
+  } finally {
+    socket.close()
+  }
+}
+\end{lstlisting}
+
+We defined \lstinline{Connect}, \lstinline{Read} and \lstinline{Write} LDKs to register handlers to Java NIO.2 asynchronous IO operators. In addition to \lstinline{Task} domain, those LDKs also support any domains that match types of \lstinline[mathescape=true]{($\hdots$ !! Unit !! Throwable !! $\hdots$)} or \lstinline[mathescape=true]{($\hdots$ !! TailRec[Unit] !! Throwable !! $\hdots$)} \footnote{Check the artifact for complete implementation.}.
+
+\lstinline[mathescape=true]{!readAll($\hdots$)} and \lstinline[mathescape=true]{!writeAll($\hdots$)} are equivalent to \lstinline[mathescape=true]{!Shift(readAll($\hdots$))} and \lstinline[mathescape=true]{!Shift(writeAll($\hdots$))}. The explicit \lstinline{Shift} calls are omitted because we provided an implicit conversion from any \lstinline{Continuation}s(including \lstinline{Task}s) to \lstinline{Shift} LDKs.
+
+We also provided a \lstinline{blockingAwait} method, to block the current thread until the result of the asynchronous task is ready, therefore, \lstinline{asynchronousHttpClient} can be used synchronously, as shown in \cref{usingAsynchonousHttpClient}.
+
+\begin{lstlisting}[caption={Using the example HTTP client},label={usingAsynchonousHttpClient}]
+val httpResponse = Task.blockingAwait(asynchronousHttpClient(new URL("http://example.com/")))
+httpResponse should startWith("HTTP/1.1 200 OK")
+\end{lstlisting}
+
+\subsubsection{Parallel execution}\label{Parallel execution}
+
+Another useful LDK for asynchronous programming is \lstinline{Fork}, which duplicate the current control flow, and the child control flow are executed in parallel, similar to the POSIX \lstinline{fork} system call, as shown in \cref{usingHttpClientInParallel}.
+
+\begin{lstlisting}[caption={Using HTTP client in parallel},label={usingHttpClientInParallel}]
+val Urls = Seq(
+  new URL("http://example.com/"),
+  new URL("http://example.org/")
+)
+def parallelTask: Task[Seq[String]] = {
+  val url: URL = !Fork(Urls)
+  val content: String = !httpClient(url)
+  !Return(content)
+}
+
+val Seq(fileContent0, fileContent1) = Task.blockingAwait(parallelTask)
+assert(fileContent0.startsWith("HTTP/1.1 200 OK"))
+assert(fileContent1.startsWith("HTTP/1.1 200 OK"))
+\end{lstlisting}
+
+Since the execution of \lstinline{parallelTask} is forked, the two URLs will be downloaded in parallel. The results are then collected into a \lstinline{Task} of \lstinline{Seq} at the \lstinline{!Return} LDK.
+
+\subsubsection{Modularity and performance}
+
+Our approach achieved both better modularity and better performance than previous implementation.
+
+Most of previous asynchronous programing libraries, including Scala Future \cite{haller2012sip}, Monix \cite{nedelcu2017monix}, and Cats effects \cite{typelevel2017cats}, are built from a solid implementation, along with some callback scheduler for custom behaviors. In contrast, our approach separate atomic features into independent \lstinline{Dsl} type classes.
+
+Scalaz Concurrent \cite{kenji2017scalaz} or other monad transformer \cite{liang1995monad} based approach can separate asynchronous programing features into monad of asynchronous handling and monad transformer of exception handling. Even though, trampolines are not able to implemented as monad transformers, as a result, intrusive code for trampolines must be present in each monad instance and monad transformer instance, or the call stack may overflow. In contrast, our approach allows non-intrusive \lstinline{Dsl} derivation for \lstinline{TailRec[Unit]}, then the ability of stack safety will be added on previously stack unsafe \lstinline{Dsl}s.
+
+According to our benchmarks in \cref{Benchmarks}, on HotSpot JVM, our \lstinline{Task} implementation is much faster than monad transformer based implementations, and has similar performance in comparison to solid implementations. On GraalVM, our \lstinline{Task} implementation is faster than all other implementations.
+\subsection{Collection comprehensions}\label{Collection comprehensions}
+
+List comprehension or array comprehension is a feature to create a collection based on some other collections, which has been implemented as first class feature in many programming languages including Scala. In this section, we will present the \lstinline{Each} LDK, which allows collection comprehensions for arbitrary collection types. Unlike other first class comprehension, our LDK-based collection comprehension collaborates with other LDKs, thus allowing creating complex code of effects or actions along with collection comprehensions.
+
+\subsubsection{Heterogeneous comprehensions}\label{Heterogeneous comprehensions}
+
+Suppose we want to calculate all composite numbers below $n$, the program can be written in Scala's native \lstinline{for}-comprehension as shown in \cref{compositeNumbersBelow-for}.
+
+\begin{lstlisting}[caption={Calculating all composite numbers below $n$ with \lstinline{for}-comprehension},label={compositeNumbersBelow-for}]
+def compositeNumbersBelow(n: Int) = (for {
+  i <- 2 until math.ceil(math.sqrt(n)).toInt
+  j <- 2 * i until n by i
+} yield j).to[Set]
+\end{lstlisting}
+
+The \lstinline{compositeNumbersBelow} can be ported to LDK-based collection comprehension with the following steps:
+
+\begin{enumerate}
+  \item Replacing the \lstinline{for} keyword and the trailing \lstinline[mathescape=true]{.to[$CollectionType$]} by the heading $CollectionType$.
+  \item Replacing every \lstinline[mathescape=true]{$p$ <- $e$} by \lstinline[mathescape=true]{val $p$ = !Each($e$)}.
+  \item Moving the value to \lstinline{yield} to the last expression position of the comprehension block.
+\end{enumerate}
+
+Therefore, \cref{compositeNumbersBelow-for} can be rewrite to \cref{compositeNumbersBelow} with the help of the \lstinline{Each} LDK, or \cref{compositeNumbersBelow-simplified} after removing the temporary variable \lstinline{j}.
+
+\begin{lstlisting}[caption={Calculating all composite numbers below $n$ with \lstinline{Each} LDK},label={compositeNumbersBelow}]
+def compositeNumbersBelow(n: Int): Set[Int] = Set {
+  val i = !Each(2 until math.ceil(math.sqrt(n)).toInt)
+  val j = !Each(2 * i until n by i)
+  j
+}
+
+// Output: Set(10, 14, 6, 9, 12, 8, 4)
+println(compositeNumbersBelow(15))
+\end{lstlisting}
+
+
+\begin{lstlisting}[caption={Calculating all composite numbers below $n$ with \lstinline{Each} LDK, the simplicied version},label={compositeNumbersBelow-simplified}]
+def compositeNumbersBelow(n: Int): Set[Int] = Set {
+  val i = !Each(2 until math.ceil(math.sqrt(n)).toInt)
+  !Each(2 * i until n by i)
+}
+\end{lstlisting}
+
+Note that \lstinline{compositeNumbersBelow} creates a \lstinline{Set}, which is different from the type of source collection. Our LDK-base collection comprehension allows heterogeneous source collection types. Even other collection-like types, including \lstinline{Array} and \lstinline{String}, are supported, as shown in \cref{heterogeneous}.
+
+\begin{lstlisting}[caption={LDK-based heterogeneous collection comprehension based on \lstinline{Array} and \lstinline{String}},label={heterogeneous}]
+def heterogeneous = List { !Each(Array("foo", "bar", "baz")) + !Each("LDK") }
+
+// Output: List(fooL, fooD, fooK, barL, barD, barK, bazL, bazD, bazK)
+println(heterogeneous)
+\end{lstlisting}
+\subsubsection{Filters}
+
+We also provides the \lstinline{Continue} LDK to skip an element from the source collections. It provides the similar feature to the \lstinline{if} clause in Scala's native \lstinline{for}-comprehension. An example of using \lstinline{Continue} LDK to calculate prime numbers is shown in \cref{primeNumbersBelow}.
+
+\begin{lstlisting}[caption={Calculating all prime numbers below $n$ with \lstinline{Each} and \lstinline{Continue} LDK},label={primeNumbersBelow}]
+def primeNumbersBelow(maxNumber: Int) = List {
+  val compositeNumbers = compositeNumbersBelow(maxNumber)
+  val i = !Each(2 until maxNumber)
+  if (compositeNumbers(i)) !Continue
+  i
+}
+
+// Output: List(2, 3, 5, 7, 11, 13)
+println(primeNumbersBelow(15))
+\end{lstlisting}
+
+The implementation of \lstinline{Continue} LDK is similar to \lstinline{Return}, except is pass an empty collection to the handler instead of the given value.
+
+\subsubsection{Asynchronous comprehensions}\label{Asynchronous comprehensions}
+
+The \lstinline{Each} LDK can be used in \lstinline{Task} of collections as well, with the help of \lstinline{Dsl} derivation. The usage of \lstinline{Each} is very similar to the \lstinline{Fork} keyword. The only difference is that \lstinline{Each} sequentially executes tasks while \lstinline{Fork} executes tasks in parallel. For example, if we replace the \lstinline{Fork} LDK in \cref{usingHttpClientInParallel} by \lstinline{Each}, those URLs will be fetched sequentially, as shown in \cref{usingHttpClientSequentially}.
+
+\begin{lstlisting}[caption={Using HTTP client in parallel},label={usingHttpClientSequentially}]
+def sequentialTask: Task[Seq[String]] = {
+  val url: URL = !Each(Urls)
+  val content: String = !httpClient(url)
+  !Return(content)
+}
+\end{lstlisting}
+
+\subsubsection{Generator comprehensions}\label{Generator comprehensions}
+
+Since the \lstinline{Each} LDK works in any function that returns a collection, it can be also used in \lstinline{Stream} functions, which support the \lstinline{Yield} LDK as well. As a result, generator and collection comprehension can be used together.
+
+Suppose we are creating a function to prepare flags for invoking the \texttt{gcc} command line tool. Given a source file and a list of include paths, it should return a \lstinline{Stream} of the command line.
+It can be implemented from the \lstinline{Yield}, \lstinline{Each} and \lstinline{Continue} as shown in \cref{gccFlagBuilder}.
+
+\begin{lstlisting}[caption={Build a command-line by using generator and collection comprehension together},label={gccFlagBuilder}]
+def gccFlagBuilder(sourceFile: String, includes: String*): Stream[String] = {
+  !Yield("gcc")
+  !Yield("-c")
+  !Yield(sourceFile)
+  val include = !Each(includes)
+  !Yield("-I")
+  !Yield(include)
+  !Continue
+}
+
+// Output: List(gcc, -c, main.c, -I, lib1/include, -I, lib2/include)
+println(gccFlagBuilder("main.c", "lib1/include", "lib2/include").toList)
+\end{lstlisting}
+
+\section{Benchmarks}\label{Benchmarks}
+
+We created some benchmarks to evaluate the computational performance of code generated by our compiler plug-in for LDKs, especially, we are interesting how our name-based CPS transformation and other direct style DSL affect the performance in an effect system that support both asynchronous and synchronous effects.
+
+Our benchmarks measured the performance of LDKs in the \lstinline{Task} domain mentioned in \cref{Asynchronous programming}, along with other combination of effect system with direct style DSL, listed in \cref{combination}:
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l}
+    Effect System & direct style DSL \\
+    \hline
+    The \texttt{Task} LDK & name-based CPS transformation provided by \textit{Dsl.scala} \\
+    Scala Future \cite{haller2012sip} & Scala Async \cite{haller2013sip} \\
+    Scala Continuation library \cite{rompf2009implementing} & Scala Continuation compiler plug-in \\
+    Monix tasks \cite{nedelcu2017monix} & \texttt{for}-comprehension \\
+    Cats effects \cite{typelevel2017cats} & \texttt{for}-comprehension \\
+    Scalaz Concurrent \cite{kenji2017scalaz} & \texttt{for}-comprehension \\
+  \end{tabular}
+  \caption{The combination of effect system and direct style DSL being benchmarked}
+  \label{combination}
+\end{table}
+
+\subsection{The performance of recursive functions in effect systems}
+
+The purpose of the first benchmark is to determine the performance of recursive functions in various effect system, especially when a direct style DSL is used.
+
+\subsubsection{The performance baseline}
+
+In order to measure the performance impact due to direct style DSLs, we have to measure the performance baseline of different effect systems at first. We created some benchmarks for the most efficient implementation of a sum function in each effect system. These benchmarks perform the following computation:
+
+\begin{itemize}
+  \item Creating a \lstinline{List[X[Int]]} of 1000 tasks, where \lstinline{X} is the data type of task in the effect system.
+  \item Performing recursive right-associated ``binds'' on each element to add the \lstinline{Int} to an accumulator, and finally produce a \lstinline{X[Int]} as a task of the sum result.
+  \item Running the task and blocking awaiting the result.
+\end{itemize}
+
+Note that the tasks in the list is executed in the current thread or in a thread pool. We keep each task returning a simple pure value, because we want to measure the overhead of effect systems, not the task itself.
+
+The ``bind'' operation means the primitive operation of each effect system. For Monix tasks, Cats effects, Scalaz Concurrent and Scala Continuations, the ``bind'' operation is \lstinline{flatMap}; for \textit{Dsl.scala}, the ``bind'' operation is \lstinline{Shift} LDK, which may or may not be equivalent to \lstinline{flatMap} according to the type of the current domain. In \lstinline{Continuation} domain, the \lstinline{Dsl} instance for \lstinline{Shift} LDK is resolved as \lstinline{derivedContinuationDsl(shiftDsl)}, whose \lstinline{cpsApply} method flat maps a \lstinline{Continuation} to another \lstinline{Continuation}; when using ``underscore trick'', the \lstinline{Dsl} instance for \lstinline{Shift} LDK is resolved as \lstinline{shiftDsl}, which just forwards \lstinline{cpsApply} to the underlying CPS function as a plain function call.
+
+We use the !-notation to perform the \lstinline{cpsApply} in \textit{Dsl.scala}. The !-notation results the exact same Java bytecode to manually passing a callback function to \lstinline{cpsApply}, as shown in \cref{RawSum.dsl}.
+
+\begin{lstlisting}[float=htbp,caption={The most efficient implementation of sum based on ordinary CPS function},label={RawSum.dsl}]
+def loop(tasks: List[Task[Int]], accumulator: Int = 0)(callback: Int => TaskDomain): TaskDomain = {
+  tasks match {
+    case head :: tail =>
+      // Expand to: Shift(head).cpsApply(i => loop(tail, i + accumulator)(callback))
+      loop(tail, !head + accumulator)(callback)
+    case Nil =>
+      callback(accumulator)
+  }
+}
+\end{lstlisting}
+
+However, direct style DSLs for other effect systems are not used in favor of raw \lstinline{flatMap} calls, in case of decay of the performance. \Cref{RawSum.future} shows the benchmark code for Scala Futures. The code for all the other effect systems are similar to it.
+
+\begin{lstlisting}[float=htbp,caption={The most efficient implementation of sum based on Scala Futures},label={RawSum.future}]
+def loop(tasks: List[Future[Int]], accumulator: Int = 0): Future[Int] = {
+  tasks match {
+    case head :: tail =>
+      head.flatMap { i =>
+        loop(tail, i + accumulator)
+      }
+    case Nil =>
+      Future.successful(accumulator)
+  }
+}
+\end{lstlisting}
+
+The benchmark result is shown in \cref{RawSum} (larger score is better):
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l|l|rl}
+   \multicolumn{1}{c|}{\texttt{Benchmark}} & \texttt{executedIn} & \texttt{size} & \multicolumn{2}{c}{\texttt{Score, ops/s}} \\
+  \hline
+  \texttt{RawSum.cats} & \texttt{thread-pool} & \texttt{1000} & \texttt{799.072} & \scriptsize $\pm$ \texttt{3.094}  \\
+  \texttt{RawSum.cats} & \texttt{current-thread} & \texttt{1000} & \texttt{26932.907} & \scriptsize $\pm$ \texttt{845.715}  \\
+  \texttt{RawSum.dsl} & \texttt{thread-pool} & \texttt{1000} & \texttt{729.947} & \scriptsize $\pm$ \texttt{4.359}  \\
+  \texttt{RawSum.dsl} & \texttt{current-thread} & \texttt{1000} & \texttt{31161.171} & \scriptsize $\pm$ \texttt{589.935}  \\
+  \texttt{RawSum.future} & \texttt{thread-pool} & \texttt{1000} & \texttt{575.403} & \scriptsize $\pm$ \texttt{3.567}  \\
+  \texttt{RawSum.future} & \texttt{current-thread} & \texttt{1000} & \texttt{876.377} & \scriptsize $\pm$ \texttt{8.525}  \\
+  \texttt{RawSum.monix} & \texttt{thread-pool} & \texttt{1000} & \texttt{743.340} & \scriptsize $\pm$ \texttt{11.314}  \\
+  \texttt{RawSum.monix} & \texttt{current-thread} & \texttt{1000} & \texttt{55421.452} & \scriptsize $\pm$ \texttt{251.530}  \\
+  \texttt{RawSum.scalaContinuation} & \texttt{thread-pool} & \texttt{1000} & \texttt{808.671} & \scriptsize $\pm$ \texttt{3.917}  \\
+  \texttt{RawSum.scalaContinuation} & \texttt{current-thread} & \texttt{1000} & \texttt{17391.684} & \scriptsize $\pm$ \texttt{385.138}  \\
+  \texttt{RawSum.scalaz} & \texttt{thread-pool} & \texttt{1000} & \texttt{722.743} & \scriptsize $\pm$ \texttt{11.234}  \\
+  \texttt{RawSum.scalaz} & \texttt{current-thread} & \texttt{1000} & \texttt{15895.606} & \scriptsize $\pm$ \texttt{235.992}  \\
+  \end{tabular}
+  \caption{The benchmark result of sum for performance baseline}
+  \label{RawSum}
+\end{table}
+
+The \lstinline{Task} alias of continuation-passing style function used with \textit{Dsl.scala} is quite fast. \textit{Dsl.scala}, Monix and Cats Effects score on top 3 positions for either tasks running in the current thread or in a thread pool.
+
+\subsubsection{The performance impact of direct style DSLs}\label{The performance impact of direct style DSLs}
+
+In this section, we will present the performance impact when different syntax notations are introduced. For ordinary CPS functions, we added one more !-notation to avoid manually passing the \lstinline{callback} in the previous benchmark (\cref{LeftAssociatedSum.dsl,RightAssociatedSum.dsl}). For other effect systems, we refactored the previous sum benchmarks to use Scala Async, Scala Continuation's \lstinline{@cps} annotations, and \lstinline{for}-comprehension, respectively (\cref{LeftAssociatedSum.future,RightAssociatedSum.future,LeftAssociatedSum.scalaContinuation,RightAssociatedSum.scalaContinuation,LeftAssociatedSum.scalaz,RightAssociatedSum.scalaz}).
+
+\begin{lstlisting}[float=htbp,caption={Left-associated sum based on LDKs of \textit{Dsl.scala}},label={LeftAssociatedSum.dsl}]
+def loop(tasks: List[Task[Int]]): Task[Int] = _ {
+  tasks match {
+    case head :: tail =>
+      !head + !loop(tail)
+    case Nil =>
+      0
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Right-associated sum based on LDKs of \textit{Dsl.scala}},label={RightAssociatedSum.dsl}]
+def loop(tasks: List[Task[Int]], accumulator: Int = 0): Task[Int] = _ {
+  tasks match {
+    case head :: tail =>
+      !loop(tail, !head + accumulator)
+    case Nil =>
+      accumulator
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Left-associated sum based on Scala Async},label={LeftAssociatedSum.future}]
+def loop(tasks: List[Future[Int]]): Future[Int] = async {
+  tasks match {
+    case head :: tail =>
+      await(head) + await(loop(tail))
+    case Nil =>
+      0
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Right-associated sum based on Scala Async},label={RightAssociatedSum.future}]
+def loop(tasks: List[Future[Int]], accumulator: Int = 0): Future[Int] = async {
+  tasks match {
+    case head :: tail =>
+      await(loop(tail, await(head) + accumulator))
+    case Nil =>
+      accumulator
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Left-associated sum based on Scala Continuation plug-in},label={LeftAssociatedSum.scalaContinuation}]
+def loop(tasks: List[() => Int @suspendable]): Int @suspendable = {
+  tasks match {
+    case head :: tail =>
+      head() + loop(tail)
+    case Nil =>
+      0
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Right-associated sum based on Scala Continuation plug-in},label={RightAssociatedSum.scalaContinuation}]
+def loop(tasks: List[() => Int @suspendable], accumulator: Int = 0): Int @suspendable = {
+  tasks match {
+    case head :: tail =>
+      loop(tail, head() + accumulator)
+    case Nil =>
+      accumulator
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Left-associated sum based on \lstinline{for}-comprehension},label={LeftAssociatedSum.scalaz}]
+def loop(tasks: List[Task[Int]]): Task[Int] = {
+  tasks match {
+    case head :: tail =>
+      for {
+        i <- head
+        accumulator <- loop(tail)
+      } yield i + accumulator
+    case Nil =>
+      Task(0)
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[float=htbp,caption={Right-associated sum based on \lstinline{for}-comprehension},label={RightAssociatedSum.scalaz}]
+def loop(tasks: List[Task[Int]], accumulator: Int = 0): Task[Int] = {
+  tasks match {
+    case head :: tail =>
+      for {
+        i <- head
+        r <- loop(tail, i + accumulator)
+      } yield r
+    case Nil =>
+      Task.now(accumulator)
+  }
+}
+\end{lstlisting}
+
+Note that reduced sum can be implemented in either left-associated recursion or right-associated recursion. The above code contains benchmark for both cases. The benchmark result is shown in \cref{LeftAssociatedSum,RightAssociatedSum}:
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l|l|rl}
+   \multicolumn{1}{c|}{\texttt{Benchmark}} & \texttt{executedIn} & \texttt{size} & \multicolumn{2}{c}{\texttt{Score, ops/s}} \\
+  \hline
+  \texttt{LeftAssociatedSum.cats} & \texttt{thread-pool} & \texttt{1000} & \texttt{707.940} & \scriptsize $\pm$ \texttt{10.497}  \\
+  \texttt{LeftAssociatedSum.cats} & \texttt{current-thread} & \texttt{1000} & \texttt{16165.442} & \scriptsize $\pm$ \texttt{298.072}  \\
+  \texttt{LeftAssociatedSum.dsl} & \texttt{thread-pool} & \texttt{1000} & \texttt{729.122} & \scriptsize $\pm$ \texttt{7.492}  \\
+  \texttt{LeftAssociatedSum.dsl} & \texttt{current-thread} & \texttt{1000} & \texttt{19856.493} & \scriptsize $\pm$ \texttt{386.225}  \\
+  \texttt{LeftAssociatedSum.future} & \texttt{thread-pool} & \texttt{1000} & \texttt{339.415} & \scriptsize $\pm$ \texttt{1.486}  \\
+  \texttt{LeftAssociatedSum.future} & \texttt{current-thread} & \texttt{1000} & \texttt{410.785} & \scriptsize $\pm$ \texttt{1.535}  \\
+  \texttt{LeftAssociatedSum.monix} & \texttt{thread-pool} & \texttt{1000} & \texttt{742.836} & \scriptsize $\pm$ \texttt{9.904}  \\
+  \texttt{LeftAssociatedSum.monix} & \texttt{current-thread} & \texttt{1000} & \texttt{19976.847} & \scriptsize $\pm$ \texttt{84.222}  \\
+  \texttt{LeftAssociatedSum.scalaContinuation} & \texttt{thread-pool} & \texttt{1000} & \texttt{657.721} & \scriptsize $\pm$ \texttt{9.453}  \\
+  \texttt{LeftAssociatedSum.scalaContinuation} & \texttt{current-thread} & \texttt{1000} & \texttt{15103.883} & \scriptsize $\pm$ \texttt{255.780}  \\
+  \texttt{LeftAssociatedSum.scalaz} & \texttt{thread-pool} & \texttt{1000} & \texttt{670.725} & \scriptsize $\pm$ \texttt{8.957}  \\
+  \texttt{LeftAssociatedSum.scalaz} & \texttt{current-thread} & \texttt{1000} & \texttt{5113.980} & \scriptsize $\pm$ \texttt{110.272}  \\
+  \end{tabular}
+  \caption{The benchmark result of left-associated sum in direct style DSLs}
+  \label{LeftAssociatedSum}
+\end{table}
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l|l|rl}
+   \multicolumn{1}{c|}{\texttt{Benchmark}} & \texttt{executedIn} & \texttt{size} & \multicolumn{2}{c}{\texttt{Score, ops/s}} \\
+  \hline
+    \texttt{RightAssociatedSum.cats} & \texttt{thread-pool} & \texttt{1000} & \texttt{708.441} & \scriptsize $\pm$ \texttt{9.201}  \\
+    \texttt{RightAssociatedSum.cats} & \texttt{current-thread} & \texttt{1000} & \texttt{15971.331} & \scriptsize $\pm$ \texttt{315.063}  \\
+    \texttt{RightAssociatedSum.dsl} & \texttt{thread-pool} & \texttt{1000} & \texttt{758.152} & \scriptsize $\pm$ \texttt{4.600}  \\
+    \texttt{RightAssociatedSum.dsl} & \texttt{current-thread} & \texttt{1000} & \texttt{22393.280} & \scriptsize $\pm$ \texttt{677.752}  \\
+    \texttt{RightAssociatedSum.future} & \texttt{thread-pool} & \texttt{1000} & \texttt{338.471} & \scriptsize $\pm$ \texttt{2.188}  \\
+    \texttt{RightAssociatedSum.future} & \texttt{current-thread} & \texttt{1000} & \texttt{405.866} & \scriptsize $\pm$ \texttt{2.843}  \\
+    \texttt{RightAssociatedSum.monix} & \texttt{thread-pool} & \texttt{1000} & \texttt{736.533} & \scriptsize $\pm$ \texttt{10.856}  \\
+    \texttt{RightAssociatedSum.monix} & \texttt{current-thread} & \texttt{1000} & \texttt{21687.351} & \scriptsize $\pm$ \texttt{107.249}  \\
+    \texttt{RightAssociatedSum.scalaContinuation} & \texttt{thread-pool} & \texttt{1000} & \texttt{654.749} & \scriptsize $\pm$ \texttt{7.983}  \\
+    \texttt{RightAssociatedSum.scalaContinuation} & \texttt{current-thread} & \texttt{1000} & \texttt{12080.619} & \scriptsize $\pm$ \texttt{274.878}  \\
+    \texttt{RightAssociatedSum.scalaz} & \texttt{thread-pool} & \texttt{1000} & \texttt{676.180} & \scriptsize $\pm$ \texttt{7.705}  \\
+    \texttt{RightAssociatedSum.scalaz} & \texttt{current-thread} & \texttt{1000} & \texttt{7911.779} & \scriptsize $\pm$ \texttt{79.296}  \\
+  \end{tabular}
+  \caption{The benchmark result of right-associated sum in direct style DSLs}
+  \label{RightAssociatedSum}
+\end{table}
+
+The result demonstrates that the name-based CPS transformation provided by \textit{Dsl.scala} is faster than all other direct style DSLs in the right-associated sum benchmark. The \textit{Dsl.scala} version sum consumes a constant number of memory during the loop, because we implemented a tail-call detection in our CPS-transform compiler plug-in, and the \lstinline{Dsl} interpreter for \lstinline{Task} use a trampoline technique \cite{tarditi1992no}. On the other hand, the benchmark result of Monix Tasks, Cats Effects and Scalaz Concurrent posed a significant performance decay, because they costs O(n) memory due to the \lstinline{map} call generated by \lstinline{for}-comprehension, although those effect systems also built in trampolines. In general, the performance of recursive monadic binds in a \lstinline{for}-comprehension is always underoptimized due to the inefficient \lstinline{map}.
+
+\subsection{The performance of collection manipulation in effect systems}
+
+The previous sum benchmarks measured the performance of manually written loops, but usually we may want to use higher-ordered functions to manipulate collections. We want to know how those higher-ordered functions can be expressed in direct style DSLs, and how would the performance be affected by direct style DSLs.
+
+In this section, we will present the benchmark result for computing the Cartesian product of lists.
+
+\subsubsection{The performance baseline}
+
+As we did in sum benchmarks, we created some benchmarks to maximize the performance for Cartesian product. Our benchmarks create the Cartesian product from \lstinline{traverseM} for Scala Future, Cats Effect, Scalaz Concurrent and Monix Tasks. \Cref{RawCartesianPruduct.future} shows the benchmark code for Scala Future.
+
+\begin{lstlisting}[float=htbp,caption={Cartesian product for Scala Future, based on Scalaz's \lstinline{traverseM}},label={RawCartesianPruduct.future}]
+def cellTask(taskX: Future[Int], taskY: Future[Int]): Future[List[Int]] = async {
+  List(await(taskX), await(taskY))
+}
+
+def listTask(rows: List[Future[Int]], columns: List[Future[Int]]): Future[List[Int]] = {
+  rows.traverseM { taskX =>
+    columns.traverseM { taskY =>
+      cellTask(taskX, taskY)
+    }
+  }
+}
+\end{lstlisting}
+
+Scala Async or \lstinline{for}-comprehension is used in element-wise task \lstinline{cellTask}, but the collection manipulation \lstinline{listTask} is kept as manually written higher order function calls, because neither Scala Async nor \lstinline{for}-comprehension supports \lstinline{traverseM}.
+
+The benchmark for \textit{Dsl.scala} is entirely written in LDKs as shown in \cref{RawCartesianPruduct.dsl}:
+
+\begin{lstlisting}[float=htbp,caption={Cartesian product for ordinary CPS functions, based on \textit{Dsl.scala}},label={RawCartesianPruduct.dsl}]
+def cellTask(taskX: Task[Int], taskY: Task[Int]): Task[List[Int]] = _ {
+  List(!taskX, !taskY)
+}
+
+def listTask(rows: List[Task[Int]], columns: List[Task[Int]]): Task[List[Int]] = {
+  cellTask(!Each(rows), !Each(columns))
+}
+\end{lstlisting}
+
+The \lstinline{Each} LDK is available here because it is adaptive. \lstinline{Each} LDK can be used in not only \lstinline{List[_]} domain, but also \lstinline{(_ !! Coll[_])} domain as long as \lstinline{Coll} is a Scala collection type that supports \lstinline{CanBuildFrom} type class.
+
+We didn't benchmark Scala Continuation here because all higher ordered functions for \lstinline{List} do not work with Scala Continuation.
+
+The benchmark result is shown in \cref{RawCartesianProduct}.
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l|l|rl}
+   \multicolumn{1}{c|}{\texttt{Benchmark}} & \texttt{executedIn} & \texttt{size} & \multicolumn{2}{c}{\texttt{Score, ops/s}} \\
+  \hline
+  \texttt{RawCartesianProduct.cats} & \texttt{thread-pool} & \texttt{50} & \texttt{136.415} & \scriptsize $\pm$ \texttt{1.939}  \\
+  \texttt{RawCartesianProduct.cats} & \texttt{current-thread} & \texttt{50} & \texttt{1346.874} & \scriptsize $\pm$ \texttt{7.475}  \\
+  \texttt{RawCartesianProduct.dsl} & \texttt{thread-pool} & \texttt{50} & \texttt{140.098} & \scriptsize $\pm$ \texttt{2.062}  \\
+  \texttt{RawCartesianProduct.dsl} & \texttt{current-thread} & \texttt{50} & \texttt{1580.876} & \scriptsize $\pm$ \texttt{27.513}  \\
+  \texttt{RawCartesianProduct.future} & \texttt{thread-pool} & \texttt{50} & \texttt{100.340} & \scriptsize $\pm$ \texttt{1.894}  \\
+  \texttt{RawCartesianProduct.future} & \texttt{current-thread} & \texttt{50} & \texttt{93.678} & \scriptsize $\pm$ \texttt{1.829}  \\
+  \texttt{RawCartesianProduct.monix} & \texttt{thread-pool} & \texttt{50} & \texttt{142.071} & \scriptsize $\pm$ \texttt{1.299}  \\
+  \texttt{RawCartesianProduct.monix} & \texttt{current-thread} & \texttt{50} & \texttt{1750.869} & \scriptsize $\pm$ \texttt{18.365}  \\
+  \texttt{RawCartesianProduct.scalaz} & \texttt{thread-pool} & \texttt{50} & \texttt{78.588} & \scriptsize $\pm$ \texttt{0.623}  \\
+  \texttt{RawCartesianProduct.scalaz} & \texttt{current-thread} & \texttt{50} & \texttt{357.357} & \scriptsize $\pm$ \texttt{2.102}  \\
+  \end{tabular}
+  \caption{The benchmark result of Cartesian product for performance baseline}
+  \label{RawCartesianProduct}
+\end{table}
+
+Monix tasks, Cats Effects and ordinary CPS functions created from \textit{Dsl.scala} are still the top 3 scored effect systems.
+
+\subsubsection{The performance of collection manipulation in direct style DSLs}\label{The performance of collection manipulation in direct style DSLs}
+
+We then refactored the benchmarks to direct style DSLs. \Cref{CartesianProduct.future} is the code for Scala Future, written in \lstinline{ListT} monad transformer provided by Scalaz. The benchmarks for Monix tasks, Scalaz Concurrent are also rewritten in the similar style.
+
+\begin{lstlisting}[float=htbp,caption={Cartesian product for Scala Future, based on \lstinline{ListT} transformer},label={CartesianProduct.future}]
+def listTask(rows: List[Future[Int]], columns: List[Future[Int]]): Future[List[Int]] = {
+  for {
+    taskX <- ListT(Future.successful(rows))
+    taskY <- ListT(Future.successful(columns))
+    x <- taskX.liftM[ListT]
+    y <- taskY.liftM[ListT]
+    r <- ListT(Future.successful(List(x, y)))
+  } yield r
+}.run
+\end{lstlisting}
+
+With the help of \lstinline{ListT} monad transformer, we are able to merge \lstinline{cellTask} and \lstinline{listTask} into one function in a direct style \lstinline{for}-comprehension, avoiding any manual written callback functions.
+
+We also merged \lstinline{cellTask} and \lstinline{listTask} in the \textit{Dsl.scala} version of benchmark as shown in \cref{CartesianProduct.dsl}.
+
+\begin{lstlisting}[float=htbp,caption={Cartesian product for ordinary CPS functions, in one function},label={CartesianProduct.dsl}]
+def listTask: Task[List[Int]] = reset {
+  List(!(!Each(inputDslTasks)), !(!Each(inputDslTasks)))
+}
+\end{lstlisting}
+
+This time, Cats Effects are not benchmarked due to lack of \lstinline{ListT} in Cats. The benchmark result are shown in \cref{CartesianProduct}.
+
+\begin{table}[htbp]
+  \begin{tabular}{l|l|l|rl}
+   \multicolumn{1}{c|}{\texttt{Benchmark}} & \texttt{executedIn} & \texttt{size} & \multicolumn{2}{c}{\texttt{Score, ops/s}} \\
+  \hline
+  \texttt{CartesianProduct.dsl} & \texttt{thread-pool} & \texttt{50} & \texttt{283.450} & \scriptsize $\pm$ \texttt{3.042}  \\
+  \texttt{CartesianProduct.dsl} & \texttt{current-thread} & \texttt{50} & \texttt{1884.514} & \scriptsize $\pm$ \texttt{47.792}  \\
+  \texttt{CartesianProduct.future} & \texttt{thread-pool} & \texttt{50} & \texttt{91.233} & \scriptsize $\pm$ \texttt{1.333}  \\
+  \texttt{CartesianProduct.future} & \texttt{current-thread} & \texttt{50} & \texttt{150.234} & \scriptsize $\pm$ \texttt{20.396}  \\
+  \texttt{CartesianProduct.monix} & \texttt{thread-pool} & \texttt{50} & \texttt{28.597} & \scriptsize $\pm$ \texttt{0.265}  \\
+  \texttt{CartesianProduct.monix} & \texttt{current-thread} & \texttt{50} & \texttt{120.068} & \scriptsize $\pm$ \texttt{17.676}  \\
+  \texttt{CartesianProduct.scalaz} & \texttt{thread-pool} & \texttt{50} & \texttt{31.110} & \scriptsize $\pm$ \texttt{0.662}  \\
+  \texttt{CartesianProduct.scalaz} & \texttt{current-thread} & \texttt{50} & \texttt{87.404} & \scriptsize $\pm$ \texttt{1.734}  \\
+  \end{tabular}
+  \caption{The benchmark result of Cartesian product in direct style DSLs}
+  \label{CartesianProduct}
+\end{table}
+
+Despite the trivial manual lift calls in \lstinline{for}-comprehension, the monad transformer approach causes terrible computational performance in comparison to manually called \lstinline{traverseM}. In contrast, the performance of \textit{Dsl.scala} even got improved when \lstinline{cellTask} is inlined into \lstinline{listTask}.

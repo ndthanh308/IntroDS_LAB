@@ -1,0 +1,543 @@
+% !TEX root = paper.tex
+
+\section{A Calculus for Asynchronous Effects: Values and Computations}
+\label{sec:basic-calculus:computations}
+
+Before we  focus on extensions necessary for higher-order asynchronous effects in \autoref{sec:higher-order-extensions},
+we first recap \lambdaAEff, our existing core calculus for programming with first-order asynchronous effects~\cite{Ahman:POPL}.
+The version we present here differs from the original one in two aspects: we drop the reliance on general recursion, as
+reinstallable interrupt handlers that we introduce in \autoref{sec:extensions:reinstallable-interrupt-handlers} are sufficient to express
+all the existing examples, and we slightly modify the behaviour of
+the $\tmkw{await}$ construct in order to make the meta-theory slightly simpler.
+
+To better explain the different features of the calculus and its semantics, we split the recap of
+\lambdaAEff~into a \emph{sequential} part (discussed below) and a
+\emph{parallel} part (discussed in \autoref{sec:basic-calculus:processes}).
+
+\subsection{Values and Computations}
+\label{sec:basic-calculus:values-and-computations}
+
+We base \lambdaAEff~on the fine-grain
+call-by-value $\lambda$-calculus (FGCBV)~\cite{Levy:FGCBV}, and as such, it is a low-level
+intermediate language to which a corresponding high-level user-facing programming language
+could be compiled to---this is what happens in our prototype implementation~\cite{pretnar21:AEff}.
+
+The syntax of terms is given in \autoref{fig:terms}, stratified into \emph{values} and \emph{computations},
+as in FGCBV.
+While we do not study effect inference in this paper, we equip certain terms with type annotations that
+in our experience should make it possible to fully infer types.
+
+
+% Figure environment removed
+
+\paragraph{Values}
+
+The values $V,W,\ldots$ are mostly standard. They include
+variables, introduction forms for
+sums and products, and functions. The only \lambdaAEff-specific value
+is $\tmpromise V$, which denotes a \emph{fulfilled promise}, indicating that the promise of
+handling some interrupt has been fulfilled with the value $V$.
+
+\paragraph{Computations} The computations $M,N,\ldots$ also include all
+standard terms from FGCBV:
+returning values, sequencing, function
+application, and elimination forms.
+
+The first two \lambdaAEff-specific computations are \emph{signals} $\tmopout{op}{V}{M}$ and
+\emph{interrupts} $\tmopin{op}{V}{M}$, where
+$\opsym{op}$ is drawn from a set $\sig$ of names, $V$ is a data
+payload, and $M$ is a continuation.
+
+The next \lambdaAEff-specific computation is the \emph{interrupt handler} $\tmwith{op}{x}{M}{p}{N}$,
+where $x$ is bound in $M$ and $p$ in $N$.
+As discussed in the previous section, one should understand this computation as making a promise
+to handle a future incoming interrupt $\opsym{op}$ by executing the computation $M$. Sub-computations of the continuation
+$N$ can then explicitly await, when necessary, for this promise to be fulfilled by blocking on the \emph{promise-typed variable} $p$
+using the final \lambdaAEff-specific computation term, the \emph{awaiting} construct $\tmawait{V}{x}{M}$.
+It is useful to note that the $p$ used above is an ordinary variable---it just gets assigned the distinguished promise type
+$\typromise X$ by the interrupt handler (as discussed in \autoref{sec:basic-calculus:type-system:computations}).
+
+\subsection{Small-Step Operational Semantics}
+\label{sec:basic-calculus:semantics:computations}
+
+We equip \lambdaAEff~with an evaluation contexts based
+small-step operational semantics,
+defined using a reduction relation $M \reduces N$.
+The \emph{reduction rules} and \emph{evaluation contexts} are given
+in \autoref{fig:small-step-semantics-of-computations}. We discuss
+the rules in detail below. Note that since we have chosen to equip effectful constructs with explicit continuations,
+the evaluation contexts are used to compress four congruence rules into a single one. If instead
+we took generic versions (like seen in Section~\ref{sec:overview:runningexample})
+as primitives, almost all the rules in \autoref{fig:small-step-semantics-of-computations},
+apart from the ones for standard monadic computations, would need to be phrased
+in terms of sequential composition (i.e., $\tmkw{let}$), leading to a notably less clear presentation.
+% Figure environment removed
+
+\paragraph{Computation Rules}
+The first group includes \emph{standard reduction rules} from FGCBV, such as $\beta$-reducing function applications, sequential composition, and the standard elimination forms.
+%
+These rules involve standard \emph{capture avoiding substitutions} $V[W/x]$ and $M[W/x]$,
+defined by straightforward mutual structural recursion on $V$ and $M$.
+
+\paragraph{Algebraicity}
+This group of reduction rules \emph{propagates outwards} the signals that have been issued, interrupt handlers that have been installed,
+and computations awaiting fulfilled promises. While it is not surprising that outgoing signals
+behave like algebraic \emph{operation calls}, getting propagated outwards as far as possible, then it is much more curious that
+the natural operational behaviour of interrupt handlers turns out to be the same. As we shall explain in \autoref{sec:conclusion},
+despite using the (operating systems inspired) ``handler'' terminology, mathematically interrupt handlers are in fact a form of scoped algebraic operations~\cite{Pirog:ScopedOperations}.
+
+In contrast to our original calculus~\cite{Ahman:POPL}, the awaiting construct also propagates outwards. Before,
+awaiting a promise in any subcomputation would block the evaluation immediately, whereas now, we can do the
+additional outwards propagation steps. Importantly, this does not significantly change the computational behaviour, as after
+the propagation, the evaluation still blocks as long as the promise is left unfulfilled. The main difference and benefit is that
+all computations awaiting for a promise variable $p$ now show this explicitly at their top-level, as they are of the form
+$\tmawait{p}{x}{M}$. This change significantly simplifies
+the normal forms of computations (see \autoref{sec:basic-calculus:type-safety}) and the resulting meta-theory.
+
+In the last two algebraicity rules, and other similar ones, we assume Barendregt's variable
+convention to avoid accidentally capturing free variables when extending the scope of 
+binders.
+
+\paragraph{Commutativity of Signals With Interrupt Handlers}
+This rule complements the algebraicity rule for signals, by further propagating
+them outwards, past enveloping interrupt handlers. From the perspective of algebraic effects,
+this rule is an example of two algebraic operations \emph{commuting}~\cite{Hyland:SumAndTensor}.
+Since in this rule, the scope of $p$ contracts, the usual variable naming precautions are
+not sufficient for type safety. Instead, the type system ensures (see Section~\ref{sec:basic-calculus:type-system:computations}) that the (promise-typed)
+variable $p$ cannot appear in the payload value $V$.
+
+\paragraph{Interrupt Propagation}
+The handler-operation curiosity does not end with interrupt handlers. This group of reduction rules describes how
+interrupts are \emph{propagated inwards} into sub-computations. While $\tmopin{op}{V}{M}$ might look like a conventional
+operation call, then its operational behaviour instead mirrors that of \emph{deep effect handling}~\cite{Plotkin:HandlingEffects},
+where one also recursively descends into the computation being handled.
+
+When designing interrupt propagation, we must ensure that each interrupt handler receives a corresponding interrupt, no matter
+how deep inside the computation we install it. The first reduction rule states that
+we can safely discard an interrupt when it reaches a trivial, effect-free
+computation $\tmreturn W$. The second rule states that we can propagate incoming interrupts past any outward moving signals. The next
+two rules describe how interrupts interact with interrupt handlers, in particular, that the former behave like effect handling
+(when understanding interrupt handlers as generalised algebraic operations). On the one hand, if the interrupt
+matches the interrupt handler it encounters, the corresponding handler code $M$ is executed, and the interrupt is
+propagated inwards into the continuation $N$. On the other hand, if the interrupt
+does not match the interrupt handler, it is simply propagated past the interrupt handler into $N$.
+Finally, to simplify normal forms, we propagate interrupts inside computations awaiting fulfilled promises as well. As with the algebraicity rule,
+this lets the computation take a single additional step after which the $\tmkw{await}$ construct reaches the top and blocks
+the evaluation.
+
+We have given the interrupt propagation rules only for terms that are in normal form (see \autoref{lem:results-are-final}). For example, we do not push interrupts into the branches of sum elimination.
+Instead, for terms that are still reducing, interrupts remain as parts of their evaluation contexts
+and wait for inner interrupt handlers to propagate outwards and meet them.
+
+An alternative design choice for interrupt propagation would be to take inspiration from
+\emph{shallow interrupt handling}~\cite{Kammar:Handlers}, and instead of always propagating
+the interrupts inwards into the continuations of interrupt handlers, the programmers themselves
+would have to manually (recursively) reinvoke the interrupts that need to be propagated
+inwards. In addition to giving an algebraically more natural semantics (due to the relationship
+with deep effect handling), our choice of allowing interrupts to always propagate inwards provides a
+more predictable programming model, in which an installed interrupt handler is guaranteed to
+be executed whenever a corresponding interrupt is received, no matter what other installed interrupt 
+handlers may do on the way. We leave exploring a variant of \lambdaAEff~based on shallow effect 
+handling, and its formal relationship to this paper, for future work.
+
+\paragraph{Awaiting a Promise To Be Fulfilled}
+In addition to the two rules for outwards propagation, the semantics of the $\tmkw{await}$ construct
+includes a $\beta$-rule allowing the blocked computation $M$ to resume executing as $M[V/x]$
+when the $\tmkw{await}$ in question is given a fulfilled promise $\tmpromise V$.
+
+\paragraph{Evaluation Contexts}
+The semantics allows reductions under \emph{evaluation contexts} $\E$.
+Observe that  as discussed earlier, the inclusion of interrupt handlers in the evaluation contexts means that reductions
+involve potentially open terms.
+Also, differently from the semantics of conventional operation calls \cite{Kammar:Handlers,Bauer:EffectSystem},
+our evaluation contexts include outgoing signals. As such, the \emph{evaluation context rule} allows the execution of a computation
+to proceed even if a signal has not yet been propagated to its receiver, or when an interrupt has
+not yet arrived. Importantly, the evaluation contexts do not include $\tmkw{await}$, so as to model its blocking behaviour.
+We write $\E[M]$ for the operation of filling the hole $[~]$ in $\E$ with $M$.
+
+\paragraph{Non-Confluence}
+It is worth noting that the asynchronous design means that the operational semantics
+is \emph{nondeterministic}. More interestingly, the semantics is also \emph{not confluent}.
+
+For one source of non-confluence, let us consider two reduction sequences of a same computation,
+where for better readability, we highlight the active redex for each step:
+ \[
+\hspace{-0.15cm}
+\begin{array}{r@{\,} l}
+  & \tmopin{op}{V}{\tmwith{op}{x}{(\tmwith{op'}{y}{M}{q}{\tmawait{q}{z}{M'}})}{p}{\!\highlightgray{N}}}
+  \\[1ex]
+  \reduces & \highlightgray{\tmopin{op}{V}{\tmwith{op}{x}{(\tmwith{op'\!}{y}{\!M}{q}{\tmawait{q}{z}{M'}})}{p}{\!\highlightwhite{N'}}}}
+  \\[1ex]
+  \reduces & \highlightgray{\tmlet{p}{(\tmwith{op'}{y}{M[V/x]}{q}{\tmawait{q}{z}{M'}})}{\!\highlightwhite{\tmopin{op}{V}{N'}}}}
+  \\[1ex]
+  \reduces & \tmwith{op'}{y}{M[V/x]}{q}{\tmawait{q}{z}{(\tmlet{p}{M'}{\tmopin{op}{V}{N'}})}}
+\end{array}
+\]
+and
+\[
+\hspace{-0.15cm}
+\begin{array}{r@{\,} l}
+  & \highlightgray{\tmopin{op}{V}{\tmwith{op}{x}{(\tmwith{op'}{y}{M}{q}{\tmawait{q}{z}{M'}})}{p}{\!\highlightwhite{N}}}}
+  \\[1ex]
+  \reduces & \highlightgray{\tmlet{p}{(\tmwith{op'}{y}{M[V/x]}{q}{\tmawait{q}{z}{M'}})}{\!\highlightwhite{\tmopin{op}{V}{N}}}}
+  \\[1ex]
+  \reduces & \tmwith{op'}{y}{M[V/x]}{q}{\tmawait{q}{z}{(\tmlet{p}{M'}{\tmopin{op}{V}{N}})}}
+\end{array}
+\]
+Here, both final computations are \emph{temporarily} blocked until an incoming interrupt $\opsym{op'}$
+is propagated to them and the variable $q$ gets bound to a fulfilled promise. Until this happens,
+it is not possible for the blocked continuation $N$ to reduce to $N'$ in the latter final computation.
+
+Another, distinct source of non-confluence concerns the commutativity of outgoing signals with enveloping interrupt
+handlers. For instance, the following composite computation
+\[
+\tmopin{op}{V}{{\tmwith {op} x {\tmopout{op'}{W'}{M}} p {\tmopout{op''}{W''}{N}}}}
+\]
+can nondeterministically reduce to either
+\[
+\tmopout{op'}{W'}{\tmopout{op''}{W''}{{\tmlet{p}{M}{\tmopin{op}{V}{N}}}}}
+\]
+if we first propagate the interrupt $\op$ inwards, or to
+\[
+\tmopout{op''}{W''}{\tmopout{op'}{W'}{{\tmlet{p}{M}{\tmopin{op}{V}{N}}}}}
+\]
+if we first propagate the signal $\op''$ outwards. As a result, in the resulting two computations,
+the signals $\op'$ and $\op''$ get issued, and received by other processes, in a different order.
+
+\paragraph{A More Efficient Operational Semantics?}
+Finally, it is worth emphasising that the operational semantics we present in
+this paper is meant to serve as a declarative reference semantics of
+\lambdaAEff, and as a means to relate the behaviour of the program constructs
+specific to \lambdaAEff~to the behaviour of conventional algebraic effects and
+their handlers. As such, the semantics is clearly not as efficient as one might
+desire in a real-world implementation. For instance, in the current semantics,
+signals are propagated out of computations one small step at a time. Instead,
+one might consider an alternative semantics in which there would be a reduction
+rule to pull signals out of computations from arbitrary depths. Dually, the
+propagation of interrupts into computations also happens one small step at a
+time. Here one might wonder whether it could be possible to use substitution in
+\lambdaAEff~to make that propagation more efficient, akin to how we currently
+use substitution to propagate fulfilled promises to sub-computations. Yet
+another approach could be to model signal and interrupt propagation using shared
+channels, as noted in \autoref{sec:conclusion}. However, as in this paper our
+focus is not on the efficiency of the semantics, we leave all such explorations
+for future work.
+
+
+\subsection{Type-and-Effect System}
+\label{sec:basic-calculus:type-system:computations}
+
+We equip \lambdaAEff~with a type system in the tradition of type-and-effect systems for algebraic effects and
+effect handlers \cite{Bauer:EffectSystem,Kammar:Handlers}, by extending the simple type system of FGCBV
+with annotations about programs' possible effects (such as issued signals and installed interrupt handlers)
+in function and computation types.
+
+\subsubsection{Types}
+\label{sec:basic-calculus:type-system:computations:types}
+
+We define types in \autoref{fig:types}, separated into ground, value, and computation types.
+
+% Figure environment removed
+
+As noted in \autoref{sec:basic-calculus:values-and-computations}, \lambdaAEff~is parameterised over a set
+$\sig$ of signal and interrupt \emph{names}. To each such name $\op \in \sig$, we assign a \emph{signature}
+$\op : A_\op$ that specifies the payload type~$A_\op$ of the corresponding signal or interrupt.
+%
+Crucially, in order to be able to later prove that \lambdaAEff~is type-safe, we must put restrictions
+on these signatures, as they classify values that may cross interrupt handler or process boundaries.
+In \autoref{sec:extensions:fitch-style-modal-types}, we describe the exact reasons behind this restriction,
+and propose a more flexible type system employing Fitch-style modal types~\cite{Clouston:FitchStyle}. But for the sake of exposition, we use here
+the more limited approach from our original work~\cite{Ahman:POPL}, and restrict payload types to
+\emph{ground types} $A, B, \ldots$, which include base, unit, empty, product, and sum types, but importantly
+exclude promise and function types.
+
+\emph{Value types} $X,Y,\ldots$ extend ground types with function and promise types.
+The \emph{function type} $\tyfun{X}{\tycomp{Y}{(\o,\i)}}$ classifies functions that take $X$-typed arguments
+to computations classified by the \emph{computation type} $\tycomp{Y}{(\o,\i)}$, i.e., ones that return $Y$-typed
+values, while possibly issuing signals specified by $\o$ and handling interrupts specified by $\i$.
+The \emph{effect annotations} $\o$ and $\i$ are drawn from sets $O$ and $I$ whose definitions we discuss
+in \autoref{sec:basic-calculus:effect-annotations}. The \lambdaAEff-specific \emph{promise type}
+$\typromise{X}$ classifies promises that can be fulfilled by supplying a value of type $X$.
+
+
+\subsubsection{Effect Annotations}
+\label{sec:basic-calculus:effect-annotations}
+
+We now explain how we define the sets $O$ and $I$ from which we draw the
+effect annotations we use for specifying functions and computations.
+%
+Traditionally, effect systems for algebraic effects simply use (flat) sets of
+operation names for effect annotations \cite{Bauer:EffectSystem,Kammar:Handlers}.
+In \lambdaAEff, however, we need to be
+more careful, because triggering an interrupt handler executes a computation
+that can issue potentially different signals and handle different interrupts from the main
+program, and we would like to capture this in types.
+
+\paragraph{Signal Annotations}
+First, as outgoing signals do not carry any computational data, we follow
+the tradition of type-and-effect systems for algebraic effects, and define
+$O$ to be the \emph{power set} $\Pow \sig$. As such, each $\o \in O$ is a subset of
+the signature $\Sigma$, specifying which signals a computation might issue (this is
+an over-approximation of the actually issued signals).
+
+\paragraph{Interrupt Handler Annotations}
+As observed above, for specifying installed interrupt handlers, we cannot use (flat) sets
+of interrupt names as the effect annotations $\i \in I$ if we want to track the nested
+(and sometimes recursive) effectful structure of interrupt handlers.
+
+Instead, intuitively each $\i \in I$ is a
+\emph{possibly infinite} nesting of partial mappings of pairs of $O$- and $I$-annotations to names in
+$\sig$---these pairs of annotations classify the possible effects of the corresponding interrupt handler code.
+We use the
+record notation
+\[
+\i = \{ \op_1 \mapsto (\o_1,\i_1) , \ldots , \op_n \mapsto (\o_n,\i_n) \}
+\]
+to mean that $\i$ maps $\op_1, \ldots, \op_n$ to the annotations $(\o_1,\i_1), \ldots, (\o_n,\i_n)$,
+while any other names in $\sig$ are unannotated, corresponding to no interrupt handlers being installed for
+these other names. We write $\i\, (\op_i) = (\o_i,\i_i)$ to mean that the annotation
+$\i$ maps $\op_i$ to $(\o_i,\i_i)$.
+
+Formally,
+we define $I$ as the \emph{greatest fixed point}
+of a set functor $\Phi$, given by
+\[
+\Phi (X) \defeq \sig \Rightarrow (O \times X)_\bot
+\]
+where $\Rightarrow$ is exponentiation, $\times$ is Cartesian product,
+and $(-)_\bot$ is the lifting operation, which we use to represent unannotated names, and which is defined
+using the disjoint union as $(-) \cupdot \{\bot\}$. Formally speaking, $I$ is given
+by an isomorphism $I \cong \Phi(I)$, but for presentation purposes we leave it
+implicit and work as if we had a strict equality $I = \Phi(I)$.
+
+
+\paragraph{Subtyping and Recursive Effect Annotations}
+Both $O$ and $I$ come equipped with natural \emph{partial orders}: for $O$, $\order O$ is given simply by
+subset inclusion; and for $I$, the pointwise order~$\order I$ is characterised as follows:
+\[
+\begin{array}{l c l}
+\i \order I \i'
+&
+\text{iff}
+&
+\forall\, (\op \in \sig) \, (\o'' \in O) \, (\i'' \in I) .\, \i\, (\op) = ({\o''} , {\i''}) \implies
+\\[0.5ex]
+&& \exists\, (\o''' \in O) \, (\i''' \in I) .\, \i'\, (\op) = ({\o'''} , {\i'''}) \wedge \o'' \order O \o''' \wedge \i'' \order I \i'''
+\end{array}
+\]
+%
+We also use the \emph{product order} $\order {O \times I}$, defined as
+$(\o,\i) \order {O \times I} (\o',\i') \defeq \o \order O \o' \wedge \i \order I \i'$.
+%
+In particular, we use $\order {O \times I}$ to define the subtyping
+relation for \lambdaAEff's computation types.
+
+Furthermore, both $O$ and $I$ carry a \emph{join-semilattice} structure, where
+$\o \sqcup \o' \in O$ is given simply by the union of sets $\o \cup \o'$, while
+$\i \sqcup \i' \in I$ is given pointwise as follows:
+\[
+(\i \sqcup \i')(\op)
+~\defeq~
+\begin{cases}
+(\o'' \sqcup \o''' , \i'' \sqcup \i''') & \mbox{if } \i\, (\op) = (\o'',\i'') \wedge \i'\, (\op) = (\o''',\i''') \\
+(\o'' , \i'') & \mbox{if } \i\, (\op) = (\o'',\i'') \wedge \i'\, (\op) = \bot \\
+(\o''' , \i''') & \mbox{if } \i\, (\op) = \bot \wedge \i'\, (\op) = (\o''',\i''') \\
+\bot & \mbox{if } \i\, (\op) = \bot \wedge \i'\, (\op) = \bot \\
+\end{cases}
+\]
+
+Importantly, the partial orders $(O,\order O)$ and $(I,\order I)$ are both \emph{$\omega$-complete} and \emph{pointed}, i.e.,
+they form \emph{pointed $\omega$-cpos}, meaning that they have least upper bounds of all increasing $\omega$-chains, and
+least elements (given by the empty set $\emptyset$ and the constant $\bot$-valued mapping, respectively).
+%
+As a consequence, and as is well-known, \emph{least fixed points} of continuous (endo)maps on them are then guaranteed
+to exist~\cite{Amadio:Domains, Gierz:ContinuousLattices}.
+%
+For \lambdaAEff, we are particularly interested in the least fixed points of continuous maps $f : I \to I$,
+so as to specify and typecheck code examples involving reinstallable interrupt handlers, as we illustrate in
+\autoref{sec:extensions:reinstallable-interrupt-handlers}.
+%
+
+We also note that if we were only interested in the type safety of \lambdaAEff, and not
+in typechecking reinstallable interrupt handler examples, then we would not need $(I,\order I)$ to be \emph{$\omega$-complete},
+and could have instead chosen $I$ to be the
+\emph{least fixed point} of the set functor $\Phi$ defined earlier, which is what we do for simplicity in our \pl{Agda}
+formalisation. In this case, each interrupt handler annotation $\i \in I$ would be a \emph{finite} nesting of partial mappings.
+
+Finally, we envisage that any future full-fledged high-level language based on \lambdaAEff~would
+allow users to define their (recursive) effect annotations in a small domain-specific language, providing
+a syntactic counterpart to the domain-theoretic development we use in this paper.
+
+\paragraph{Interrupt Actions}
+
+We mimic the act of triggering an interrupt handler for some interrupt $\op$ on an effect annotation $(\o, \i)$ through an
+\emph{action} defined as follows:
+\[
+\opincomp {op} {(\o , \i)}
+~\defeq~
+  \begin{cases}
+   \left(\o \sqcup \o' , \i[\op \mapsto \bot] \sqcup \i' \right) & \mbox{if } \i\, (\op) = (\o',\i')\\
+   (\o,\i) & \mbox{otherwise}
+  \end{cases}
+\]
+If $(\o, \i)$ lists any interrupt handlers installed for $\op$, then $\i\, (\op) = (\o',\i')$,
+where $(\o',\i')$ specifies the effects of said handler code. Now, when the inward propagating
+interrupt reaches those interrupt handlers, it triggers the execution of the corresponding handler code,
+and thus the entire interrupted computation can also issue signals in $\o'$ and handle interrupts in $\i'$.
+
+The notation $\i[\op \mapsto \bot]$ sets $\i$ to $\bot$ at $\op$,
+and leaves it unchanged elsewhere.
+%
+Mapping $\op$ to $\bot$ in the definition of $\tmkw{\downarrow}$ captures that the interrupt $\op$ triggers all the corresponding interrupt handlers that are installed in the computation that it is propagated to.
+
+\subsubsection{Typing Rules}
+\label{sect:typing-rules}
+
+We characterise \emph{well-typed values} using the judgement $\Gamma \types V : X$
+and \emph{well-typed computations} using the judgement $\Gamma \types M : \tycomp{X}{(\o,\i)}$.
+In both judgements, $\Gamma$ is a \emph{typing context}.
+The rules defining these judgements are respectively given in \autoref{fig:value-typing-rules} and
+\ref{fig:computation-typing-rules}.
+
+% Figure environment removed
+
+% Figure environment removed
+
+\paragraph{Values}
+
+The rules for values are mostly standard.
+The only \lambdaAEff-specific rule is \textsc{TyVal-Promise}, which states that in order to fulfil
+a \emph{promise} of type $\typromise X$, one has to supply a value of type $X$. In the rule \textsc{TyVal-Var}, we emphasise the position of the variable in the context, as it will become important once we extend the calculus with modal types in \autoref{sec:extensions:fitch-style-modal-types}.
+
+\paragraph{Computations}
+
+Analogously to values, the typing rules are standard for computation terms that \lambdaAEff~inherits from FGCBV,
+with the \lambdaAEff-rules additionally tracking effect information.
+
+The first \lambdaAEff-specific typing rule \textsc{TyComp-Signal} states that in order
+to issue a signal $\op$ in a computation that has type $\tycomp{X}{(\o,\i)}$, we must have $\op \in \o$ and the type of
+the payload value has to match $\op$'s signature $\op : A_\op$.
+
+The rule \textsc{TyComp-Interrupt} is used to type incoming interrupts.
+In particular, when the outside world propagates an interrupt $\op$ to a computation
+$M$ of type $\tycomp{X}{(\o,\i)}$, the resulting
+computation $\tmopin{op}{V}{M}$ gets assigned the type $\tycomp{X}{\opincomp {op} (\o,\i)}$,
+where the action $\opincomp {op} (\o,\i)$ of the interrupt $\op$ on the annotation $(\o, \i)$ is given as
+discussed in \autoref{sec:basic-calculus:effect-annotations}.
+
+The rule \textsc{TyComp-Promise} states that
+the interrupt handler code $M$ has to return a fulfilled promise of type $\typromise X$, for some type $X$,
+while possibly issuing signals $\o'$ and handling interrupts $\i'$, both of which are
+determined by the effect annotation $\i$ of the entire computation, as
+$(\o',\i') = \i\, (\op)$. The variable $p$ bound in the continuation, which sub-computations can block on
+to await $\op$ to arrive and be handled, also gets assigned
+the promise type $\typromise X$.
+
+It is worth noting that we could have had $M$ simply
+return values of type $X$, but at the cost of not being able to implement some of the more interesting examples,
+such as the guarded interrupt handlers defined in \autoref{sec:applications:guarded-handlers}.
+At the same time, for \lambdaAEff's type safety, it is
+crucial that $p$ would have remained assigned the distinguished promise type $\typromise X$.
+
+The rule \textsc{TyComp-Await} simply states that after awaiting a promise of type $\typromise X$,
+the continuation~$M$ can refer to the promised value using the variable $x$ of type $X$.
+
+Finally, the rule \textsc{TyComp-Subsume} allows \emph{subtyping}, required to prove type preservation for rules where an interrupt encounters an interrupt handler.
+To simplify the presentation, we consider a limited form of subtyping, in which we
+shallowly relate only effect annotations.
+
+\subsection{Type Safety}
+\label{sec:basic-calculus:type-safety}
+
+The sequential part of \lambdaAEff~satisfies the expected type safety properties
+ensuring that ``well-typed programs do not go wrong''. We split these safety properties into the usual
+\emph{progress} and \emph{preservation} theorems \cite{Wright:SynAppTypeSoundness}.
+We omit their proofs~\cite{Ahman:POPL} from this summary, and revisit them
+in \autoref{sec:type-safety} for the extended version of \lambdaAEff,
+as the proofs for the extended calculus also apply to the version summarised in this section.
+
+The progress result states that well-typed (and sufficiently) closed computations can either make another step of
+reduction, or they are already in a well-defined result form (and thus have correctly stopped reducing).
+As such, we first need to define when we consider \lambdaAEff-computations
+to be in \emph{result form} (commonly also called a normal form). We do so using the
+judgements $\CompResult {\Psi} {M}$,
+which states that $M$ has reached its final form as an isolated computation term,
+and $\RunResult {\Psi} {M}$, which states that $M$ has reached the final form of a
+computation running inside a process with all its signals already having been propagated to
+other parallel processes (described in more detail in \autoref{sec:basic-calculus:type-safety:processes}):
+\begin{mathpar}
+  \coopinfer{}{
+    \CompResult {\Psi} {M}
+  }{
+    \CompResult {\Psi} {\tmopout {op} V M}
+  }
+  \and
+  \coopinfer{}{
+    \RunResult {\Psi} {M}
+  }{
+    \CompResult {\Psi} {M}
+  }
+  \and
+  \coopinfer{}{
+  }{
+    \RunResult {\Psi} {\tmreturn V}
+  }
+  \and
+  \coopinfer{}{
+    \RunResult {\Psi \cup \{p\}} {N}
+  }{
+    \RunResult {\Psi} {\tmwith {op} x M p N}
+  }
+  \and
+  \coopinfer{}{
+    p \in \Psi
+  }{
+    \RunResult {\Psi} {\tmawait p x M}
+  }
+\end{mathpar}
+In these judgements, $\Psi$ is a set
+of (promise-typed) variables $p$ that have been bound by interrupt handlers enveloping the given computation.
+Intuitively, these judgements express that a computation $M$ is in a (top-level)
+result form $\CompResult {\Psi} {M}$ when, considered as a tree, it has a shape in which \emph{all}
+signals are towards the root, interrupt handlers are in the intermediate nodes, and
+the leaves contain return values and computations that are temporarily blocked
+while awaiting one of the promise-typed variables $p$ in $\Psi$ to be fulfilled.
+
+The new reduction rules that propagate the awaiting construct out of sequencing and interrupts into the awaiting construct ensure the explicit form of all blocking computations and considerably simplify the definition of $\RunResult {\Psi} {M}$ compared to the previous version of our work~\cite{Ahman:POPL}.
+%
+The finality of these result forms is captured by the next lemma.
+
+\begin{lem}
+\label{lem:results-are-final}
+Given $\Psi$ and $M$, such that $\CompResult {\Psi} {M}$, then there is no $N$ with $M \reduces N$.
+\end{lem}
+
+Using the result forms, the progress theorem for the sequential part of \lambdaAEff\ is as follows:
+
+\begin{thm}[Progress for computations]
+\label{thm:progress}
+Given a well-typed computation
+\[
+  p_1 \of \typromise {X_1}, \ldots, p_n \of \typromise {X_n} \types M : \tycomp{Y}{(\o,\i)}
+\]
+then either
+\begin{enumerate}[(a)]
+  \item there exists a computation $N$, such that $M \reduces N$, or
+  \item the computation $M$ is in a result form, i.e., we have $\CompResult {\{p_1, \ldots, p_n\}} {M}$.
+\end{enumerate}
+\end{thm}
+
+In particular, with the empty context, we get the usual progress statement, which states that
+$\types M : \tycomp{X}{(\o, \i)}$ implies that either $M \reduces N$ for some $N$
+or that $\CompResult {\emptyset} {M}$ holds. This implies that any promise variable
+which we are awaiting to be fulfilled must correspond to one of the installed interrupt handlers.
+Additionally, the type system ensures that all outgoing signals are listed in $\o$ and all
+installed interrupt handlers are specified in $\i$.
+
+The type preservation result is standard and says that reduction preserves well-typedness.
+
+\begin{thm}[Preservation for computations]
+\label{thm:preservation}
+Given a computation $\Gamma \types M : \tycomp{X}{(\o,\i)}$, such that $M$
+can reduce as $M \reduces N$, then we have $\Gamma \types N : \tycomp{X}{(\o,\i)}$.
+\end{thm}

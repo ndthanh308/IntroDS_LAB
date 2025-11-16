@@ -1,0 +1,270 @@
+%%%% Section 5 %%%%%%%%%%%%
+\section{Implementation details of the numerical method}
+\subsection{Numerical integration}
+\label{sec:5a}
+The numerical simulations in this paper are performed using a custom C++ code
+that uses the OpenMP library~\cite{dagum98} for multithreading. The core of the
+simulation involves integrating the ODE system for the position $\vq_k$ and
+velocity $\vqd_k$ degrees of freedom described in Eqs.~\eqref{eq:ys} \&
+\eqref{eq:vs}. This is solved using the fourth-order adaptive ``first same as
+last'' (FSAL) Runge--Kutta method~\cite{hairer93}. This method uses five
+intermediate stages, where the first four can be used construct a fourth-order
+accurate solution, and the final stage can be used to construct an auxiliary
+third-order accurate solution for step size selection. With the FSAL property,
+the final stage can be re-used as the first stage of the next step, reducing
+the total computational work. We implement adaptive step size selection via the
+procedures described by Hairer et al.~\cite{hairer93}, which uses a combination
+of absolute tolerance $\Atol$ and relative tolerance $\Rtol$. Initial step size
+selection is also performed using the methods of Hairer et al.~\cite{hairer93}.
+
+Adaptive integration is beneficial for our simulations, since the appropriate
+step size choices vary greatly over the course of the simulation. In the
+initial stages, yarn elasticity is the most important physical effect and large
+timesteps can be taken. Once contact forces become important, the timestep
+sizes are substantially reduced. Similar methods have been employed in
+the simulation of crumpled sheets~\cite{andrejevic22}, which has comparable
+behavior.
+
+Our simulations output snapshots at equally spaced time intervals. Since the
+timesteps are chosen adaptively, the integration time points will not align
+with the output time points in general. To solve this issue, we make use of
+dense output~\cite{hairer93} and construct a cubic Hermite interpolant of the
+simulation state over each integration time step. Evaluating this interpolant
+at the output time point results in a fourth-order accurate approximation of
+the solution. The snapshots are outputted as binary files that contain the
+complete simulation state, which can be post-processed to perform a variety
+of analyses.
+
+It is worth noting that the ODE system representing the yarn mechanics is not
+infinitely differentiable, since the contact forces are discretely switched on
+and off as yarns move past each other. Proving that the Runge--Kutta scheme is
+fourth-order accurate requires that the mathematical solution has Taylor
+expansions up to fourth order, which is not true in the case when an
+integration timestep passes over a moment when a contact force is switched on
+or off. Because of this, it is not possible to guarantee that the results are
+fourth-order accurate. Nevertheless, we opt to use the fourth-order scheme
+since it results in good accuracy and performance overall. Furthermore, Hairer
+et al.~\cite{hairer93} demonstrate that in practical cases, adaptive-timestep
+integrators can approach high-order accuracy even when the ODE system lacks
+sufficient smoothness, since the integrator can automatically refine the
+timestep when passing over a discrete switch in the ODE, minimizing the
+additional error incurred.
+
+\subsection{Linear system}
+\label{sec:5b}
+For a single yarn with $N$ spline segments we write $\vq\in \R^{3N+3}$ and
+$\vqd\in \R^{3N+3}$ to be the vectors describing the yarn position and
+velocity, respectively. From Eqs.~\eqref{eq:lagr} \& \eqref{eq:dkint} the
+general equation of motion for a particular component $(\vq_k,\vqd_k)$
+is given by
+\begin{align}
+  \frac{d}{dt} \left( [ M \vqd]_k \right) &= \Big( \nabla_{\vq_k} V(\vq) + \nabla_{\vqd_k} D(\vq,\vqd) \Big), \label{eq:lagr2a} \\
+  \frac{d}{dt} \left( \vq_k \right) &= \vqd_k \label{eq:lagr2b}
+\end{align}
+where $M$ is a banded matrix whose components are defined by
+Eq.~\eqref{eq:ke_integ}. For $2\le j \le N-2$, away from the end points, the
+components of $M$ are given by
+\begin{equation}
+  M_{jk} = \begin{cases}
+    \tfrac{151}{315} & \qquad \text{if $k=j$,} \\
+    \tfrac{397}{1680} & \qquad \text{if $|k-j|=1$,} \\
+    \tfrac{1}{42} & \qquad \text{if $|k-j|=2$,} \\
+    \tfrac{1}{5040} & \qquad \text{if $|k-j|=3$,} \\
+    0 & \qquad \text{otherwise.}
+  \end{cases}
+\end{equation}
+Near the end points, the matrix values change, because the B-spline
+functions are no longer fully contained within $\Omega$. The values for $j<2$
+are given in Table \ref{tab:ke_boundary}, and the values for $j>N-2$ are
+obtained via symmetry. Our code can also handle the case when either the
+position or direction of the end point is fixed, which results in adjusting
+the linear system to incorporate a linear algebraic constraint.
+
+\begin{table}
+  \centering
+  \begin{tabular}{|c|cccccc|}
+    \hline
+    & $k=-1$ & $k=0$ & $k=1$ & $k=2$ & $k=3$ & $k=4$ \\
+    \hline
+    $j=-1$ & \nicefrac{1}{252} & \nicefrac{43}{1680} & \nicefrac{1}{84} & \nicefrac{1}{5040} & & \\
+    $j=0$ & \nicefrac{43}{1680} & \nicefrac{151}{630} & \nicefrac{59}{280} & \nicefrac{1}{42} & \nicefrac{1}{5040} & \\
+    $j=1$ & \nicefrac{1}{84} & \nicefrac{59}{280} & \nicefrac{599}{1260} & \nicefrac{397}{1680} & \nicefrac{1}{42} & \nicefrac{1}{5040} \\
+    \hline
+  \end{tabular}
+  \caption{Coefficients in the matrix $M$, defined in Eq.~\eqref{eq:ke_integ}
+  arising from the kinetic energy term in the Lagrangian formulation
+  of the yarn dynamics.\label{tab:ke_boundary}} 
+\end{table}
+
+To solve the ODE system in Eqs.~\eqref{eq:lagr2a} \& \eqref{eq:lagr2b} it is
+necessary to solve the linear system $Mq=f$ where $q\in \R^{(3N+3)\times 3}$
+are entries of $\vqd$ arranged into a matrix, with the $x$, $y$, and $z$
+components each in one column. $f \in \R^{(3N+3)\times 3}$ are the
+corresponding source terms, from the right hand side of Eq.~\eqref{eq:lagr2a}. The
+matrix $M$ remains fixed throughout the simulation, and therefore during the
+initialization its LU factorization is precomputed. This accelerates the
+solution of the linear system during the simulation. The LAPACK library is
+used, with the LU factorization being performed using the \texttt{dgbtrf}
+routine for a general banded matrix in double-precision floating point
+arithmetic. The \texttt{dgbtrs} routine is then used to solve the linear
+systems during the timesteps.
+
+%\begin{table}
+%  \begin{tabular}{ccccccc}
+%    ,1/6.,2/3.,1/6.,0.,
+%    ,7/720.,173/1260.,137/840.,29/1260.,1/5040.,
+%    ,121/1260.,13093/5040.,4553/630.,9883/2520.,509/1260.,17/5040.,
+%  \end{tabular}
+%
+%  \begin{tabular}{ccccccc}
+%    ,1/2.,0.,-1/2.,0.,
+%    ,43/1680.,151/630.,59/280.,1/42.,1/5040.,
+%    ,1/63.,397/1680.,307/630.,149/630.,1/42.,1/5040.,
+%  \end{tabular}
+%
+%  \begin{tabular}{cccccc}
+%    ,1/6.,2/3.,1/6.,0.,
+%    ,1/2.,0.,-1/2.,0.,0.,
+%    ,31/5040.,587/2520.,55/72.,283/630.,239/5040.,1/2520
+%  \end{tabular}
+%\end{table}
+
+\subsection{Contact sphere diameter calculations}
+\label{sec:csphere}
+As described in Sec.~\ref{sec:2c}, yarn--yarn contact forces are handled by
+introducing $n$ equally spaced spheres of radius $d_\text{con}$ along each spline segment.
+If $\dcon=d$, then the envelope formed by the spheres would be smaller
+than the yarn itself. We therefore systematically choose $\dcon$ to
+better approximate the yarn shape. Let $D=l/(2n)$ be the distance between
+successive contact spheres. Assuming that $D$ is small relative to $d$, the
+contact sphere diameter is chosen to be
+\begin{equation}
+  \dcon=\frac{d+\sqrt{d^2 + \tfrac23 D^2}}{2},
+\end{equation}
+which ensures that the average diameter of the envelope of spheres is equal to
+$d$. To choose the number of contact spheres, we define a parameter $\alpha$
+corresponding to the maximum allowable mean square deviation between the
+contact sphere envelope and the filament diameter, which is typically set to be
+several percent. Then the number of contact spheres satisfies
+\begin{equation}
+  n = \left\lceil \frac{l}{d\sqrt{6(1+\alpha)\alpha}}  \right\rceil,
+\end{equation}
+where $\lceil\cdot\rceil$ is the ceiling operator. Since the contact spheres
+overlap, when considering Eq.~\eqref{eq:contact_integ}, it is necessary to
+screen out the effect of interactions from neighboring spheres along the same
+yarn. This is done by defining a screening number $n_\text{screen} = \lceil
+\beta \dcon/D \rceil$ where $\beta$ is a dimensionless parameter. Terms in the
+sum of Eq.~\ref{eq:contact_integ} are only considered if the indices of the
+spheres are separated by at least $n_\text{screen}$.
+
+\subsection{Tethering forces and initial sample generation}
+\label{sec:5d}
+To perform the uniaxial tension tests, tethering forces are applied to the
+fabric to fix the displacement in two end regions. This procedure is similar
+to the approach used in the immersed boundary method~\cite{peskin02}
+to simulate fixed walls~\cite{fai18}. Specifically, two regions $D_+$ and
+$D_-$ are defined, where typically $D_\pm = \{ (x,y,z)\in \R^3 \,:\, \pm
+y>y_\text{fix} \}$ for a constant $y_\text{fix}$ when pulling a sample in the
+$y$ direction.
+
+During the simulation initialization, all spline segments that lie fully within
+$D_+$ and $D_-$ are marked, and the reference position of each
+quadrature point within each marked segment is recorded. Using
+this information, the additional energy contributions
+\begin{equation}
+  V^t_\pm = k_t \int_\Omega I_{D_\pm}(s) \| \vy(s) - \vec{F}_\pm(\vy_\text{ref}(s),t) \|^2 ds
+  \label{eq:energy_tether}
+\end{equation}
+are added to Eq.~\eqref{eq:lagr}, where $I_{D_\pm}(s)$ is equal to one in spline
+segments marked within $D_\pm$, and zero otherwise. Here, $\vec{F}_\pm: \R^3
+\to \R^3$ are time-dependent affine transformations of the reference position.
+They can be used to apply the constant pulling velocity in the end regions.
+The forces that are measured in the tension tests are computed as the total
+force applied to the fabric in each tethered region.
+
+As described in Sec.~\ref{sec:6e}, the experimental samples created by the knitting
+machine are already under substantial tension, meaning that the yarns are much
+tighter than the examples shown in Figs.~\ref{fig2:knit_patterns} \&
+\ref{fig1:knit_assembly}. It is difficult to initialize the simulation in tighter
+configurations directly, since any overlaps in the initial state may result in
+very large initial contact forces. Because of this, we perform a preliminary
+simulation to generate the samples for the tension tests. We initialize the
+yarn in a loose configuration given by Eq.~\eqref{eq:basic_param_spiral}, and
+then make the spline rest length $l$ a function of time, applying a linear
+ramping so that
+\begin{equation}
+  l(t) = \begin{cases}
+    l_0 - (1-\eta) \frac{t}{T_r} & \qquad \text{if $t<T_r$,} \\
+    \eta l_0 & \qquad \text{if $t\ge T_r$,}
+  \end{cases}
+\end{equation}
+where $l_0$ is the initial rest length of the yarn, $T_r$ is the duration of
+the ramping, and $\eta$ is a dimensionless ratio chosen to ensure that the
+final state matches the same compression as the experimental samples. During
+this procedure, the two end regions are tethered using the energy contributions
+in Eq.~\eqref{eq:energy_tether} to prevent the sample from curling. Since the
+rest length is reduced, the affine transformations $\vec{F}_\pm$ are used to
+apply a commensurable shrinkage to the tethered regions. The precise amount of
+shrinkage is determined by comparing to the geometry of the
+experimental samples. After this preliminary simulation is performed, the yarn
+state is saved and then used as the starting configuration for the tension test
+simulations.
+
+
+\section{Materials and Experiments}
+\subsection{Material selection}
+\label{sec:6a}
+Commercially available acrylic spun yarns (16/2 Vybralite Acryclic Yarns, National Spinning Co. by Peter Patchis Yarns, USA) were selected to create all knitted fabric swatches, which were mainly collected for the study of Sanchez et al.~\cite{Sanchez2023}. We performed the pull-out and bending tests on a single yarn, in order to benchmark the previously reported stretching stiffness, and to calibrate the bending stiffness of selected experimental material.
+  
+\subsection{Filament diameter}
+\label{sec:6b}
+Scanning Electron Microscope (SEM) images were taken with a Tescan Vega scanning electron microscope for the acrylic spun yarns, in order to measure the diameter of the yarn accurately. To adjust for camera orientation, we used Adobe Photoshop to calculate the projected area of the yarn segment under orthogonal projection and used that to calculate the effective yarn diameter as projected area divided by the fixed yarn length of \SI{20}{mm}. This process was repeated three times on three different yarn segments from the same material. The averaged yarn diameter, \SI{0.0524}{cm}, from experimental measurements was used to benchmark the yarn diameter used in simulation. In addition, we assume a circular and consistent cross section with this calibrated effective radius from onward for related calculations. 
+
+\subsection{Yarn linear density}
+\label{sec:6c}
+We adopt yarn linear density defined as 
+    \begin{equation}
+    \rho = \frac{M}{l},
+    \label{eq:yarn_density}
+    \end{equation}
+which is a standard definition adopted in the textile industry and is provided by the manufacturer as \SI{0.077}{g/m}. The equivalent term in simulation is \SI{7.7e-4}{g/cm}. 
+
+\subsection{Characterisation of yarn properties}
+\label{sec:6d}
+    % Figure environment removed
+Figure \ref{fig5a:yarn_pullout} illustrates the experimental set up for a pull-out test on a single yarn, in order to measure its stretching stiffness. A pull-out test of a single yarn adhered to acrylic boards with instant adhesive to prevent slippage was performed on at least three different samples, with fixed gauge length recorded to calculate tensile strain. All samples were tested at a rate of \SI{5}{mm/min} on a Universal Testing Machine (Instron 5566R), and tensile force $F$ and tensile strain $\epsilon$ were directly measured during loading processes. The stretching stiffness of a single yarn 
+    \begin{equation}
+    E^s = \frac{F}{\pi r^2 \epsilon} 
+    \label{eq:yarn_stretch}
+    \end{equation}
+    first underwent a linear stage with \SI{79.0}{MPa} within \SI{5}{\%} tensile strain, followed by softening behaviour. In all simulation tests, we assumed linear elasticity and calibrated the equivalent stretching stiffness to be \SI{7.9e8}{g/(cm.s^2)}. This assumption was further testified by histogram measurement of the stretch of individual yarn segments. On average, less than \SI{20}{\%} yarn segments are stretched by more than \SI{5}{\%} even when the fabric samples are stretched by more then \SI{60}{\%}. 
+    % Figure environment removed
+Figure \ref{fig5b:yarn_bend} illustrates the experimental set up for a bending test on a single yarn cantilevered at one end with the free end consisting a horizontal length $\lambda$, and drops by a vertical displacement of $\delta$ due to gravity. We assume that gravity of the yarn acts as a distributed load $q=\pi r^2 \rho g$ and referring to Chakrabarti et al.~\cite{Chakrabarti2021}, the bending stiffness of such soft material can be determined from sets of fixed $\lambda$ and measured $\delta$ from:
+    \begin{equation}
+    E^b = \frac{q \lambda^4}{8 \delta I}.
+    \label{eq:yarn_bend}
+    \end{equation}
+    For each bending test, we took high resolution photos of the cantilevered yarn segment, with pixel images on the background. Each pixel grid represents \SI{0.25}{mm} and post processing in Adobe Photoshop was done to ensure an orthogonal perspective. From a series of bending tests on three different yarn segments, we calibrated the bending stiffness of the used acrylic spun yarn to be \SI{0.249}{MPa} and its equivalent parameter in simulation is \SI{2.49e4}{g/(cm.s^2)}. Note that the measured bending stiffness differs from the stretching stiffness by several magnitudes due to the soft nature of used material.
+
+%\item Artificial density scaling \\
+%\item Global damping in order to remain in the quasi-static regime \\
+%\item Other parameters: \\
+%  \begin{itemize}
+%      \item Contact parameters \\
+%      \item $k_{dt}$ and $k_{dn}$ \\
+%      \item Tolerance on the contact sphere envelope (0.03) \\
+%    \end{itemize}
+
+\subsection{Fabrication of knitted fabrics}
+\label{sec:6e}
+For reference we summarise the experimental protocol to fabricate and to test the fabric swatches from Sanchez et al.~\cite{Sanchez2023} here. In total, six samples for each knitted structure (jersey, garter 1 by 1, rib 1 by 1 and seed 1 by 1) were fabricated with the same settings on stitch spacing and machine tension on a Kniterate V-bed knitting machine S8 (Kniterate, EU), and all consisting of 41 wales by 40 courses (i.e., number of stitches along the warp and the weft directions respectively). The ``knitout'' programme \cite{McCann2017} was used to convert the Python frontend (specified by McCann et al.~\cite{McCann2016}) to Kniterate-specific machine language ``kcode'', in order to operate the knitting machine. The unit arclength of each fabric $l$ was determined by 
+    \begin{equation}
+    L = \frac{M}{\rho N_w N_c},
+    \label{eq:yarn_arclength}
+    \end{equation}
+from directly measured mass of fabricated sample $M$, fixed yarn linear density from the manufacturer and number of wales $N_w$ and number of courses $N_c$. After fabrication, all samples were left at ambient conditions for 24-48 hours to enable material relaxation, as responding to residual stresses from the manufacturing process. Then, the dimensions of all samples were measured and approximated as those of samples in their reference states.
+
+\subsection{Uniaxial tensile tests to characterise the knitted fabrics}
+\label{sec:6f}
+All knitted fabric samples were cyclically tested using Universal Testing Machiens (an Instron 5544A with a smaller-range load cell and an Instron 5566R with a larger-range load cell). The gauge lengths were recorded, in order to offset mismatch between previously recorded sample dimensions and ground-truth sample dimensions in stress-free states on the testing machines. These samples were pre-cycled to force magnitude of \SI{20}{N} at a fixed rate of \SI{10}{mm/min} during loading stage and \SI{20}{mm/min} during unloading, followed by two cycles at a rate of \SI{5}{mm/min} until reaching \SI{15}{N}. This upper bound on force was selected empirically, in order to prevent fabrics from plastic deformation. For our study, we selected the mechanical responses measured after pre-cycling, as they were robustly repeated through cycles for the same fabric and the same tensile loading direction. Note that the strain ranges from experiments were smaller than those from numerics presented in this study, since the former were collected from a particular cycle of the cyclic tests way before failure.
+

@@ -1,0 +1,177 @@
+%-------------------------------------------------------------------------------
+\section{\maestro Architecture}
+\label{section:architecture}
+%-------------------------------------------------------------------------------
+
+\maestro uses symbolic analysis to extract information on how the NF maintains state, and with it infer possible dependencies between parallel instances. This analysis is crucial to achieve synchronization-free parallelization that shards state by carefully splitting traffic among cores. How this careful orchestration of packets can be used to avoid synchronization among parallel instances is better explained via an example.
+
+\subsection{Parallelizing a firewall}
+\label{subsection:par_firewall}
+
+Consider a firewall NF connecting a LAN and a WAN that only forwards packets from the WAN that correspond to flows started in the LAN. To keep track of ongoing flows, it stores flow information in a map. Packets from the WAN lookup flow information symmetrically relative to packets from the LAN, naturally swapping source and destination fields.
+
+Note that not all packets need access to all entries in the map: only the ones belonging to the packet's flow. As such, in a parallel execution, making sure that \emph{packets of the same flow are sent to the same core}, conjoined with the fact that packets of the same core are processed sequentially, allows us to parallelize this firewall without any synchronization between its instances---a \emph{shared-nothing} architecture.
+
+This orchestration of packets from the same flow to the same core requires a specific RSS configuration. Not only must we send LAN packets of the same flow to the same core, but also their (symmetric) WAN responses. A configuration partially fulfilling these requirements was already found by Woo and Park~\cite{Woo2012}{\protect\footnote{Woo and Park's solution considers only a single RSS configuration, whereas our firewall deals with two ports (LAN and WAN), each requiring independent configurations. Although their findings are transposable to this scenario, it still requires expertise from the developers.}}. By adapting their configuration to the firewalls' needs, we ensure that every packet that needs access to the same memory region is sent to the same core.
+
+\subsection{Generalizing NF parallelization}
+\label{subsection:generalizing}
+
+The above parallelization process is well tailored for our firewall, but different NFs keep state in different ways, and thus require different sharding solutions. Moreover, when access to specific state precludes flow-sharding, synchronization is necessary to maintain semantics.
+
+\maestro deals with this parallelization process automatically by using the architecture shown in~{\cref{fig:arch}}. \maestro starts by analyzing the NF using Exhaustive Symbolic Execution (ESE)~\cite{zaostrovnykh2019verifying,bolt,Cadar2008} to retrieve a sound and complete model of its behavior. Then, it hands the model over to a three stage pipeline: (1) the Constraints Generator, which uses this model to analyze how the NF keeps its state and arrive at a sharding solution; then (2) the RSS Configuration Generator, which uses a solver to find an RSS configuration that steers packets following the sharding rules found by the previous stage to the same core; and finally (3) the Code Generator, that generates a parallel implementation of the original NF that configures the RSS accordingly and adds additional synchronization mechanisms if needed.
+
+% Figure environment removed
+
+%-------------------------------------------------------------------------------
+\subsection{Extracting the NF's model}
+%-------------------------------------------------------------------------------
+
+\maestro uses ESE to extract the complete NF's model. This allows us to not only analyze how the NF maintains its state, but also generate modified versions of its implementation.
+
+The extracted model is an execution tree containing all the possible code execution paths a packet can trigger. Each node on this graph is either conditional (representing a branch condition), a stateful operation (representing a call to a stateful data structure, \eg a map or a vector), or packet operation (\eg, forwarding, dropping, etc.). Both the packet and stateful data are traced as symbols, and every node contains a list of constraints on these symbols that can be given to a solver to query their possible values under any code path.
+
+%-------------------------------------------------------------------------------
+\subsection{Finding the sharding solution}
+\label{subsection:sharding}
+%-------------------------------------------------------------------------------
+
+The NF model is passed to the Constraints Generator, which is tasked with finding a sharding solution that allows shared-nothing parallelization.
+The idea is to find the constraints that hold true between packets that access the same state, \ie packets that must be processed on the same core.
+This is intrinsically tied to how the NF maintains state.
+For example, in a map for two operations to access the same state they must use the same \emph{key}.
+By symbolically tracking how such keys are derived from packets, we reason about the constraints on packets that access common state.
+
+\subsubsection{Building a stateful report} The Constraints Generator starts by analyzing the NF's model and builds a stateful report (SR) of all the performed stateful operations. Each SR entry specifies the operation's name (\eg \texttt{map\_put}), object instance, and other relevant arguments (\eg the key used), and all the possible constraints on both the received packet and other stateful data when the operation was performed (\eg \texttt{map\_put} was called when a UDP packet arrived from interface 0).
+
+\subsubsection{Filtering entries} After building the SR, the Constraints Generator removes all entries related to read-only objects (\eg routing tables that are filled on start-up and never updated).
+Such read-only accesses to shared state do not require coordination among cores and need not be reasoned about.
+Should all accesses be read-only, the SR will be left empty and \maestro asks the Code Generator to generate a parallel implementation that uses RSS with the sole purpose of load-balancing traffic among cores (we explain the RSS mechanism in \cref{subsec:keygen}).
+
+\subsubsection{Analyzing the entries} The use of any data structure can potentially preclude a shared-nothing approach, and therefore we need to infer the conditions under which it is safe to perform stateful operations concurrently for each of them (or if no such conditions exist). We present the analysis for one of the most predominant data structures: the map~\cite{khalid2016paving,zaostrovnykh2019verifying,ebpf-maps,khalid2016paving}.
+
+The map stores data indexed by a key. This data can be accessed via the function \texttt{map\_get}, and modified with \texttt{map\_put}. Two map calls access the same memory region if and only if they are given the same key. For a shared-nothing approach, packets that trigger map calls to the same instance using the same key need to be steered to the same core. This alone is, however, insufficient: we need to not only take into consideration any RSS limitations, but also reason about the use of multiple different map instances (or other data structures), each independently tied to the previous requirement. With this in mind, we designed a set of rules to guide \maestro towards finding correct shared-nothing sharding solutions:
+
+\begin{enumerate}[label=\textbf{R\arabic*},ref=R\arabic*,noitemsep]
+    \item \label{cf:eq_keys} \textit{Key equality.} The most obvious case is when two packets access the same map instance using the same key. In this case, the Constraints Generator builds the constraint from the formulas for the keys (\circled{1} in \cref{fig:constraints_generator}).
+    
+	\item \label{cf:subsumption} \textit{Subsumption.} If a map instance is accessed using a subset of the packet fields used to access a second instance, then the subset takes precedence over its larger counterpart.
+    That is, the coarser-grained requirement wins over the finer-grained one.
+    This is exemplified in scenario \circled{2} in \cref{fig:constraints_generator}: sending packets with the same source address to the same core will also guarantee that packets with the same 5-tuple are also sent to the same core. More generally, we can always use a subset of the required packet fields. As we will see later, this rule can act further in concert with others to resolve incompatibilities.
+
+	\item \label{cf:disjoint} \textit{Disjoint dependencies.} Accesses using disjoint sets of packet fields are problematic. For example, an NF that keeps a pair of independent counters, one for source addresses and other for destination addresses, requires packets with the same source address \emph{or} the same destination address to be sent to the same core. Due to limitations in the RSS mechanism, this is not possible, and so \maestro warns the user and provides the fundamental reason why the shared-nothing approach cannot be applied (\circled{3} in \cref{fig:constraints_generator}).
+
+	\item \label{cf:incompatible} \textit{Incompatible dependencies.} RSS uses packet fields to steer packets to cores. This means that using keys containing (1) incompatible RSS packet fields or (2) no packet fields at all will completely block our attempt at correctly steering packets to cores. This is the case, for example, of NFs which index data with constant keys (as exemplified in case \circled{4} of \cref{fig:constraints_generator}). Again, in this case, \maestro provides feedback to the user as to why the shared-nothing approach is unfeasible.
+
+	\item \label{cf:interchangeable} \textit{Interchangeable constraints.} We define a pair of constraints as \emph{interchangeable} if they trigger the same NF behavior. This allows us to completely replace constraints matching rules \ref{cf:disjoint} or \ref{cf:incompatible} with others that, if interchangeable, do not prohibit shared-nothing parallelization.
+    Example \circled{5} of \cref{fig:constraints_generator} showcases this scenario: although the NF stores source addresses using an RSS-incompatible dependency (source MAC), the Constraints Generator finds that the NF's behavior is \emph{exactly the same} whether we shard on the MAC address or the destination IP address. In this case, these constraints are interchangeable, which allows \maestro to shard on either of them. Because the first constraint uses an incompatible RSS field (a MAC address), the Constraints Generator opts for using the second one (the destination IP) for sharding.
+\end{enumerate}
+\vspace{-1em}
+
+These rules allow \maestro to correctly find sharding solutions for a wide range of NFs (as we show in \cref{section:evaluation}).
+Note that only \ref{cf:eq_keys} is specific to data structures that use a key to index state (\eg maps, vectors, sketches). \ref{cf:subsumption}, \ref{cf:disjoint}, \ref{cf:incompatible}, and \ref{cf:interchangeable} are otherwise data structure agnostic, and \maestro employs them to all entries, regardless of their specific data structure.
+Though much of this analysis focuses on maps, it can be used as building blocks for others (\eg vectors, sketches, token buckets).
+Moreover, we need only reason about these details \emph{once} per data-structure (or, at most, each time a breaking change is made).
+Once data-structure developers encode such properties into \maestro, NF developers can freely use these stateful data structures to build their NFs.
+Even when \maestro fails to find a shared-nothing solution, it still provides the developer the fundamental reason why (\eg constant keys or non-packet dependencies). When met with this result, the developer is faced with a decision: either use this feedback to tweak the NF implementation so that it becomes amenable to shared-nothing parallelism, or request a lock-based implementation from \maestro.
+
+\subsubsection{Generating the constraints} The next step in the \maestro pipeline is to generate the actual constraints, \ie, the conditions that, if satisfied by a pair of packets, dictate that they must be sent to the same core.
+Towards this end, \maestro iterates over each pair of report entries of the same state instances, creating SMT formulas stating that both keys must be equal, and joining them all together with logical \emph{ANDs}.
+
+Finally, we note that RSS must be independently configured on each interface. As such, the constraints generated by \maestro are interface-specific, reasoning about pairs of packets which may arrive from separate interfaces. Case \circled{5} from \cref{fig:constraints_generator} exemplifies this. It requires LAN packets to be sent to the same core as packets from the WAN if the source address of the former equals the destination address of the latter.
+
+\cref{fig:fw-pipeline} shows the constraints found by the Constraint Generator when analyzing our firewall example. It finds that LAN packets with the same addresses and ports must be sent to the same core, and similarly for WAN packets. It also finds that WAN and LAN packets must be sent to the same core if they have the same, but swapped, sources and destinations.
+
+% Figure environment removed
+
+%-------------------------------------------------------------------------------
+\subsection{Finding the right RSS configuration}
+\label{subsec:keygen}
+%-------------------------------------------------------------------------------
+
+The previous stage tackled the challenge of finding a shared-nothing sharding solution, producing constraints between packets that when true require the packets to be processed on the same core. We now focus on materializing this sharding solution by automatically finding RSS configurations that satisfy these constraints.
+
+RSS is a hardware mechanism in the NIC that steers packets to core-specific queues. Once configured with an RSS key and a set of packet fields, it extracts from incoming packets the values of those fields and feeds them to a toeplitz-based hash-function~\cite{rss-hashes} (depicted in \cref{fig:toeplitz}). The hash is used to index an indirection table containing queue identifiers, and the packet is inserted in the corresponding queue.
+
+Two packets with the same hash will be sent to the same core. Given the configurability of the RSS hashing function, we use this to ensure that packets that need to be processed on the same core will have the same hash.
+For simple constraints we can arrive at a satisfying RSS configuration solely by correctly choosing the packet field set (\eg, hashing only source and destination IPs and ports when requiring TCP packets with the same 5-tuple to be sent to the same core).
+However, what if (1) the NF requires a subset of packet fields that can only be used as a group in the RSS mechanism (\eg, a traffic monitor that shards solely the destination IP), (2) it requires complex constraints between packets (\eg, a Hierarchical Heavy Hitter sharding on multiple subnets of the source IP and/or source ports), or (3) there are constraints between packets arriving in different interfaces (which is the case for many NFs requiring both LAN and WAN interfaces, as in NATs, Firewalls, Connection Limiters, \etc)?
+
+To address these scenarios in a generalized way, we built \librs, a C library capable of taking constraints as inputs and outputting RSS configurations that satisfy them. It uses the Z3 solver~\cite{de2008z3} to find suitable configurations by encoding the problem in a logical format. \maestro uses \librs to generate RSS configurations that satisfy the constraints given by the Constraints Generator module.
+
+%-------------------------------------------------------------------------------
+\subsubsection{Building the statement}
+%-------------------------------------------------------------------------------
+The query given to the solver needs to encode the following problem: \emph{given set of constraints, find RSS keys that generate the same hash for every pair of packets that satisfy them}. To build this statement, we need to encode both the hash function and the constraints into an SMT format.
+
+Let $k$ be a 52~byte\protect\footnote{Value for the Intel E810 100G NIC\cite{e810}, but trivially adjustable in \librs.} RSS key, $d$ and $d'$ hash inputs for each of the packets (whose sizes depend on the extracted packet fields, \eg 12~bytes for source and destination IPs and ports), and $h(k,d)$ the 32~bit hash. Also, let $|k| \ge |d| + |h|$, $H(k, k', d, d')$ be true iff $h(k,d) = h(k',d')$, and $C(d,d')$ be the constraint between $d$ and $d'$ provided by the constraint generator.
+
+% Figure environment removed
+
+\noindent
+\textbf{Hash function.} As shown in \cref{fig:toeplitz}, $H(k, k', d, d')$ can be represented as:
+
+\vspace{-1.5em}
+\begin{align}
+\label{eq:hashes_equality}
+\bigwedge_{b = 0}^{|h|-1}
+\left[
+\bigoplus_{x = 0}^{|d|} ( d[x] \land k[x + b] ) = \bigoplus_{y = 0}^{|d'|} ( d'[y] \land k'[y + b] )
+\right]
+\end{align}
+\vspace{-1em}
+
+\noindent
+\textbf{Base statement.} Initially, let us encode the following query: \emph{find a single key $k$ such that, given any two hash inputs $d$ and $d'$ that obey the constraints C, their corresponding hashes will always be equal.} That is:
+
+\vspace{-2em}
+\begin{equation}
+\label{eq:statement_non_trivial}
+\forall_{d, d'} \dsepA
+k \ne 0 \land \left[
+(C(d, d') \land d \neq d') \rightarrow H(k, k, d, d')
+\right]
+\end{equation}
+\vspace{-2em}
+
+Having the key be 0 would always output 0 valued hashes, steering all packets to a single core, so we prevent the key from taking that value.
+
+\noindent\textbf{Compatibility with multiple keys.} Each interface can have its RSS mechanism individually configured.
+With that in mind, let $C_{ij}(d,d')$ be the constraint between a pair of packets coming from ports $i$ and $j$, configured with the keys $k_i$ and $k_j$ respectively.
+Note that $C_{ij} = C_{ji}$, therefore it is enough to consider, for example, all the constraints $C_{ij: \{ j \le i \}}$.
+For \cref{eq:statement_non_trivial} to be multi-key aware, we simply conjunct the constraints across all $i$ and $j$, allowing the solver to manage each key combination problem as a specific statement that must be true. That is, for $n$ ports:
+
+\vspace{-2em}
+\begin{equation}
+\label{eq:statement_multikeys}
+\forall_{d, d'} \dsepA \bigwedge_{i = 1}^n \bigwedge_{j = 1}^i \left[ ( C_{ij}(d, d') \land d \neq d') \rightarrow H(k_i, k_j, d, d') \right]
+\end{equation}
+\vspace{-1.5em}
+
+\noindent\textbf{Compatibility with varying sets of RSS packet fields.}
+Just as different ports may need distinct RSS keys, we may also need to configure RSS to use different sets of packet fields depending on the interface. One way to address this would be to consider hash inputs $d_0, ..., d_n$ for $n$ interfaces. This, however, highly increases the complexity of the query\protect\footnote{For $n$ interfaces, and thus considering $d_0,d_0',...,d_{n-1},d_{n-1}'$, with 96~bit hash inputs we would have to deal with $2 \times 96 \times n$ free bits.}.
+Another way to look at it would be to extend the hash inputs to include the union of both field-sets and to deal with any unused bits.
+To make the statement in \cref{eq:statement_multikeys} consider constraints between packets arriving at different ports with different RSS packet field options, we again add more clauses to our large conjunction, now considering all relevant RSS field sets, all while extracting for each one the required least significant bits of $d$ and $d'$ accordingly.
+
+When given the constraints of our firewall, \librs outputs two RSS keys, one for each NIC interface. The symmetry between the keys resembles the findings in \cite{Woo2012}, but generalized to two interfaces, rather than just one.
+
+%-------------------------------------------------------------------------------
+\subsection{Code Generator}
+%-------------------------------------------------------------------------------
+
+This stage takes the generated RSS configuration, as well as the NF's model, and outputs a parallel implementation of the original NF. Because the model is a sound and complete representation of the original NF, it can be used to generate an implementation identical in funcionality to the original one. More importantly, it can be modified to employ shared-nothing parallelism by (1) configuring RSS, (2) allocate the state independently for each core, (3) making sure that each stateful call uses the data structures' instances of that particular core, and (4) launching the NF in multiple cores.
+
+%-------------------------------------------------------------------------------
+\subsubsection{Parallel implementation with locking mechanisms}
+%-------------------------------------------------------------------------------
+When \maestro rules out a shared-nothing solution, it can fall back to generating parallel implementations that use locking mechanisms.
+In this scenario, it configures RSS with both a random key and all the available RSS-compatible packet fields, as now all cores share the same state.
+
+\maestro also needs to carefully coordinate access to shared data using read/write locks.
+As such, we distinguish read-packets from write-packets: the former trigger only stateful read operations, and the latter trigger at least one write.
+To efficiently handle this scenario, we created a custom, highly optimized read/write lock implementation that entirely avoids cache-line sharing when acquiring read locks.
+We do this with a series of per-core, cache-aligned, atomic spin-locks that indicate whether the core has permission to proceed.
+Acquiring a read lock requires just locking the current core's lock. To perform a write, however, one must lock all core-specific locks (in order, to avoid deadlocks).
+With this in place, we speculatively process all packets as read-only until they attempt to perform a write operation, at which point we stop processing, release the local lock, acquire all core-specific locks, and restart processing the packet from the beginning.
+
+The performance toll is minimized when an NF is subjected to read-heavy workloads (see \cref{subsection:benchmarks}), as read-only packets need only acquire a core-specific cache-aligned lock, and have no need to atomically write to any shared variable, or write to shared data. As all write-packets start out as read-packets before backtracking, starvation is not an issue.

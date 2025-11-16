@@ -1,0 +1,944 @@
+\documentclass{article} %
+\usepackage{times}
+
+\usepackage{fullpage}
+\usepackage{natbib}
+
+\usepackage[utf8]{inputenc} %
+\usepackage[T1]{fontenc}    %
+\usepackage{hyperref}       %
+\usepackage{url}            %
+\usepackage{booktabs}       %
+\usepackage{amsfonts}       %
+\usepackage{nicefrac}       %
+\usepackage{microtype}      %
+\usepackage{xcolor}         %
+\usepackage{multirow}
+\usepackage{listings}
+\usepackage{wrapfig}
+
+
+\usepackage{shortcuts}
+\newcommand{\kw}[1]{\noindent{\textcolor{purple}{\{{\bf KW:} \em{#1}\}}}}
+\newcommand{\yl}[1]{\noindent{\textcolor{red}{\{{\bf YL:} \em{#1}\}}}}
+\newcommand{\jx}[1]{\noindent{\textcolor{cyan}{\{{\bf JX:} \em{#1}\}}}}
+\newcommand{\ws}[1]{\noindent{\textcolor{orange}{\{{\bf WS:} \em{#1}\}}}}
+
+\newcommand{\env}{\textsc{JoinGym}}
+\newcommand{\Ntables}{N_{\text{tables}}}
+\newcommand{\Ncols}{N_{\text{cols}}}
+\newcommand{\sel}{\textrm{Sel}}
+
+\title{JoinGym: An Efficient Query Optimization\\Environment for Reinforcement Learning}
+
+\author{%
+Kaiwen Wang$^{*}$ \quad Junxiong Wang$^{*}$ \quad Yueying Li \quad Nathan Kallus \\
+Immanuel Trummer \quad Wen Sun \\
+\\
+Cornell University
+\\
+{\small
+\texttt{\{kw437,~jw2544,~yl3469,~kallus,~it224,~ws455\}@cornell.edu}
+}
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+\def\thefootnote{*}\footnotetext{Equal contribution.}\def\thefootnote{\arabic{footnote}}
+
+\begin{abstract}
+Join order selection (JOS) is the problem of ordering join operations to minimize total query execution cost and it is the core NP-hard combinatorial optimization problem of
+query optimization.
+In this paper, we present \textsc{JoinGym}, a lightweight and easy-to-use query optimization environment for reinforcement learning (RL) that captures both the left-deep and bushy variants of the JOS problem.
+Compared to existing query optimization environments, the key advantages of \textsc{JoinGym} are usability and significantly higher throughput which we accomplish by simulating query executions entirely offline.
+Under the hood, \textsc{JoinGym} simulates a query plan's cost by looking up intermediate result cardinalities from a pre-computed dataset.
+We release a novel cardinality dataset for $3300$ SQL queries based on real IMDb workloads which may be of independent interest, \eg, for cardinality estimation.
+Finally, we extensively benchmark four RL algorithms and find that their cost distributions are heavy-tailed, which motivates future work in risk-sensitive RL. In sum, \textsc{JoinGym} enables users to rapidly prototype RL algorithms on realistic database problems without needing to setup and run live systems.
+
+\end{abstract}
+
+\section{Introduction}
+Deep reinforcement learning (RL) has achieved many successes in games \citep{bellemare2013arcade,cobbe2020leveraging,schrittwieser2020mastering} and robotics simulators \citep{tassa2018deepmind,freeman2021brax}, which has driven most of the empirical research in RL.
+Beyond these settings, RL has the potential to greatly impact many other real-world domains such as congestion control \citep{tessler2022reinforcement}, job scheduling \citep{mao2016resource} and database query optimization \citep{marcus2019neo,Yang:EECS-2022-194,lim2023database}, which is the focus of this paper. Unfortunately most systems applications do not have realistic simulators and training occurs online in a live system. This makes RL research in these domains prohibitively expensive for most labs, which is not inclusive and slows down progress.
+It is thus crucial to develop realistic and efficient simulators to accelerate RL research for data systems problems. In this work, we present \env{}, the first lightweight and easy-to-use simulator for query optimization that can simulate real-world data management problems without needing to setup live systems.
+
+In database query optimization, join order selection (JOS; \emph{a.k.a.} join order optimization or access path selection) is the NP-hard combinatorial optimization problem of finding the query execution plan of minimum cost.
+Given the ubiquity of databases, the JOS problem is very practically important and this has motivated many works in search heuristics \citep{selinger1979access, chandra1980structure, vardi1982complexity, cosmadakis1988decidable} and RL \citep{marcus2019neo,yang2022balsa,marcus2018deep,krishnan2018learning}.
+The JOS problem exhibits three key challenges: (1) long-tailed return distributions, (2) generalization in discrete combinatorial problems, (3) partial observability. These challenges are common in real systems applications but are understudied since they are not captured by the popular game and robotic simulators.
+With \env{}, our aim is to provide a lightweight yet realistic simulator that can motivate methodological innovations in these three underexplored areas of RL.
+
+The novel idea that makes \env{} so efficient is to simulate query executions completely offline by looking up the size of intermediate tables from join sequences. These intermediate result (IR) cardinalities can be pre-computed since they are deterministic and system-agnostic. Along with \env{}, we also release a new dataset of IR cardinalities for $3300$ queries on the Internet Movie Database (IMDb). Our query set contains $100$ queries for each of the $33$ templates that reflect diverse user interests about movies; this is $30\times$ larger and more diverse than the Join Order Benchmark \citep[JOB;][]{leis2015good}.
+
+One trade-off of our offline approach is that cumulative IR cardinality is a proxy for the online runtime metrics that end users care about, \eg, query latency or resource consumption.
+However, it is well-established that minimizing IR cardinalities is by far the problem of query optimization that has the largest impact on execution cost \citep{lohman2014query,leis2015good,neumann2018adaptive,kipf2019estimating,trummer2021skinnerdb}. In particular, \citet{lohman2014query} observed that bad cost models typically account for at most 30\% degredation in runtime metrics, while high IR cardinalities can cause metrics to blow up by many orders of magnitude.
+Importantly, focusing on cardinality minimization affords computational advantages that we leverage: IR cardinalities are deterministic and system-agnostic so they can be pre-computed. In contrast, runtime metrics are system-dependent and can only be obtained from live query executions which are slow and costly. For example, large queries (\eg, $q29\_44$, $q29\_80$ in \env{}) can take days to process on a commercial database, especially if the RL policy selects a sub-optimal join order, while \env{} can simulate thousands of queries per second on a personal laptop.
+Thus, by reducing query optimization to its absolute core, we can provide a realistic lightweight simulator that is practically useful for RL research.
+
+We now briefly overview the paper.
+In \cref{sec:query-opt-prelims}, we mathematically formulate query optimization and recall the four variants of the JOS problem that are most often used in practice.
+Namely, \env{} supports both left-deep and bushy plans as well as enabling or disabling Cartesian products, which are common heuristics to reduce search space at the slight cost of optimality.
+Then in \cref{sec:impl-details}, we formulate JOS as a Partially Observable Contextual Markov Decision Process (POCMDP) and describe our design choices for the state, action, and reward. The context is partially observable because query embeddings are lossy compressions of base table contents and hence cannot fully determine the IR cardinalities. Finally, in \cref{sec:online-exps}, we perform an extensive benchmarking of standard RL algorithms on \env{}. We observe that return distributions are long-tailed and that generalization can be improved, which motivates further methodological RL research for problems in database query optimization and beyond.
+
+Our main contributions are summarized as follows:
+\begin{enumerate}[leftmargin=0.7cm]
+\item We provide the first lightweight simulator for query optimization that enables inexpensive and inclusive RL research on said problem.
+\item We release a novel dataset containing all IR cardinalities of $3300$ queries on IMDb, which is used by \env{} and may be of independent interest, \eg, cardinality estimation.
+\item We extensively benchmark RL algorithms on \env{} and find that existing algorithms can generalize well at the $90\%$ quantile. However, we observe that their generalization sharply worsens due to the long-tailed cost distribution.
+This motivates future research to address the key challenges of query optimization: 1) long-tailed returns, 2) generalization in combinatorial optimization, 3) partial observability.
+\end{enumerate}
+In sum, \env{} is an efficient and realistic environment that enables rapid prototyping of algorithms for query optimization. Our aim is to make query optimization accessible to the ML\&RL communities and to accelerate methodological research in the intersection of data systems and ML\&RL.
+\env{} and its datasets are open-sourced at \href{https://github.com/kaiwenw/JoinGym}{https://github.com/kaiwenw/JoinGym}.
+
+
+
+
+
+
+\section{Related Works}
+\paragraph{Environments for Query Optimization.}
+The query optimization environment from Park \citep{mao2019park} require a DBMS backend (\eg, PostgreSQL or Apache Calcite) and setting this up correctly can already be nontrivial. Their costs are computed by either querying the DBMS's cost model, which takes seconds per step, or online query execution time, which can take hours per step. Meanwhile, our costs are computed by looking up IR cardinalities and \env{} can simulate thousands of trajectories per second on a standard laptop, which is orders of magnitude faster than Park's environment. Also, Park only supports the $113$ queries of JOB, while \env{} supports $3300$ queries that we selected for diverse human searches based on templates from JOB.
+\citet{lim2023database} describes the architecture of DB-Gym, which like Park also runs in a real DBMS and thus can be very costly.
+
+\paragraph{Improving Query Optimization with RL.}
+Modern database systems typically posit a fixed data correlation between tables for cardinality estimation, which may lead to sub-optimal plans when these correlation assumptions break down. Hence, JOS is still an unsolved problem \citep{lohman2014query} and a natural idea is to apply data-driven approaches to more accurately estimate cardinalities \citep{Yang:EECS-2022-194}. \citet{marcus2019neo,krishnan2018learning,yang2022balsa} showed that deep RL can be competitive and improve over existing heuristics in certain settings. \citet{marcus2021bao,gunasekaran2023deep} showed that RL can auto-tune the parameters of the underlying DBMS and achieve superior performance. These prior works laid the foundation for the RL formulation that we adopt and improve on later in the paper. However, these prior works require setting up a DBMS and executing live queries, which as mentioned before can be slow and costly. Our goal is to make JOS accessible to RL researchers, without being slowed down by the setup and costs of real databases.
+
+
+
+
+
+
+
+
+
+
+
+\textbf{Other Related Environments. }
+The main RL challenges presented by \env{} are (1) long-tailed returns, (2) generalization and (3) partial observability.
+For (1), there are no RL environments based on realistic problems with long-tailed returns to the best of our knowledge. \env{} can serve as the first real-world benchmark for developing risk-sensitive RL that can optimize for the tail \citep{chow2015risk,ma2021conservative,wang2023near}.
+For (2), Procgen \citep{cobbe2020leveraging} is specifically designed for testing RL generalization by using procedural generated video games.
+For (3), POPGym \citep{morad2023popgym} provides a suite of games and navigation environments that are partially observable.
+There is a lack of environments for (2) \& (3) beyond games, and \env{} can serve as such a benchmark for combinatorial optimization and systems-inspired problems.
+
+
+
+\section{Database Query Optimization Preliminaries}\label{sec:query-opt-prelims}
+
+A database consists of $\Ntables$ tables, $\texttt{DB} = \braces{T_1,T_2,\dots,T_{\Ntables}}$,
+where each table $T_i$ has a set of $\Ncols(T_i)$ columns, $\text{Cols}(T_i) = \braces{C_{i,1},C_{i,2},\dots,C_{i,\Ncols(T_i)}}$.
+A SQL query can be abstracted into three parts $q = (I,U,J)$.
+First, $I=\{i_1,\dots,i_{|I|}\}\subset [\Ntables]$ specifies the tables needed for this query.
+Second, $U=\braces{u_i}_{i\in I}$ is a set of unary \emph{filter predicates} such that for each $i\in I$, a filtered table $\wt T_i = u_i(T_i)$
+is produced from keeping the rows of $T_i$ that satisfy the filter predicate $u_i$.
+The fraction of rows in $T_i$ that satisfy $u_i$ is defined as the \emph{selectivity}, $\sel_i = \nicefrac{|\wt T_i|}{|T_i|}$.
+Third, $J=\{P_{i_1i_2}\}_{i_1\neq i_2\in I}$ is a set of binary \emph{join predicates} that specify which columns should have matching values between two tables.
+
+Given two tables $R$ and $S$ and join predicates $P\subset [\Ncols(R)]\times [\Ncols(S)]$, define their binary join as
+\begin{equation}
+R\Join_P S
+= \braces{ r \cup s \mid r \in R, s \in S, r_a = s_b\; \forall (a,b)\in P }, \label{eq:def-join}
+\end{equation}
+where $r\cup s$ means concatenating rows $r$ and $s$, and $r_a = s_b$ stipulates that the $a$-th column of $r$ matches the $b$-th column of $s$ in value.
+Letting $\overline P=\{(b,a):(a,b)\in P\}$, we restrict $P_{i_1i_2}=\overline{P_{i_2i_1}}$.
+
+The \emph{result} of $q$ is $\tilde T_{i_1}\Join_{P_{i_1,i_2}\cup\cdots\cup P_{i_1,i_{|I|}}}(\tilde T_{i_2}\Join_{P_{i_2,i_3}\cup\cdots\cup P_{i_2,i_{|I|}}}\cdots(\tilde T_{i_{|I|-1}}\Join_{P_{i_{|I|-1},i_{|I|}}}\tilde T_{i_{|I|}}))$.
+However, there are different ways to execute the same query as different sequences of binary joins.
+For example, if $q=(\{1,2,3,4\},\{u_1,u_2,u_3,u_4\},\{P_{1,2},P_{1,3},\dots\})$, two different plans to execute the same query would be $\tilde T_1\Join_{P_{1,2}\cup P_{1,3}\cup P_{1,4}} (\tilde T_2 \Join_{P_{2,3}\cup P_{2,4}} (\tilde T_3\Join_{P_{3,4}}\tilde T_4))$ and $(\tilde T_1\Join_{P_{1,3}} \tilde T_3)\Join_{P_{1,2}\cup P_{1,4}\cup P_{3,2}\cup P_{3,4}} (\tilde T_2\Join_{P_{2,4}} \tilde T_4)$. The former involves the \emph{intermediate results} (IRs) $\mathrm{IR}_1=\tilde T_3\Join_{P_{3,4}}\tilde T_4$ and $\mathrm{IR}_2=\tilde T_2 \Join_{P_{2,3}\cup P_{2,4}} \mathrm{IR}_1$, while the latter involves the IRs $\mathrm{IR}_1=\tilde T_1\Join_{P_{1,3}} \tilde T_3$ and $\mathrm{IR}_2=\tilde T_2\Join_{P_{2,4}} \tilde T_4$.
+The IRs in each of these plans can have drastically different cardinalities and the plans can therefore have drastically different run-times and computational costs \citep{ramakrishnan2003database}.
+The IR cardinality generally depends on the selectivity of base tables and the correlation of joined columns.
+JOS is the problem of finding a feasible join order that achieves the minimum total size of all IRs, \ie, cardinalities.
+
+\paragraph{Left-Deep vs. Bushy Plans. }
+All join orders are expressible as a binary tree where the leaves are (filtered) base tables $\wt T_i$ and each internal node represents the IR from joining its two children. In the DB literature, the most important types of join plans are \emph{bushy} and \emph{left-deep} \citep{leis2015good}.
+Left-deep plans iteratively join base tables with the IR of cumulative joins so far, which is represented by a left-deep tree. Bushy plans allow for any possible binary tree; \eg, joining two non-base-table IRs is allowed in bushy plans but disallowed in left-deep plans. Left-deep plans usually suffice for fast query execution and reduce the search space of bushy plans by an exponential factor \citep{leis2015good}. However, computing the optimal plan is still NP-hard \citep{ibaraki1984optimal}.
+
+
+\paragraph{Disabling Cartesian Products to Reduce Search Space.}\label{sec:disable-cp}
+CPs are expensive join operations where no constraints are placed on the column values, \ie, the CP between $R$ and $S$ is $R\Join_{\emptyset} S = \braces{r\cup s\mid r\in R, s\in S}$, which always has cardinality equal to the product of the two source tables' cardinalities.
+Disabling (\ie, avoiding) \emph{Cartesian products} (CPs) has been a popular heuristic to reduce search space size by trading off optimality \citep{ramakrishnan2003database}.
+CP is indeed the most expensive binary join, but they can actually sometimes lead to smaller cumulative costs, \eg, it may be beneficial to CP two small tables before joining a large table \citep{vance1996rapid}.
+
+
+\section{\env{}: A Database Query Optimization Environment}\label{sec:impl-details}
+We formulate JOS as a Partially Observable Contextual Markov Decision Process (POCMDP), and then describe how we encode the context and observation that is implemented by \env{}.
+
+\subsection{Partially Observable Contextual MDP Formulation}
+Selecting the join order naturally fits into the POCMDP framework, since it is a sequence of actions (joins) and per-step costs (IR sizes) with the goal of minimizing the cumulative cost.
+This can be formulated as a (partially observable) contextual MDP, consisting of context space $\Xcal$, state space $\Scal$, finite action space $\Acal$, horizon $H$, transition kernels $P(s'\mid s,a)$, and contextual reward functions $r(s,a; x)$, where $s,s'\in\Scal,a\in\Acal,x\in\Xcal$.
+First, the context $x\in\Xcal$ is a fixed encoding of the query $q$. The trajectory is a join plan for this query and is generated as follows.
+At time $h\in[H]$, the state $s_h$ is the \emph{partial join plan} that has been executed so far, and the action $a_h$ specifies the join operation to perform now.
+For bushy plans, $a_h$ can be any valid edge in the join graph; for left-deep plans, $a_h$ is simply the $h$-th table to add to the left-deep tree.
+Performing the join specified by $a_h$ results in an IR, whose cardinality is the cost $c_h$.
+We define the reward as the negative step-wise regret $r_h\propto\nicefrac{C^\star_{\text{plan\_type}}}{H}-c_h$, where $C^\star_{\text{method}}$ is the minimum cumulative cost, for $\text{plan\_type}\in \braces{ \text{bushy}, \text{left-deep} }$.
+For numerical stability, we normalize our reward and clip each $c_h$ by $100 C^\star_{\text{plan\_type}}$.
+While $r_h$ can be either negative or positive, the cumulative reward is non-positive with zero being optimal. This procedure iterates until all queried tables are joined. For bushy plans, the horizon is the number of joins, \ie, $H=|J|=|I|-1$; for left-deep plans, the $a_1$ corresponds to staging the first table, which does not perform any joins, and so $r_1 = 0$ and $H=|J|+1=|I|$.
+\cref{tab:compare-left-bushy} summarizes this setup.
+
+
+\begin{table*}[t]
+\centering
+\def\arraystretch{1.5}%
+\footnotesize
+\begin{tabular} {|l|c|c|}
+\hline
+Components & Left-deep \env{} & Bushy \env{} \\
+\hline
+Context $x$ & \multicolumn{2}{c|}{ Query encoding described in \cref{sec:state-encoding}. } \\
+\hline
+State $s_h$ & \multicolumn{2}{c|}{ Partial plan encoding described in \cref{sec:state-encoding}. } \\
+\hline
+Action $a_h$ & Table to join, from Discrete($\Ntables$) & Edge to join, from Discrete($\binom{\Ntables}{2}$) \\
+\hline
+Reward $r_h$ & \multicolumn{2}{c}{ Negative step-wise regret: $r_h\propto\nicefrac{C^\star_{\text{plan\_type}}}{H}-c_h$ for $\text{plan\_type}\in \braces{ \text{left-deep},\text{bushy} }$ } \vline \\
+\hline
+Transition $P$ & \multicolumn{2}{c}{ Deterministic transition of dynamic state features, described in \cref{sec:state-encoding}. } \vline \\
+\hline
+Horizon $H$ & $|I|$ & $|I|-1$ \\
+\hline
+\end{tabular}
+\caption{Components of \env{} for deciding the join order of a single query $q=(I,U,J)$. Between the left-deep and bushy variants, the key difference is their actions (table vs edge). }
+\label{tab:compare-left-bushy}
+\vspace{-0.15in}
+\end{table*}
+
+\paragraph{Remarks.}
+First, the set of legal actions shrinks throughout the trajectory as the policy cannot choose joins that have already been selected, \ie, $\Acal=\Acal_1\supset\Acal_2\supset\dots\supset\Acal_H$. We handle this by \emph{action masking} \citep{huang2022closer}, where we constrain the policy's action selection and update rules to only consider legal actions at each step.\footnote{Another approach would be to give a large cost for choosing unavailable actions, but this would require the agent to learn to avoid such actions. We avoid this unnecessary learning with action masking.}
+Second, the transition and reward dynamics are \emph{deterministic} and stochasticity comes from the context since queries may be sampled from some distribution.
+Third, only the reward is contextual and the transition kernel is not. Our POCMDP formulation can be interpreted as a latent MDP \citep{kwon2021rl}, where each query is an MDP but we do not know the full information of the query but only see a partially observable context.
+
+
+\paragraph{Partial Observability.} Recall that each query $q$ is encoded by a context $x$ which in particular encodes the base tables. Partial observability arises when this encoding of the base tables is lossy, \ie, the encoding is not fully predictive of the IR cardinalities. Note that the Markov propery still holds for the non-contextual transition kernel and only the reward is affected by partial observability.
+In practical applications where base tables contain millions of rows, any tractable encoding will necessarily be lossy.
+The best representation for tables is still an open research question \citep{ortiz2018learning,marcus2019neo,Yang:EECS-2022-194}. \env{} can be easily modified to handle new table embeddings by changing a few lines of code. Our dataset of IR cardinalities remains valid for any embedding scheme as IR cardinalities are agnostic to the table representation.
+
+
+
+
+
+\subsection{Context and State Encoding} \label{sec:state-encoding}
+
+\label{sec:joingym}
+% Figure environment removed
+
+Given a query $q$, we represent the context $x = \prns*{ v^{\sel}(q), v^{\text{goal}}(q)}$ with two components that are fixed for this query.
+The first part is the \emph{selectivity encoding}, a vector $v^{\sel}(q)\in [0,1]^{\Ntables}$ where the $t$-th entry is the selectivity of $u_t$ if $t\in I$, and $0$ otherwise:
+\begin{equation}
+    \forall t\in[\Ntables]: v^{\sel}(q)[t] =
+    \begin{cases}
+        \sel_t, &\text{ if } t\in I, \\
+        0, &\text{ o/w }.
+            \end{cases}\notag %
+\end{equation}
+The second part is the \emph{query encoding}, a binary vector $v^{\text{goal}}(q)\in\braces{0,1}^{\Ncols}$ (abusing notation, we define $\Ncols = \sum_{T}\Ncols(T)$) representing which columns need to be joined in this query; the $c$-th entry is $1$ if column $c$ appeared in any join predicate, and $0$ otherwise:
+\begin{equation}
+    \forall c\in[\Ncols]: v^{\text{goal}}(q)[c] = \I{ \exists (R,S,P)\in J, \exists p\in P: c=p[0]\vee c=p[1] }. \notag%
+\end{equation}
+
+At time $h\in[H]$, we represent the state $s_h$ as the as \emph{partial plan encoding} $v^{\text{pp}}_h$, which represents the joins specified by prior actions $a_{1:h-1}$. Two examples are given in \cref{fig:trajectories}(d).
+The partial plan encoding is a vector $v^{\text{pp}}_h\in\braces{-1,0,1,2,\dots}^{\Ncols}$ where the $c$-th entry is positive if column $c$ has already been joined, $-1$ if the table of column $c$ has been joined or selected but column $c$ has not been joined yet, and $0$ otherwise.
+If column $c$ has already been joined, the $c$-th entry will be the index of its join-tree in the forest; in left-deep plans, the index will always be $1$ since there is always only one join-tree, but in bushy plans with more than one tree, the index can be larger than $1$.
+It is clearly important to mark joined columns (with positive numbers) since the policy needs to know which columns have been joined to choose the next action.
+In addition, we also mark unjoined columns belonging to joined or selected tables with the value $-1$. For example, in left-deep plans, we must be able to tell which table was selected by $a_1$ at $h=2$, even though said table has only been ``staged'' but not joined.
+Beyond this special case, another use-case of the $-1$-marking is that it signals marked columns as part of potentially small IR; perhaps the rows of the table has been filtered from a prior join and it is better to join with this table rather than an unjoined base table.
+We highlight that the partial plan encoding only logs which columns have been joined/staged rather than the current join tree, because future costs only depend on the current IRs rather than the tree structure.
+
+
+\subsection{Importance of Generalization in Query Optimization}
+In real applications such as IMDb, developers create \emph{query templates} so that searches by a user instantiates a template with filter predicates that reflect the user's interests.
+A query's template determines its final query graph and different query templates may often share common subgraphs.
+Using the query graph structure, deep RL models can \emph{generalize} to improve future query execution planning. For example in \cref{fig:query_plan}, the optimal join plan for (b) is a sub-tree of the optimal plan for (c).
+However, while queries with the same template have a common query graph, optimal join orders can vary significantly due to different filter conditions that are applied, \eg, \cref{fig:query_plan} (a) \& (b) are instances of the same template (and hence share the same graph) but have different optimal join orders.
+Thus, the key challenge in data-driven query optimization is to learn which correct query instances to mimic based on the context (\ie, filter predicates, query graph).
+
+
+
+
+
+% Figure environment removed
+
+
+
+\subsection{\env{} API}
+\env{} adheres to the standard Gymnasium API \citep{gymnasium}, a maintained fork of OpenAI Gym \citep{brockman2016openai}.
+The left-deep and bushy variants are registered under the environment-ids `\texttt{joinopt\_left-v0}' and `\texttt{joinopt\_bushy-v0}' respectively. \env can be instantiated with \texttt{env = gym.make(env\_id, disable\_cp, query\_ids)}, where \texttt{disable\_cp} is a flag for disabling Cartesian products (described in \cref{sec:disable-cp}), and \texttt{query\_ids} is a set of queries that will be loaded.
+\env{} implements the abstract MDP described in \cref{sec:joingym} via the standard Gymnasium API:
+\begin{enumerate}[label=(\roman*),leftmargin=0.7cm]
+    \item \texttt{state, info = env.reset(options=\{query\_id=x\})}: reset the trajectory to represent the query with id \texttt{x}, and observe the initial state. If no \texttt{query\_id} is specified, then a random query is picked from the query set inputted to the constructor.
+    \item \texttt{next\_state, reward, done, \_, info = env.step(action)}: perform join operation specified by \texttt{action}, and observe the next state and reward. \texttt{done} is \texttt{True} if and only if all tables of the current query have been joined.
+    There is no step truncation, so we ignore the fourth output of the Gymnasium specification for \texttt{env.step}.
+\end{enumerate}
+Above, \texttt{state} \& \texttt{next\_state} are vector representations of the partially observed state, described in \cref{sec:state-encoding}. Moreover, \texttt{info[`action\_mask']} is a multi-hot encoding of the valid actions $\Acal_h$ at the current step. The RL algorithm should take this into account, \eg, masking out Q-values, so only valid actions are considered. We provide examples of how to do this in our experimental code.
+
+
+\subsection{New Dataset of IR cardinalities}
+Recall that \env{} contains $3300$ IMDb queries, comprised of $100$ queries for each of the $33$ templates from the Join Order Benchmark \citep[JOB;][]{leis2015good}. The $M$-th query from the $N$-th template has query id $qN\_M$, with $N\in[33],N\in[100]$.
+Our query set is $30\times$ larger and more diverse than the $113$ queries of the JOB that were used in prior works \citep{mao2019park}.
+With \env{}, we release a new dataset containing all possible IR cardinalities for all $3300$ queries, which was an exhaustive pre-computation we ran on hundreds of CPUs for weeks. We describe our query generation process in \cref{app:generating-queries}.
+\env{} relies on this dataset to simulate query plan costs offline by simply looking up the IR cardinalities, instead of executing queries online.
+Beyond its use in \env{}, this dataset may also be of independent interest for research in cardinality estimation \citep{han2021cardinality} and representation learning for query and table embeddings \citep{ortiz2018learning}.
+
+
+\section{Benchmarking Reinforcement Learning on \env{}}\label{sec:online-exps}
+
+\begin{wrapfigure}{r}{0.5\textwidth}
+\centering
+% Figure removed
+\caption{Complementary CDF of the CCM distribution over train, validation and test queries, of the best algorithm (TD3) for ``disable CP \& left-deep``.}
+\label{fig:ccdf-main-text}
+\end{wrapfigure}
+\leavevmode
+
+
+\begin{table*}[!th]
+\centering
+\def\arraystretch{1.2}%
+\scriptsize
+\begin{tabular}{|l|l|l|r|r|r|r|r|r|r|r|r|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{Mean}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 8.9e+06 & 2.7e+04 & 3.6e+06 & 4.1e+04 & \bfseries \color{violet} 1.9e+04 & 1e+05 & 8e+04 & 4.9e+04 & 1.8e+06 \\
+\cline{3-12}
+ &  & val & 3.4e+04 & 1.8e+04 & 1.9e+04 & 2.4e+04 & 1.9e+04 & \bfseries \color{violet} 1.7e+04 & 4.1e+04 & 3e+04 & 2.8e+04 \\
+\cline{3-12}
+ &  & tst & 2.6e+05 & 1.4e+05 & 4.1e+05 & 8.3e+04 & 1.5e+05 & \bfseries \color{violet} 3.4e+04 & 3.8e+04 & 3.5e+04 & 1.3e+05 \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & \bfseries \color{violet} 4e+03 & 1.3e+04 & 2.2e+04 & 8.3e+03 & 1.3e+06 & 4.4e+03 & 4e+06 & 2.8e+05 & 2.1e+04 \\
+\cline{3-12}
+ &  & val & 1.5e+04 & 1.2e+04 & 1.4e+04 & \bfseries \color{violet} 9.2e+03 & 1.6e+04 & 1.3e+04 & 2e+04 & 1.2e+04 & 1.1e+04 \\
+\cline{3-12}
+ &  & tst & 2.9e+05 & 1.7e+05 & 1.1e+05 & 4.5e+05 & 1.9e+04 & \bfseries \color{violet} 1.8e+04 & 4.7e+05 & 2.5e+05 & 4.6e+04 \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 2e+45 & 1.5e+50 & 3e+37 & 5.8e+33 & 7.8e+26 & 1.1e+24 & 1.7e+47 & 2.1e+53 & \bfseries \color{violet} 1.1e+15 \\
+\cline{3-12}
+ &  & val & 1.4e+30 & 1.6e+29 & 8.1e+25 & 5.3e+21 & 2.1e+05 & \bfseries \color{violet} 1.8e+05 & 1.6e+42 & 3.5e+42 & 3.8e+05 \\
+\cline{3-12}
+ &  & tst & 2.4e+46 & 1.7e+45 & 2.2e+41 & 8.5e+30 & 3.2e+25 & \bfseries \color{violet} 3.6e+19 & 4e+49 & 4.1e+51 & 1.3e+28 \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 3.3e+24 & 9.3e+08 & 1.9e+08 & 1.5e+14 & 1.5e+14 & 1.6e+05 & \bfseries \color{violet} 1.3e+04 & 1.8e+04 & 7.9e+10 \\
+\cline{3-12}
+ &  & val & 2.4e+04 & 1.8e+04 & 2.6e+04 & 2.2e+04 & 1.6e+05 & 2.3e+04 & \bfseries \color{violet} 1.2e+04 & \bfseries \color{violet} 1.2e+04 & 4.8e+04 \\
+\cline{3-12}
+ &  & tst & 7.7e+14 & 1.9e+11 & 8.1e+17 & 1.4e+27 & 2.1e+10 & 1.7e+25 & \bfseries \color{violet} 5.6e+05 & 1.1e+06 & 5.2e+23 \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\begin{tabular}{|l|l|l|r|r|r|r|r|r|r|r|r|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{$90\%$ Quantile}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 7.3 & \bfseries \color{violet} 4.4 & 5.2 & 5.6 & 5.3 & 7.3 & 13 & 9.5 & 6 \\
+\cline{3-12}
+ &  & val & 16 & \bfseries \color{violet} 13 & 14 & 15 & 15 & 18 & 18 & \bfseries \color{violet} 13 & 23 \\
+\cline{3-12}
+ &  & tst & 46 & \bfseries \color{violet} 25 & 30 & 30 & 26 & 40 & 55 & 33 & 42 \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 5.5 & 5.6 & 7 & 6.5 & 6.9 & \bfseries \color{violet} 5.2 & 11 & 8.6 & \bfseries \color{violet} 5.2 \\
+\cline{3-12}
+ &  & val & 12 & 15 & 13 & 14 & 13 & \bfseries \color{violet} 9.5 & 20 & 14 & 11 \\
+\cline{3-12}
+ &  & tst & 28 & 30 & 34 & 34 & 22 & 20 & 39 & 32 & \bfseries \color{violet} 19 \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 6.4e+04 & 2.4e+05 & 4.6e+04 & 3.2e+04 & 1.8e+02 & 42 & 7.7e+18 & 3e+14 & \bfseries \color{violet} 35 \\
+\cline{3-12}
+ &  & val & 2e+05 & 1.1e+06 & 5.8e+04 & 6e+04 & 3.1e+02 & 1.4e+02 & 4e+18 & 2.8e+14 & \bfseries \color{violet} 1e+02 \\
+\cline{3-12}
+ &  & tst & 1.6e+05 & 1.2e+05 & 2.1e+05 & 6.9e+04 & 2e+03 & 4.9e+02 & 2.2e+17 & 2.1e+17 & \bfseries \color{violet} 2.8e+02 \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 17 & \bfseries \color{violet} 6.3 & 17 & 9.9 & 3.6e+02 & 17 & 7.7 & 6.8 & 9.9 \\
+\cline{3-12}
+ &  & val & 25 & 15 & 27 & 22 & 2e+02 & 24 & 13 & \bfseries \color{violet} 12 & 27 \\
+\cline{3-12}
+ &  & tst & 64 & 36 & 66 & 59 & 1.7e+03 & 1e+02 & \bfseries \color{violet} 28 & 30 & 92 \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\caption{The top table contains the average CCM (lower is better) over the training (trn), validation (val) or testing (tst) query sets and over four possible environments. The bottom table contains the $90\%$ quantile CCM.
+RB stands for ``replay buffer''; PER stands for ``prioritized experience replay''. We highlight the best performing algorithm (lowest CCM) in each row.}
+\label{tab:new-data-results}
+\vspace{-0.15in}
+\end{table*}
+
+We present benchmarking results on \env{} that measure the performance of popular RL methods on the JOS task. We're specifically interested in testing the generalization abilities of these algorithms on tasks with long-tailed returns as well as partial observability.
+
+\textbf{Experiment Setup. }
+Recall that our new dataset contains $100$ queries for each of the $33$ templates from the JOB \citep{leis2015good}. For each template, we randomly selected $60,20,20$ queries for training ($1980$ queries), validation ($660$ queries) and testing ($660$ queries) respectively.
+We benchmarked four different RL algorithms: (i) an off-policy Q-learning algorithm Deep Q-Network (DQN) \citep{mnih2015human}; (ii-iii) two off-policy actor-critic algorithms, Twin Delayed Deep Deterministic policy gradient (TD3) \citep{fujimoto2018addressing} and Soft Actor-Critic (SAC) \citep{haarnoja2018soft}; and (iv) an on-policy actor-critic algorithm Proximal Policy Optimization (PPO) \citep{schulman2017proximal}.
+For DQN, we conducted an ablation with the Double Q-learning \citep{van2016deep}.
+For (i-iii), we conducted ablations with standard replay buffer (RB) vs. prioritized experience replay (PER) \citep{schaul2015prioritized}.
+
+\textbf{Training and Evaluation. }
+All algorithms were trained for \emph{one million steps} on the training queries and the best performing algorithm was selected by the cumulative cost multiple (CCM) averaged over the validation queries.
+We define the \emph{cumulative cost multiple} (CCM) as the cumulative IR cardinality of the join plan divided by the smallest possible cumulative IR cardinality for this query.
+This can be interpreted as a \emph{multiplicative regret} and lower is better.
+We sweeped over multiple learning rates per algorithm and also used the average CCM on the validation queries for selecting the best hyperparameter. For these best hyperparameters, we report the average CCM over the test queries in \cref{tab:new-data-results}. As shown in \cref{fig:ccdf-main-text}, the CCM distributions are long-tailed so we also report the $p90$ CCM ($90\%$ quantile) over each query set. Our results are averaged over $10$ seeds and we report the standard errors along additional $p95$ \& $p99$ results in \cref{sec:full-results}. An example learning curve of the best algorithm (TD3) for left-deep plans with CPs disabled is shown in \cref{fig:learning_curve}.
+
+
+\textbf{Discussion. }
+\textbf{1)} Algorithms uniformly perform much better in left-deep \env{} than bushy \env{} because the search space is exponentially smaller. For the same reason, algorithms uniformly perform better when CPs are disallowed.
+The hardest setting is bushy with CPs, where most algorithms diverge and those that converge have CCMs orders of magnitude worse than the other settings.
+\textbf{2)} Regarding generalization, the gap between the validation and test performance is only $2\times$ for $p90$ and it increases to $10\times$ for $p95$. For $p99$, both the validation and test performance are significantly worse than training. This exponential widening of the generalization gap is likely explained by the fact that the long tail is exactly where partial observability is more pronounced, causing catastrophic failure in planning of the policy.
+\textbf{3)} Off-policy actor critic methods (TD3 \& SAC) achieve the best results for the mean and are also near-optimal for the quantiles. They are more sample efficient than PPO due to their sample reuse and more stable than DQN for the query optimization task. We also find that prioritized replay does not always improve performance.
+
+
+% Figure environment removed
+
+
+
+
+\section{Conclusion}
+In this work, we presented \env{}, the first efficient simulator for query optimization based on IR cardinalities which we hope can accelerate research in the intersection of RL and systems.
+\emph{For the RL community}, \env{} is a realistic environment for prototyping data-driven combinatorial optimization algorithms. Notably, it exhibits specific challenges in long-tailed returns, generalization and partial observability, which are underexplored by existing simulators, \eg, Atari and MuJoCo.
+\emph{For the systems community}, this work also provides a new dataset of IR cardinalities, which can be useful for improving cardinality estimation algorithms \citep{Yang:EECS-2022-194,han2021cardinality} and representation learning for query and table embeddings \citep{ortiz2018learning}.
+Finally, we believe that risk-sensitive RL can play an important role in dealing with the long-tailed returns, which are common in systems applications.
+In our experiments, we found that standard RL algorithms can generalize well at the $90\%$ quantile, but their performance sharply drops at higher quantiles, \eg, $95\%$ or $99\%$. Risk-sensitive RL can optimize for the worst $\tau$-percent of outcomes, \eg, Conditional Value-at-Risk (CVaR), which would ensure better tail performance. Existing works in CVaR RL \citep{lim2022distributional,urp2021riskaverse,ma2021conservative} have focused on noisy versions of games and MuJoCo, so it would be promising future work to develop and test such algorithms for real systems applications.
+
+
+
+
+
+
+
+\newpage
+\bibliographystyle{plainnat}
+\bibliography{main}
+
+\newpage
+\appendix
+
+
+\newpage
+
+\newpage
+\appendix
+\onecolumn
+
+
+\begin{center}\LARGE
+\textbf{Appendices}
+\end{center}
+
+\section{List of Abbreviations and Notations}
+
+{\renewcommand{\arraystretch}{1.2}%
+\begin{table}[h!]
+    \centering
+      \caption{List of Abbreviations} \vspace{0.3cm}
+    \begin{tabular}{l|l}
+    JOS & Join Order Selection \\
+    DB & Database \\
+    IR & Intermediate result table \\
+    CP & Cartesian product join \\
+    JOB & Join Order Benchmark \citep{leis2015good}\\
+    CCM & Cumulative Cost Multiple
+    \end{tabular}
+    \label{tab:abbrev}
+\end{table}
+}
+
+
+{\renewcommand{\arraystretch}{1.2}%
+\begin{table}[h!]
+    \centering
+      \caption{List of Notations} \vspace{0.3cm}
+    \begin{tabular}{l|l}
+    $\Ntables$ & Number of tables in the DB \\
+    $\Ncols(T)$ & Number of columns in table $T$ \\
+    $\Ncols$ & Total number of columns amongst all tables in DB \\
+    $A \Join_P B$ & Binary join operator, defined in \cref{eq:def-join} \\
+    \end{tabular}
+    \label{tab:notation}
+\end{table}
+}
+
+
+\section{Statistics about \env{}}\label{app:joingym-statistics}
+
+
+% Figure environment removed
+
+
+\paragraph{Search space of Left-deep vs. Bushy plans.}
+Recall that left-deep plans only allow for left-deep join trees, while bushy plans allow for arbitrary binary trees. We can compute the size of the search space for both types of plans, which is a simple exercise in combinatorics.
+With $|I|$ tables, there are $|I|!$ possible left-deep plans and $|I|!C_{|I|-1}$ bushy plans, where the $k$-th Catalan number $C_{k}$ is the number of unlabeled binary trees with $k+1$ leafs.
+By Stirling's approximation, $n!\approx\Theta\prns*{\sqrt{n}\prns*{\frac{n}{e}}^n}$ and $n!C_{n-1}\approx\Theta\prns*{n^{-1}\prns*{\frac{4n}{e}}^n}$.
+The middle of \cref{fig:mdp_statistics} illustrates the exponential growth of two different search spaces (\ie, left-deep search space and bushy search space) as the number of join tables increases. The bushy search space exhibits even faster growth compared to the left-deep plans. In our most challenging query template, search space exceeds $10^{15}$ for left-deep plans and surpasses $10^{23}$ for bushy plans.
+While left-deep plans usually suffice for fast query execution, bushy plans can sometimes yield join plans with smaller IR cardinalities and faster runtime \citep{leis2015good}.
+
+
+\textbf{Statistics of queries in \env{}. }
+The left of \cref{fig:mdp_statistics} shows the distribution of the number of join tables in \env{}. More than half of the queries join at least nine tables. The right figure shows the sorted cumulative IR sizes of different join orders for the same representative query. The left-most point is the optimal plan. The sharp jump in cardinalities from the optimal illustrates the key challenge of query optimization.
+
+
+
+\section{Further Comparison with Related Database Environments}
+
+Unlike other data system gym environments \citep{mao2019park,lim2023database} or reinforcement learning (RL) on real database systems \citep{marcus2019neo,yang2022balsa,krishnan2018learning}, which execute queries online and use runtime costs as rewards, our environment is lightweight (i.e., it uses offline traces) and focuses on the fundamental challenge in query optimization: cardinality estimation. With the JoinGym environment, users can simulate millions of large joins within just a few minutes, whereas it takes a few hours (e.g., q24\_20, q24\_98), even a few days (e.g., q29\_44, q29\_80) to run some queries  with the default configuration in PostgreSQL, which makes the other system slow and expensive.
+
+\paragraph{Why IR cardinality is a good proxy for the cost of a query plan?}
+\begin{enumerate}[leftmargin=15pt]
+    \item \citet{lohman2014query} puts it eloquently, ``The root of all evil, the Achilles Heel of query optimization, is the estimation of the size of intermediate results, known as cardinalities. In my experience, the cost model may introduce errors of at most 30\% for a given cardinality, but the cardinality model can quite easily introduce errors of many orders of magnitude! Let’s attack problems that really matter, those that account for optimizer disasters, and stop polishing the round ball.''
+    \item \citet{neumann2018adaptive} adopts IR cardinalities as the key metric for benchmarking query optimization algorithms. Numerous database papers focus on enhancing cardinality estimation with sketching/statistical methods \citep{kipf2019estimating} and neural models \citep{kipf2018learned}. Also, many database theory works \citep{atserias2013size,ngo2018worst} focus on designing new algorithms to minimize the size of the intermediate result.
+    \item Furthermore, the IR cardinality metric provides computational advantages, which we leverage: (i) IR cardinality does not depend on specific system configurations (e.g., IO and CPU); (ii) IR cardinality is deterministic so we can pre-compute it for all our queries; (iii) with our pre-computed dataset, users can simulate millions of large joins within just a few minutes.
+\end{enumerate}
+
+In sum, IR cardinality is the most common and important metric for query optimization algorithms. At the same time, its system-independent and deterministic nature allows us to design a realistic environment that is lightweight, enabling ML \& RL researchers from diverse communities to collaboratively tackle the core problem in query optimization.
+
+\paragraph{State and context embeddings. }
+We use the same selectivity encoding as
+\textsc{Balsa} \citep{yang2022balsa} and \textsc{Neo} \citep{marcus2019neo}. However, their query encoding is an adjacency matrix (at the table level) that preserves the tree structure, while we encode queries with a multi-hot vector (at the column level) marking which columns should be joined, similar to \textsc{DP} \citep{krishnan2018learning} and \textsc{ReJoin} \citep{marcus2018deep}.
+To the best of our knowledge, marking the tree's component index in the partial plan encoding is novel and allows us to handle bushy plans without keeping track of the whole tree; except \textsc{DP}, the aforementioned works only consider left-deep trees.
+Note that since the graph structure does not influence future IR sizes but column information does, our encoding is more compact than prior encoding schemes of \textsc{Balsa} and \textsc{Neo}.
+\env{} is designed so that one can easily change the state and context encoding schemes without needing to collect any more data, which is the costly step of building \env{} that we have already finished.
+
+
+\section{Implementation Details of \env{}}
+We now describe the specific implementation details of \env{}. This section is intended for advanced users who want to change how we encode state, actions or rewards. We appreciate any questions or feedback and welcome pull requests.
+
+Our code registers two \texttt{gymnasium.Env} classes that implement bushy and left-deep join plans:
+\begin{enumerate}[leftmargin=2em]
+    \item \texttt{JoinOptEnvBushy} (in file \texttt{join\_optimization/envs/join\_opt\_env\_bushy.py}),
+    \item \texttt{JoinOptEnvLeft} (in file \texttt{join\_optimization/envs/join\_opt\_env\_left.py}).
+\end{enumerate}
+As mentioned in \cref{tab:compare-left-bushy}, the main difference between these two environments lies in their action space; a bushy plan's actions are pairs of tables, while a left-deep plan's actions are single tables. Since their state representations are nearly identical, both \texttt{JoinOptEnvBushy} and \texttt{JoinOptEnvLeft} subclass a base class called \texttt{JoinOptEnvBase} (in file \texttt{join\_optimization/envs/join\_opt\_env\_base.py}), which we describe first.
+
+
+\paragraph{JoinOptEnvBase}
+This base class handles most of the \texttt{\_\_init\_\_} initialization work of loading in the database schema, loading in the IR cardinality dataset, as well as constructing the selectivity encoding $v^{\text{Sel}}(q)$ and goal encodings $v^{\text{goal}}(q)$ (defined in \cref{sec:state-encoding}) for all the queries $q$ in our dataset. Recall that $v^{\text{Sel}}(q)$ and $v^{\text{goal}}(q)$ are static during the trajectory, so we can pre-compute them when initializing the environment.
+
+\texttt{JoinOptEnvBase} also contains a helper function \texttt{log\_cardinality\_to\_reward} that converts log IR cardinality at step $h$, \ie, $\log c_h$, to this step's reward $r_h = \frac{1}{C_{\max}(q)}\prns{ C_{\min}(q) - \exp\prns{ \min\braces{\log c_h, \log C_{\max}(q)} } }$, where $C_{\max}(q)=100\cdot C^\star(q)$, $C^\star(q)$ is the optimal (minimum-possible) \emph{cumulative} IR cardinality for query $q$, and $C_{\min}(q) = \nicefrac{C^\star(q)}{\text{num tables to join in }q}$. To interpret this expression, note that $\exp\prns{ \min\braces{\log c_h, \log C_{\max}(q)} } = \min\braces{c_h, C_{\max}(q)}$. We perform the clipping since IR cardinalities can get large, especially with Cartesian products enabled; this is also why we perform clipping inside the $\exp$ and work in log-space. Next, we can interpret $\sum_h c_h - C_{\min}(q)$ as essentially the regret of this trajectory, as $C_{\min}(q)\cdot H=C^\star(q)$. Finally, the scaling by $\nicefrac{1}{C_{\max}(q)}$ is for normalization. In essence, our reward is the per-step negative regret.
+
+\paragraph{JoinOptEnvLeft and JoinOptEnvBushy}
+Each class has three main jobs: 1) maintaining the left-deep join tree, 2) a function to compute the partial plan encoding, 3) a function for computing the valid action masks. As for (1), since left-deep and bushy trees have different structures, we maintain them in different ways, though they both use the \texttt{TreeNode} data structure to do so. For (2), the partial plan encoding can be computed by examining the \texttt{TreeNode} so far, and only retaining the useful information. Finally, since the action spaces are different, each class has different functions for the valid action mask (3). It is worth highlighting that each class has two functions for computing the valid action mask: \texttt{self.valid\_action\_mask()} is used when Cartesian products are allowed, and \texttt{self.valid\_action\_mask\_with\_heurstic()} is used otherwise.
+
+
+
+\section{Mechanism for generating queries}\label{app:generating-queries}
+
+We use the $33$ predefined query templates of the Join Order Benchmark (JOB) \citep{leis2015good} and introduce variations in unary predicates, \ie, filter statements, to generate new queries. To randomly generate realistic unary predicates, we begin by conducting a manual examination of all columns within each table to select a subset of columns that are typically used in real user queries. The columns we identified were \texttt{aka\_name(name), aka\_title(title), char\_name(name), comp\_cast\_type(kind), company\_name(name, country\_code), company\_type(kind), info\_type(info), keyword(keyword), kind\_type(kind), link\_type(link), movie\_companies(note), movie\_info(info), movie\_info\_idx(info), name(name), person\_info(note), role\_type(role), title(title, production\_year)}. To simulate searches by real IMDb users, we compiled the top $100$ most common values for each column using ChatGPT. If any column has less than $100$ unique values, we do not need to use ChatGPT and simply used all the possible values.
+
+For example, consider the SQL template \texttt{q1}, reproduced below.
+\begin{lstlisting}[language=sql]
+SELECT MIN(mc.note) AS production_note,
+       MIN(t.title) AS movie_title,
+       MIN(t.production_year) AS movie_year
+FROM company_type AS ct,
+     info_type AS it,
+     movie_companies AS mc,
+     movie_info_idx AS mi_idx,
+     title AS t
+WHERE ct.id = mc.company_type_id
+  AND t.id = mc.movie_id
+  AND t.id = mi_idx.movie_id
+  AND mc.movie_id = mi_idx.movie_id
+  AND it.id = mi_idx.info_type_id
+\end{lstlisting}
+
+We consider unary predicates from those candidate columns \texttt{company\_type(kind), info\_type(info), movie\_companies(note),  movie\_info\_idx(info), title(title, production\_year)}. For each candidate column, we flip a coin and decide to add a unary predicate with probability $50\%$. Suppose that the coin flips for each column were respectively $1,0,0,0$, so we only choose the \texttt{company\_type(kind)} column to create a unary predicate.
+Subsequently, we pick random number $n\sim \text{Unif}(\braces{1,2,3,4,5})$ and take $n$ random elements from the `top-100 list' described above.
+Suppose that $n = 2$ and we randomly sampled `production companies' and `special effects companies' from the `top-100 list' for the \texttt{company\_type(kind)} column. This process leads us to the resulting query \texttt{q1\_0}.
+\begin{lstlisting}[language=sql]
+SELECT MIN(mc.note) AS production_note,
+    MIN(t.title) AS movie_title,
+    MIN(t.production_year) AS movie_year
+FROM company_type AS ct,
+    info_type AS it,
+    movie_companies AS mc,
+    movie_info_idx AS mi_idx,
+    title AS t
+WHERE ct.id = mc.company_type_id
+    AND t.id = mc.movie_id
+    AND t.id = mi_idx.movie_id
+    AND mc.movie_id = mi_idx.movie_id
+    AND it.id = mi_idx.info_type_id
+    AND ct.kind in ('production companies',
+        'special effects companies')
+\end{lstlisting}
+Note the key addition is the last filter statement, \texttt{AND ct.kind in (`production companies', `special effects companies')}.
+We repeat this procedure $99$ more times to produce \texttt{q1\_0}, \dots, \texttt{q1\_99}.
+We repeat the above for the $32$ remaining templates \texttt{q2}, \dots, \texttt{q33}, which yields the $100\times 33=3300$ random queries that make up our new dataset.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{Limitations}
+
+\paragraph{Multiple base tables in a query.}
+Our current solution is to introduce duplicate tables and treat tables from the same basetables differently. Given query templates, our encoding has $n$ positions for a basetable, where
+$n$ is the maximum number of times this basetable appears among all query templates. We assume that query templates are fixed. We acknowledge that this solution may not be elegant and can be improved in future work.
+
+\paragraph{Dynamic workload.}
+In this benchmark, we assume the RL agent is trained and evaluated on the same database, \ie, we assume the DB content is kept static as in prior works \citet{yang2022balsa}. However, in real applications, the database may dynamically change over time.
+It is possible to add more queries and databases to \env{} by simply running our data collection script to collect more cardinality data. %
+
+\section{Additional Results for Online RL}\label{sec:full-results}
+
+The following tables show the mean, $p90$, $p95$, $p99$ results with standard error confidence intervals computed over $10$ seeds.
+\begin{table*}
+\centering
+\def\arraystretch{1.2}%
+\scriptsize
+\begin{tabular}{|l|l|l|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{Mean}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 8.9e+06 (8.8e+06) & 2.7e+04 (2.6e+04) & 3.6e+06 (3.6e+06) & 4.1e+04 (3.7e+04) & \bfseries \color{violet} 1.9e+04 (1.1e+04) & 1e+05 (5.7e+04) & 8e+04 (3.2e+04) & 4.9e+04 (1.3e+04) & 1.8e+06 (1.7e+06) \\
+\cline{3-12}
+ &  & val & 3.4e+04 (1e+04) & 1.8e+04 (2.5e+03) & 1.9e+04 (3.3e+03) & 2.4e+04 (2.8e+03) & 1.9e+04 (3.1e+03) & \bfseries \color{violet} 1.7e+04 (3.7e+03) & 4.1e+04 (4.1e+03) & 3e+04 (7.5e+03) & 2.8e+04 (2.5e+03) \\
+\cline{3-12}
+ &  & tst & 2.6e+05 (1.4e+05) & 1.4e+05 (3.3e+04) & 4.1e+05 (1.4e+05) & 8.3e+04 (2.5e+04) & 1.5e+05 (9.2e+04) & \bfseries \color{violet} 3.4e+04 (6e+03) & 3.8e+04 (1e+04) & 3.5e+04 (9.8e+03) & 1.3e+05 (4.6e+04) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & \bfseries \color{violet} 4e+03 (7.7e+02) & 1.3e+04 (6.9e+03) & 2.2e+04 (1.1e+04) & 8.3e+03 (5.8e+03) & 1.3e+06 (1.3e+06) & 4.4e+03 (2.7e+02) & 4e+06 (1.7e+06) & 2.8e+05 (2.7e+05) & 2.1e+04 (1e+04) \\
+\cline{3-12}
+ &  & val & 1.5e+04 (1.5e+03) & 1.2e+04 (1.3e+03) & 1.4e+04 (2.6e+03) & \bfseries \color{violet} 9.2e+03 (1.2e+03) & 1.6e+04 (3.7e+03) & 1.3e+04 (1.4e+03) & 2e+04 (2.4e+03) & 1.2e+04 (1.4e+03) & 1.1e+04 (1e+03) \\
+\cline{3-12}
+ &  & tst & 2.9e+05 (2.3e+05) & 1.7e+05 (8.8e+04) & 1.1e+05 (6.2e+04) & 4.5e+05 (2e+05) & 1.9e+04 (3.7e+03) & \bfseries \color{violet} 1.8e+04 (4e+03) & 4.7e+05 (1.9e+05) & 2.5e+05 (1.1e+05) & 4.6e+04 (2.6e+04) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 2e+45 (2e+45) & 1.5e+50 (1.5e+50) & 3e+37 (2.9e+37) & 5.8e+33 (5.7e+33) & 7.8e+26 (7.8e+26) & 1.1e+24 (1.1e+24) & 1.7e+47 (1.7e+47) & 2.1e+53 (2.1e+53) & \bfseries \color{violet} 1.1e+15 (1.1e+15) \\
+\cline{3-12}
+ &  & val & 1.4e+30 (1.4e+30) & 1.6e+29 (1.6e+29) & 8.1e+25 (5.4e+25) & 5.3e+21 (5.3e+21) & 2.1e+05 (6.8e+04) & \bfseries \color{violet} 1.8e+05 (4.2e+04) & 1.6e+42 (8.8e+41) & 3.5e+42 (2.2e+42) & 3.8e+05 (1.1e+05) \\
+\cline{3-12}
+ &  & tst & 2.4e+46 (2.4e+46) & 1.7e+45 (1.7e+45) & 2.2e+41 (2.2e+41) & 8.5e+30 (7.5e+30) & 3.2e+25 (3.2e+25) & \bfseries \color{violet} 3.6e+19 (3.6e+19) & 4e+49 (4e+49) & 4.1e+51 (3.4e+51) & 1.3e+28 (1.3e+28) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 3.3e+24 (3.3e+24) & 9.3e+08 (9.3e+08) & 1.9e+08 (1.4e+08) & 1.5e+14 (1.5e+14) & 1.5e+14 (1.5e+14) & 1.6e+05 (7.1e+04) & \bfseries \color{violet} 1.3e+04 (7.3e+03) & 1.8e+04 (1.1e+04) & 7.9e+10 (5.6e+10) \\
+\cline{3-12}
+ &  & val & 2.4e+04 (5e+03) & 1.8e+04 (2.9e+03) & 2.6e+04 (3.1e+03) & 2.2e+04 (2.1e+03) & 1.6e+05 (5.7e+04) & 2.3e+04 (4.1e+03) & \bfseries \color{violet} 1.2e+04 (1.3e+03) & \bfseries \color{violet} 1.2e+04 (8e+02) & 4.8e+04 (1.2e+04) \\
+\cline{3-12}
+ &  & tst & 7.7e+14 (5.5e+14) & 1.9e+11 (1.5e+11) & 8.1e+17 (7.5e+17) & 1.4e+27 (1.4e+27) & 2.1e+10 (2.1e+10) & 1.7e+25 (1.7e+25) & \bfseries \color{violet} 5.6e+05 (1.9e+05) & 1.1e+06 (7.5e+05) & 5.2e+23 (5.2e+23) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\begin{tabular}{|l|l|l|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{$90\%$ Quantile}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 7.3 (2.3) & \bfseries \color{violet} 4.4 (0.11) & 5.2 (0.17) & 5.6 (0.52) & 5.3 (0.32) & 7.3 (0.74) & 13 (1.3) & 9.5 (0.73) & 6 (0.32) \\
+\cline{3-12}
+ &  & val & 16 (2.7) & \bfseries \color{violet} 13 (0.71) & 14 (0.85) & 15 (0.75) & 15 (1.5) & 18 (1.9) & 18 (1.8) & \bfseries \color{violet} 13 (0.8) & 23 (2) \\
+\cline{3-12}
+ &  & tst & 46 (15) & \bfseries \color{violet} 25 (2.5) & 30 (5.4) & 30 (2.9) & 26 (3.6) & 40 (7.7) & 55 (11) & 33 (3.1) & 42 (4) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 5.5 (0.51) & 5.6 (0.37) & 7 (1.1) & 6.5 (1.4) & 6.9 (0.98) & \bfseries \color{violet} 5.2 (0.43) & 11 (0.99) & 8.6 (0.69) & \bfseries \color{violet} 5.2 (0.92) \\
+\cline{3-12}
+ &  & val & 12 (0.73) & 15 (1.7) & 13 (0.79) & 14 (2) & 13 (1.7) & \bfseries \color{violet} 9.5 (0.41) & 20 (1.5) & 14 (1.1) & 11 (1.5) \\
+\cline{3-12}
+ &  & tst & 28 (3.1) & 30 (2.6) & 34 (3.7) & 34 (3.2) & 22 (3.1) & 20 (2) & 39 (3.1) & 32 (4) & \bfseries \color{violet} 19 (4.6) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 6.4e+04 (5.8e+04) & 2.4e+05 (2.4e+05) & 4.6e+04 (4.5e+04) & 3.2e+04 (2.9e+04) & 1.8e+02 (1.5e+02) & 42 (21) & 7.7e+18 (7.6e+18) & 3e+14 (3e+14) & \bfseries \color{violet} 35 (5.5) \\
+\cline{3-12}
+ &  & val & 2e+05 (1.9e+05) & 1.1e+06 (1.1e+06) & 5.8e+04 (4.2e+04) & 6e+04 (4.7e+04) & 3.1e+02 (2.3e+02) & 1.4e+02 (78) & 4e+18 (3.9e+18) & 2.8e+14 (2.8e+14) & \bfseries \color{violet} 1e+02 (26) \\
+\cline{3-12}
+ &  & tst & 1.6e+05 (6.9e+04) & 1.2e+05 (1.1e+05) & 2.1e+05 (1.5e+05) & 6.9e+04 (4.4e+04) & 2e+03 (1.8e+03) & 4.9e+02 (2.6e+02) & 2.2e+17 (2.2e+17) & 2.1e+17 (2.1e+17) & \bfseries \color{violet} 2.8e+02 (43) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 17 (8.5) & \bfseries \color{violet} 6.3 (0.38) & 17 (6.2) & 9.9 (3.2) & 3.6e+02 (2.9e+02) & 17 (1.4) & 7.7 (0.32) & 6.8 (0.31) & 9.9 (0.62) \\
+\cline{3-12}
+ &  & val & 25 (8.9) & 15 (2.2) & 27 (7.7) & 22 (4.2) & 2e+02 (99) & 24 (2.1) & 13 (0.64) & \bfseries \color{violet} 12 (0.57) & 27 (2.4) \\
+\cline{3-12}
+ &  & tst & 64 (21) & 36 (2.7) & 66 (16) & 59 (16) & 1.7e+03 (1.1e+03) & 1e+02 (8.7) & \bfseries \color{violet} 28 (2.5) & 30 (3.3) & 92 (14) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\caption{The results of \cref{tab:new-data-results} with standard error computed over $10$ seeds. }
+\label{tab:full-results-1}
+\vspace{-0.15in}
+\end{table*}
+
+
+\begin{table*}
+\centering
+\def\arraystretch{1.2}%
+\scriptsize
+\begin{tabular}{|l|l|l|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{$95\%$ Quantile}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 80 (67) & \bfseries \color{violet} 9.4 (0.29) & 13 (0.68) & 14 (1.9) & 16 (1.3) & 25 (3.7) & 85 (14) & 48 (7.9) & 37 (3.5) \\
+\cline{3-12}
+ &  & val & 2.6e+02 (1.1e+02) & 2.2e+02 (39) & 1.8e+02 (27) & 2e+02 (19) & 2.5e+02 (43) & \bfseries \color{violet} 1.5e+02 (20) & 2.3e+02 (25) & 1.8e+02 (23) & 4.1e+02 (63) \\
+\cline{3-12}
+ &  & tst & 1.5e+03 (4e+02) & 1.1e+03 (2.5e+02) & 2e+03 (6.5e+02) & 1.3e+03 (3.1e+02) & \bfseries \color{violet} 1e+03 (2.4e+02) & 1.3e+03 (2.5e+02) & 2.4e+03 (3.5e+02) & 1.2e+03 (2.9e+02) & 3.7e+03 (1.3e+03) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 19 (3.8) & \bfseries \color{violet} 18 (2.7) & 28 (7.8) & 24 (8.4) & 32 (8) & 19 (2.3) & 47 (7.1) & 34 (5.3) & 38 (14) \\
+\cline{3-12}
+ &  & val & 1.3e+02 (17) & 1.6e+02 (21) & 1.2e+02 (11) & 1.5e+02 (39) & 1.1e+02 (21) & \bfseries \color{violet} 67 (7.8) & 1.5e+02 (30) & 79 (8.6) & 1.2e+02 (34) \\
+\cline{3-12}
+ &  & tst & 7e+02 (1.8e+02) & 6.2e+02 (79) & 8.3e+02 (1.4e+02) & 1.3e+03 (3.1e+02) & \bfseries \color{violet} 5.2e+02 (72) & 5.4e+02 (1.1e+02) & 1.7e+03 (2.6e+02) & 1e+03 (1.8e+02) & 5.5e+02 (1.3e+02) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 3.7e+08 (3.4e+08) & 3.8e+09 (3.8e+09) & 2.8e+07 (2.7e+07) & 2.9e+06 (1.9e+06) & 1.2e+04 (1.2e+04) & 4.2e+03 (3.8e+03) & 4.7e+22 (3.2e+22) & 7.6e+20 (7.3e+20) & \bfseries \color{violet} 1.4e+03 (4.3e+02) \\
+\cline{3-12}
+ &  & val & 8.9e+07 (5.3e+07) & 5.8e+11 (5.8e+11) & 6.6e+08 (6.5e+08) & 2.6e+06 (1.2e+06) & 3e+04 (2.7e+04) & 3.6e+04 (3.3e+04) & 2.5e+24 (2.5e+24) & 5.1e+21 (3.1e+21) & \bfseries \color{violet} 7.1e+03 (1.9e+03) \\
+\cline{3-12}
+ &  & tst & 1.9e+09 (1.8e+09) & 1.3e+08 (1.3e+08) & 1.3e+08 (1.1e+08) & 7.9e+06 (4.6e+06) & 6.1e+04 (4.7e+04) & 3e+04 (1.6e+04) & 3.6e+22 (3.5e+22) & 1.8e+24 (1.6e+24) & \bfseries \color{violet} 2.1e+04 (4e+03) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 1.4e+02 (1.1e+02) & \bfseries \color{violet} 22 (2.2) & 1.1e+02 (52) & 54 (30) & 5.9e+03 (4.3e+03) & 83 (17) & 28 (1.4) & 23 (1.9) & 1.6e+02 (30) \\
+\cline{3-12}
+ &  & val & 2e+02 (56) & 1.9e+02 (45) & 3.9e+02 (1.5e+02) & 2.5e+02 (68) & 1.1e+04 (7.5e+03) & 2.7e+02 (20) & \bfseries \color{violet} 76 (7) & 82 (8.8) & 5.9e+02 (66) \\
+\cline{3-12}
+ &  & tst & 2.4e+03 (7.7e+02) & 1.6e+03 (3.9e+02) & 3.8e+03 (1.3e+03) & 1.8e+03 (3.9e+02) & 4.7e+04 (2.2e+04) & 5.8e+03 (1.3e+03) & \bfseries \color{violet} 1.1e+03 (2.4e+02) & 1.3e+03 (2.5e+02) & 7.5e+03 (9.5e+02) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\begin{tabular}{|l|l|l|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|p{0.06\linewidth}|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{$99\%$ Quantile}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{TD3} & \multicolumn{2}{c|}{SAC} & PPO \\
+ \hline
+ &  &  & RB & PER & RB & PER & RB & PER & RB & PER &  \\
+\hline
+\multirow[c]{6}{*}{\rotatebox{90}{disable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 1.8e+04 (1.6e+04) & \bfseries \color{violet} 55 (3.8) & 7e+02 (4.6e+02) & 4.2e+02 (2.2e+02) & 2.4e+03 (1.4e+03) & 3e+03 (1.5e+03) & 3.9e+04 (9e+03) & 2.2e+04 (1e+04) & 4e+04 (1e+04) \\
+\cline{3-12}
+ &  & val & 5.1e+05 (2e+05) & 3.1e+05 (7.1e+04) & 2.7e+05 (7.2e+04) & 3.3e+05 (9e+04) & 2.7e+05 (7.3e+04) & \bfseries \color{violet} 1.9e+05 (5.2e+04) & 4.3e+05 (5.2e+04) & 4.7e+05 (6e+04) & 5.7e+05 (6.5e+04) \\
+\cline{3-12}
+ &  & tst & \bfseries \color{violet} 3.3e+05 (3.3e+04) & 7.5e+05 (4.1e+05) & 6e+05 (1.6e+05) & 5.4e+05 (1.3e+05) & 4.5e+05 (9e+04) & 4.6e+05 (3.3e+04) & 6.2e+05 (1.1e+05) & 4e+05 (8.6e+04) & 6e+05 (5e+04) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 2e+03 (9.1e+02) & \bfseries \color{violet} 1.5e+03 (8.3e+02) & 7e+03 (3.6e+03) & 3.3e+03 (2.2e+03) & 9.6e+03 (4.1e+03) & 2e+03 (7.6e+02) & 9.9e+03 (3.7e+03) & 4.6e+03 (2.3e+03) & 2.8e+04 (1.6e+04) \\
+\cline{3-12}
+ &  & val & 3e+05 (3.9e+04) & 2.5e+05 (2.8e+04) & 2.2e+05 (4.4e+04) & 1.4e+05 (2.4e+04) & 2e+05 (3.8e+04) & 1.5e+05 (2.6e+04) & 2.4e+05 (3.1e+04) & \bfseries \color{violet} 1.2e+05 (2.1e+04) & 2.1e+05 (3.3e+04) \\
+\cline{3-12}
+ &  & tst & 3.1e+05 (3.2e+04) & 4.6e+05 (6.5e+04) & 4.5e+05 (5.9e+04) & 5.7e+05 (1.1e+05) & \bfseries \color{violet} 3e+05 (3.2e+04) & 3.3e+05 (2.4e+04) & 4.3e+05 (4.3e+04) & 3.7e+05 (3.3e+04) & 3.1e+05 (4e+04) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\multirow[c]{6}{*}{\rotatebox{90}{enable CP}} & \multirow[c]{3}{*}{\rotatebox{90}{bushy}} & trn & 4.3e+26 (3.7e+26) & 5.7e+23 (5.7e+23) & 1.3e+17 (1e+17) & 7.9e+14 (7.7e+14) & \bfseries \color{violet} 4.2e+05 (1.6e+05) & 2.5e+06 (1.6e+06) & 1.8e+37 (1.1e+37) & 3.6e+42 (3.6e+42) & 1.6e+06 (4.2e+05) \\
+\cline{3-12}
+ &  & val & 1.2e+22 (1.2e+22) & 5.7e+24 (5.7e+24) & 2.8e+23 (2.1e+23) & 1.7e+14 (9.8e+13) & \bfseries \color{violet} 2e+06 (4.4e+05) & 3.1e+06 (1.8e+06) & 3.7e+38 (2.9e+38) & 4.2e+40 (2.8e+40) & 5.6e+06 (1.5e+06) \\
+\cline{3-12}
+ &  & tst & 2.5e+29 (2.5e+29) & 5.7e+25 (5.7e+25) & 1e+23 (1e+23) & 6.5e+18 (6.4e+18) & \bfseries \color{violet} 2.6e+06 (5.9e+05) & 4.1e+06 (1.6e+06) & 9.2e+39 (9.2e+39) & 1.3e+41 (1.3e+41) & 7.6e+06 (2.3e+06) \\
+\cline{2-12} \cline{3-12}
+ & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & 7.1e+04 (5.5e+04) & 3.5e+03 (1.2e+03) & 3.7e+04 (1.9e+04) & 1.9e+04 (1.3e+04) & 1e+06 (5.1e+05) & 7.6e+04 (2.3e+04) & 5.1e+03 (1.8e+03) & \bfseries \color{violet} 1.9e+03 (6.9e+02) & 4.3e+05 (1.1e+05) \\
+\cline{3-12}
+ &  & val & 2.3e+05 (7.9e+04) & 2.4e+05 (4.6e+04) & 3.1e+05 (5.6e+04) & 3.6e+05 (8.6e+04) & 1.6e+06 (3.1e+05) & 2.6e+05 (4.1e+04) & \bfseries \color{violet} 1.3e+05 (4.5e+04) & 1.4e+05 (2.5e+04) & 6.3e+05 (1.6e+05) \\
+\cline{3-12}
+ &  & tst & 1.8e+06 (7.1e+05) & 7.6e+05 (1.6e+05) & 7.9e+05 (1e+05) & 1.4e+06 (3.6e+05) & 4.8e+06 (7.6e+05) & 7.6e+06 (6.1e+06) & \bfseries \color{violet} 3.8e+05 (4.1e+04) & 4.4e+05 (3.6e+04) & 3.3e+06 (1.9e+06) \\
+\cline{1-12} \cline{2-12} \cline{3-12}
+\hline
+\end{tabular}
+\caption{The $95\%$ and $99\%$ quantile of CMMs with standard error computed over $10$ seeds. }
+\label{tab:full-results-2}
+\vspace{-0.15in}
+\end{table*}
+
+
+
+\newpage
+\subsection{Additional Learning Curves}
+In this section, we plot the learning curves of the best performing algorithm in each of the four possible settings in $\{\text{disable CP}, \text{enable CP}\} \times \{\text{left}, \text{bushy}\}$. Performance is measured by mean CCM (from \cref{tab:new-data-results}) and we plot the average performance over $10$ runs (shaded region is stderr over said runs).
+For each setting, we also show the CCM distribution over the training, validation and testing query sets in a complementary CDF (CCDF) plot.
+The CCDF shows that these distributions are long-tailed.
+
+
+\subsubsection{Bushy plans with disable CPs heuristic}
+
+% Figure environment removed
+
+
+\newpage
+\subsubsection{Left-deep plans with disable CP heuristic}
+
+
+% Figure environment removed
+
+
+
+\newpage
+\subsubsection{Bushy plans with CPs}
+
+% Figure environment removed
+
+
+\newpage
+\subsubsection{Left-deep plans with CPs}
+
+% Figure environment removed
+
+
+\newpage
+\subsubsection{Heuristic Method}
+We also plot results for a heuristic \texttt{ikkbzbushy} which builds join selectivity estimates based on the training data and uses dynamic programming (DP) to compute the best bushy plan according to the estimated IR cardinalities (based on the join selectivity estimates). Similar with RL agents which learns in training queries, we build selectivity estimation of join predicates using training queries. We follow the most classic approach \citep{ramakrishnan2003database} for estimating selectivities of each join pair $R\Join_P S$ using $\sel_i(R\Join_P S) = \frac{|R\Join_P S|}{|R| |S|}$ and take the average among all queries as the final selectivities. And in the validate and test, we estimate the IR size using $\sel_i(R\Join_P S) |R| |S|$. \texttt{ikkbzbushy} can guarantee that the final plan has the smallest estimation cost.
+
+So amongst all heuristics that use the same estimated IR cardinalities, this approach is the best possible heuristic since it uses the plan with the smallest estimated cost. However, since the selectivity estimation step is biased, the final performance is very poor, and worse than the RL-based approaches.
+It's worth mentioning that DP-based approaches can take hours on med-large size queries since the problem space grows exponentially. In contrast, RL methods are much faster to run.
+
+% Figure environment removed
+
+\newpage
+\section{Benchmarking Offline RL}
+We now benchmark offline RL algorithms on optimizing left-deep plans with CPs disallowed. In this section, we focus on the $113$ queries from the JOB \citep{leis2015good} which is a smaller and easier setting than our main dataset of $3300$ queries.
+We focus on the JOB for offline RL because \citet{leis2015good} provided behavior policy traces for all $113$ queries, based on popular search heuristics (described below).
+
+\begin{table*}[!h]
+\centering
+\def\arraystretch{1.2}%
+\scriptsize
+\begin{tabular}{|l|l|l|r|r|r|r|r|r|r|r|r|r|}
+\hline
+ \multicolumn{3}{|c|}{\textbf{JOB Data}} & \multicolumn{2}{|c|}{DQN} & \multicolumn{2}{c|}{DDQN} & \multicolumn{2}{c|}{BC} & \multicolumn{2}{c|}{BCQ} & \multicolumn{2}{c|}{CQL} \\
+\hline
+ &  &  & Median & STD & Median & STD & Median & STD & Median & STD &  Median & STD \\
+\hline
+\multirow[c]{3}{*}{\rotatebox{90}{\tiny{disable CP}}} & \multirow[c]{3}{*}{\rotatebox{90}{left}} & trn & \bfseries \color{violet} 3.22 & 1.9e6 & 1471  & 3.4e10 & 1.6e5 & 7.6e+11 &  3.1e3 & 2.7e13  &  79 &\ 4.1e12\\
+\cline{3-13}
+ &  & tst & \bfseries \color{violet}  3.19 & 1.9e6 & 1470 & 3.3e10 & 8.0e4 & 7.3e12 & 9908 & 2.6e13 & 76 & 3.9e12\\
+\cline{3-13}
+ &  & val & \bfseries \color{violet} 3.21 &  2.0e6 & 1.0e3 & 3.4e10 & 6.4e5 & 7.5e12 & 1.5e5 & 2.9e13 & 81 & 4.1e12\\
+\cline{1-13} \cline{1-13}
+\end{tabular}
+\caption{CCM (lower is better) averaged over the training (trn), validation (val) or testing (tst) query sets. }
+\label{tab:offline-results}
+\vspace{-0.15in}
+\end{table*}
+
+\paragraph{Experimental Setup}
+Our offline dataset is comprised of trajectories from the following behavior policies provided by the JOB \citep{leis2015good}: adaptive, dphyp, genetic, goo, goodp, goodp2, gooikkbz, ikkbz, ikkbzbushy, minsel, quickpick, simplification \citep{neumann2018adaptive}.
+We highlight that these behavior policies are \emph{search} heuristics, which operate given a cost model, \eg, estimated IR cardinalities, to plan over. To generate behavior trajectories, we provided these heuristics access to the ground-truth IR cardinalities. Alternatively, one could take traces from existing DBMS such as PostgreSQL.
+For each heuristic, we collected $1000$ trajectories across different queries. We partition the dataset for training, evaluation and testing similarly as in our online experiments.
+
+\paragraph{Discussions}
+\cref{tab:offline-results} summarizes our offline results. We find that DQN has the best performance in terms of median and the validation/testing results are even better than online.
+CQL also obtains reasonable performance, but all other methods seem to have relatively poor median performance even on the training set. It's worth noting that all methods seem to have a heavy tail performance distribution (over queries), as shown by the large standard deviations. In later sections of the appendix, we see this is the case for online RL as well. This heavy-tail distribution of returns motivates applying risk-sensitive RL methods to \env{} for future work.
+
+We also tested on some other offline algorithms, such as SAC, and it is hard to converge hence we didn't report the results. We observe that the TD error is increasing, although the Q value functions, actors and critics are learning. Making too many TD updates to the Q-function in offline deep RL is known to sometimes lead to performance degradation and unlearning, we can use regularization to address the issue~\citep{kumar2021dr3}.
+
+
+
+\subsection{Hyperparameters for Offline RL Algorithms}
+We performed hyperparameter search with grid search and Bayesian optimization. The final parameters we used for evaluation is shown below in Tables~\ref{tab:bc}-\ref{tab:ddqn}.
+
+\subsubsection{Batch-Constrained Q-learning}
+
+
+
+\begin{table}[H]
+    \centering
+    \caption{Hyperparameter of Batch-Constrained Q-learning algorithm (BCQ).}
+    \begin{tabular}{l|l}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Learning rate & $6.25 \times 10^{-5}$ \\
+        Optimizer & Adam ($\beta = (0.95, 0.999)$) \\
+        Batch size & 32 \\
+        Number of critics & 6 \\
+        Discount factor & 0.99 \\
+        Target network synchronization coefficiency & 0.005 \\
+        Action flexibility & 0.3 \\
+        Gamma & 0.99 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\subsubsection{Behavior Cloning}
+\begin{table}[H]
+    \centering
+    \caption{Hyperparameter of Behavior Cloning (BC).}
+    \begin{tabular}{l|l}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Learning rate & 0.001 \\
+        Optimizer & Adam ($\beta = (0.9, 0.999)$) \\
+        Batch size & 100 \\
+        Beta & 0.5 \\
+        \bottomrule
+    \end{tabular} \label{tab:bc}
+\end{table}
+
+\subsubsection{Conservative Q-Learning}
+
+
+
+\begin{table}[H]
+    \centering
+    \caption{Hyperparameter of Conservative Q-Learning (CQL).}
+    \begin{tabular}{l|l}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Actor learning rate & $3 \times 10^{-4}$ \\
+        Critic learning rate & $3 \times 10^{-4}$ \\
+        Learning rate for temperature parameter of SAC & $1 \times 10^{-4}$ \\
+        Learning rate for alpha & $1 \times 10^{-4}$ \\
+        Batch size & 256 \\
+        N-step TD calculation & 1 \\
+        Discount factor & 0.99 \\
+        Target network synchronization coefficiency & 0.005 \\
+        The number of Q functions for ensemble & 2 \\
+
+        Initial temperature value & 1.0 \\
+        Initial alpha value & 1.0 \\
+        Threshold value & 10.0 \\
+        Constant weight to scale conservative loss & 5.0 \\
+        The number of sampled actions to compute & 10 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\subsubsection{DQN}
+\begin{table}[H]
+    \centering
+    \caption{Hyperparameter of DQN.}
+    \begin{tabular}{l|l}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Learning rate & 6.25e-4 \\
+        Batch size & 32 \\
+        target\_update\_interval  & 8000 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection{Double DQN}
+
+
+\begin{table}[H]
+    \centering
+    \caption{Hyperparameter of DDQN.}
+    \begin{tabular}{l|l}
+        \toprule
+        Hyperparameter & Value \\
+        \midrule
+        Learning rate & 6.25e-4 \\
+        Batch size & 32 \\
+        target\_update\_interval  & 8000 \\
+        \bottomrule
+    \end{tabular} \label{tab:ddqn}
+\end{table}
+
+
+
+
+
+
+\end{document}

@@ -1,0 +1,196 @@
+%------------------------------------------------------------------------------
+\section{\sys}
+\label{sec:flexr}
+%------------------------------------------------------------------------------
+
+\subsection{Overview}
+\label{sec:flexroverview}
+To bring flexibility to XR workload distribution, we built \sys\ as a DSP system specialized for XR, taking the design benefits of modularity and task parallelism.
+Driven by our design decisions, \sys\ is built on top of a thread-level SP library, RaftLib~\cite{beard2017raftlib}, and provides the benefit of efficient local communication for the collocated kernels ({\bf D1}).
+For the communication semantics to enable kernel synchronization and dependencies of XR pipelines, we extend the semantics of the RaftLib port with support for non-blocking and for remote communication ({\bf D2}).
+For recency management of local and remote communication, \sys\ allows setting the maximum number of messages in the local port buffer and specifying network protocols for remote ports at runtime ({\bf D3}).
+
+Even with the necessary DSP features for XR, there are still issues about providing these features properly to the system stakeholders: developers writing kernels and users requesting distributed pipelines with given kernels.
+\sys\ enables flexibility in configuring XR pipelines via its kernel abstraction with interfaces separating development- and deployment-time concerns.
+While the developer implements an XR kernel function and knows its input dependencies, the user creates a distributed XR pipeline and configures the connectivity of kernels (local or remote), output-port semantics, and recency management mechanism of the pipeline context.
+In addition, there can be a case where the user needs to connect an output of a kernel into multiple downstream kernels.
+
+Our kernel abstraction provides the interfaces allowing the developer to register input and output ports and use the registered ports in the kernel function regardless of how they will be configured by a user.
+The behavior of the registered ports becomes different based on the user-specified communication attributes at runtime.
+The user can also branch dynamically an output port with different communication attributes and flexibly create distributed pipelines with various topologies without modifying the kernels. %codes.
+
+% Figure environment removed
+
+% Figure environment removed
+
+
+
+Figure~\ref{fig:flexr_overview} shows the high-level design of \sys\ and how it operates.
+\circled{1} The developers write kernels with our kernel abstractions for implementing their XR functionalities or incorporating existing functionality implementations by wrapping them in kernel functions.
+\circled{2} With given kernels, the user requests a distributed pipeline as a YAML recipe describing pipelined kernels and their communication attributes.
+\circled{3} The recipe parser parses the recipe and generates pipeline metadata of the kernels and connection information.
+\circled{4} The local pipeline metadata is passed to the pipeline manager, and it creates a local pipeline by instantiating the kernels and configuring port connections.
+\circled{5} The part of the recipe about the remote pipeline is sent to the request listener on the server.
+\circled{6} The server's recipe parser parses the received recipe and generates pipeline metadata. If the pipeline works with external applications, it starts the applications.
+\circled{7} Then, the server's pipeline manager also creates the server-side pipeline, and the remote ports of local and remote pipelines are connected.
+\circled{8} The pipelines, distributed across the client and server, run with dataflow.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Kernel Design}
+\label{sec:flexrkernel}
+In SP, the compute kernel is a pipeline component, which includes an execution function and communication ports.
+To provide the necessary DSP features for flexible configuration of the communication attributes, we design a \sys\ kernel with two abstractions: the \sys\ port and port manager.
+They abstract the different communication channels for local and remote operation of a \sys\ kernel, allowing the developer to write kernels without specifying the communication attributes and the user to configure the connection at runtime without modifying kernels.
+A developer registers the input and output ports of the kernel with tags via the port manager interface, and the registered ports are instantiated and configured by the port manager based on the user recipe.
+
+
+
+Figure~\ref{fig:kernel_design} shows our kernel design.
+Each kernel has its ID, logger, frequency manager, execution function, and port manager.
+The ID is used for the recipe parser and pipeline manager in Figure~\ref{fig:flexr_overview}.
+The frequency manager adjusts the execution frequency when a kernel should run at a stable frequency, and the logger is for the developer to log the kernel events.
+The execution function processes data from the input ports and sends out the result to the output port.
+
+
+\noindent\textbf{Port Manager.}
+When kernels are instantiated, the port manager of each kernel activates and dynamically branches the \sys\ ports based on the pipeline metadata.
+In addition, it provides developers with  interfaces to use the \sys\ ports without considering how the ports will be configured by a user.
+
+The port manager design is shown in Figure~\ref{fig:kernel_design}.
+The manager has input and output port maps.
+These port maps have the mapping information of the port tags registered by a developer and the \sys\ ports activated with the communication attributes by a user.
+A kernel function can get inputs and send outputs via the port manager interfaces with the tag.
+The branched port map contains the ports branched from the registered output port.
+When a registered output port needs to be connected into multiple downstream ports with different communication attributes, the port manager activates the branched ports and keeps their mapping information to the registered port.
+When a kernel function sends an output to the registered port, it is also sent through the branched ports by using this mapping information.
+
+Listing~\ref{lst:kernelcode} shows the codes of an example kernel which a developer implements (\circled{1} in Figure~\ref{fig:flexr_overview}).
+In Line~\ref{portS}-\ref{portE}, the developer registers the input and output ports with the tags.
+The registered ports are used in Line~\ref{getS}-\ref{sendS} without specifying their connection types and branching states.
+The port manager hides the complexities of using the dynamically instantiated ports from developers.
+
+
+\begin{lstlisting}[caption={\small An example kernel with two input and one output ports registered by a developer.}, captionpos=b, label={lst:kernelcode}, float=h]
+class ExampleKernel: public FleXRKernel {
+  public:
+    ExampleKernel() {
+      portManager.registerInPortTag("in1", PortSemantics::BLOCKING);(*@\label{portS}@*)
+      portManager.registerInPortTag("in2", PortSemantics::NONBLOCKING);(*@\label{portS2}@*)
+      portManager.registerOutPortTag("out");(*@\label{portE}@*)
+    }
+
+    raft::kstatus run() {
+      MsgType *in1=portManager.getInput<MsgType>("in1");(*@\label{getS}@*)
+      MsgType *in2=portManager.getInput<MsgType>("in2");(*@\label{getS2}@*)
+      MsgType *out=portManager.getOutputPlaceholder<MsgType>("out");(*@\label{getE}@*)
+
+      /* Kernel Functionality ... */
+
+      portManager.sendOutput("out", out);(*@\label{sendS}@*)
+    }
+}
+\end{lstlisting}
+
+\noindent\textbf{\sys\ Port } abstracts different local and remote communication ports and exposes a unified interface to the port manager.
+When the pipeline manager creates a pipeline (\circled{4} and \circled{7} in Figure~\ref{fig:flexr_overview}), a kernel is instantiated and its ports are configured by the port manager with user-specified port connectivity, semantics, and recency management mechanism.
+Since these communication attributes are determined by the contexts of the requested pipeline, the operation of a \sys\ port should differ based on the attributes given at runtime.
+We design the \sys\ port abstraction as a state machine with the integrated interfaces.
+
+The design of a \sys\ port is shown in Figure~\ref{fig:kernel_design}.
+Each \sys\ port has the port semantics, connection state, and local and remote ports.
+The port semantics is for specifying the communication semantics: blocking and non-blocking.
+The connection state indicates whether it is local or remote, and the network protocol for the remote.
+The local and remote ports are the actual communication channels internally used and interfaced by the \sys\ port abstraction.
+Since the \sys\ port is an abstraction for different communication ports, it is extensible.
+New network protocols and local channels can be seamlessly integrated into distributed XR pipelines.
+
+Listing~\ref{lst:yamlrecipe} is part of an example pipeline recipe which a user provides (\circled{2} in Figure~\ref{fig:flexr_overview}).
+The user creates a pipeline by specifying the kernels, their port attributes in Line 5, 7-8, 11-12, and 14-15 and connections in Line 17-22.
+When the pipeline is created, the port manager activates the \sys\ port.
+The activation instantiates an underlying channel corresponding to the specified attributes, and the channel is interfaced via the \sys\ port. % under the hood.
+The \sys\ port provides uniform interfaces to the port manager while
+behaving differently based on the underlying channel.
+
+
+\begin{lstlisting}[caption={\small A part of the pipeline recipe for the example kernel in Listing~\ref{lst:kernelcode} and a connection.}, language=yaml, escapechar=|, captionpos=b, label={lst:yamlrecipe}, float=h]
+- kernel   : ExampleKernel
+  id       : example_kernel1
+  input    :
+    - port_name: in1
+      connection_type: local
+    - port_name: in2
+      connection_type: remote
+      remote_info: [RTP, 14802]
+  output   :
+    - port_name: out
+      connection_type: local
+      semantics: blocking
+    - port_name: branched_out
+      connection_type: remote
+      remote_info    : [127.0.0.1, 14805, TCP]
+      branched_from: out
+- local_connections:
+  - send_kernel: example_kernel1
+    send_port_name: out
+    recv_kernel: example_kernel2
+    recv_port_name: input
+    queue_size: 1
+\end{lstlisting}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Communication Semantics and Data Recency Management}
+\label{sec:flexrcommunication}
+To express the relationships among kernels and their dependencies and synchronization requirements, both blocking and non-blocking semantics are necessary for the local and remote communication primitives.
+\sys\ supports the required semantics.
+The local communication in \sys\ is based on the RaftLib port.
+Since the send and receive primitives of the vanilla RaftLib port are only with blocking semantics, we extend them with non-blocking semantics by checking the queue buffer of the connected RaftLib ports.
+A non-blocking send does not wait and continues when the queue connected to the downstream kernel is full.
+A non-blocking receive continues without waiting when the queue to the upstream kernel is empty.
+For remote communications, the socket and protocol implementations have interfaces with different semantics, and we map the underlying port interfaces to the \sys\ port.
+
+The data recency management mechanism in \sys\ is to prevent  data from aging in the pipeline queues.
+For local, \sys\ provides  recency management by limiting the number of messages in the queue buffer, which puts a bound on the maximum queuing delay~\cite{little1961proof}.
+The recency management for remote communication is done by supporting  different network protocols, currently supporting TCP and RTP over UDP.
+For TCP connection, the in-order and reliable delivery may lead to lower data timeliness due to its retransmission and acknowledgment mechanisms.
+RTP over UDP has the advantage for data recency at the cost of data loss.
+By supporting these different protocols and queue size management, the recency management is achieved for remote and local communications.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Register-Activation Interface and Port-level Configuration}
+\label{sec:flexrportlevel}
+We embody the necessary DSP features for XR in the \sys\ kernel, but these features should be provided properly to the stakeholders for supporting the runtime flexibility in distributed XR pipelines.
+The kernel developers know the input dependencies of their kernel functions, but it is unknown to them how their kernels are used in a pipeline which a user creates.
+When requesting a pipeline, the user arranges the pipeline structure with the kernel communication attributes.
+So, the user determines how the kernels operate within the pipeline.
+To provide the features to the proper stakeholder, \sys\ has  register-activation interfaces of the port manager at a port granularity, which streamline the development and deployment phases but clearly separate the features provided to each phase.
+
+Based on the information available to the development and deployment phases, we identify the proper stakeholder for each feature and make the interfaces expose it.
+Table~\ref{tab:intfeat} summarizes the provided interfaces to each stakeholder.
+The developers register ports and set the input-port dependencies as they know the kernel functionalities.
+The connection type, branching outstream, output semantics, and recency management are specified by the user recipe because these attributes should be configured when the port manager activates \sys\ ports by the metadata of the user pipeline.
+
+The register-activation interfaces are enabled by the \sys\ port and port manager, and the stakeholders use the \sys\ features through them.
+When the developer registers the ports, the semantics of input ports are set via the port manager as shown in Line~\ref{portS}-\ref{portS2} of Listing~\ref{lst:kernelcode}.
+The connection types, recency management, and output semantics are specified by the user recipe as shown in Listing~\ref{lst:yamlrecipe}.
+The user can branch a single registered port with separate attributes in Line 13-16 of Listing~\ref{lst:yamlrecipe}.
+When the pipeline manager instantiates the pipeline kernels, the user-specified attributes and branching are set for each port by the port manager.
+
+\begin{table}[]
+  \centering
+  \caption{\label{tab:intfeat}\small \sys\ interface availability for the stakeholders to manipulate the features to resolve the DSP issues in \S\ref{sec:streamprocessing}.}
+  \resizebox{0.8\linewidth}{!}{
+    \tiny
+    \begin{tabular}{|l|c|c|}
+      \hline
+      \diagbox{Feature}{Stakeholder}   & Developer   & User \\ \hline
+      Port registration             & \ding{51}   &             \\ \hline
+      Port activation               &             & \ding{51}   \\ \hline
+      Output branching              &             & \ding{51}   \\ \hline
+      Input semantics               & \ding{51}   &             \\ \hline
+      Output semantics              &             & \ding{51}   \\ \hline
+      Recency management            &             & \ding{51}   \\ \hline
+    \end{tabular}
+  }
+\end{table}

@@ -1,0 +1,84 @@
+\section{Methodology}
+\label{sec:method}
+In the following we describe our method in detail: Sec. \ref{sec:problem_formulation} provides a formalization of the task and an overview of the proposed method, Sec.~\ref{sec:context_encoder} describes the architectural components, respectively the context encoder, the VAE encoder and decoder, Sec.~\ref{sec:training} illustrates the employed losses and training procedure, Sec.~\ref{sec:inference} describes the inference process, while Sec.~\ref{sec:implementation_details} describes the implementation details.
+\subsection{Problem Formulation and Overview}
+\label{sec:problem_formulation}
+
+We start the section by formalizing the task of Interactive Neural Painting (INP). We assume a dataset $\mathcal{D}$ of reference images paired with a sequence of stroke parameters $s=s^{1:T}$ of length $T$, representing a decomposition of the image into a sequence of individual strokes. Each stroke is represented \new{by a tuple of eight parameters} as $s=(x, \rho, \sigma, \omega)$, where $x$ is the position of the stroke center on the canvas, $\rho$ is the color, $\sigma$ represents the stroke size expressed as height and width, and $\omega$ is the stroke orientation. At time $t$, given a reference image $I_{\mathrm{ref}}$ and the corresponding sequence of strokes up to the current time $s^{1:t}$, the INP task consists in predicting a set of stroke sequences of length $k$. The set of predicted stroke sequences is presented to the user who can either select one sequence, partially or in its entirety, as the painting continuation or manually define the next strokes if no proposed sequence captures the user's current painting intentions (see Fig.~\ref{fig:teaser}). Note that predicting a sequence of length $k>1$ (\cite{liu2021painttransformer,zou2021stylized}) gives the user the possibility to better understand whether the proposed continuation corresponds to her painting intentions. The operation is repeated iteratively until completion of the painting. \new{The expected behaviour of predicted strokes should exhibit the following characteristics:
+\begin{itemize}
+    \item Each sequence makes the canvas more similar to the reference image, hence assisting the user in the final goal of completing the painting.
+    \item Each sequence presents the same characteristics of the dataset stroke sequences in terms of positioning, color, size and orientation, thus ensuring seamless interaction between the user and the painting agent.
+    \item The predicted set contains diverse sequences that cover the main possible continuations of the painting process, hence providing diverse continuation to the user among which to choose. 
+\end{itemize}
+We devise a set of quantitative evaluation metrics that captures each of these desired behaviours and present them in Sec.~\ref{sec:metrics}.\\
+}
+
+In this paper we propose \methodname, a method for INP. Our approach consists in a transformer-based conditional VAE architecture and is depicted in Fig.~\ref{fig:architecture}. At time $t$, given a reference image $I_{\mathrm{ref}}$, context strokes $s_c = s^{t-k+1:t}$, and a context image $I_c$ defined as the rendering of strokes $s^{1:t}$, the context encoder $C$ extracts a context vector $c = C(I_{\mathrm{ref}},I_c,s_c)$. During training, the VAE encoder $E$ encodes the target stroke sequence $s_t = s^{t+1:t+k}$ into a posterior gaussian distribution $\mu_z,\sigma^2_z=E(s_t,c)$ and the latent code $z$ is sampled from it. During inference, instead, the latent code is sampled from the prior distribution $\mathcal{N}(0, 1)$.
+The latent code $z$ is used in conjunction with $c$ to condition the VAE decoder that produces the sequence of inferred target strokes $\hat{s}_t=D(z,c)$.
+
+% Figure environment removed
+
+\subsection{Architecture Components}
+\label{sec:context_encoder}
+Next, we describe the architectural components of \methodname~depicted in Fig. \ref{fig:architecture}.
+
+\paragraph{Context Encoder} The context encoder $C$ receives as input the reference image $I_{\mathrm{ref}}$ $\in \mathbb{R}^{3 \times H \times W}$, the context image $I_c$ $\in \mathbb{R}^{3 \times H \times W}$, the sequence of context strokes parameters $s_c$ \new{$\in \mathbb{R}^{k \times 8}$} and produces a representation of the context $c$. % = C(I_{\mathrm{ref}},I_c,s_c)$. 
+First, a visual feature encoder $F$, modeled as a CNN, extracts visual features \new{$\fvisual \in \mathbb{R}^{\mathrm{dim} \times H' \times W'}$} 
+from the input images. Following \cite{liu2021painttransformer}, we model $F$ as a separate backbone for reference and context images respectively and concatenate the output features along the channel dimension to obtain $\fvisual$.
+A linear layer is used to extract context stroke features from $s_c$, resulting in features $\fstrokes \in \mathbb{R}^{k \times \fdim}$. 
+Successively, we flatten the spatial dimensions of the visual features $\fvisual \in \mathbb{R}^{(H' \cdot W') \times \fdim}$, and concatenate them with the strokes features $\fstrokes$ along the sequence length dimension. The resulting token sequence $c_{in} \in \mathbb{R}^{L \times \fdim}$, with $L=(H'\cdot W')+k$, is enriched with 3D sinusoidal positional encodings (\cite{vaswani2017attention}) which are added to each element of the sequence. Two encoding dimensions represent the $x$ and $y$ coordinates of the visual feature or stroke and the third is used to represent the temporal position of each stroke in the sequence. Lastly, a Transformer encoder $C_e$ process $c_{in}$ producing the context output $c \in \mathbb{R}^{L \times \fdim}$. 
+
+\paragraph{VAE Encoder and Decoder} We use a VAE conditioned on the context information $c$ to produce a reconstruction $\hat{s}_t$ of the target strokes.
+We model the VAE encoder $E$ as a transformer decoder receiving as query input a \new{the target strokes $s_t \in \mathbb{R}^{k\times8}$, which are projected to the hidden dimension of the transformer $\fdim$ with a linear layer.} The input sequence is enriched with 3D sinusoidal positional encodings (\cite{vaswani2017attention}), and two learnable tokens corresponding to the output mean and variance of the posterior gaussian distribution $\mu_z, \sigma_z^2 = E(s_t,c)$. We make use of the learnable tokens as a way to obtain outputs from the transformer representing the input sequence pooled over the temporal dimension (\cite{petrovich21actor}). The context information is used to condition $E$ and is provided as key and value inputs, conditioning the encoder through cross-attention.
+
+The VAE decoder $D$ produces the sequence of reconstructed target strokes $\hat{s}_t=D(z,c)$. Preliminary experiments show that directly predicting $\hat{s}_t$ from $z$ and the context $c$ is difficult, so we propose a decoder composed of two stages $D=D_2 \circ D_1$, each modeled as a separate transformer decoder. The initial decoder $D_1$ receives as query input 1D sinusoidal positional encodings (\cite{vaswani2017attention}) providing temporal information regarding target strokes and predicts stroke positions $\hat{x}_t=D_1(z,c)$ of the target strokes. The transformer decoder is conditioned with the cross-attention mechanism on the context $c$ and on the latent variable $z \sim \mathcal{N}(\mu_z,\sigma_z^2)$ which are received as key and value inputs. The second transformer decoder $D_2$ is responsible for inferring the remaining stroke parameters conditioned by $\hat{x}_t$. In order to provide precise information about the reference image in the neighborhood of each predicted position, we extract image features $f_x$ from $f$ corresponding to the predicted position of each stroke using bilinear sampling, \textit{i.e.} $f_{\hat{x}}\!=\!\texttt{bilinear}(f,\hat{x}_t)$. Similarly to the VAE encoder, the sampled features are enriched with 3D sinusoidal positional encodings and are used as query inputs to infer the remaining stroke parameters $(\hat{\rho}_t,\hat{\sigma}_t,\hat{\omega}_t)=D_2(z,c,f_{\hat{x}})$. As with $D_1$, $c$ and $z$ condition the decoder as key and value inputs in the cross-attention operation. Finally, the outputs of $D_1$ and $D_2$ are combined to form the reconstructed target strokes $\hat{s}_t = (\hat{x}_t,\hat{\rho}_t,\hat{\sigma}_t,\hat{\omega}_t)$.
+
+\subsection{Training}
+\label{sec:training}
+
+We train our model using the $\beta$-VAE (\cite{higgins2017betavae}) objective with an isotropic Gaussian prior as the main driving loss:
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{\beta\mhyphen\mathrm{VAE}} &= \mathbb{E}_{z\sim E(s_t,c)} \left\|s_t - \hat{s}_t\right\|_2^2 \\ 
+    & + \lambda_{\mathrm{KL}} \mathcal{D}_\mathrm{KL}(\mathcal{N}(\mu_z, \sigma_z^2) \| \mathcal{N}(0, 1)).
+\end{split}
+\end{equation}
+
+In addition, we notice that imprecisions in the reconstruction of the stroke positions $\hat{x}_t$ may bring to a situation where the reconstructed stroke color $\hat{\rho}_t$ differs from the color of $I_\mathrm{ref}$ at $\hat{x}_t$ which we call $\tilde{\rho}_t = I_\mathrm{ref}(\hat{x}_t)$. This mismatch is caused by the model ignoring the reference image and predicting target colors by attending only to context strokes and latent code and leads to performance degradation. For this reason, we introduce a color reconstruction loss that fosters the model to produce output strokes whose color is coherent with $I_\mathrm{ref}$:
+\begin{equation}
+    \mathcal{L}_{\mathrm{col}} = \left\|\tilde{\rho} - \hat{\rho}\right\|_2^2.
+\end{equation}
+
+Moreover, we propose two additional regularization losses that are aimed at improving the visual results at inference time when the latent codes $z$ are sampled from the prior distribution rather than the posterior. First, we impose the same color reconstruction loss on the predicted strokes to improve color coherency: 
+\begin{equation}
+    \mathcal{L}_{\mathrm{col}}^{reg} = \mathbb{E}_{z\sim \mathcal{N}(0,1)} \left\|I_{\mathrm{ref}}(x(D(z,c))) - \rho(D(z,c))\right\|_2^2,
+\end{equation}
+where $x(\cdot)$ and $\rho(\cdot)$ represent function extracting respectively position and color from the tuple of stroke parameters. Second, we impose a distribution matching objective aimed at maximizing the similarity between the characteristics of predicted and dataset stroke sequences. In particular, we propose to explicitly maximize the likelihood of sampling from the prior a sequence of strokes that is compatible with the dataset stroke distribution. For each sequence of corresponding context and target strokes, we concatenate them forming vector $s=s_c\mathbin\Vert s_t=s^{t-k+1:t+k}$, and build the corresponding feature vector $\psi$ capturing the relations between neighboring strokes. The feature vector $\psi$ is computed by taking the concatenation of the stroke features computed as follows: 
+\begin{equation}
+\label{eq:stroke_features}
+    \psi = {\mathbin\Vert}_{l=1}^{l_\mathrm{max}}\left( {\mathbin\Vert}_{i=1}^{L-l} (s^{i+l} - s^{i})\right),
+\end{equation}
+where $L=2k$ represents the sequence length and $l_\mathrm{max}$ represents the maximum distance between strokes for which to extract features. In the following, we denote as $\psi$ the features produced on dataset stroke sequences and as $\hat{\psi}$ the features produced on inferred stroke sequences.
+To make the computation tractable and easy to optimize, we assume independence of each dimension and fit two multivariate gaussian distributions $\mathcal{N}(\mu_\psi, \Sigma_\psi)$ and $\mathcal{N}(\mu_{\hat{\psi}}, \Sigma_{\hat{\psi}})$, respectively on $\psi$ and $\hat{\psi}$. Successively, we minimize KL divergence between the dataset distribution and the generated strokes distribution:
+\begin{equation}
+    \mathcal{L}_{\mathrm{dist}}^{reg} = \mathbb{E}_{z\sim \mathcal{N}(0,1)} \mathcal{D}_\mathrm{KL}(\mathcal{N}(\mu_{\hat{\psi}}, \Sigma_{\hat{\psi}}) \| \mathcal{N}(\mu_\psi, \Sigma_\psi)).
+\end{equation}
+The final optimization objective is given by:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\beta\mhyphen\mathrm{VAE}} + \lambda_{\mathrm{col}} \mathcal{L}_{\mathrm{col}} + \lambda_{\mathrm{col}}^{reg} \mathcal{L}_{\mathrm{col}}^{reg} + \lambda_{\mathrm{dist}}^{reg} \mathcal{L}_{\mathrm{dist}}^{reg},
+\label{eq:fianl_objective}
+\end{equation}
+where $\lambda_{\mathrm{col}}$, $\lambda_{\mathrm{col}}^{reg}$ and $\lambda_{\mathrm{dist}}^{reg}$ represent positive weighting terms. We show details of our training procedure in the \emph{Supp. Mat.}.
+
+\subsection{Inference}
+\label{sec:inference}
+
+At inference time, our model is used iteratively to assist users in the creation of paintings corresponding to a reference image $I_\mathrm{ref}$. We consider the current state of the canvas as $I_c$ and the last $k$ strokes drawn on the canvas as the context strokes $s_c$. The context encoder $C$ is used to extract the context representation $c$. We note that, given the interactive scenario, the context strokes can originate either from the user or by a previous iteration of the model.
+We then sample a latent vector $z$ from the prior distribution $\mathcal{N}(0, 1)$ and use the decoder to produce a plausible continuation of the painting process $D(z,c)$. By repeatedly sampling the latent vector $z$ from the prior distribution and keeping the context fixed, we provide a diverse set of plausible continuations of the painting from which the user can select the best option or keep drawing strokes manually if not satisfied by the proposals. The process is iterated until the painting is complete.
+
+\subsection{Implementation Details}
+\label{sec:implementation_details}
+Following \cite{liu2021painttransformer}, we set the sequence length $k\!=\!8$ in all our experiments. We observe that, at inference time, the effective value of $k$ can be smaller, with the user selecting a sub-sequence of the proposed continuation. \new{Likewise, the length of the context strokes $s_c$ is set to $k=8$, which can be modified at inference time according to the user needs. We set the image resolution of $I_{\mathrm{ref}}, I_c$ to $H\!=\!W\!=\!256$, and implement the context feature extractor $F$ as a convolutional network reducing the spatial dimension of the input by a factor of 8, thus resulting in a feature map $\fvisual$ of size $H'\!=\!W'\!=16$. This makes the effective length of  $c_{in}$, the input of the context encoder, $L\!=\!256 + 8$. We model the context encoder $C_e$ as a transformer encoder, while the VAE encoder $E$ and VAE decoder $D$ are implemented as transformer decoders.  In all the cases, we set the hidden dimension of the models to $\fdim\!=\!256$.}
+We train the final model for 5000 epochs, with a batch size of 32, using the AdamW optimizer (\cite{LoshchilovH19}) with initial learning rate of $1\mathrm{e}{-4}$ and cosine scheduler. We select the weights of each loss component in Eq.~\eqref{eq:fianl_objective} with a grid-search on the \textit{Oxford-IIIT Pet INP}, and apply the same configuration for experiments on the \textit{ADE 20K Outdoor INP}. The weight of each loss component is, respectively, $\lambda_{\mathrm{KL}}\!=\!2.5\mathrm{e}{-4}$, $\lambda_{\mathrm{col}}\!=\!2.5\mathrm{e}{-2}$,
+$\lambda^{reg}_{\mathrm{col}}\!=\!2.5\mathrm{e}{-3}$ and $\lambda^{reg}_{\mathrm{dist}}\!=\!5.0\mathrm{e}{-6}$.
+Additional implementation details are present in the \emph{Supp. Mat.}.

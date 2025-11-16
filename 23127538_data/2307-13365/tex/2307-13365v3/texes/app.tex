@@ -1,0 +1,331 @@
+\newpage
+\appendix
+\onecolumn
+\section{Appendix}
+\iffalse
+You can have as much text here as you want. The main body must be at most $8$ pages long.
+For the final version, one more page can be added.
+If you want, you can use an appendix like this one.  
+
+The $\mathtt{\backslash onecolumn}$ command above can be kept in place if you prefer a one-column appendix, or can be removed if you prefer a two-column appendix.  Apart from this possible change, the style (font size, spacing, margins, page numbering, etc.) should be kept the same as the main body.
+\fi
+%\section{Appendix}
+\noindent \textbf{Quick Start-up.} Note that in our supplementary materials, we provide a \textbf{Jupyter Notebook} demonstrating the application of our SRA technique on LLaMA. By following the instructions in the notebook, users can quickly experience the enhancement of long-text comprehension in LLMs through SRA. The implementation is straightforward, and we highly recommend trying it for direct testing and evaluation.
+
+\noindent \textbf{Overview.} This supplementary material is to elaborate on our further analyses and implementation details.
+
+\subsection{Attention Score Distribution Analysis}
+\label{sec:attn_dist}
+
+
+Due to the dynamic adjustment characteristics of Softmax and RoPE, conventional mathematical analysis methods struggle to quantify their behavior effectively. However, as shown in Equation~\ref{eq:attn_rope}, by focusing solely on the approximate scaling trend of the attention score $\mA$ under the influence of $\mP$ and $\mD$, we can simplify the problem into a segmented classification framework.
+
+Given the Softmax function:
+\begin{equation}
+\label{eq:softmax}
+    \sigma(x_i) = \frac{e^{x_i}}{\sum_{j=1}^{n} e^{x_j}}
+\end{equation}
+Since Softmax dynamically adjusts its normalization based on the values of $\mA$, we intentionally omit the denominator of the Softmax function and focus solely on its exponential numerator $e^x$ to simplify the problem. The segmentation of classification of both RoPE upper boundary and the $e^x$ is shown in Fig~\ref{fig:classify_func}. 
+
+
+Based on the magnitude of their gradients, we classify them into three intervals with distinct scaling capacities to facilitate estimation and differentiation. By combining the scaling capacities of RoPE $\mP$ and Softmax $\mD$, we derive 9 corresponding scaling levels for $\mD \mP$. We denote $\mathbf{S}$ corresponds to Sublinear, $\mathbf{L}$ to Linear, and $\mathbf{E}$ to Exponential scaling. At the same time, we use superscripts \( r \) and \( s \) to indicate whether they belong to RoPE or Softmax, respectively. The reason for making this distinction is that, in terms of actual scaling, it is straightforward to observe that \( \mathbf{E}^s > \mathbf{E}^r \), $\mathbf{S}^r \approx \mathbf{L}^r$, and \( \mathbf{S}^s \ll \mathbf{S}^r \).
+
+
+
+In conjunction with the token classification discussed in the main text regarding the attention mechanism, we can easily map different types of tokens to their corresponding $\mD \mP$ scaling levels. Furthermore, this mapping allows for straightforward estimation of the scaling intervals for various token types under the combined effects of RoPE and Softmax.
+
+\textbf{Linchpins} $\mX_{lin}$: Tokens with scaling magnitude $\mathbf{E}^r \mathbf{E}^s$. These tokens exhibit high cosine similarity and are close to the current token. After Softmax normalization, their values typically exceed $1e-1$, reflecting their significant contribution to the attention mechanism.
+
+\textbf{Context Fillers} $\mX_{con}$: Tokens with scaling magnitude $\mathbf{E}^r \mathbf{L}^s$. These tokens are adjacent to the current token but lack high similarity. Due to the dominance of the exponential scaling part $e^x$ in Softmax, their values after Softmax normalization usually fall within the range $[1e-2,5e-2]$.
+
+\textbf{Hidden Gems} $\mX_{hid}$:  Tokens with scaling magnitudes $\mathbf{L}^r \mathbf{E}^s$ or $\mathbf{S}^r \mathbf{E}^s$. These tokens exhibit high similarity but are far from the current token. Since $\mathbf{S}^r \approx \mathbf{L}^r$, the effects of RoPE are significantly diminished. Consequently, even distant $\mX_{hid}$ tokens maintain a similar magnitude to $\mX_{con}$ after Softmax normalization. Additionally, $\mX_{hid}$ with $\mathbf{S}^r \mathbf{E}^s$ scaling often surpass $\mX_{con}$ in magnitude but generally remain below $1e-1$.
+
+\textbf{Small Potatoes} $\mX_{pot}$: TTokens with scaling magnitudes that do not fall into the previously defined categories. Due to the exponential nature of $e^x$, values below 0 are significantly suppressed, and Softmax normalization further amplifies the influence of the three primary token types described above. As a result, $\mX_{pot}$ tokens typically have values after Softmax normalization that fall below $1e-2$, often less than $1e-3$.
+
+\subsection{Transformation of Information Between Layers}
+\label{sec:info_trans}
+
+Our experiments are conducted on the retrieval task presented in Sec.~\ref{sec:retrieval_eval}, we compute the accumulated attention score for the \textit{PASS KEY} token across all layers, with results shown in Figure~\ref{fig:retri_pass}. From the figure, it is evident that beyond a certain distance, no clear regular pattern emerges. Additionally, the accumulated attention score is too small to strongly validate that the model inherently tends to focus on these keywords. 
+
+
+%-------------------------------------------------
+% Figure environment removed
+%-------------------------------------------------
+
+%-------------------------------------------------
+% Figure environment removed
+%-------------------------------------------------
+
+On the other hand, as previous works have demonstrated~\cite{tang2024quest,ge2024model}, the majority of attention is concentrated on the surrounding tokens. This indicates that the final tokens cannot independently retrieve information from distant keywords. Consequently, we infer that information in the model is transmitted incrementally in a step-by-step manner.
+
+\subsection{SRA Algorithm}
+\label{sec:outler_sra}
+We present our outer-loop SRA in Algorithm~\ref{algo:sra_outer}.
+
+\begin{algorithm}[h]
+   \caption{Outer-loop Scaled ReAttention}
+\begin{algorithmic}
+    \label{algo:sra_outer}
+   \STATE {\bfseries After applying Softmax on attention weights:}
+   \STATE {\bfseries Input:} Attention Weights $\mWa$, Layer Index $i$, Layer Num $l$, Outer Threshold $\tau_{ou}$, Outer Scaling $s_{ou}$, Final Num $C_e$. \COMMENT{All undefined functions are from Torch.}
+   \IF[Inter Loop]{$ (l-1) > i > 0 $}
+    \STATE /* Function only on indexes with Hidden Gems */
+    
+    \STATE $\mathbf{idx}_{gem} = any(\mWa[\pou(\mWa,i)] > (\tau_{ou} / C_e))$ 
+    
+    \STATE $\mathbf{\mW}_{eli} = \eou(\mWa[\mathbf{idx}_{gem}], i+4)$ 
+    
+    \STATE $\mathbf{idx}_{tar} = \pou(\mathbf{\mW}_{eli},i)$
+    
+    \STATE $\mW_{tar} = \mW_{eli}[\mathbf{idx}_{tar}]$
+    
+    \STATE /* Prepare scaled attention removal */
+    \STATE $\mW_{re} = sum(\mW_{eli},dim=-1)$
+    
+    \STATE $\mW_{rm} = oneslike(\mW_{re})-\mW_{re}$
+    \STATE $\mathbf{m}_{gem} = where(\mW_{tar} > 0, 1, 0.01)$
+    
+    \STATE $\mW_{add} = div(\mW_{rm}, sum(\mathbf{m}_{gem}, dim=-1))*s_{ou} $
+    \STATE /* Readded to original weights */
+    
+    \STATE $\mW_{eli}[\mathbf{idx}_{tar}] = \mW_{tar} + \mW_{add}$
+    \STATE $\mWa[\mathbf{idx}_{gem}] = \mW_{eli}$
+    \ENDIF 
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{SRA Configurations}
+\label{sec:sra_config}
+In this section, we first analyze the impact of the configurations of SRA themselves, which remain consistent across different models and tasks. Subsequently, we examine the variations introduced by different models and tasks to assess their influence on performance further. Since we conducted extensive experiments on almost every model and task, and many parameters are interrelated, we will only present the conclusions in this section. For detailed experiments, please refer to the following Tables~\ref{tab:longchat_llama3}-\ref{tab:longbench_v1_lla2}. Notice that the results reported in the main paper are selected from the top 3 most successful configurations for open-source tasks, as it's reasonable to implement different configurations on different prompt lengths and various task categories. Due to the special submission deadline, we did not have enough time to organize our extensive experiments. For LongBench v1 and v2, we have trained above 20 sets of parameters for each model. We only present a portion of the experimental results here and \textbf{will update more experiments in our Supplementary Materials}. Please stay tuned for updates to the supplementary materials. All results are reproducible, and we strongly recommend using our provided Start-Up for direct testing.
+
+\paragraph{SRA Parameters}
+We first discuss the configuration of the start index \( C_s \) and the last index \( C_e \) tokens in SRA. We found that as long as \( C_s \) is restricted within a certain range and not set too far back—thus preventing SRA from missing critical information—it generally does not affect the final results. Even if we include the first token (attention sink), the outcome merely serves as an outlier suppression mechanism. In our experiments, all \( C_s \) values were set to 50.
+
+In contrast, the configuration of \( C_e \) has a significant impact on the final results. \( C_e \) greatly enhances the retrieval strength of current tokens for previous tokens. However, in practical scenarios, the long-time decay nature of RoPE is inherently reasonable for most daily tasks, so the model may not necessarily need to extensively focus on prior content. Therefore, the setting of \( C_e \) is highly task-dependent. In XSum summarization in Sec.~\ref{sec:xsum}, we set $C_e=50$. In open-source tasks and LongChat, we generally set $C_e=5\%$.
+
+For the other four parameters, \( \tau_{in} \), \( \tau_{ou} \), \( s_{in} \), and \( s_{ou} \), there is no fixed pattern as their behavior is highly dependent on the model and the task. Generally, \( s_{in} \) and \( s_{ou} \) are more influenced by the model, as different training methodologies result in varying sensitivities to the disturbances introduced by SRA adjustments. For instance, retrieval-trained models exhibit much higher sensitivity compared to models trained across a broader range of downstream tasks.
+
+In contrast, \( \tau_{in} \) and \( \tau_{ou} \) depend on both the model and the task. From the model perspective, their behavior is similar to \( s_{in} \) and \( s_{ou} \). However, from the task perspective, counterintuitively, finer granularity enhancements require smaller magnitudes. For example, in retrieval tasks, \( \tau_{in} \) and \( \tau_{ou} \) should be set to lower values, whereas larger values are preferable for summarization tasks. This is because the information is transformed step by step, there is no such ``extra attention" for the ``intended tokens". Only small enhancements step by step could make a difference.
+
+\paragraph{Model Variations} Basically, we found that the retrieval-trained models are more sensitive such as \textbf{Longchat-7B-16K}. Through an in-depth analysis, we found that their attention distribution tends to be smoother, where the Linchpins are not as magnificent as those in other models, therefore raising the other ones' magnitudes, as shown in Table~\ref{tab:longchat_long}. A quick method to determine if a model is highly sensitive to adjustments is to use the following parameter settings: \( C_e = 50 \), \( \tau_{in} = 0.3 \), \( \tau_{ou} = 0.3 \), \( s_{in} = 3 \), and \( s_{ou} = 3 \). If the model's performance degrades under these settings, it indicates high sensitivity to adjustments. Since Hidden Gems represent only a minority, comprising less than 25\% of attention heads and tokens, the disturbance caused by SRA adjustments should generally be minimal. Therefore, the proposed parameter configuration is typically sufficient for a quick and reliable sensitivity assessment.
+
+\paragraph{Task Variations}
+Compared to the first two, we can summarize a general overall pattern. However, for task variations, due to the diversity and uniqueness of the tasks themselves, it is difficult to provide an accurate and detailed classification for most tasks, making a precise theoretical judgment nearly impossible. Through extensive experiments on LongBench v1~\cite{bai2023longbench} and LongBench v2~\cite{bai2024longbench}, we provide the following recommendations for configuration choices:
+\vspace{-10pt}
+\begin{itemize}
+    \setlength{\itemsep}{-3pt}
+    \item If the final prompt is lengthy but contains critical information, select at most the last 10\% $C_e$ with low $s_{ou}$.
+    \item Outer-loop SRA has a greater impact overall. For retrieval-based tasks, prioritize outer-loop iterations, while for comprehension tasks, focus more on inner-loop iterations.
+    \item Be mindful of the limited durability of LLMs. Avoid excessive pressure on both loops, especially the outer loop. 
+    \item Even simple ReAttention techniques without amplifying the eliminated attention weights can provide improvements.
+\end{itemize}
+
+
+\subsection{Excessive Usage of SRA}
+Excessive use of SRA can lead to serious consequences, including but not limited to hallucinations, disorganized language structures, repetitive or incomplete responses, and impaired weak-modal language functionality. For normal models, \( s_{in} \) and \( s_{out} \) should be restricted to within 6, and for retrieval-based models, they should be limited to within 2 to ensure proper model functionality. Specifically, excessive usage of SRA significantly increases PPL. For example, under the configuration \( C_s = 50 \), \( C_e = 200 \), \( \tau_{in} = 0.5 \), \( \tau_{ou} = 0.5 \), \( s_{in} = 8 \), and \( s_{ou} = 8 \), the PPL for the last 200 tokens of \textbf{LLaMA-3-8B} can rise to over 25 with total 1028 tokens.
+
+  
+
+\begin{table}[tb]
+    \centering
+    %\setstretch{0.8}
+    %\scriptsize
+    \footnotesize
+    \caption{\textbf{LLaMA-3-8B-Instruct results on LongChat.}}
+    \begin{tabular}{|c|c|c|c|c|c|c|}
+    \toprule
+    \multicolumn{6}{|c|}{\textbf{Parameters}} & \textbf{Average} \\
+    \midrule
+    $C_s$ & $C_e$ & $\tau_{in}$ & $\tau_{ou}$ & $s_{in}$ & $s_{ou}$ & 59.5 (Or)\\
+    \midrule
+    50 & 200 & 0.3 & 0.3 & 2 & 2 & 58.5\\
+
+    \hline
+    100 & 200 & 0.3 & 0.3 & 2 & 2 & 58.5\\
+
+    \hline
+    300 & 200 & 0.3 & 0.3 & 2 & 2 & 58.5\\
+
+    \hline
+    1200 & 200 & 0.3 & 0.3 & 2 & 2 & 56.0\\
+
+    \hline
+    50 & 200 & 0.3 & 0.3 & 3 & 3 & 60.5\\
+
+    \hline
+    50 & 10\% & 0.3 & 0.3 & 2 & 2 & 60.0\\
+
+    \hline
+    50 & 5\% & 0.3 & 0.3 & 2 & 2 & 66.0\\
+
+    \hline
+    50 & 5\% & 0.3 & 0.1 & 2 & 2.5 & 66.5\\
+
+    \hline
+    50 & 5\% & 0.1 & 0.1 & 3 & 2.5 & 65.0\\
+
+    \hline
+    50 & 5\% & 0.5 & 0.3 & 4 & 3 & 57.5\\
+
+    \hline
+    50 & 5\% & 0.5 & 0.3 & 2 & 4 & 56.5\\
+
+    \hline
+    50 & 5\%  & 0.5 & 0.3 & 3 & 2 & 59.0\\
+
+    \hline
+    50 & 200 & 0.5 & 0.3 & 3 & 3 & 61.5\\
+
+    \hline
+    50 & 400 & 0.5 & 0.3 & 3 & 3 & 50.5\\
+    
+    \bottomrule
+    \end{tabular}
+    %\vspace{-1.5em}
+    \label{tab:longchat_llama3}
+\end{table}
+
+
+
+\begin{table}[tb]
+    \centering
+    %\setstretch{0.8}
+    %\scriptsize
+    \footnotesize
+    \caption{\textbf{Longchat-7B-16K results on LongChat.}}
+    \begin{tabular}{|c|c|c|c|c|c|c|}
+    \toprule
+    \multicolumn{6}{|c|}{\textbf{Parameters}} & \textbf{Average} \\
+    \midrule
+    $C_s$ & $C_e$ & $\tau_{in}$ & $\tau_{ou}$ & $s_{in}$ & $s_{ou}$ & 72 (Or)\\
+    \midrule
+    
+    50 & 5\% & 0.5 & 0.3 & 3 & 3 & 59.2\\
+
+    \hline
+    50 & 5\% & 0.3 & 0.3 & 2 & 2 & 57.6\\
+
+    \hline
+    50 & 5\% & 0.3 & 0.1 & 2 & 2 & 71.2\\
+
+    \hline
+    50 & 5\% & 0.3 & 0.1 & 1 & 1 & 74.0\\
+
+    \hline
+    50 & 5\% & 0.1 & 0.1 & 2 & 2 & 71.4\\
+
+    \hline
+    50 & 5\% & 0.1 & 0.1 & 1 & 1 & 73.2\\
+
+    \hline
+    50 & 5\%  & 0.1 & 0.1 & 1.5 & 1.5 & 77.0\\
+
+    \hline
+    50 & 5\%  & 0.1 & 0.1 & 1.2 & 1.5 & 79.4\\
+
+    \hline
+    50 & 5\%  & 0.05 & 0.05 & 1.2 & 1.5 & 81.2\\
+
+    \hline
+    50 & 5\%  & 0.1 & 0.05 & 1.2 & 1.5 & 78.5\\
+    
+    \bottomrule
+    \end{tabular}
+    %\vspace{-1.5em}
+    \label{tab:longchat_long}
+    %\end{minipage}
+\end{table}
+
+
+
+%------------------------------------------------------------
+\begin{table*}[tb]
+\footnotesize
+\centering
+\renewcommand{\arraystretch}{0.9}
+\caption{ \textbf{LLaMA-2-7B-Chat results on LongBench v1.}}
+%\resizebox{\linewidth}{!}
+{
+\begin{tabular}{cccccc|ccccccc}
+\toprule
+$C_s$ & $C_e$ & $\tau_{in}$ & $\tau_{ou}$ & $s_{in}$ & $s_{ou}$  & \textbf{MFQA-EN} & \textbf{VCSUM}  & \textbf{TREC} & \textbf{SAMSum} & \textbf{LSHT} & \textbf{LCC} & \textbf{RB-P} \\ 
+
+\midrule
+
+50 & 200 & 0.5 & 0.3 & 4 & 6 & 36.50 & 13 & 62.5 & 40.2 & 18.0 & 54.13 & 50.72\\ 
+
+100 & 200 & 0.5 & 0.3 & 4 & 6 & 34.99 & 13 & 62.5 & 40.2 & 18.0 & 54.13 & 50.72 \\
+
+200 & 200 & 0.5 & 0.3 & 4 & 6 & 33.12 & 13 & 62.5 & 40.2 & 18.0 & 54.13 & 50.72 \\  
+
+400 & 200 & 0.5 & 0.3 & 4 & 6 & 35.53 & 13 & 62.5 & 40.2 & 18.0 & 54.13 & 50.72 \\
+
+800 & 200 & 0.5 & 0.3 & 4 & 6 & 34.31 & 18 & 65.0 & 40.23 & 18.5 & 57.42 & 52.66 \\ 
+
+\midrule
+
+50 & 5\% & 0.5 & 0.3 & 4 & 6 & 36.68 & 20 & 65.0 & 40.23 & 18.5 & 57.42 & 52.66 \\ 
+
+50 & 10\% & 0.5 & 0.3 & 4 & 6 & 34.94 & 20 & 65.0 & 40.23 & 18.5 & 57.42 & 52.66 \\  
+
+50 & 10\% & 0.3 & 0.1 & 4 & 4 & 36.19 & 20 & 65.0 & 40.23 & 18.5 & 57.42 & 52.66 \\  
+
+50 & 5\% & 0.3 & 0.1 & 4 & 4 & 37.08 & 20 & 65.0 & 40.23 & 18.5 & 57.42 & 52.66 \\  
+
+50 & 5\% & 0.5 & 0.3 & 4 & 6 & 36.22 & 15 & 64.5 & 41.02 & 17.75 & 58.50 & 52.45 \\ 
+
+50 & 5\% & 0.3 & 0.3 & 3 & 3 & 36.55 & 20 & 65.0 & 39.87 & 18.0 & 59.20 & 52.44 \\  
+
+\midrule
+
+50 & 5\% & 0.3 & 0.3 & 5 & 4 & 35.78 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 5\% & 0.3 & 0.3 & 5 & 5 & 36.58 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 5\% & 0.5 & 0.3 & 5 & 5 & 36.46 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 5\% & 0.3 & 0.1 & 5 & 5 & 35.29 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 5\% & 0.3 & 0.3 & 4.5 & 6 & 37.62 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 5\% & 0.5 & 0.1 & 4 & 5 & 37.24 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\
+
+\midrule
+
+800 & 10\% & 0.5 & 0.3 & 4 & 4 & 35.12 & 16 & 64.5 & 40.2 & 18.5 & 57.42 & 52.66 \\ 
+
+800 & 10\% & 0.5 & 0.3 & 4 & 4 & 36.46 & 19 & 65.5 & 41.5 & 19.25 & 59.4 & 52.43 \\ 
+
+50 & 10\% & 0.3 & 0.5 & 4 & 6 & 37.83 & 21 & 64.5 & 41.5 & 19.25 & 59.4 & 52.44 \\ 
+
+400 & 10\% & 0.3 & 0.5 & 4 & 6 & 35.53 & 20 & 64.5 & 41.5 & 18.0 & 58.76 & 52.44 \\ 
+
+50 & 10\% & 0.3 & 0.3 & 6 & 6 & 35.53 & 19 & 66.5 & 42.31 & 19.25 & 59.4 & 53.23 \\ 
+
+200 & 10\% & 0.5 & 0.5 & 4 & 4 & 36.79 & 15 & 62.5 & 40.2 & 17.75 & 59.2 & 52.43 \\ 
+
+\bottomrule
+\end{tabular}
+}
+%\vspace{-4pt}
+\label{tab:longbench_v1_lla2}
+\end{table*}
+%------------------------------------------------------------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+% This document was modified from the file originally made available by
+% Pat Langley and Andrea Danyluk for ICML-2K. This version was created
+% by Iain Murray in 2018, and modified by Alexandre Bouchard in
+% 2019 and 2021 and by Csaba Szepesvari, Gang Niu and Sivan Sabato in 2022.
+% Modified again in 2023 and 2024 by Sivan Sabato and Jonathan Scarlett.
+% Previous contributors include Dan Roy, Lise Getoor and Tobias
+% Scheffer, which was slightly modified from the 2010 version by
+% Thorsten Joachims & Johannes Fuernkranz, slightly modified from the
+% 2009 version by Kiri Wagstaff and Sam Roweis's 2008 version, which is
+% slightly modified from Prasad Tadepalli's 2007 version which is a
+% lightly changed version of the previous year's version by Andrew
+% Moore, which was in turn edited from those of Kristian Kersting and
+% Codrina Lauth. Alex Smola contributed to the algorithmic style files.
